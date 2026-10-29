@@ -44,8 +44,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test \"test/*.test.mjs\"",
-    "selftest": "node --test \"test/*.test.mjs\" && node plugins/dsh-agent-board/selftest.mjs && node plugins/dsh-agent-board/selftest-client.mjs",
+    "test": "node scripts/test.mjs",
+    "selftest": "node scripts/test.mjs && node plugins/dsh-agent-board/selftest.mjs && node plugins/dsh-agent-board/selftest-client.mjs",
     "plugin:selftest": "node plugins/dsh-agent-board/selftest.mjs && node plugins/dsh-agent-board/selftest-client.mjs",
     "board": "node bin/atk.mjs board",
     "serve": "node bin/atk.mjs serve",

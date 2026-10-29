@@ -164,8 +164,11 @@ version bump + migration note.
 
 ## 6. Testing
 
-- `node --test "test/*.test.mjs"` (built-in runner; a bare directory argument is
-  rejected by Node 24 on Windows). No vitest/jest.
+- `npm test` runs `node scripts/test.mjs`, which expands `test/*.test.mjs` and
+  invokes the built-in `node --test` runner with explicit paths. That indirection
+  is required: Node 20 does not expand globs, Node 22+ expands them only as a
+  literal, Windows `cmd` expands none, and Node 24 rejects a bare directory
+  argument on Windows. No vitest/jest.
 - Every command module gets at least one test that builds a throwaway project in
   `mkdtemp(path.join(os.tmpdir(), "atk-test-"))`, writes a minimal config +
   state/ownership files, and asserts both library output and CLI exit codes.

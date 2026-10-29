@@ -143,7 +143,7 @@ Node.js >= 20.11. No runtime dependencies. The test suite uses the built-in
 `node --test` runner:
 
 ```bash
-npm test          # node --test "test/*.test.mjs"
+npm test          # node scripts/test.mjs (works on Node 20 / Windows / POSIX)
 npm run selftest  # tests + board plugin selftests
 ```
 

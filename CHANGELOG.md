@@ -31,6 +31,13 @@ semantic versioning.
 
 ### Fixed
 
+- `runCommand` passed the joined command line to `spawn` without a shell off
+  Windows, so every array-form step (fast/quick gates, ownership git lookups)
+  failed on Linux/macOS; it now spawns command and argv separately.
+- `npm test` goes through `scripts/test.mjs`, which expands the test glob itself,
+  so the suite runs on Node 20 and on every platform; two cache/util tests no
+  longer depend on Windows-only `%TEMP%` behaviour. The CI matrix now covers the
+  full suite on Node 20/22/24 across Ubuntu and Windows.
 - The `atk board` help text and the generated `commands.md` claimed the command
   renders `board.md` too; it writes only `board.html` (`atk state board` writes
   the markdown board).

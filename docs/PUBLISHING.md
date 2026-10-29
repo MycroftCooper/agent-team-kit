@@ -9,7 +9,7 @@ This page assumes the package is `agent-team-kit` and the binary is `atk`.
       `repository` / `bugs` / `homepage` URLs (this repo:
       `MycroftCooper/agent-team-kit`).
 - [ ] `node --version` >= 20.11; the package has **no** `dependencies`.
-- [ ] `npm test` passes (`node --test "test/*.test.mjs"`).
+- [ ] `npm test` passes (`node scripts/test.mjs`).
 - [ ] `npm run selftest` passes (tests + the board plugin's two selftests).
 - [ ] `npm pack --dry-run` lists only intended files.
 - [ ] `CHANGELOG.md` has an entry for the version being published.

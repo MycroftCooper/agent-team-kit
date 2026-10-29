@@ -27,12 +27,13 @@ async function exists(target) {
 }
 
 async function setup(t, targetDir) {
-  const relativePath = `%TEMP%/${path.basename(targetDir)}`;
+  // Absolute paths keep the fixture independent of %TEMP%/$TMPDIR naming; the
+  // env-expansion itself is covered by the util tests.
   const project = await createProject({
     config: {
       cache: {
         targets: [
-          { name: "cargo-target", path: relativePath, env: "CARGO_TARGET_DIR" },
+          { name: "cargo-target", path: targetDir, env: "CARGO_TARGET_DIR" },
           { name: "unused-target", path: path.join(os.tmpdir(), "atk-cache-does-not-exist") },
         ],
       },
@@ -41,7 +42,7 @@ async function setup(t, targetDir) {
   const logger = memoryLogger();
   const ctx = await createContext({ cwd: project.root, logger });
   t.after(() => rm(project.root, { recursive: true, force: true }));
-  return { ...project, ctx, logger, expectedPath: expandPath(relativePath), run: (argv) => runCache(argv, ctx) };
+  return { ...project, ctx, logger, expectedPath: expandPath(targetDir), run: (argv) => runCache(argv, ctx) };
 }
 
 test("cache status reports every configured target with expanded paths and sizes", async (t) => {
@@ -50,7 +51,7 @@ test("cache status reports every configured target with expanded paths and sizes
   assert.equal(await run(["status"]), 0);
   const report = logger.lines.json.at(-1);
   assert.equal(report.schemaVersion, 1);
-  assert.equal(path.resolve(expectedPath), path.resolve(targetDir), "%TEMP% is expanded with the live env");
+  assert.equal(path.resolve(expectedPath), path.resolve(targetDir), "the configured path is used as-is");
   const cargo = report.targets.find((target) => target.name === "cargo-target");
   assert.equal(cargo.exists, true);
   assert.equal(cargo.files, 2);

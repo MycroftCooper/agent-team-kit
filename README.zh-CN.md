@@ -131,7 +131,7 @@ node bin/atk.mjs --cwd examples/minimal board
 Node.js >= 20.11，无运行时依赖。测试用内置 runner：
 
 ```bash
-npm test          # node --test "test/*.test.mjs"
+npm test          # node scripts/test.mjs（Node 20 / Windows / POSIX 都可用）
 npm run selftest  # 测试 + 看板插件自测
 ```
 

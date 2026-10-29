@@ -72,10 +72,13 @@ test("splitTableRow trims leading/trailing pipes", () => {
 });
 
 test("expandPath expands %TEMP%, $HOME and ~", () => {
-  const env = { TEMP: "C:/temp", HOME: "/home/x" };
-  assert.equal(expandPath("%TEMP%/x", { root: "C:/project", env }).replace(/\\/g, "/"), "C:/temp/x");
-  assert.equal(expandPath("~/x", { root: "C:/project", env }).replace(/\\/g, "/"), `${os.homedir().replace(/\\/g, "/")}/x`);
-  assert.equal(expandPath("rel/x", { root: "C:/project", env }).replace(/\\/g, "/"), "C:/project/rel/x");
+  const env = { TEMP: path.join(os.tmpdir(), "atk-temp"), HOME: path.join(os.tmpdir(), "atk-home") };
+  const root = path.resolve("atk-project");
+  const norm = (value) => value.replace(/\\/g, "/");
+  assert.equal(norm(expandPath("%TEMP%/x", { root, env })), norm(path.join(env.TEMP, "x")));
+  assert.equal(norm(expandPath("$TEMP/x", { root, env })), norm(path.join(env.TEMP, "x")));
+  assert.equal(norm(expandPath("~/x", { root, env })), norm(path.join(os.homedir(), "x")));
+  assert.equal(norm(expandPath("rel/x", { root, env })), norm(path.join(root, "rel/x")));
 });
 
 test("localIso keeps a local offset", () => {
