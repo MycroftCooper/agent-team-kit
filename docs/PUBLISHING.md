@@ -99,7 +99,9 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-Without the secret the workflow stops before publishing. The local alternative is
+The workflow skips the publish step when that version already exists on npm, so a
+tag pushed after a local publish does not fail. Without the secret the workflow
+stops before publishing. The local alternative is
 `npm login && npm publish --access public`.
 
 ## GitHub template repository
