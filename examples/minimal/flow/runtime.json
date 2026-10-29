@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 2,
+  "updatedAt": "2026-10-29T21:05:00+08:00",
+  "note": "Maintained by LEAD: who is working on what, plus recent events. Slice and package state lives in state.json.",
+  "agents": [
+    {
+      "role": "LEAD",
+      "status": "working",
+      "task": "DEMO-R01",
+      "detail": "dispatching SLICE-01",
+      "since": "2026-10-29T20:10:00+08:00"
+    },
+    {
+      "role": "DEV",
+      "status": "working",
+      "task": "SLICE-01",
+      "detail": "greet() implementation",
+      "since": "2026-10-29T20:20:00+08:00"
+    },
+    {
+      "role": "QA",
+      "status": "waiting",
+      "task": "SLICE-01",
+      "detail": "waiting for the frozen manifest",
+      "since": "2026-10-29T20:30:00+08:00"
+    }
+  ],
+  "events": [
+    {
+      "at": "2026-10-29T20:10:00+08:00",
+      "role": "LEAD",
+      "text": "batch DEMO-R01 opened with one slice"
+    },
+    {
+      "at": "2026-10-29T20:20:00+08:00",
+      "role": "DEV",
+      "text": "SLICE-01 candidate created"
+    }
+  ]
+}

@@ -1,0 +1,213 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/OWNER/agent-team-kit/agent-flow.config.schema.json",
+  "title": "agent-team-kit project configuration",
+  "description": "Placed at <project>/agent-flow.config.json (or <project>/.agent-flow/config.json). All paths are project-relative posix paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": 1 },
+    "project": { "type": ["string", "null"], "description": "Display name; defaults to the project directory name." },
+    "language": { "enum": ["en", "zh-CN", "zh"], "description": "Label language for generated boards and documents." },
+    "layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "flowDir": { "type": "string", "description": "Where state/board/role files live. Default .agent-flow" },
+        "artifactDir": { "type": "string", "description": "Machine artifacts: metrics, manifests, ci-fast reports." },
+        "evidenceDir": { "type": "string", "description": "Durable acceptance receipts (QA approval, apply receipts)." },
+        "tempPrefix": { "type": "string", "description": "Prefix used to recognise candidate snapshots/receipts under the OS temp dir." }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Explicit overrides for any file inside the project. Missing keys derive from layout.flowDir.",
+      "properties": {
+        "state": { "type": "string" },
+        "ownership": { "type": "string" },
+        "board": { "type": "string" },
+        "boardHtml": { "type": "string" },
+        "humanTodos": { "type": "string" },
+        "runtime": { "type": "string" },
+        "currentBatch": { "type": "string" },
+        "taskTemplate": { "type": "string" },
+        "commandsDoc": { "type": "string" },
+        "rolesDir": { "type": "string" },
+        "archiveDir": { "type": "string" },
+        "todoSource": { "type": "string", "description": "Markdown backlog table imported by `atk state import`." },
+        "handoffDoc": { "type": "string", "description": "Long-lived handoff log rotated by `atk docs rotate`." }
+      }
+    },
+    "roles": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+      "description": "Role identifiers used by ownership.json, task tickets and the board."
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fast": {
+          "type": ["object", "null"],
+          "description": "Change-scoped fast gate (atk gate fast). Steps run in parallel unless parallel=false.",
+          "additionalProperties": false,
+          "properties": {
+            "parallel": { "type": "boolean" },
+            "groups": {
+              "type": "object",
+              "description": "Named glob groups used to classify changed files.",
+              "additionalProperties": { "type": "array", "items": { "type": "string" } }
+            },
+            "steps": { "type": "array", "items": { "$ref": "#/definitions/gateStep" } }
+          }
+        },
+        "quick": { "$ref": "#/definitions/gateCommand" },
+        "local": { "$ref": "#/definitions/gateCommand" }
+      }
+    },
+    "batch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "manifestTag": { "type": "string" },
+        "qaSchemaVersion": { "type": "integer" },
+        "idPattern": { "type": "string" },
+        "allowedPrefixes": { "type": "array", "items": { "type": "string" } },
+        "budgetRounds": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "roots": { "type": "array", "items": { "type": "string" } } }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "path"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "path": { "type": "string", "description": "Supports %TEMP% / $TEMP / ~ expansion." },
+              "env": { "type": "string", "description": "Environment variable to export when using this cache." }
+            }
+          }
+        }
+      }
+    },
+    "board": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": { "type": "string" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "compactLimit": { "type": "integer", "minimum": 1 },
+        "fallbackPollMs": { "type": "integer", "minimum": 1000 }
+      }
+    },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Identity of the DeepSeek Harness board plugin copy kept in this project.",
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "route": { "type": "string", "pattern": "^/" },
+        "title": { "type": "string" },
+        "tabKind": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9]*$" },
+        "commandId": { "type": "string" },
+        "dir": { "type": "string", "description": "Where `atk plugin sync` copies the board plugin inside the project." }
+      }
+    },
+    "import": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional overrides for `atk state import` (markdown backlog parsing).",
+      "properties": {
+        "stagePatterns": {
+          "type": ["array", "null"],
+          "items": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 }
+        },
+        "typePatterns": {
+          "type": ["array", "null"],
+          "items": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 }
+        }
+      }
+    },
+    "rotation": {
+      "type": "array",
+      "description": "Long-lived documents rotated by `atk docs rotate`.",
+      "items": {
+        "type": "object",
+        "required": ["path", "archiveDir"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "archiveDir": { "type": "string" },
+          "archivePrefix": { "type": "string" },
+          "keep": { "type": "integer", "minimum": 0 },
+          "mode": { "enum": ["sections", "narrative"] },
+          "headingLevel": { "type": "integer", "minimum": 1, "maximum": 6 },
+          "startMarker": { "type": "string", "description": "For narrative mode: the heading that ends the narrative zone." },
+          "pointer": { "type": "string", "description": "Optional template for the pointer line left behind." }
+        }
+      }
+    },
+    "todoSource": { "type": ["string", "null"], "description": "Shortcut for paths.todoSource." },
+    "handoffDoc": { "type": ["string", "null"], "description": "Shortcut for paths.handoffDoc." }
+  },
+  "definitions": {
+    "gateCommand": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "command": { "$ref": "#/definitions/command" },
+        "cwd": { "type": "string" },
+        "env": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "gateStep": {
+      "type": "object",
+      "required": ["name", "command"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "kind": { "type": "string" },
+        "phase": { "enum": ["preflight", "main"] },
+        "command": { "$ref": "#/definitions/command" },
+        "when": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "group": { "type": ["string", "array"], "items": { "type": "string" } },
+            "changed": { "type": "boolean" },
+            "includingTests": { "type": "boolean" }
+          }
+        },
+        "files": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "group": { "type": ["string", "array"], "items": { "type": "string" } },
+            "mode": { "enum": ["append", "each"] },
+            "includeTouchedTests": { "type": "boolean" },
+            "fallback": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "roleFlag": { "type": "boolean", "description": "Append --role <ROLE> to the command." },
+        "filesFlag": { "type": "boolean", "description": "Append --files <comma list> to the command." }
+      }
+    },
+    "command": {
+      "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" }, "minItems": 1 }]
+    }
+  }
+}

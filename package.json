@@ -1,0 +1,62 @@
+{
+  "name": "agent-team-kit",
+  "version": "0.1.0",
+  "description": "Reusable multi-agent delivery workflow: a state-machine CLI (atk), role contracts, evidence gates and a DeepSeek Harness kanban board plugin.",
+  "keywords": [
+    "agent",
+    "multi-agent",
+    "workflow",
+    "kanban",
+    "task-board",
+    "deepseek-harness",
+    "dsh",
+    "coding-agent",
+    "cli"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "atk": "bin/atk.mjs",
+    "agent-team-kit": "bin/atk.mjs"
+  },
+  "exports": {
+    ".": "./lib/index.mjs",
+    "./config": "./lib/config.mjs",
+    "./util": "./lib/util.mjs",
+    "./labels": "./lib/labels.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "templates",
+    "presets",
+    "skills",
+    "docs",
+    "plugins",
+    "agent-flow.config.schema.json",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "selftest": "node --test \"test/*.test.mjs\" && node plugins/dsh-agent-board/selftest.mjs && node plugins/dsh-agent-board/selftest-client.mjs",
+    "plugin:selftest": "node plugins/dsh-agent-board/selftest.mjs && node plugins/dsh-agent-board/selftest-client.mjs",
+    "board": "node bin/atk.mjs board",
+    "serve": "node bin/atk.mjs serve",
+    "check": "node --check bin/atk.mjs && node -e \"import('./lib/index.mjs')\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OWNER/agent-team-kit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/OWNER/agent-team-kit/issues"
+  },
+  "homepage": "https://github.com/OWNER/agent-team-kit#readme"
+}

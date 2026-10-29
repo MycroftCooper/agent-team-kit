@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-10-29T21:05:00+08:00",
+  "source": "committed demo project - safe to edit or delete",
+  "batch": {
+    "id": "DEMO-R01",
+    "goal": "Ship a tiny greet() helper with one tested behavior.",
+    "stopCondition": "The slice is QA-passed, applied and accepted by the user.",
+    "devClosedByUser": false,
+    "applyMode": "local-tree",
+    "openQuestions": ["Should greet() support a locale argument?"],
+    "slices": [
+      {
+        "id": "SLICE-01",
+        "label": "Greet helper",
+        "status": "in_progress",
+        "qaPassed": null,
+        "applied": null,
+        "owner": "DEV",
+        "exit": "greet('Ada') returns 'Hello, Ada!'; atk gate fast passes",
+        "evidence": "artifacts/evidence",
+        "note": "implementation in flight"
+      }
+    ]
+  },
+  "counts": { "total": 2, "byStage": { "implemented": 1, "todo": 1 } },
+  "packages": [
+    {
+      "id": "DEMO-01",
+      "type": "feature",
+      "typeRaw": "feature",
+      "owner": "DEV",
+      "module": "greeting",
+      "scope": "src/greet.mjs",
+      "stage": "implemented",
+      "statusRaw": "implemented",
+      "priority": "P1",
+      "evidence": "atk gate fast report",
+      "note": "greet() implemented and covered by a unit test",
+      "depsRaw": "",
+      "deps": [],
+      "archived": false,
+      "migrated": true,
+      "verification": {},
+      "updatedAt": "2026-10-29T20:40:00+08:00",
+      "archivedAt": null,
+      "archivedBy": null,
+      "archiveReason": null,
+      "archiveEvidence": null,
+      "firstSeenAt": "2026-10-29T20:10:00+08:00"
+    },
+    {
+      "id": "DEMO-02",
+      "type": "bug",
+      "typeRaw": "bug",
+      "owner": "QA",
+      "module": "docs",
+      "scope": "README.md",
+      "stage": "todo",
+      "statusRaw": "not started",
+      "priority": "P2",
+      "evidence": "",
+      "note": "README example calls greet() with swapped arguments",
+      "depsRaw": "DEMO-01",
+      "deps": ["DEMO-01"],
+      "archived": false,
+      "migrated": true,
+      "verification": {},
+      "updatedAt": "2026-10-29T20:40:00+08:00",
+      "archivedAt": null,
+      "archivedBy": null,
+      "archiveReason": null,
+      "archiveEvidence": null,
+      "firstSeenAt": "2026-10-29T20:11:00+08:00"
+    }
+  ],
+  "subitems": [
+    {
+      "id": "DEMO-01-F01",
+      "parent": "DEMO-01",
+      "type": "feature",
+      "owner": "DEV; QA",
+      "stage": "partial"
+    }
+  ]
+}

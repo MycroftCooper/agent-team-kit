@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "{{DATE}}",
+  "note": "Human-only todos: only the user (or the board UI) may tick these. Agents may read and add, never tick.",
+  "items": []
+}

@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 2,
+  "updatedAt": "{{DATE}}",
+  "note": "Maintained by LEAD: who is working on what, plus recent events. Slice and package state lives in state.json.",
+  "agents": {{AGENTS_JSON}},
+  "events": []
+}

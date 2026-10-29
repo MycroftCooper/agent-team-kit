@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "project": "Minimal Demo",
+  "language": "en",
+  "layout": {
+    "flowDir": "flow",
+    "artifactDir": "artifacts/agent-flow",
+    "evidenceDir": "artifacts/evidence",
+    "tempPrefix": "minimal-demo"
+  },
+  "roles": ["LEAD", "DEV", "QA"],
+  "gates": {
+    "fast": {
+      "parallel": true,
+      "groups": {
+        "code": ["src/**/*.js", "src/**/*.mjs"],
+        "tests": ["tests/**/*", "**/*.test.mjs"],
+        "docs": ["docs/**", "*.md"]
+      },
+      "steps": []
+    },
+    "quick": null,
+    "local": null
+  },
+  "batch": {
+    "manifestTag": "agent-flow-manifest-v1",
+    "qaSchemaVersion": 1,
+    "idPattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$",
+    "allowedPrefixes": ["src", "tests", "docs"],
+    "budgetRounds": 12
+  },
+  "baseline": { "roots": ["src", "tests", "docs"] },
+  "cache": { "targets": [] },
+  "board": {
+    "title": "Minimal Demo Board",
+    "port": 1422,
+    "compactLimit": 50,
+    "fallbackPollMs": 30000
+  },
+  "plugin": {
+    "id": "minimal-demo-board",
+    "route": "/minimal-demo-board",
+    "title": "Minimal Demo Board",
+    "tabKind": "minimalDemoBoard",
+    "commandId": "minimal-demo-board.open",
+    "dir": "tools/minimal-demo-board"
+  },
+  "rotation": []
+}

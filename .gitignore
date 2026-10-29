@@ -1,0 +1,13 @@
+node_modules/
+.pnpm-store/
+coverage/
+*.log
+*.tmp
+*.tmp-*
+.DS_Store
+Thumbs.db
+artifacts/
+.agent-flow/state.json.tmp-*
+
+*.tgz
+

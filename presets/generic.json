@@ -1,0 +1,50 @@
+{
+  "$schema": "../agent-flow.config.schema.json",
+  "schemaVersion": 1,
+  "project": null,
+  "language": "en",
+  "layout": {
+    "flowDir": ".agent-flow",
+    "artifactDir": "artifacts/agent-flow",
+    "evidenceDir": "artifacts/evidence",
+    "tempPrefix": "agent-flow"
+  },
+  "roles": ["LEAD", "DEV", "QA"],
+  "gates": {
+    "fast": {
+      "parallel": true,
+      "groups": {
+        "code": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.js", "src/**/*.mjs", "src/**/*.css"],
+        "tests": ["**/*.test.ts", "**/*.test.tsx", "**/*.spec.ts", "**/*.spec.tsx", "tests/**/*"],
+        "docs": ["docs/**", "*.md"],
+        "scripts": ["scripts/**/*.mjs"]
+      },
+      "steps": []
+    },
+    "quick": null,
+    "local": null
+  },
+  "batch": {
+    "manifestTag": "agent-flow-manifest-v1",
+    "qaSchemaVersion": 1,
+    "idPattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$",
+    "allowedPrefixes": ["src", "app", "lib", "docs", "scripts", "tests", "public"],
+    "budgetRounds": 12
+  },
+  "baseline": { "roots": ["src", "app", "lib", "docs", "scripts", "tests"] },
+  "cache": { "targets": [] },
+  "board": {
+    "title": "Agent Board",
+    "port": 1421,
+    "compactLimit": 50,
+    "fallbackPollMs": 30000
+  },
+  "plugin": {
+    "id": "agent-board",
+    "route": "/agent-board",
+    "title": "Agent Board",
+    "tabKind": "agentBoard",
+    "commandId": "agent-board.open"
+  },
+  "rotation": []
+}

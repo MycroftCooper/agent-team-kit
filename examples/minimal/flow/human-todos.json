@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-10-29T21:05:00+08:00",
+  "note": "Human-only todos: only the user (or the board UI) may tick these. Agents may read and add, never tick.",
+  "items": [
+    {
+      "id": "T01",
+      "text": "Confirm the batch goal and stop condition",
+      "done": true,
+      "createdAt": "2026-10-29T20:10:00+08:00",
+      "doneAt": "2026-10-29T21:00:00+08:00",
+      "note": "recorded in state.json batch"
+    },
+    {
+      "id": "T02",
+      "text": "Approve applying SLICE-01 to the original tree",
+      "done": false,
+      "createdAt": "2026-10-29T20:10:00+08:00",
+      "doneAt": null,
+      "note": "only after QA passes and dev is closed"
+    }
+  ]
+}

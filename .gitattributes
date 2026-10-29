@@ -1,0 +1,8 @@
+# Normalise line endings so the toolkit works the same on Windows/macOS/Linux.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary

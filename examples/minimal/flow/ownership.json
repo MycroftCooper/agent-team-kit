@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "note": "Path prefix -> role. Longest prefix wins; a path claimed by two roles is a configuration error. Maintained by LEAD.",
+  "roles": ["LEAD", "DEV", "QA"],
+  "ignoredPrefixes": [
+    "artifacts/",
+    "node_modules/",
+    ".git/",
+    "dist/",
+    "coverage/"
+  ],
+  "rules": [
+    { "prefix": "tests/", "role": "QA", "note": "acceptance tests and QA evidence" },
+    { "prefix": "docs/", "role": "LEAD", "note": "documentation" },
+    { "prefix": "src/", "role": "DEV", "note": "product code and adjacent tests" },
+    { "prefix": "flow/", "role": "LEAD", "note": "workflow state, tickets and role contracts" }
+  ],
+  "rootFiles": {
+    "role": "LEAD",
+    "names": ["agent-flow.config.json", ".gitignore"]
+  }
+}

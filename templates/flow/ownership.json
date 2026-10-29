@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "note": "Path prefix -> role. Longest prefix wins; a path claimed by two roles is a configuration error. Maintained by LEAD.",
+  "roles": {{ROLES_JSON}},
+  "ignoredPrefixes": {{IGNORED_PREFIXES_JSON}},
+  "rules": {{RULES_JSON}},
+  "rootFiles": {{ROOT_FILES_JSON}}
+}

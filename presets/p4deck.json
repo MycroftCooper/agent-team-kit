@@ -1,0 +1,140 @@
+{
+  "$schema": "../agent-flow.config.schema.json",
+  "schemaVersion": 1,
+  "project": "P4Deck",
+  "language": "zh-CN",
+  "layout": {
+    "flowDir": "ForAIDoc/PM/工作流",
+    "artifactDir": "artifacts/workflow",
+    "evidenceDir": "artifacts/evidence",
+    "tempPrefix": "P4Deck"
+  },
+  "paths": {
+    "state": "ForAIDoc/PM/工作流/state.json",
+    "ownership": "ForAIDoc/PM/工作流/ownership.json",
+    "board": "ForAIDoc/PM/工作流/看板.md",
+    "boardHtml": "ForAIDoc/PM/工作流/看板.html",
+    "humanTodos": "ForAIDoc/PM/工作流/人类待办.json",
+    "runtime": "ForAIDoc/PM/工作流/运行状态.json",
+    "currentBatch": "ForAIDoc/PM/工作流/当前批次.md",
+    "taskTemplate": "ForAIDoc/PM/工作流/任务单模板.md",
+    "commandsDoc": "ForAIDoc/PM/工作流/命令速查.md",
+    "rolesDir": "ForAIDoc/PM/工作流/角色",
+    "archiveDir": "ForAIDoc/PM/归档",
+    "todoSource": "ForAIDoc/PM/Windows本机私用TODO.md",
+    "handoffDoc": "ForAIDoc/PM/并行交接.md"
+  },
+  "roles": ["LEAD", "FE", "BE", "QA"],
+  "gates": {
+    "fast": {
+      "parallel": true,
+      "groups": {
+        "web": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.css"],
+        "rust": ["src-tauri/**/*.rs"],
+        "docs": ["ForAIDoc/**/*.md", "*.md"],
+        "scripts": ["scripts/**/*.mjs"],
+        "tests": ["tests/**/*.ts", "src/**/*.test.ts", "src/**/*.test.tsx"]
+      },
+      "steps": [
+        {
+          "name": "ownership",
+          "phase": "preflight",
+          "command": ["atk", "ownership", "check"],
+          "roleFlag": true,
+          "filesFlag": true,
+          "when": { "changed": true }
+        },
+        {
+          "name": "workflow-state",
+          "phase": "preflight",
+          "command": ["atk", "state", "check"],
+          "when": { "group": ["docs", "scripts"] }
+        },
+        {
+          "name": "format:changed",
+          "kind": "format",
+          "command": ["pnpm", "exec", "prettier", "--check"],
+          "when": { "group": "web" },
+          "files": { "group": "web", "mode": "append" }
+        },
+        {
+          "name": "typecheck",
+          "kind": "typecheck",
+          "command": ["pnpm", "check:web"],
+          "when": { "group": "web" }
+        },
+        {
+          "name": "vitest:related",
+          "kind": "tests",
+          "command": ["pnpm", "exec", "vitest", "related", "--run"],
+          "when": { "group": ["web", "tests"] },
+          "files": { "group": ["web", "tests"], "mode": "append", "includeTouchedTests": true }
+        },
+        {
+          "name": "script-syntax",
+          "kind": "syntax",
+          "command": ["node", "--check"],
+          "when": { "group": "scripts" },
+          "files": { "group": "scripts", "mode": "each" }
+        },
+        {
+          "name": "rust:offline-check",
+          "kind": "check",
+          "command": ["cargo", "check", "--offline", "--locked", "--lib", "--manifest-path", "src-tauri/Cargo.toml"],
+          "when": { "group": "rust" }
+        }
+      ]
+    },
+    "quick": { "command": ["pnpm", "ci:quick"] },
+    "local": { "command": ["pnpm", "ci:local"] }
+  },
+  "batch": {
+    "manifestTag": "p4deck-manifest-v1",
+    "qaSchemaVersion": 1,
+    "idPattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$",
+    "allowedPrefixes": ["src", "src-tauri", "ForAIDoc", "scripts", "tests", "public"],
+    "budgetRounds": 12
+  },
+  "baseline": { "roots": ["src", "src-tauri", "scripts", "tools", "tests", "ForAIDoc"] },
+  "cache": {
+    "targets": [
+      {
+        "name": "cargo-target",
+        "path": "%TEMP%/p4deck-shared/cargo-target",
+        "env": "CARGO_TARGET_DIR"
+      }
+    ]
+  },
+  "board": {
+    "title": "P4Deck 工作流看板",
+    "port": 1421,
+    "compactLimit": 50,
+    "fallbackPollMs": 30000
+  },
+  "plugin": {
+    "id": "p4deck-board",
+    "route": "/p4deck-board",
+    "title": "P4Deck 工作流看板",
+    "tabKind": "p4deckBoard",
+    "commandId": "p4deck.board",
+    "dir": "tools/dsh-p4deck-board"
+  },
+  "rotation": [
+    {
+      "path": "ForAIDoc/PM/并行交接.md",
+      "archiveDir": "ForAIDoc/PM/归档",
+      "archivePrefix": "并行交接",
+      "keep": 2,
+      "mode": "sections",
+      "headingLevel": 2
+    },
+    {
+      "path": "ForAIDoc/PM/Windows本机私用TODO.md",
+      "archiveDir": "ForAIDoc/PM/归档",
+      "archivePrefix": "TODO-叙事",
+      "mode": "narrative",
+      "startMarker": "当前结论与状态口径",
+      "flavor": "todo"
+    }
+  ]
+}

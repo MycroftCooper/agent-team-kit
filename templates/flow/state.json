@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "{{DATE}}",
+  "source": "created by `atk init`; state.json is the single source of truth",
+  "batch": {
+    "id": "{{BATCH_ID}}",
+    "goal": "Describe what this batch delivers in one sentence.",
+    "stopCondition": "All slices are QA-passed, applied and accepted by the user.",
+    "devClosedByUser": false,
+    "applyMode": "local-tree",
+    "openQuestions": [],
+    "slices": []
+  },
+  "counts": { "total": 0, "byStage": {} },
+  "packages": [],
+  "subitems": []
+}
