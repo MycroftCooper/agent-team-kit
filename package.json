@@ -1,6 +1,6 @@
 {
   "name": "agent-team-kit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Reusable multi-agent delivery workflow: a state-machine CLI (atk), role contracts, evidence gates and a DeepSeek Harness kanban board plugin.",
   "keywords": [
     "agent",

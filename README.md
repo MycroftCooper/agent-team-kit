@@ -1,5 +1,9 @@
 # agent-team-kit
 
+[![ci](https://github.com/MycroftCooper/agent-team-kit/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MycroftCooper/agent-team-kit/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![node](https://img.shields.io/badge/node-%3E%3D20.11-brightgreen.svg)](package.json)
+
 A reusable multi-agent delivery workflow: a state-machine CLI (`atk`), role
 contracts with enforceable write scopes, evidence gates that refuse to advance on
 missing receipts, and a kanban board with a DeepSeek Harness plugin.
@@ -9,7 +13,7 @@ missing receipts, and a kanban board with a DeepSeek Harness plugin.
 - **Config-driven.** Paths, roles, gates and the board plugin identity come from
   `agent-flow.config.json`; no project knowledge is hard-coded.
 - **Agent-friendly.** 9-line tickets, 6-line receipts, a queue command per role,
-  a compact board view and two installable skills.
+  a compact board view and three installable skills.
 
 ## 60-second quickstart
 

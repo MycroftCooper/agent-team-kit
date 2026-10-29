@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/OWNER/agent-team-kit/agent-flow.config.schema.json",
+  "$id": "https://github.com/MycroftCooper/agent-team-kit/agent-flow.config.schema.json",
   "title": "agent-team-kit project configuration",
   "description": "Placed at <project>/agent-flow.config.json (or <project>/.agent-flow/config.json). All paths are project-relative posix paths.",
   "type": "object",

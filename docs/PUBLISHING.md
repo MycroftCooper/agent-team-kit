@@ -6,7 +6,8 @@ This page assumes the package is `agent-team-kit` and the binary is `atk`.
 
 - [ ] `package.json` has `name`, `version`, `description`, `license`, `type:
       "module"`, `engines.node`, `bin`, `files`, `exports` and real
-      `repository` / `bugs` / `homepage` URLs (replace `OWNER`).
+      `repository` / `bugs` / `homepage` URLs (this repo:
+      `MycroftCooper/agent-team-kit`).
 - [ ] `node --version` >= 20.11; the package has **no** `dependencies`.
 - [ ] `npm test` passes (`node --test "test/*.test.mjs"`).
 - [ ] `npm run selftest` passes (tests + the board plugin's two selftests).
@@ -87,6 +88,20 @@ For a first release the version is already `0.1.0`; use `npm publish` directly
 after the checklist. If you publish from GitHub Actions, `--provenance` adds a
 signed attestation (requires a public repository and `id-token: write`).
 
+### Publishing from GitHub Actions
+
+`.github/workflows/publish.yml` runs on any `v*` tag: it re-runs the tests, then
+publishes with `--provenance`. Add the repository secret `NPM_TOKEN` (an npm
+automation token with publish rights) and push the tag:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+Without the secret the workflow stops before publishing. The local alternative is
+`npm login && npm publish --access public`.
+
 ## GitHub template repository
 
 1. Create the repository and push `main`:
@@ -96,7 +111,7 @@ signed attestation (requires a public repository and `id-token: write`).
    git add -A
    git commit -m "agent-team-kit 0.1.0"
    git branch -M main
-   git remote add origin git@github.com:OWNER/agent-team-kit.git
+   git remote add origin git@github.com:MycroftCooper/agent-team-kit.git
    git push -u origin main
    git tag v0.1.0 && git push origin v0.1.0
    ```

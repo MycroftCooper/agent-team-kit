@@ -1,4 +1,8 @@
-﻿# agent-team-kit
+# agent-team-kit
+
+[![ci](https://github.com/MycroftCooper/agent-team-kit/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MycroftCooper/agent-team-kit/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![node](https://img.shields.io/badge/node-%3E%3D20.11-brightgreen.svg)](package.json)
 
 可复用的多 agent 交付工作流：状态机 CLI（`atk`）+ 角色合同与可执行的写域检查 +
 证据门禁（缺回执就不推进）+ 看板（Markdown / HTML / SSE / DeepSeek Harness 插件）。
@@ -7,7 +11,7 @@
 - **配置驱动**：路径、角色、门禁、看板插件身份都来自 `agent-flow.config.json`，
   代码里没有项目私有知识。
 - **对 agent 友好**：9 行任务单、6 行回执、每角色一个队列命令、极简看板视图，
-  以及两个可安装的 skill。
+  以及三个可安装的 skill。
 
 ## 60 秒开始
 

@@ -4,10 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning.
 
-## [Unreleased]
+## [0.2.0] - 2026-10-29
 
 ### Added
 
+- Release automation for the public repository: the tag-triggered
+  `.github/workflows/publish.yml` publishes to npm with provenance, and both
+  READMEs carry CI / license / Node badges.
 - `skills/agent-team-roles`: a third agent skill for reshaping an initialized
   project's team - add, remove, rename or re-scope roles across
   `agent-flow.config.json`, `ownership.json`, `runtime.json`, the role cards, the
