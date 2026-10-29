@@ -53,10 +53,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/OWNER/agent-team-kit.git"
+    "url": "git+https://github.com/MycroftCooper/agent-team-kit.git"
   },
   "bugs": {
-    "url": "https://github.com/OWNER/agent-team-kit/issues"
+    "url": "https://github.com/MycroftCooper/agent-team-kit/issues"
   },
-  "homepage": "https://github.com/OWNER/agent-team-kit#readme"
+  "homepage": "https://github.com/MycroftCooper/agent-team-kit#readme"
 }

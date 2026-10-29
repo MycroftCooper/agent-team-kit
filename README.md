@@ -106,8 +106,10 @@ plugin tree and client bundle are composed at startup. See
 [`skills/agent-team-flow`](skills/agent-team-flow/SKILL.md) teaches an agent to
 pull tickets, respect write scopes, run gates and report the 6-line receipt.
 [`skills/agent-team-board`](skills/agent-team-board/SKILL.md) covers rendering,
-serving, installing the plugin and keeping state honest. Install instructions:
-[skills/README.md](skills/README.md).
+serving, installing the plugin and keeping state honest.
+[`skills/agent-team-roles`](skills/agent-team-roles/SKILL.md) reshapes the team
+itself: add, remove, rename or re-scope roles so they match the project, without
+re-running `atk init`. Install instructions: [skills/README.md](skills/README.md).
 
 ## Demo
 

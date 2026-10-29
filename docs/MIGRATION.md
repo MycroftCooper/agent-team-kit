@@ -133,7 +133,7 @@ in your `commands.md`.
 ## Step 7 — board and plugin
 
 ```bash
-atk board                    # render the markdown/HTML board
+atk board                    # render the static HTML board (atk state board writes board.md)
 atk serve                    # live board on board.port
 atk plugin sync              # refresh tools/dsh-p4deck-board with this project's identity
 atk plugin verify

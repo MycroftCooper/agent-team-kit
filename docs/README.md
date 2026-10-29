@@ -8,7 +8,7 @@ Chinese summary under `*.zh-CN.md`.
 | [QUICKSTART.md](QUICKSTART.md) | 60-second setup, first ticket, board, plugin | first time |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | the four layers, module map, data flow | deciding whether to adopt it |
 | [CONFIG.md](CONFIG.md) | every `agent-flow.config.json` key, with examples | customizing paths, gates, roles, plugin |
-| [ROLES.md](ROLES.md) | defining roles and write scopes | adding FE/BE/QA or your own roles |
+| [ROLES.md](ROLES.md) | defining roles and write scopes | adding, removing or re-scoping FE/BE/QA or your own roles |
 | [WORKFLOW.md](WORKFLOW.md) | ticket -> candidate -> freeze -> QA -> verify -> apply -> evidence -> archive | running a batch |
 | [BOARD.md](BOARD.md) | markdown/HTML/SSE board and the DSH plugin | showing status or installing the panel |
 | [MIGRATION.md](MIGRATION.md) | adopting an existing project with its own layout (worked example included) | moving a project onto the kit |

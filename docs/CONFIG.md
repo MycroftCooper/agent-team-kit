@@ -83,6 +83,12 @@ three are `LEAD`, `DEV`, `QA`; the `p4deck` preset uses `LEAD`, `FE`, `BE`, `QA`
 Every role gets a card in `rolesDir` (a generic card is generated for custom
 roles) and must appear in `ownership.json`.
 
+Changing this list on an initialized project also means editing `ownership.json`
+(its `roles` plus rules), `runtime.json` (`agents`), the role card and the flow
+README together - see the `agent-team-roles` skill and
+[ROLES.md](ROLES.md). Do not re-run `atk init --force` for it; that rewrites the
+whole flow directory, `state.json` included.
+
 ## `gates`
 
 ```jsonc

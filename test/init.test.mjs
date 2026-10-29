@@ -124,18 +124,51 @@ test("--json prints a machine report and nothing else", async () => {
   assert.deepEqual(report.plugin, { requested: false, synced: false, reason: "--no-plugin" });
 });
 
-test("re-running without --force refuses; --force replaces the config", async () => {
+test("re-running without --force refuses; --force re-scaffolds the config and flow state", async () => {
   const root = await makeProject();
   assert.equal((await runInit(root, ["--project", "demo"])).code, 0);
+
+  // Simulate a live project: edited state and a custom ownership rule.
+  const flow = path.join(root, ".agent-flow");
+  const statePath = path.join(flow, "state.json");
+  const state = await readJsonFile(statePath);
+  state.batch.goal = "KEEP-ME";
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const ownershipPath = path.join(flow, "ownership.json");
+  const ownership = await readJsonFile(ownershipPath);
+  ownership.rules = ownership.rules.map((rule) => (rule.prefix === "src/" ? { ...rule, role: "LEAD" } : rule));
+  await writeFile(ownershipPath, `${JSON.stringify(ownership, null, 2)}\n`, "utf8");
+  const todosPath = path.join(flow, "human-todos.json");
+  const todos = await readJsonFile(todosPath);
+  todos.items = [
+    { id: "T01", text: "KEEP-ME-TODO", done: false, createdAt: "2026-01-01T00:00:00+00:00", doneAt: null, note: "" },
+  ];
+  await writeFile(todosPath, `${JSON.stringify(todos, null, 2)}\n`, "utf8");
+  const boardHtmlPath = path.join(flow, "board.html");
+  await writeFile(boardHtmlPath, "OLD-BOARD", "utf8");
 
   const refused = await runInit(root, ["--project", "renamed"]);
   assert.equal(refused.code, 1);
   assert.match(refused.log.errorText(), /refusing to overwrite/);
   assert.equal((await readJsonFile(path.join(root, CONFIG_FILE))).project, "demo");
+  assert.equal((await readJsonFile(statePath)).batch.goal, "KEEP-ME", "a refused init must not touch state");
 
-  const forced = await runInit(root, ["--project", "renamed", "--force"]);
+  const forced = await runInit(root, ["--project", "renamed", "--force", "--roles", "LEAD,DEV"]);
   assert.equal(forced.code, 0, forced.log.errorText());
   assert.equal((await readJsonFile(path.join(root, CONFIG_FILE))).project, "renamed");
+  assert.deepEqual((await readJsonFile(path.join(root, CONFIG_FILE))).roles, ["LEAD", "DEV"]);
+  // --force rewrites every generated flow document, not only the config. This is
+  // why docs/ROLES.md and the agent-team-roles skill say never to use it to
+  // change roles on a live project.
+  assert.notEqual((await readJsonFile(statePath)).batch.goal, "KEEP-ME", "--force resets state.json");
+  assert.equal(
+    (await readJsonFile(ownershipPath)).rules.find((rule) => rule.prefix === "src/").role,
+    "DEV",
+    "--force resets ownership.json",
+  );
+  assert.deepEqual((await readJsonFile(todosPath)).items, [], "--force resets human-todos.json (user data)");
+  assert.equal(await readFile(boardHtmlPath, "utf8"), "OLD-BOARD", "init never rewrites board.html");
+  assert.ok(existsSync(path.join(flow, "roles", "QA.md")), "cards of roles dropped from --roles are left behind");
 });
 
 test("--no-plugin skips the board plugin copy", async () => {

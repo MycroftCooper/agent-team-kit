@@ -19,8 +19,10 @@ toolkit must run from a bare `node` inside any project, including offline ones.
 ### Why did `atk init` refuse?
 
 An `agent-flow.config.json` (or `.agent-flow/config.json`) already exists. This is
-a guard against silently overwriting a live workflow. Re-run with `--force` when
-you intend to regenerate.
+a guard against silently overwriting a live workflow. Re-run with `--force` only
+when you intend to regenerate: it rewrites `state.json`, `ownership.json`, the
+boards and every role card. To change roles on a live project, use the
+`agent-team-roles` skill instead.
 
 ### What exactly does `atk init` write?
 
@@ -34,6 +36,15 @@ card per role), and — unless `--no-plugin` — a copy of the DSH board plugin.
 Yes. They are ordinary Markdown/JSON. `--force` regenerates them, so keep custom
 edits in separate files or make them after the last `init`. Role cards are meant
 to be edited per project.
+
+### How do I add, remove or change a role (agent)?
+
+Edit the config, `ownership.json`, `runtime.json`, the role card and the flow
+README together, then run `atk ownership verify-config`, `atk state check` and
+`atk board --json`. The
+[`agent-team-roles`](../skills/agent-team-roles/SKILL.md) skill has the exact
+order, the card skeleton and the failure table. Do not use `atk init --force` for
+this.
 
 ### Why doesn't the board update?
 

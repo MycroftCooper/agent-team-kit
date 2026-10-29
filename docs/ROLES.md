@@ -15,15 +15,19 @@ the middle one; humans and agents read the card.
    IDs are upper-case (`^[A-Z][A-Z0-9_]*$`), unique, and their order is the
    display order on the board.
 
-2. Regenerate cards (or add them by hand):
+2. Create the cards:
 
    ```bash
-   atk init --roles LEAD,FE,BE,QA --force
+   atk init --roles LEAD,FE,BE,QA            # fresh project only
    ```
 
    `atk init` writes a card for every role: a specific bundled card for
-   `LEAD`/`DEV`/`FE`/`BE`/`QA`, and a generic card for anything else. `--force`
-   overwrites generated files, so customize cards after the last `init`.
+   `LEAD`/`DEV`/`FE`/`BE`/`QA`, and a generic card for anything else. On a project
+   that is already initialized, do **not** re-run `atk init --force` to add or
+   change a role: it rewrites the config, `state.json`, `ownership.json`, the
+   boards and every existing card. Add the card in place instead - see the
+   [`agent-team-roles` skill](../skills/agent-team-roles/SKILL.md) for the edit
+   order and the verification step.
 
 3. Map paths to roles in `ownership.json` (next section).
 
@@ -101,17 +105,41 @@ Example: a designer role that owns `design/` and nothing else.
 ]
 ```
 
-Then:
+Then, on an initialized project, make the five edits in place (no `atk init`):
+
+1. `roles` in `agent-flow.config.json`, at the display position;
+2. `roles` in `ownership.json`, then reassign the fallback rule that `atk init`
+   already created for that prefix (or add a rule when the prefix is new) -
+   appending a second rule for the same prefix fails `verify-config`;
+3. `roles/DESIGN.md` (copy the generic contract and adapt it);
+4. an `agents` entry in `runtime.json` so the board shows the role;
+5. the role table in `<flowDir>/README.md` (and the previous owner's row when the
+   prefix moved).
+
+Then verify:
 
 ```bash
-atk init --roles LEAD,DESIGN,DEV,QA --force     # writes roles/DESIGN.md (generic card)
-atk ownership verify-config                     # no unused roles, no conflicts
+atk ownership verify-config     # no unknown roles, no conflicts, no unused role
+atk state check
+atk board --json                # agents[] includes DESIGN
 atk queue --for DESIGN
+atk ownership map design/tokens.json
 ```
 
-The generic card is a starting point; edit `roles/DESIGN.md` to add the role's
-real task loop and receipt examples. Do not put scope in the card — put it in
-`ownership.json`.
+`atk ownership verify-config` checks `ownership.json` only; confirm its `roles`
+holds the same ids as `config.roles`, since the two files are maintained
+separately.
+
+The [`agent-team-roles` skill](../skills/agent-team-roles/SKILL.md) has the full
+procedure (add / change / rename / remove), the card skeleton and the failure
+table. The generic card is a starting point; edit `roles/DESIGN.md` to add the
+role's real task loop and receipt examples. Do not put scope in the card — put it
+in `ownership.json`.
+
+A new top-level scope (for example `design/`) also needs an entry in
+`batch.allowedPrefixes`, otherwise `atk batch manifest` refuses those paths, plus
+the matching `baseline.roots` / `gates.fast.groups` entries when they are used -
+see [CONFIG.md](CONFIG.md#batch).
 
 ## Role sets that work well
 
@@ -121,5 +149,7 @@ real task loop and receipt examples. Do not put scope in the card — put it in
 | `LEAD, FE, BE, QA` | separate frontend and host/backend, one integrator |
 | `LEAD, DEV, QA, REVIEW` | you want a review step distinct from QA; give REVIEW no product write scope |
 
-A role without any write scope is valid (e.g. an observer or reviewer); assign it
-only root files or no paths at all.
+A role without product write scope is valid (e.g. an observer or reviewer), but
+`atk ownership verify-config` reports `role <ROLE> has no write scope` and exits
+`1` because it cannot tell a reviewer from an unconfigured role. Give it a real
+prefix (for example `reviews/`) when you want a clean exit.

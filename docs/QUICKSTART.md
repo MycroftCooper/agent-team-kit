@@ -25,8 +25,11 @@ atk board                    # renders <flowDir>/board.html
 atk state check              # validate state.json
 ```
 
-`atk init` is idempotent with `--force` and refuses to overwrite an existing
-`agent-flow.config.json` without it. Preview it first:
+`atk init` refuses to overwrite an existing `agent-flow.config.json` without
+`--force`, and `--force` rewrites **every** generated flow file - including
+`state.json`, `ownership.json`, the boards and all role cards. Use it to
+re-scaffold, not to tweak a live project (for that, see the
+[`agent-team-roles`](../skills/agent-team-roles/SKILL.md) skill). Preview first:
 
 ```bash
 atk init --project my-app --dry-run
@@ -80,8 +83,9 @@ Override flags: `--roles LEAD,DEV,QA --language en|zh-CN --flow-dir <dir>`.
 
 ## Install the agent skills
 
-Copy [`../skills/agent-team-flow`](../skills/agent-team-flow/SKILL.md) and
-[`../skills/agent-team-board`](../skills/agent-team-board/SKILL.md) into your
+Copy [`../skills/agent-team-flow`](../skills/agent-team-flow/SKILL.md),
+[`../skills/agent-team-board`](../skills/agent-team-board/SKILL.md) and
+[`../skills/agent-team-roles`](../skills/agent-team-roles/SKILL.md) into your
 agent host's skills directory. See [`../skills/README.md`](../skills/README.md).
 
 ## Install the DSH panel (optional)

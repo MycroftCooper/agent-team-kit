@@ -45,7 +45,7 @@
 
 | Command | What it does |
 |---|---|
-| `atk board` | Render `board.md` plus the static HTML board |
+| `atk board` | Render the static HTML board (`board.md` comes from `atk state board`) |
 | `atk serve` | Serve the live board (file watch + SSE, fallback poll) |
 | `atk plugin sync [--out <dir>]` | Copy the DeepSeek Harness board plugin into this project |
 | `atk plugin verify` | Check the project copy against the toolkit version |

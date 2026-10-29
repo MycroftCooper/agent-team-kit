@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+
+- `skills/agent-team-roles`: a third agent skill for reshaping an initialized
+  project's team - add, remove, rename or re-scope roles across
+  `agent-flow.config.json`, `ownership.json`, `runtime.json`, the role cards, the
+  flow README and the rendered boards, with a verification checklist, a failure
+  table and a card skeleton.
+- Tests: `test/skills.test.mjs` (skill frontmatter, README discoverability, and
+  every `atk <command>` a skill references) and `test/roles.test.mjs` (add,
+  duplicate-prefix and remove role end to end), plus a `--force` regression that
+  locks in how much `atk init --force` rewrites.
+
+### Changed
+
+- `docs/ROLES.md`, `docs/CONFIG.md`, `docs/FAQ.md` and both quickstarts no longer
+  present `atk init --force` as a safe way to rework a live project: it rewrites
+  `state.json`, `ownership.json`, the boards and every card. They point at the
+  in-place edit order instead, and the scope-less-role note now matches
+  `atk ownership verify-config` (it reports such a role and exits `1`).
+
+### Fixed
+
+- The `atk board` help text and the generated `commands.md` claimed the command
+  renders `board.md` too; it writes only `board.html` (`atk state board` writes
+  the markdown board).
+
 ## [0.1.0] - 2026-10-29
 
 First public release: the workflow extracted from a production desktop-application

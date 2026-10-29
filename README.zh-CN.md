@@ -100,8 +100,9 @@ patch，然后**重启 DSH**——插件树与客户端 bundle 在启动时组�
 
 [`skills/agent-team-flow`](skills/agent-team-flow/SKILL.md) 教 agent 取任务、遵守
 写域、跑门禁、交 6 行回执；[`skills/agent-team-board`](skills/agent-team-board/SKILL.md)
-覆盖看板渲染、服务、插件安装与状态诚实。安装说明见
-[skills/README.md](skills/README.md)。
+覆盖看板渲染、服务、插件安装与状态诚实；[`skills/agent-team-roles`](skills/agent-team-roles/SKILL.md)
+按项目实际情况新增、删除、改名或调整 agent（角色），且不需要重跑 `atk init`。
+安装说明见 [skills/README.md](skills/README.md)。
 
 ## 示例
 

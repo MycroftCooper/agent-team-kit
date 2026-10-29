@@ -45,7 +45,7 @@
 
 | 命令 | 作用 |
 |---|---|
-| `atk board` | 生成 board.md 与静态 HTML 看板 |
+| `atk board` | 生成静态 HTML 看板（`board.md` 由 `atk state board` 生成） |
 | `atk serve` | 启动实时看板（文件监听 + SSE，30 秒兜底） |
 | `atk plugin sync [--out <dir>]` | 复制 DSH 看板插件到本项目 |
 | `atk plugin verify` | 校验项目内插件副本是否与工具包一致 |

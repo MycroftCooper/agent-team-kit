@@ -1,14 +1,15 @@
 # Agent skills
 
-Two skills teach an agent to participate in the workflow without re-reading the
+Three skills teach an agent to participate in the workflow without re-reading the
 docs on every task:
 
 | Skill | Use it when |
 |---|---|
 | [`agent-team-flow`](agent-team-flow/SKILL.md) | the agent takes tickets, edits under a write scope, runs gates and reports a 6-line receipt |
 | [`agent-team-board`](agent-team-board/SKILL.md) | the agent renders/serves the board, installs the DSH plugin, or diagnoses a stale board |
+| [`agent-team-roles`](agent-team-roles/SKILL.md) | the agent adds, removes, renames or re-scopes roles so the team fits the project |
 
-Both are plain directories with a `SKILL.md` that starts with YAML frontmatter
+All are plain directories with a `SKILL.md` that starts with YAML frontmatter
 (`name`, `description`) followed by short instructions and commands. They contain
 no project-specific paths — every command runs against the project in the current
 directory.
@@ -28,12 +29,15 @@ Common layouts:
 # POSIX
 ln -s /path/to/agent-team-kit/skills/agent-team-flow ~/.codex/skills/agent-team-flow
 ln -s /path/to/agent-team-kit/skills/agent-team-board ~/.codex/skills/agent-team-board
+ln -s /path/to/agent-team-kit/skills/agent-team-roles ~/.codex/skills/agent-team-roles
 
 # Windows (PowerShell, run as the user; no admin needed for the user profile)
 New-Item -ItemType SymbolicLink -Path "$HOME\.codex\skills\agent-team-flow" `
   -Target "D:\GitCode\agent-team-kit\skills\agent-team-flow"
 New-Item -ItemType SymbolicLink -Path "$HOME\.codex\skills\agent-team-board" `
   -Target "D:\GitCode\agent-team-kit\skills\agent-team-board"
+New-Item -ItemType SymbolicLink -Path "$HOME\.codex\skills\agent-team-roles" `
+  -Target "D:\GitCode\agent-team-kit\skills\agent-team-roles"
 ```
 
 If symlinks are not available, copy the directories instead — the skills are
@@ -58,6 +62,10 @@ instructions (for example `npx agent-team-kit`) so skill examples still work.
 - Keep commands aligned with your project's copy of `atk`; do not invent flags.
 - Role-specific behaviour belongs in the generated flow-dir role cards
   (`<flowDir>/roles/<ROLE>.md`), not in a fork of the skill.
+- Changing *which roles exist* is a project edit, not a skill fork: follow
+  `agent-team-roles` and keep its verification step. Never re-run
+  `atk init --force` on a live project to add a role — it resets `state.json`,
+  `ownership.json`, the boards and every role card.
 
 ## Verify the install
 

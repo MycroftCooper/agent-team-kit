@@ -19,7 +19,10 @@ atk state check      # 校验 state.json
 ```
 
 `atk init` 默认写入 `generic` 预设；已有 `agent-flow.config.json` 时拒绝覆盖，需
-`--force`。先预览：
+`--force`。但 `--force` 会重写**所有**生成的流程文件（含 `state.json`、
+`ownership.json`、看板与全部角色卡），只适用于重新脚手架，不要用来改一个正在用的
+项目（改角色见 [`agent-team-roles`](../skills/agent-team-roles/SKILL.md) skill）。
+先预览：
 
 ```bash
 atk init --project my-app --dry-run
@@ -70,8 +73,8 @@ tools/agent-board/          DSH 看板插件副本（--no-plugin 时跳过）
 
 ## 安装 agent skills
 
-把 `skills/agent-team-flow` 与 `skills/agent-team-board` 复制或软链到 agent 宿主
-的技能目录，详见 [../skills/README.md](../skills/README.md)。
+把 `skills/agent-team-flow`、`skills/agent-team-board` 与 `skills/agent-team-roles`
+复制或软链到 agent 宿主的技能目录，详见 [../skills/README.md](../skills/README.md)。
 
 ## 安装 DSH 面板（可选）
 
