@@ -99,3 +99,18 @@ test("baseline start is deterministic for unchanged content", async (t) => {
   const third = JSON.parse(await readFile(baselinePath, "utf8"));
   assert.notEqual(third.files["src/a.ts"], first.files["src/a.ts"]);
 });
+
+test("baseline snapshot skips build dirs and generated files", async (t) => {
+  const { run, baselinePath } = await setup(t, {
+    files: {
+      "src/a.ts": "export const a = 1;\n",
+      "src/target/generated.ts": "export const target = 1;\n",
+      "src/dist/bundle.js": "bundle\n",
+      "src/tsconfig.app.tsbuildinfo": "{}\n",
+      "src/debug.log": "log\n",
+    },
+  });
+  assert.equal(await run(["start"]), 0);
+  const baseline = JSON.parse(await readFile(baselinePath, "utf8"));
+  assert.deepEqual(Object.keys(baseline.files).sort(), ["src/a.ts"]);
+});

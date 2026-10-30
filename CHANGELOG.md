@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- `atk baseline start` no longer hashes build output (`target/`, `target-qa/`,
+  `dist/`, `artifacts/`, `.local/`, `coverage/`, ...) or generated files
+  (`*.tsbuildinfo`, `*.log`). On projects with a large Rust/Cargo target this
+  turns a minutes-long snapshot into a sub-second one and stops the baseline from
+  churning on every build.
+- `atk evidence --collect-temp` skips build directories inside candidate copies
+  and tolerates a UTF-8 BOM in receipt JSON (PowerShell's
+  `Set-Content -Encoding utf8` writes one), so receipts are no longer silently
+  dropped because `JSON.parse` threw.
+- `atk cache status` measures GB-scale cache targets with one recursive listing
+  plus batched `stat` calls instead of one `stat` per file.
+- `atk init` tolerates a BOM in preset files, and `readJsonl` tolerates a BOM on
+  the first metrics line.
+- Tests cover BOM receipts and the evidence/baseline build-directory skip.
+
 ## [0.2.0] - 2026-10-29
 
 ### Added

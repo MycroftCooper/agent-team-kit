@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -175,6 +175,25 @@ test("evidence --collect-temp copies recognisable receipts from tempPrefix dirs"
   const copied = path.join(env.evidenceDir, path.basename(tempDir), "qa-qa-approval.json");
   assert.equal((await stat(copied)).isFile(), true);
   assert.equal(JSON.parse(await readFile(copied, "utf8")).batchId, "S1");
+});
+
+test("evidence --collect-temp skips build dirs and reads BOM receipts", async (t) => {
+  const env = await setup(t);
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), `${env.prefix}-bom-`));
+  t.after(() => rm(tempDir, { recursive: true, force: true }));
+  const receiptText = JSON.stringify({ noninteractiveQA: "passed", batchId: "S1", manifestSha256: "F".repeat(64) });
+  await writeFile(path.join(tempDir, "qa-bom.json"), `\uFEFF${receiptText}`, "utf8");
+  await writeJson(path.join(tempDir, "target", "manifest-hidden.json"), {
+    files: [{ path: "src/app.ts" }],
+    manifestSha256: "F".repeat(64),
+  });
+
+  assert.equal(await env.run(["--collect-temp", "--json"]), 0);
+  const report = env.logger.lines.json.at(-1);
+  assert.equal(report.collected.copied, 1, "BOM receipt is copied, build-dir JSON is skipped");
+  const copied = path.join(env.evidenceDir, path.basename(tempDir), "qa-qa-bom.json");
+  assert.equal((await stat(copied)).isFile(), true);
+  assert.equal(JSON.parse((await readFile(copied, "utf8")).replace(/^\uFEFF/, "")).batchId, "S1");
 });
 
 test("evidence fails cleanly when state.json is missing", async (t) => {
