@@ -122,6 +122,17 @@ fact looks wrong, the missing input is a receipt, not a manual edit.
 - `atk state restore <ID>` reverses an archive; `atk state import` never
   resurrects archived packages.
 
+## 10. Release (human + LEAD)
+
+- Day-to-day commits stay on `branch.development` (default `dev`).
+- Once the gate is green, run `atk release --version x.y.z` to preview the plan,
+  then `--apply` to checkout `branch.release` (default `master`), merge with
+  `--no-ff` and create the `v<version>` tag; the command switches back to dev.
+- The release command refuses an unclean worktree, a mismatched version file, a
+  stale/red gate report or a duplicate tag; `--skip-gate` / `--allow-dirty` are
+  explicit escape hatches.
+- No push is performed: push both branches and the tag yourself.
+
 ## The proof ladder
 
 | Rung | Proves | Does not prove |

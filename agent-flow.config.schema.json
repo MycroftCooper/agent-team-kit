@@ -79,6 +79,19 @@
         "budgetRounds": { "type": "integer", "minimum": 1 }
       }
     },
+    "branch": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Branch rules scaffolded by atk init and enforced by atk release. The kit repository itself does not require this flow.",
+      "properties": {
+        "development": { "type": "string", "default": "dev", "description": "Day-to-day integration branch; every agent commit lands here." },
+        "release": { "type": "string", "default": "master", "description": "Release line; only receives --no-ff merges from branch.development." },
+        "tagPrefix": { "type": "string", "default": "v", "description": "Annotated tag prefix, e.g. v0.2.0." },
+        "versionFile": { "type": ["string", "boolean"], "default": "package.json", "description": "File whose .version must match --version; false disables the check." },
+        "gateReport": { "type": ["string", "boolean", "null"], "default": null, "description": "Gate report checked before releasing; null = <artifactDir>/ci-fast-latest.json, false disables." },
+        "requireCleanTree": { "type": "boolean", "default": true, "description": "Refuse to release from an unclean worktree unless --allow-dirty." }
+      }
+    },
     "baseline": {
       "type": "object",
       "additionalProperties": false,

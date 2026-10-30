@@ -36,6 +36,7 @@
 | `atk batch verify --manifest <f> --qa <f>` | 原树漂移 / 候选改动 / QA 绑定 |
 | `atk batch apply --manifest <f> [--apply --confirm-dev-closed]` | 默认 dry-run；两个 flag 才真写 |
 | `atk baseline start` / `atk baseline changed` | 不依赖 git commit 的本片基线 |
+| `atk release --version <semver> [--note] [--apply]` | 发布：开发分支 → 发布分支 `--no-ff` merge + tag（默认 dry-run，校验分支/工作树/版本/门禁） |
 | `atk cache status` / `atk cache clean` | 查看 / 清理共享构建缓存 |
 | `atk measure record` / `atk measure summary` | 记录 / 汇总量测 |
 | `atk sync` | import → evidence → board 一条命令收尾 |

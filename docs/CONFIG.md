@@ -143,6 +143,29 @@ whole flow directory, `state.json` included.
 | `allowedPrefixes` | Top-level prefixes a batch may touch. |
 | `budgetRounds` | Default round budget shown in tickets (default 12). |
 
+## `branch`
+
+Branch rules scaffolded by `atk init` and enforced by `atk release`. The kit
+repository itself does not require this flow; projects created with the kit get
+these defaults:
+
+```json
+"branch": {
+  "development": "dev",
+  "release": "master",
+  "tagPrefix": "v",
+  "versionFile": "package.json",
+  "gateReport": null,
+  "requireCleanTree": true
+}
+```
+
+- `development`: day-to-day branch; every agent commit lands here.
+- `release`: release line; only `--no-ff` merges from `development` plus tags.
+- `versionFile`: `.version` must match `atk release --version`; `false` disables.
+- `gateReport`: checked before releasing; `null` means
+  `<artifactDir>/ci-fast-latest.json`, `false` disables the check.
+
 ## `baseline`
 
 `baseline.roots` lists directories walked by `atk baseline start` / `changed`.

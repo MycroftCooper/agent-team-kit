@@ -6,6 +6,18 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `branch` config section (development/release/tagPrefix/versionFile/gateReport/
+  requireCleanTree) with dev -> master defaults, scaffolded into every project by
+  `atk init` (the kit repository itself keeps its single-branch flow).
+- `atk release --version <semver>`: dry-run by default; verifies the current
+  branch, clean worktree, version file and a fresh/green gate report, then merges
+  development into release with `--no-ff` and creates an annotated `v<semver>` tag.
+- Generated flow docs (README and commands cheat sheet, both languages) document
+  the branch model and release command; `test/release.test.mjs` covers dry-run,
+  version mismatch, wrong branch and apply.
+
 ### Fixed
 
 - `atk baseline start` no longer hashes build output (`target/`, `target-qa/`,

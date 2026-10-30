@@ -87,6 +87,14 @@ pass is not a combined pass. Report each rung separately; never collapse them.
 - Long-lived docs rotate with `atk docs rotate` (dry-run by default, concurrency
   guarded).
 
+## Branch and release
+
+- Day-to-day work happens on `{{DEV_BRANCH}}`; **every agent commit goes there**.
+- `{{RELEASE_BRANCH}}` is the release line: it only receives `--no-ff` merges from
+  `{{DEV_BRANCH}}` and carries `{{TAG_PREFIX}}<semver>` tags. Never develop on it directly.
+- Release: once the gate is green run `atk release --version x.y.z` (dry-run by default;
+  it verifies branch, worktree, version file and gate freshness), then re-run with `--apply`.
+
 ## Non-negotiables
 
 The original tree is read-only for agents. Fresh verify before apply. QA is

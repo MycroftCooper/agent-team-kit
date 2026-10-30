@@ -36,6 +36,7 @@
 | `atk batch verify --manifest <f> --qa <f>` | Check drift, candidate changes and QA binding |
 | `atk batch apply --manifest <f> [--apply --confirm-dev-closed]` | Dry-run by default; writes only with both flags |
 | `atk baseline start` / `atk baseline changed` | Change baseline that does not depend on git commits |
+| `atk release --version <semver> [--note] [--apply]` | Merge development -> release with --no-ff and tag it (dry-run by default; checks branch/worktree/version/gate) |
 | `atk cache status` / `atk cache clean` | Inspect and clean shared build caches |
 | `atk measure record` / `atk measure summary` | Record and summarise workflow measurements |
 | `atk sync` | import -> evidence -> board in one command |

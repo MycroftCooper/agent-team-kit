@@ -77,6 +77,14 @@ atk state board --compact             # 给 agent 的极简看板
 - 看板保留独立的「已完成归档」区，不混进活跃看板。
 - 长文档用 `atk docs rotate` 轮转（默认 dry-run + 并发保护）。
 
+## 分支与发布
+
+- 日常开发在 `{{DEV_BRANCH}}`；**所有 agent 的提交都进 {{DEV_BRANCH}}**。
+- `{{RELEASE_BRANCH}}` 是发布线：只接受从 `{{DEV_BRANCH}}` 的 `--no-ff` merge，并打
+  `{{TAG_PREFIX}}<semver>` tag；不要在发布线上直接开发。
+- 发布：门禁通过后执行 `atk release --version x.y.z`（默认 dry-run，校验分支 /
+  工作树 / 版本文件 / 门禁新鲜度），确认后加 `--apply`。
+
 ## 底线
 
 原树对 agent 只读；Apply 前必须 fresh verify；QA 独立；单写者；未经用户授权不做
