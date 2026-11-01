@@ -159,24 +159,65 @@ async function getEvents() {
   return body.items ?? body;
 }
 
+/**
+ * Read the dispatch command straight from SQLite. The gate must assert the
+ * command lifecycle, not only the Run: QA-003 showed that result requests were
+ * rejected with 400 and swallowed, so every Run-level assertion still passed
+ * while the command never left CLAIMED.
+ */
+async function commandRow(commandId) {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(dbFile, { readOnly: true });
+  try {
+    return (
+      db
+        .prepare(
+          "SELECT status, owner_id AS ownerId, generation, result_json AS resultJson, completed_at AS completedAt FROM dispatch_commands WHERE id = ?",
+        )
+        .get(commandId) ?? null
+    );
+  } finally {
+    db.close();
+  }
+}
+
+async function liveCommands() {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(dbFile, { readOnly: true });
+  try {
+    return Number(db.prepare("SELECT COUNT(*) AS c FROM dispatch_commands WHERE status IN ('PENDING','CLAIMED')").get().c);
+  } finally {
+    db.close();
+  }
+}
+
 try {
   await startBackend(seed);
+
+  // Each phase seeds its own command inside the check, so "no command may stay
+  // PENDING/CLAIMED" is a real assertion instead of tripping over commands that
+  // later phases have not reached yet.
 
   // -------------------------------------------------------------------------
   // 1. happy path
   // -------------------------------------------------------------------------
-  const happy = seedRun(seed, "happy");
-
   check("a dispatch command is claimed, the session runs and the run COMPLETES", async () => {
+    const happy = seedRun(seed, "happy");
     const runtime = createMockRuntime({ scenario: "complete", sessionIdFactory: () => "mock-happy" });
     const client = createInternalClient({ baseUrl: base, token: internalToken });
     const host = createHost({ client, runtime, ownerId: "host-happy", leaseMs: LEASE_MS, pollMs: 20, flushMs: 10, heartbeatMs: 500, logger: quietLogger });
     await host.tick();
     await waitFor(async () => (await getRun(happy.run.id)).status === "COMPLETED", 15000, "run COMPLETED");
+    await waitFor(async () => (await commandRow(happy.command.id))?.status === "DONE", 10000, "dispatch command DONE");
     await host.stop();
+    expect(host.stats.errors === 0, `the host logged ${host.stats.errors} error(s); a swallowed 400 would leave the command in CLAIMED`);
     const run = await getRun(happy.run.id);
     expect(run.status === "COMPLETED", `expected COMPLETED, got ${run.status}`);
     expect(run.exitCode === 0 || run.exitCode === null, `unexpected exitCode ${run.exitCode}`);
+    const command = await commandRow(happy.command.id);
+    expect(command.status === "DONE", `expected the dispatch command DONE, got ${command.status}`);
+    expect(command.ownerId === "host-happy", `expected owner host-happy, got ${command.ownerId}`);
+    expect((await liveCommands()) === 0, "no command may stay PENDING/CLAIMED after completion");
     const events = await getEvents();
     const runEvents = events.filter((event) => event.aggregateId === happy.run.id);
     const updated = runEvents.filter((event) => event.type === "run.updated");
@@ -190,11 +231,12 @@ try {
   // -------------------------------------------------------------------------
   // 2. crash mid-run, then reclaim: never restart, report INTERRUPTED
   // -------------------------------------------------------------------------
-  const crash = seedRun(seed, "crash");
-
   check("a dead host's command is reclaimed as INTERRUPTED and never restarted", async () => {
+    const crash = seedRun(seed, "crash");
     const client = createInternalClient({ baseUrl: base, token: internalToken });
-    const hangingRuntime = createMockRuntime({ scenario: "hang", sessionIdFactory: () => "mock-crash" });
+    // ignoreStop:true is what makes the simulated crash faithful — a real dead
+    // process cannot emit a polite cancelled event on its way out.
+    const hangingRuntime = createMockRuntime({ scenario: "hang", ignoreStop: true, sessionIdFactory: () => "mock-crash" });
     const deadHost = createHost({ client, runtime: hangingRuntime, ownerId: "host-dead", leaseMs: LEASE_MS, pollMs: 20, flushMs: 10, heartbeatMs: 500, logger: quietLogger });
     await deadHost.tick();
     expect(hangingRuntime._sessionCount === 1, `the dead host should have started exactly one session, got ${hangingRuntime._sessionCount}`);
@@ -207,21 +249,25 @@ try {
     const recoveryHost = createHost({ client, runtime: recoveryRuntime, ownerId: "host-recovery", leaseMs: LEASE_MS, pollMs: 20, flushMs: 10, heartbeatMs: 500, logger: quietLogger });
     await recoveryHost.tick();
     await waitFor(async () => (await getRun(crash.run.id)).status === "INTERRUPTED", 15000, "run INTERRUPTED");
+    await waitFor(async () => (await commandRow(crash.command.id))?.status === "FAILED", 10000, "dispatch command FAILED");
     await recoveryHost.stop();
 
     expect(recoveryRuntime._sessionCount === 0, `a reclaimed command must not start a session, got ${recoveryRuntime._sessionCount}`);
     expect(recoveryHost.stats.interrupted === 1, `expected 1 interrupted, got ${recoveryHost.stats.interrupted}`);
+    expect(recoveryHost.stats.errors === 0, `the recovery host swallowed ${recoveryHost.stats.errors} error(s)`);
     const run = await getRun(crash.run.id);
     expect(run.status === "INTERRUPTED", `expected INTERRUPTED (never COMPLETED), got ${run.status}`);
-    return "INTERRUPTED, 0 sessions started by the recovery host";
+    const command = await commandRow(crash.command.id);
+    expect(command.status === "FAILED", `expected the reclaimed command FAILED, got ${command.status}`);
+    expect(String(command.resultJson ?? "").includes("reclaimed-after-lost-lease"), `expected the reason in result_json, got ${command.resultJson}`);
+    return `INTERRUPTED, command FAILED (${command.resultJson}), 0 sessions started by the recovery host`;
   });
 
   // -------------------------------------------------------------------------
   // 3. generation fencing: an outdated holder cannot append events
   // -------------------------------------------------------------------------
-  const fenced = seedRun(seed, "fenced");
-
   check("an outdated generation is refused and leaves the run untouched", async () => {
+    const fenced = seedRun(seed, "fenced");
     const client = createInternalClient({ baseUrl: base, token: internalToken });
     const claim = await client.claim({ ownerId: "host-stale", leaseMs: LEASE_MS });
     expect(claim?.command?.id, "expected to claim the seeded command");

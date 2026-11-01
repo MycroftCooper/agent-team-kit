@@ -55,8 +55,19 @@ export function createInternalClient({ baseUrl, token, fetchImpl = globalThis.fe
       const query = new URLSearchParams({ owner: ownerId, leaseMs: String(leaseMs) });
       return call("GET", `/internal/v1/dispatch/claim?${query}`);
     },
-    result(commandId, { generation, status, result }) {
-      return call("POST", `/internal/v1/dispatch/${encodeURIComponent(commandId)}/result`, { generation, status, result });
+    result(commandId, { ownerId, generation, status, exitCode, summary, error }) {
+      // The backend validates the result body: ownerId + generation prove the
+      // holder, status is DONE|FAILED, and only exitCode/summary/error are
+      // accepted as payload. A missing ownerId here used to fail with 400 and get
+      // swallowed, leaving commands stuck in CLAIMED (QA-003 finding).
+      return call("POST", `/internal/v1/dispatch/${encodeURIComponent(commandId)}/result`, {
+        ownerId,
+        generation,
+        status,
+        ...(exitCode === undefined ? {} : { exitCode }),
+        ...(summary === undefined ? {} : { summary }),
+        ...(error === undefined ? {} : { error }),
+      });
     },
     renew(runId, { ownerId, generation, leaseMs }) {
       return call("POST", `/internal/v1/runs/${encodeURIComponent(runId)}/renew`, { ownerId, generation, leaseMs });

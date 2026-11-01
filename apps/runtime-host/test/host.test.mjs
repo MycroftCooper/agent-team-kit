@@ -112,8 +112,11 @@ test("a reclaimed command is never restarted; it is reported interrupted", async
   const ended = client.calls.events.flatMap((call) => call.events).find((event) => event.type === "session.ended");
   assert.equal(ended?.reason, "interrupted");
   assert.equal(client.calls.result[0].status, "FAILED");
-  assert.equal(client.calls.result[0].result.reason, "reclaimed-after-lost-lease");
+  assert.equal(client.calls.result[0].error, "reclaimed-after-lost-lease");
+  assert.equal(client.calls.result[0].summary, "reclaimed-after-lost-lease");
+  assert.equal(client.calls.result[0].ownerId, "host-b", "the result must identify the holder (QA-003)");
   assert.equal(host.stats.interrupted, 1);
+  assert.equal(host.stats.errors, 0, "no error may be swallowed on the reclaim path");
   await host.stop();
 });
 

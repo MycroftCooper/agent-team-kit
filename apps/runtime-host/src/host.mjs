@@ -81,7 +81,14 @@ export function createHost({ client, runtime, ownerId, leaseMs = 30000, pollMs =
     await flush(runId);
     const status = reason === "completed" ? "DONE" : "FAILED";
     const response = await safe("result", () =>
-      client.result(entry.command.id, { generation: entry.lease.generation, status, result: { exitCode: exitCode ?? null, reason } }),
+      client.result(entry.command.id, {
+        ownerId,
+        generation: entry.lease.generation,
+        status,
+        exitCode: exitCode ?? null,
+        summary: reason,
+        ...(status === "FAILED" ? { error: reason } : {}),
+      }),
     );
     if (status === "DONE") stats.completed += 1;
     clearSession(runId);
@@ -93,6 +100,7 @@ export function createHost({ client, runtime, ownerId, leaseMs = 30000, pollMs =
     if (!entry) return;
     entry.buffer.push(event);
     if (event.type === "session.ended") {
+      entry.ended = true;
       void finish(runId, event.reason, event.exitCode);
     }
   }
@@ -115,6 +123,15 @@ export function createHost({ client, runtime, ownerId, leaseMs = 30000, pollMs =
       }),
     );
     if (!session) {
+      // The runtime could not start: report the failure as a runtime fact so the
+      // Run becomes FAILED, then close the command. A bare result call would
+      // leave the Run stranded in STARTING.
+      await safe("start-failure-event", () =>
+        client.events(runId, {
+          generation: lease.generation,
+          events: [{ type: "session.ended", sessionId: `failed-start-${command.id}`, reason: "failed", exitCode: null, at: new Date(now()).toISOString() }],
+        }),
+      );
       await finish(runId, "failed", null);
       return;
     }
@@ -157,9 +174,12 @@ export function createHost({ client, runtime, ownerId, leaseMs = 30000, pollMs =
     );
     await safe("interrupt-result", () =>
       client.result(command.id, {
+        ownerId,
         generation: lease.generation,
         status: "FAILED",
-        result: { exitCode: null, reason: "reclaimed-after-lost-lease", attempts: command.attempts },
+        exitCode: null,
+        summary: "reclaimed-after-lost-lease",
+        error: "reclaimed-after-lost-lease",
       }),
     );
   }
@@ -208,7 +228,12 @@ export function createHost({ client, runtime, ownerId, leaseMs = 30000, pollMs =
       clearInterval(heartbeatTimer);
       for (const runId of [...sessions.keys()]) {
         const entry = sessions.get(runId);
-        await safe("stop-session", () => entry.session && runtime.stop(entry.session.sessionId));
+        // After a terminal runtime event the session is already over; calling
+        // stop() then would emit a cancelled event and the backend would refuse
+        // the illegal COMPLETED -> CANCELLED transition (QA-003 finding).
+        if (!entry.ended) {
+          await safe("stop-session", () => entry.session && runtime.stop(entry.session.sessionId));
+        }
         clearSession(runId);
       }
     },
