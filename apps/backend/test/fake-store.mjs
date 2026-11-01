@@ -814,6 +814,10 @@ export function createFakeStore(seed = {}) {
       review.submittedAt = nowIso();
       review.updatedAt = review.submittedAt;
       task.status = verdict === "PASS" ? "INTEGRATING" : verdict === "CHANGES_REQUESTED" ? "REJECTED" : "BLOCKED";
+      // m4-contracts §0.3: a PASS publishes the Task's candidate target hash.
+      if (verdict === "PASS" && typeof manifestHash === "string" && manifestHash !== "") {
+        task.targetHash = manifestHash;
+      }
       task.version += 1;
       task.updatedAt = nowIso();
       recordEvent({
@@ -1044,6 +1048,14 @@ export function createFakeStore(seed = {}) {
     },
     _getDispatchCommand(id) {
       return clone(dispatchCommands.get(id) ?? null);
+    },
+    _updateTask(id, changes) {
+      const task = tasks.get(id);
+      if (!task) return null;
+      Object.assign(task, clone(changes));
+      task.version += 1;
+      task.updatedAt = nowIso();
+      return clone(task);
     },
   };
 }

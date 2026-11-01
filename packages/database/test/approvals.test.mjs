@@ -186,3 +186,23 @@ test("REJECTED decisions re-queue the Task for rework, invalid args write nothin
     assert.deepEqual(fingerprint(store), before, `${label}: invalid decisions wrote nothing`);
   }
 });
+
+test("QA-005: patchTask can never set DONE; approval is the only door", (t) => {
+  for (const { label, store } of bothStores(t)) {
+    const task = seedAwaiting(store);
+    const before = fingerprint(store);
+    assert.throws(
+      () => store.patchTask("TASK-1", { expectedVersion: task.version, changes: { status: "DONE" } }),
+      (error) =>
+        error.code === "TASK_VERSION_CONFLICT" &&
+        error.details.reason === "human-approval-required" &&
+        error.details.requestedStatus === "DONE",
+      label,
+    );
+    assert.deepEqual(fingerprint(store), before, `${label}: rejected DONE patch wrote nothing`);
+
+    const approval = store.createApproval({ taskId: "TASK-1", scope: "accept", targetHash: SHA_A, actor: "HUMAN" });
+    const approved = store.decideApproval({ id: approval.id, decision: "APPROVED", actor: "HUMAN", targetHash: SHA_A });
+    assert.equal(approved.task.status, "DONE", label);
+  }
+});

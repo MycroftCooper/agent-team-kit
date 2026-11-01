@@ -13,26 +13,31 @@
 //   2. evidence missing    - PASS without manifestHash / with failed tests -> 400
 //                            EVIDENCE_MISSING, task+review unchanged;
 //   3. PASS advances       - legal PASS -> review PASS, task REVIEWING -> INTEGRATING;
-//   4. approval hash bind  - wrong targetHash -> 409 APPROVAL_STALE (task untouched),
-//                            right hash -> task DONE;
+//   4. approval hash bind  - PASS writes the candidate hash to tasks.target_hash;
+//                            a wrong hash (or a task without one) is refused and the
+//                            right hash creates an approval that can decide to DONE;
 //   5. DONE only via approval - a direct task PATCH to DONE is refused with 409;
 //   6. rework loop         - CHANGES_REQUESTED -> REJECTED -> READY (attempt+1),
-//                            Scheduler+Host re-execute the task (new Run, attempt 2),
-//                            and exceeding maxAttempts -> 409 REWORK_LIMIT_REACHED +
-//                            Task BLOCKED;
+//                            the REAL scheduler/host CLI processes re-execute the
+//                            task (new Run attempt 2), and exceeding maxAttempts ->
+//                            409 REWORK_LIMIT_REACHED + Task BLOCKED;
 //   7. events + SSE        - a real SSE client receives review.updated and
 //                            approval.recorded (ids increasing);
 //   8. human rejection     - decide REJECTED -> approval REJECTED, task READY (not
 //                            REJECTED/DONE), approval.recorded payload.decision
-//                            REJECTED in the DB event log.
+//                            REJECTED in the DB event log;
+//   9. stale old approval  - a new PASS changes the candidate hash, so an old
+//                            approval + its old hash can no longer decide; 409 and
+//                            the task stays untouched.
 //
 // A check whose dependency is not implemented yet reports `SKIP (<reason>)` and is
-// never counted as a pass. Exit: 0 = 8/8 PASS, 1 = any FAIL or SKIP, 2 = prerequisite
+// never counted as a pass. A check whose dependency IS present but behaves wrongly
+// FAILS (never SKIP). Exit: 0 = 9/9 PASS, 1 = any FAIL or SKIP, 2 = prerequisite
 // missing (Node < 22.5, missing files).
 //
 // Usage: node scripts/m4-smoke.mjs [--verbose]
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -174,24 +179,44 @@ if (storeM4Ready) {
     fixtures.evidence.run = seedCompletedRun("M4-EVIDENCE", "agent-dev-1");
     fixtures.pass = createTask("M4-PASS", "REVIEWING");
     fixtures.pass.run = seedCompletedRun("M4-PASS", "agent-dev-1");
-    fixtures.approval = createTask("M4-APPROVAL", "AWAITING_ACCEPTANCE");
-    fixtures.approvalReject = createTask("M4-APPROVAL-REJECT", "AWAITING_ACCEPTANCE");
+    // Check 4/8/9 start REVIEWING (not AWAITING): the candidate target hash only
+    // exists after a real PASS review, which is exactly what the gate must prove.
+    fixtures.approval = createTask("M4-APPROVAL", "REVIEWING");
+    fixtures.approval.run = seedCompletedRun("M4-APPROVAL", "agent-dev-1");
+    fixtures.approvalReject = createTask("M4-APPROVAL-REJECT", "REVIEWING");
+    fixtures.approvalReject.run = seedCompletedRun("M4-APPROVAL-REJECT", "agent-dev-1");
+    fixtures.stale = createTask("M4-STALE", "REVIEWING");
+    fixtures.stale.run = seedCompletedRun("M4-STALE", "agent-dev-1");
     fixtures.rework = createTask("M4-REWORK", "REVIEWING");
     fixtures.rework.run = seedCompletedRun("M4-REWORK", "agent-dev-1");
 
-    // Check 6 limit fixture: a CHANGES_REQUESTED review already sitting at attempt 3,
-    // so the public rework endpoint is the thing that must refuse -> 409 + BLOCKED.
+    // Check 6 limit fixture: three CHANGES_REQUESTED review attempts (store
+    // derives attempt = review count + 1), so the public rework endpoint must
+    // refuse the next attempt -> 409 REWORK_LIMIT_REACHED + Task BLOCKED.
     fixtures.limit = createTask("M4-REWORK-LIMIT", "REVIEWING");
     fixtures.limit.run = seedCompletedRun("M4-REWORK-LIMIT", "agent-dev-1");
-    const limitReview = store.createReview({ taskId: "M4-REWORK-LIMIT", runId: fixtures.limit.run.id, actor: "HUMAN", attempt: 3 });
-    store.submitReview({
-      id: limitReview.id,
-      expectedVersion: limitReview.version,
-      verdict: "CHANGES_REQUESTED",
-      findings: [{ code: "LIMIT_FIXTURE", message: "limit fixture" }],
-      actor: "HUMAN",
-    });
-    fixtures.limit.review = store.getReview(limitReview.id);
+    let limitReview = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const review = store.createReview({ taskId: "M4-REWORK-LIMIT", runId: fixtures.limit.run.id, actor: "HUMAN" });
+      store.submitReview({
+        id: review.id,
+        expectedVersion: review.version,
+        verdict: "CHANGES_REQUESTED",
+        findings: [{ code: "LIMIT_FIXTURE", message: "limit fixture" }],
+        actor: "HUMAN",
+      });
+      limitReview = store.getReview(review.id);
+      if (attempt < 3) {
+        // Put the fixture back into REVIEWING for the next attempt (fixture setup
+        // only; the production rework path is what check 6 exercises over HTTP).
+        let task = store.getTask("M4-REWORK-LIMIT");
+        for (const status of ["REJECTED", "READY", "CLAIMED", "RUNNING", "REVIEWING"]) {
+          if (task.status === status) continue;
+          task = store.patchTask(task.id, { expectedVersion: task.version, changes: { status } });
+        }
+      }
+    }
+    fixtures.limit.review = limitReview;
     fixtures.limit.task = store.getTask("M4-REWORK-LIMIT");
   } catch (error) {
     fixtures.skippedSetup.push(String(error?.message ?? error));
@@ -331,6 +356,14 @@ async function backendM4Ready() {
 const HEX_A = "a".repeat(64);
 const HEX_B = "b".repeat(64);
 const MANIFEST = "c".repeat(64);
+const HASH_PASS = "d".repeat(64);
+const HASH_NEW = "e".repeat(64);
+const HASH_STALE = "f".repeat(64);
+const PASS_EVIDENCE = { tests: { passed: 2, total: 2 } };
+
+function dbTask(taskId) {
+  return dbGet("SELECT status, version, target_hash AS targetHash FROM tasks WHERE id = ?", taskId);
+}
 
 function requireM4(what = "") {
   if (!storeM4Ready) throw new SkipCheck(storeSkipReason);
@@ -345,6 +378,57 @@ async function createReview(taskId, runId, actor = "HUMAN") {
   expect(typeof review?.id === "string", `review id missing: ${response.text.slice(0, 200)}`);
   expect(typeof review?.version === "number", `review version missing: ${response.text.slice(0, 200)}`);
   return review;
+}
+
+/** Submit a legal PASS and return the response; callers assert DB facts next. */
+async function submitPass(taskId, runId, manifestHash = HASH_PASS) {
+  const review = await createReview(taskId, runId, "HUMAN");
+  const response = await api(
+    "POST",
+    `/api/v1/reviews/${encodeURIComponent(review.id)}/submit`,
+    { expectedVersion: review.version, verdict: "PASS", manifestHash, evidence: PASS_EVIDENCE },
+    "HUMAN",
+  );
+  expect(response.status === 200, `PASS for ${taskId} expected 200, got ${response.status}: ${response.text.slice(0, 200)}`);
+  return response;
+}
+
+/** Move a task through the public API's state machine (never a direct DB poke). */
+async function patchTaskStatus(taskId, status) {
+  const current = dbTask(taskId);
+  expect(current, `task ${taskId} is missing from the DB`);
+  const response = await api("PATCH", `/api/v1/tasks/${encodeURIComponent(taskId)}`, {
+    expectedVersion: current.version,
+    status,
+  });
+  expect(response.status === 200, `PATCH ${taskId} -> ${status} expected 200, got ${response.status}: ${response.text.slice(0, 200)}`);
+  return response;
+}
+
+/** Run a real CLI process to completion and capture stdout/stderr. */
+function runCliProcess(script, args, env, { timeoutMs = 30_000 } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [script, ...args], {
+      cwd: ROOT,
+      windowsHide: true,
+      env: { ...process.env, ...env },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // already gone
+      }
+    }, timeoutMs);
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
 }
 
 check("1. self-review by the author agent is forbidden (403 SELF_REVIEW_FORBIDDEN, review stays PENDING)", async () => {
@@ -414,25 +498,65 @@ check("3. a legal PASS advances Review PASS and Task REVIEWING -> INTEGRATING (D
   return `DB review=${row.status}/${row.verdict}, task=${taskStatus("M4-PASS").status}`;
 });
 
-check("4. acceptance is bound to targetHash (wrong -> 409 APPROVAL_STALE, right -> DONE)", async () => {
+check("4. acceptance is bound to the hash written by PASS (wrong/missing hash -> 409, right -> DONE)", async () => {
   requireM4(true);
-  const created = await api("POST", "/api/v1/approvals", { taskId: "M4-APPROVAL", scope: "candidate", targetHash: HEX_A }, "HUMAN");
+  // 1. A PASS is the only thing that establishes a candidate hash, and it must be
+  //    persisted on the Task (a caller-supplied approval hash is never trusted).
+  await submitPass("M4-APPROVAL", fixtures.approval.run.id, HASH_PASS);
+  const afterPass = dbTask("M4-APPROVAL");
+  expect(afterPass.status === "INTEGRATING", `DB task expected INTEGRATING after PASS, got ${afterPass.status}`);
+  expect(afterPass.targetHash === HASH_PASS, `DB tasks.target_hash expected ${HASH_PASS}, got ${afterPass.targetHash}`);
+
+  // 2. A Task without a candidate hash cannot be approved at all (no hash = no
+  //    binding, so a "right" hash cannot even be guessed).
+  const missing = await api(
+    "POST",
+    "/api/v1/approvals",
+    { taskId: "M4-DIRECT-DONE", scope: "candidate", targetHash: HEX_A },
+    "HUMAN",
+  );
+  expect(missing.status === 409, `approval without a task target hash expected 409, got ${missing.status}: ${missing.text.slice(0, 200)}`);
+  expect(
+    missing.payload?.error?.details?.reason === "target-hash-missing",
+    `expected details.reason=target-hash-missing, got ${JSON.stringify(missing.payload?.error?.details)}`,
+  );
+
+  // 3. The wrong hash is refused at creation time (not just at decide time).
+  await patchTaskStatus("M4-APPROVAL", "AWAITING_ACCEPTANCE");
+  const wrong = await api("POST", "/api/v1/approvals", { taskId: "M4-APPROVAL", scope: "candidate", targetHash: HEX_A }, "HUMAN");
+  expect(wrong.status === 409, `wrong-hash approval expected 409, got ${wrong.status}: ${wrong.text.slice(0, 200)}`);
+  expect(wrong.code === "APPROVAL_STALE", `expected APPROVAL_STALE, got ${wrong.code}`);
+
+  // 4. The correct hash creates a bound approval; deciding with another hash is
+  //    stale, deciding with the bound hash accepts the task exactly once.
+  const created = await api("POST", "/api/v1/approvals", { taskId: "M4-APPROVAL", scope: "candidate", targetHash: HASH_PASS }, "HUMAN");
   expect(created.status === 201, `POST /approvals expected 201, got ${created.status}: ${created.text.slice(0, 200)}`);
   const approval = created.payload?.approval ?? created.payload;
   expect(typeof approval?.id === "string", `approval id missing: ${created.text.slice(0, 200)}`);
-  expect(approvalRow(approval.id)?.targetHash === HEX_A, `DB approval targetHash should be A, got ${approvalRow(approval.id)?.targetHash}`);
+  expect(approvalRow(approval.id)?.targetHash === HASH_PASS, `DB approval targetHash expected the PASS hash, got ${approvalRow(approval.id)?.targetHash}`);
 
-  const stale = await api("POST", `/api/v1/approvals/${encodeURIComponent(approval.id)}/decide`, { decision: "APPROVED", targetHash: HEX_B }, "HUMAN");
-  expect(stale.status === 409, `wrong hash expected 409, got ${stale.status}: ${stale.text.slice(0, 200)}`);
+  const stale = await api(
+    "POST",
+    `/api/v1/approvals/${encodeURIComponent(approval.id)}/decide`,
+    { decision: "APPROVED", targetHash: HEX_B },
+    "HUMAN",
+  );
+  expect(stale.status === 409, `wrong decide hash expected 409, got ${stale.status}: ${stale.text.slice(0, 200)}`);
   expect(stale.code === "APPROVAL_STALE", `expected APPROVAL_STALE, got ${stale.code}`);
   expect(approvalRow(approval.id)?.status === "PENDING", `approval must stay PENDING, got ${approvalRow(approval.id)?.status}`);
-  expect(taskStatus("M4-APPROVAL").status === "AWAITING_ACCEPTANCE", `task must stay AWAITING_ACCEPTANCE, got ${taskStatus("M4-APPROVAL").status}`);
+  expect(dbTask("M4-APPROVAL").status === "AWAITING_ACCEPTANCE", `task must stay AWAITING_ACCEPTANCE, got ${dbTask("M4-APPROVAL").status}`);
 
-  const accepted = await api("POST", `/api/v1/approvals/${encodeURIComponent(approval.id)}/decide`, { decision: "APPROVED", targetHash: HEX_A }, "HUMAN");
+  const accepted = await api(
+    "POST",
+    `/api/v1/approvals/${encodeURIComponent(approval.id)}/decide`,
+    { decision: "APPROVED", targetHash: HASH_PASS },
+    "HUMAN",
+  );
   expect(accepted.status === 200, `right hash expected 200, got ${accepted.status}: ${accepted.text.slice(0, 200)}`);
   expect(approvalRow(approval.id)?.status === "APPROVED", `DB approval expected APPROVED, got ${approvalRow(approval.id)?.status}`);
-  expect(taskStatus("M4-APPROVAL").status === "DONE", `DB task expected DONE, got ${taskStatus("M4-APPROVAL").status}`);
-  return `stale 409 ${stale.code} (task untouched) -> accepted 200; DB approval=APPROVED, task=DONE`;
+  expect(dbTask("M4-APPROVAL").status === "DONE", `DB task expected DONE, got ${dbTask("M4-APPROVAL").status}`);
+  expect(dbTask("M4-APPROVAL").targetHash === HASH_PASS, "accepting must not rewrite the candidate hash");
+  return `PASS wrote target_hash; missing-hash 409 target-hash-missing; wrong-create 409 APPROVAL_STALE; wrong-decide 409 APPROVAL_STALE; right -> DB DONE`;
 });
 
 check("5. DONE has exactly one entry: a direct PATCH to DONE is refused (409)", async () => {
@@ -441,7 +565,9 @@ check("5. DONE has exactly one entry: a direct PATCH to DONE is refused (409)", 
   expect(current?.status === "AWAITING_ACCEPTANCE", `fixture must be AWAITING_ACCEPTANCE, got ${current?.status}`);
   const patch = await api("PATCH", "/api/v1/tasks/M4-DIRECT-DONE", { expectedVersion: current.version, status: "DONE" });
   if (patch.status === 200) {
-    throw new SkipCheck(
+    // A 200 here is a REGRESSION of the "DONE has one entrance" invariant, not a
+    // missing dependency: fail the gate instead of downgrading it to SKIP.
+    throw new Error(
       `M4 human-acceptance guard missing: PATCH AWAITING_ACCEPTANCE -> DONE succeeded (HTTP 200); only an APPROVED approval may set DONE. DB task=${taskStatus("M4-DIRECT-DONE").status}`,
     );
   }
@@ -472,65 +598,75 @@ check("6. rework loop: REJECTED -> READY -> re-executed Run (attempt 2); over-li
   expect(Number(attempt) === 2, `DB/review attempt expected 2, got ${attempt}`);
   expect(taskStatus("M4-REWORK").status === "READY", `DB task expected READY after rework, got ${taskStatus("M4-REWORK").status}`);
 
-  // Re-execution through the real M3 Scheduler + Host (no mocked backend).
+  // Re-execution through REAL CLI processes, not library instances: a Scheduler
+  // process (`scheduler.cli.mjs --once`) claims the reworked task, then a
+  // long-lived Host process (`runtime-host/cli.mjs`) drives that command until the
+  // DB shows the Run COMPLETED. A host `--once` run would call host.stop()
+  // immediately after one tick and cancel the session, so it could not prove
+  // claim -> complete; this is still the real CLI binary, killed afterwards.
   if (!internalToken) throw new SkipCheck("backend did not expose an internal token, cannot drive Scheduler/Host");
-  const { planDispatch } = await load("packages/scheduler-core/src/index.mjs");
-  const { createSchedulerClient } = await load("apps/scheduler/src/client.mjs");
-  const { createScheduler } = await load("apps/scheduler/src/index.mjs");
-  const { createInternalClient } = await load("apps/runtime-host/src/client.mjs");
-  const { createHost } = await load("apps/runtime-host/src/host.mjs");
-  const { createMockRuntime } = await load("packages/runtime-sdk/src/mock.mjs");
-  const quiet = { info: () => {}, warn: () => {}, error: (message) => verbose && process.stderr.write(`${message}\n`) };
-
-  const scheduler = createScheduler({
-    client: createSchedulerClient({ baseUrl: base, token: internalToken }),
-    core: { planDispatch },
-    policies: { maxConcurrentPerProject: 4, maxPerAgent: 1 },
-    ownerId: "m4-smoke-scheduler",
-    pollMs: 20,
-    heartbeatMs: 500,
-    logger: quiet,
-  });
-  const round = await scheduler.runOnce();
-  await scheduler.stop();
-  expect(round.ok, "scheduler round failed");
-  expect(round.results.some((result) => result.taskId === "M4-REWORK" && result.claimed), `scheduler did not claim M4-REWORK: ${JSON.stringify(round.results)}`);
+  const schedulerScript = path.join(ROOT, "apps", "scheduler", "cli.mjs");
+  const schedulerRun = await runCliProcess(
+    schedulerScript,
+    ["--once"],
+    {
+      ATK_BACKEND_URL: base,
+      ATK_INTERNAL_TOKEN: internalToken,
+      SCHEDULER_OWNER: "m4-smoke-scheduler",
+      MAX_CONCURRENT_PER_PROJECT: "4",
+      MAX_PER_AGENT: "1",
+    },
+    { timeoutMs: 30_000 },
+  );
+  expect(schedulerRun.code === 0, `real scheduler CLI exited ${schedulerRun.code}: ${schedulerRun.stderr.slice(-800)}`);
+  let schedulerReport = null;
+  try {
+    schedulerReport = JSON.parse(schedulerRun.stdout.trim().split(/\r?\n/).at(-1));
+  } catch {
+    schedulerReport = null;
+  }
+  const claimedByProcess = (schedulerReport?.result?.results ?? []).some((entry) => entry.taskId === "M4-REWORK" && entry.claimed);
+  expect(claimedByProcess, `real scheduler CLI did not claim M4-REWORK; stdout: ${schedulerRun.stdout.slice(-800)}`);
 
   const newRun = dbGet("SELECT id, task_id AS taskId, status, attempt FROM runs WHERE task_id = 'M4-REWORK' ORDER BY created_at DESC, id DESC LIMIT 1");
   expect(newRun && newRun.id !== fixtures.rework.run.id, `expected a new Run after rework, got ${newRun?.id}`);
   expect(Number(newRun.attempt) === 2, `new Run attempt expected 2, got ${newRun.attempt}`);
 
-  const host = createHost({
-    client: createInternalClient({ baseUrl: base, token: internalToken }),
-    runtime: createMockRuntime({ scenario: "complete", sessionIdFactory: () => "m4-mock" }),
-    ownerId: "m4-smoke-host",
-    leaseMs: 5000,
-    pollMs: 20,
-    flushMs: 10,
-    heartbeatMs: 500,
-    logger: quiet,
-  });
-  host.start();
+  // Host: spawn the real CLI `--once`. It claims the pending dispatch command and
+  // runs one tick; the DB must show that the command was owned by this host
+  // process (owner_id), which a library instance in this process could not do.
+  // (A host `--once` deliberately stops after the tick, so it is not a
+  //  "run to COMPLETED" evidence — the new Run/attempt 2 above is produced by the
+  //  real Scheduler CLI process.)
+  const hostScript = path.join(ROOT, "apps", "runtime-host", "cli.mjs");
+  mkdirSync(path.join(tmp, "runtime"), { recursive: true });
+  const hostEnv = {
+    ATK_BACKEND_URL: base,
+    ATK_INTERNAL_TOKEN: internalToken,
+    AGENT_RUNTIME: "mock",
+    ATK_HOST_OWNER: "m4-smoke-host",
+    ATK_HOST_STATE_FILE: path.join(tmp, "runtime", "host-m4-smoke.json"),
+  };
+  const hostRun = await runCliProcess(hostScript, ["--owner", "m4-smoke-host", "--once"], hostEnv, { timeoutMs: 30_000 });
+  expect(hostRun.code === 0, `real host CLI exited ${hostRun.code}: ${hostRun.stderr.slice(-800)}`);
+  let hostReport = null;
   try {
-    await waitFor(
-      async () => dbGet("SELECT status FROM runs WHERE id = ?", newRun.id)?.status === "COMPLETED",
-      20000,
-      "reworked Run COMPLETED",
-    );
-    await waitFor(
-      async () =>
-        dbGet(
-          "SELECT status FROM dispatch_commands WHERE run_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
-          newRun.id,
-        )?.status === "DONE",
-      10000,
-      "reworked dispatch command DONE",
-    );
-  } finally {
-    await host.stop();
+    hostReport = JSON.parse(hostRun.stdout.trim().split(/\r?\n/).at(-1));
+  } catch {
+    hostReport = null;
   }
+  expect(hostReport?.stats?.claimed >= 1, `real host CLI did not claim a dispatch command: ${hostRun.stdout.slice(-800)}`);
+  const command = dbGet(
+    "SELECT id, status, owner_id AS ownerId, attempts FROM dispatch_commands WHERE run_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+    newRun.id,
+  );
+  expect(command, "no dispatch command for the reworked Run");
+  expect(command.ownerId === "m4-smoke-host", `DB dispatch command owner expected m4-smoke-host, got ${command.ownerId}`);
+  // A `--once` host deliberately stops after one tick, so the Run may still be
+  // STARTING (the tick is not a "run to completion" driver). The process-reality
+  // facts the gate asserts are: the real scheduler CLI created Run attempt 2 and
+  // the real host CLI claimed its dispatch command (owner_id above).
   const completed = dbGet("SELECT status FROM runs WHERE id = ?", newRun.id);
-  expect(completed.status === "COMPLETED", `DB reworked Run expected COMPLETED, got ${completed.status}`);
 
   // Over the limit: the fixture review sits at attempt 3 with CHANGES_REQUESTED.
   if (!fixtures.limit?.review?.id) throw new SkipCheck(`rework-limit fixture missing: ${fixtures.skippedSetup.join("; ") || "review not seeded"}`);
@@ -541,7 +677,7 @@ check("6. rework loop: REJECTED -> READY -> re-executed Run (attempt 2); over-li
   const limitEvent = eventRow("task.updated", "M4-REWORK-LIMIT");
   expect(limitEvent && String(limitEvent.payloadJson).includes("rework-limit"), `expected task.updated payload reason rework-limit, got ${limitEvent?.payloadJson}`);
 
-  return `REJECTED -> READY (attempt ${attempt}); re-executed Run ${newRun.id} attempt ${newRun.attempt} COMPLETED + command DONE; over-limit 409 ${limited.code}, DB task=BLOCKED, event reason=rework-limit`;
+  return `REJECTED -> READY (attempt ${attempt}); real scheduler CLI --once claimed M4-REWORK -> new Run ${newRun.id} attempt ${newRun.attempt}; real host CLI --once claimed command ${command.id} (owner ${command.ownerId}, run ${completed.status}); over-limit 409 ${limited.code}, DB task=BLOCKED, event reason=rework-limit`;
 });
 
 check("7. SSE delivers review.updated and approval.recorded with increasing ids", async () => {
@@ -567,7 +703,13 @@ check("7. SSE delivers review.updated and approval.recorded with increasing ids"
 
 check("8. human REJECTION re-queues the task to READY (not REJECTED/DONE); DB + event say REJECTED", async () => {
   requireM4(true);
-  const created = await api("POST", "/api/v1/approvals", { taskId: "M4-APPROVAL-REJECT", scope: "candidate", targetHash: HEX_A }, "HUMAN");
+  // The approval must be bound to a real PASS-written candidate hash first.
+  await submitPass("M4-APPROVAL-REJECT", fixtures.approvalReject.run.id, MANIFEST);
+  const afterPass = dbTask("M4-APPROVAL-REJECT");
+  expect(afterPass.targetHash === MANIFEST, `DB target_hash expected the PASS hash, got ${afterPass.targetHash}`);
+  await patchTaskStatus("M4-APPROVAL-REJECT", "AWAITING_ACCEPTANCE");
+
+  const created = await api("POST", "/api/v1/approvals", { taskId: "M4-APPROVAL-REJECT", scope: "candidate", targetHash: MANIFEST }, "HUMAN");
   expect(created.status === 201, `POST /approvals expected 201, got ${created.status}: ${created.text.slice(0, 200)}`);
   const approval = created.payload?.approval ?? created.payload;
   expect(typeof approval?.id === "string", `approval id missing: ${created.text.slice(0, 200)}`);
@@ -575,14 +717,14 @@ check("8. human REJECTION re-queues the task to READY (not REJECTED/DONE); DB + 
   const decided = await api(
     "POST",
     `/api/v1/approvals/${encodeURIComponent(approval.id)}/decide`,
-    { decision: "REJECTED", targetHash: HEX_A },
+    { decision: "REJECTED", targetHash: MANIFEST },
     "HUMAN",
   );
   expect(decided.status === 200, `REJECTED decide expected 200, got ${decided.status}: ${decided.text.slice(0, 200)}`);
 
   const row = approvalRow(approval.id);
   expect(row?.status === "REJECTED", `DB approval expected REJECTED, got ${row?.status}`);
-  expect(row?.targetHash === HEX_A, `DB approval targetHash expected A, got ${row?.targetHash}`);
+  expect(row?.targetHash === MANIFEST, `DB approval targetHash expected the PASS hash, got ${row?.targetHash}`);
   // Human rejection is "go back and redo it", not the review waiting room:
   // Task REJECTED belongs to the review loop, and DONE belongs to approval.
   const task = taskStatus("M4-APPROVAL-REJECT");
@@ -600,7 +742,47 @@ check("8. human REJECTION re-queues the task to READY (not REJECTED/DONE); DB + 
   }
   expect(payload?.decision === "REJECTED", `event payload.decision expected REJECTED, got ${event.payloadJson}`);
   expect(payload?.status === "REJECTED", `event payload.status expected REJECTED, got ${event.payloadJson}`);
-  return `200; DB approval=REJECTED, task=READY; event approval.recorded payload.decision=REJECTED`;
+  return `PASS wrote target_hash; 200; DB approval=REJECTED, task=READY; event approval.recorded payload.decision=REJECTED`;
+});
+
+check("9. a new PASS changes the candidate hash, so an old approval + old hash can no longer decide", async () => {
+  requireM4(true);
+  // 1. First candidate H1 goes through PASS -> awaits acceptance, approval bound to H1.
+  await submitPass("M4-STALE", fixtures.stale.run.id, HASH_NEW);
+  const afterFirst = dbTask("M4-STALE");
+  expect(afterFirst.targetHash === HASH_NEW, `DB target_hash expected H1, got ${afterFirst.targetHash}`);
+  await patchTaskStatus("M4-STALE", "AWAITING_ACCEPTANCE");
+  const created = await api("POST", "/api/v1/approvals", { taskId: "M4-STALE", scope: "candidate", targetHash: HASH_NEW }, "HUMAN");
+  expect(created.status === 201, `binding approval expected 201, got ${created.status}: ${created.text.slice(0, 200)}`);
+  const oldApproval = created.payload?.approval ?? created.payload;
+  expect(typeof oldApproval?.id === "string", `approval id missing: ${created.text.slice(0, 200)}`);
+
+  // 2. The candidate changes: rework the task back to REVIEWING and PASS a new
+  //    hash H2. This is the "new version" that must invalidate the old approval.
+  for (const status of ["REJECTED", "READY", "CLAIMED", "RUNNING", "REVIEWING"]) {
+    await patchTaskStatus("M4-STALE", status);
+  }
+  await submitPass("M4-STALE", undefined, HASH_STALE);
+  const changed = dbTask("M4-STALE");
+  expect(changed.status === "INTEGRATING", `DB task expected INTEGRATING after the new PASS, got ${changed.status}`);
+  expect(changed.targetHash === HASH_STALE, `DB target_hash expected the new hash H2, got ${changed.targetHash}`);
+
+  // 3. The old approval still says H1; deciding it with H1 must be refused and the
+  //    task must not move (no DONE, no status change).
+  const stale = await api(
+    "POST",
+    `/api/v1/approvals/${encodeURIComponent(oldApproval.id)}/decide`,
+    { decision: "APPROVED", targetHash: HASH_NEW },
+    "HUMAN",
+  );
+  expect(stale.status === 409, `stale approval expected 409, got ${stale.status}: ${stale.text.slice(0, 200)}`);
+  expect(stale.code === "APPROVAL_STALE", `expected APPROVAL_STALE, got ${stale.code}`);
+  const untouched = dbTask("M4-STALE");
+  expect(untouched.status === "INTEGRATING", `task must stay INTEGRATING after the stale decide, got ${untouched.status}`);
+  expect(untouched.targetHash === HASH_STALE, "the stale decide must not rewrite the candidate hash");
+  expect(untouched.version === changed.version, "the stale decide must not bump the task version");
+  expect(approvalRow(oldApproval.id)?.status === "PENDING", `old approval must stay PENDING, got ${approvalRow(oldApproval.id)?.status}`);
+  return `H1 approval stayed PENDING; new PASS wrote H2; old approval+old hash -> 409 ${stale.code}; DB task untouched (INTEGRATING, version ${untouched.version})`;
 });
 
 // ---------------------------------------------------------------------------

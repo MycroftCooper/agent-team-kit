@@ -60,7 +60,9 @@ test("snapshot exposes policy, tasks/files, agents, non-terminal runs and leases
     assert.deepEqual(snapshot.agents.map((agent) => agent.id), ["agent-1"], implementation);
     assert.deepEqual(snapshot.runs, [], implementation);
     assert.deepEqual(snapshot.leases, [], implementation);
-    assert.equal(snapshot.version, 0, implementation);
+    // Fixture DONE went through the approval gate: createApproval + decide each
+    // append one approval.recorded event, so the baseline is no longer 0.
+    assert.equal(snapshot.version, 2, implementation);
 
     const claimed = store.claimTask({
       taskId: "TASK-A",
@@ -71,7 +73,7 @@ test("snapshot exposes policy, tasks/files, agents, non-terminal runs and leases
       workspacePolicy: { kind: "worktree" },
     });
     snapshot = store.schedulingSnapshot();
-    assert.equal(snapshot.version, 2, `${implementation}: claim appends two events`);
+    assert.equal(snapshot.version, 4, `${implementation}: claim appends two events`);
     assert.equal(snapshot.version, store.latestSeq(), implementation);
     assert.equal(snapshot.runs.length, 1, implementation);
     assert.equal(snapshot.runs[0].id, claimed.run.id, implementation);
@@ -84,7 +86,7 @@ test("snapshot exposes policy, tasks/files, agents, non-terminal runs and leases
     const dispatch = store.claimDispatchCommand({ ownerId: "host-1", leaseMs: 60_000 });
     assert.equal(dispatch.command.runId, claimed.run.id, implementation);
     snapshot = store.schedulingSnapshot();
-    assert.equal(snapshot.version, 2, `${implementation}: dispatch claim writes no event`);
+    assert.equal(snapshot.version, 4, `${implementation}: dispatch claim writes no event`);
     assert.equal(snapshot.leases.length, 1, implementation);
     assert.equal(snapshot.leases[0].runId, claimed.run.id, implementation);
     assert.equal(snapshot.leases[0].ownerId, "host-1", implementation);
@@ -94,10 +96,10 @@ test("snapshot exposes policy, tasks/files, agents, non-terminal runs and leases
     // Terminal runs disappear from the snapshot, but their lease row remains
     // (M2 decision: release = expire with monotonic generation).
     store.updateRunStatus(claimed.run.id, { status: "RUNNING" });
-    assert.equal(store.schedulingSnapshot().version, 3, implementation);
+    assert.equal(store.schedulingSnapshot().version, 5, implementation);
     store.updateRunStatus(claimed.run.id, { status: "COMPLETED", exitCode: 0 });
     snapshot = store.schedulingSnapshot();
-    assert.equal(snapshot.version, 4, implementation);
+    assert.equal(snapshot.version, 6, implementation);
     assert.deepEqual(snapshot.runs, [], `${implementation}: only non-terminal runs are exposed`);
     assert.equal(snapshot.leases.length, 1, implementation);
     assert.equal(snapshot.tasks.find((task) => task.id === "TASK-A").status, "CLAIMED", implementation);

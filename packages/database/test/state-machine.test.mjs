@@ -106,7 +106,7 @@ test("both stores walk the legal main chain step by step", (t) => {
     });
     assert.equal(selfPatch.status, "READY", label);
     expectedVersion = selfPatch.version;
-    for (const next of ["CLAIMED", "RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE", "DONE"]) {
+    for (const next of ["CLAIMED", "RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE"]) {
       const before = store.getTask("TASK-CHAIN");
       const updated = store.patchTask("TASK-CHAIN", {
         expectedVersion: before.version,
@@ -116,7 +116,18 @@ test("both stores walk the legal main chain step by step", (t) => {
       assert.equal(updated.status, next, `${label}: ${next}`);
       assert.equal(updated.version, expectedVersion, `${label}: version after ${next}`);
     }
-    assert.equal(store.getTask("TASK-CHAIN").status, "DONE");
+    // M4: DONE cannot be patched; an APPROVED approval is the only entrance.
+    const awaiting = store.getTask("TASK-CHAIN");
+    assert.throws(
+      () => store.patchTask("TASK-CHAIN", { expectedVersion: awaiting.version, changes: { status: "DONE" } }),
+      (error) =>
+        error.code === "TASK_VERSION_CONFLICT" &&
+        error.details.reason === "human-approval-required" &&
+        error.details.requestedStatus === "DONE",
+      label,
+    );
+    const done = advanceTask(store, "TASK-CHAIN", "DONE");
+    assert.equal(done.status, "DONE", label);
   }
 });
 
@@ -137,10 +148,12 @@ test("both stores reject illegal jumps, backwards moves and DRAFT", (t) => {
       assert.throws(
         () => store.patchTask("TASK-JUMPS", { expectedVersion: before.version, changes: { status: to } }),
         (error) =>
-          error.code === "VALIDATION_ERROR" &&
-          error.details.from === from &&
-          error.details.to === to &&
-          assert.deepEqual(error.details.allowed, EXPECTED_TRANSITIONS[from]) === undefined,
+          (to === "DONE"
+            ? error.code === "TASK_VERSION_CONFLICT" && error.details.reason === "human-approval-required"
+            : error.code === "VALIDATION_ERROR" &&
+              error.details.from === from &&
+              error.details.to === to &&
+              assert.deepEqual(error.details.allowed, EXPECTED_TRANSITIONS[from]) === undefined),
         `${label}: ${from} -> ${to}`,
       );
     }
@@ -157,7 +170,7 @@ test("both stores reject illegal jumps, backwards moves and DRAFT", (t) => {
           expectedVersion: after.version,
           changes: { title: "should not apply", priority: 0, status: "DONE" },
         }),
-      (error) => error.code === "VALIDATION_ERROR",
+      (error) => error.code === "TASK_VERSION_CONFLICT",
     );
     const unchanged = store.getTask("TASK-JUMPS");
     assert.equal(unchanged.title, titleBefore, label);
@@ -214,7 +227,10 @@ test("BLOCKED is a branch state with exactly one way back (READY)", (t) => {
             expectedVersion: blockedAgain.version,
             changes: { status: to },
           }),
-        (error) => error.code === "VALIDATION_ERROR" && error.details.from === "BLOCKED",
+        (error) =>
+          (to === "DONE"
+            ? error.code === "TASK_VERSION_CONFLICT" && error.details.reason === "human-approval-required"
+            : error.code === "VALIDATION_ERROR" && error.details.from === "BLOCKED"),
         `${label}: BLOCKED -> ${to}`,
       );
     }
@@ -232,7 +248,10 @@ test("BLOCKED is a branch state with exactly one way back (READY)", (t) => {
             expectedVersion: cancelled.version,
             changes: { status: to },
           }),
-        (error) => error.code === "VALIDATION_ERROR" && error.details.from === "CANCELLED",
+        (error) =>
+          (to === "DONE"
+            ? error.code === "TASK_VERSION_CONFLICT" && error.details.reason === "human-approval-required"
+            : error.code === "VALIDATION_ERROR" && error.details.from === "CANCELLED"),
         `${label}: CANCELLED -> ${to}`,
       );
     }

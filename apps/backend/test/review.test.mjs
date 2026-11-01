@@ -168,10 +168,13 @@ test("submit PASS persists Review PASS + Task INTEGRATING and appends events", a
   assert.equal(res.json.review.version, 1);
   assert.equal(res.json.review.manifestHash, MANIFEST_HASH);
   assert.equal(res.json.task.status, "INTEGRATING");
+  // PASS publishes the candidate target hash on the Task (createApproval binds to it).
+  assert.equal(res.json.task.targetHash, MANIFEST_HASH);
 
   // The response must be backed by database facts, not just a happy shape.
   const task = await request(ctx.base, { path: "/api/v1/tasks/TASK-1", headers: readHeaders() });
   assert.equal(task.json.status, "INTEGRATING");
+  assert.equal(task.json.targetHash, MANIFEST_HASH);
   const reviews = await request(ctx.base, { path: "/api/v1/reviews?taskId=TASK-1", headers: readHeaders() });
   assert.equal(reviews.json.items[0].status, "PASS");
   const events = await request(ctx.base, { path: "/api/v1/events?afterSeq=0", headers: readHeaders() });
@@ -201,6 +204,78 @@ test("self-review is 403 SELF_REVIEW_FORBIDDEN and leaves Review/Task unchanged"
   assertErrorEnvelope(byAssignee, "SELF_REVIEW_FORBIDDEN", 403);
   assert.equal(byAssignee.json.error.details.actor, "agent-3");
   assert.equal(byAssignee.json.error.details.authorAgentId, "agent-3");
+});
+
+test("self-review cannot be bypassed with whitespace/case actor variants", async (t) => {
+  const ctx = await withServer(t);
+  const review = (await createReview(ctx)).json;
+  const variants = [
+    ["canonical self", "agent-1", 403, "SELF_REVIEW_FORBIDDEN"],
+    ["leading space", " agent-1", 400, "VALIDATION_ERROR"],
+    ["trailing space", "agent-1 ", 400, "VALIDATION_ERROR"],
+    ["uppercase", "AGENT-1", 403, "SELF_REVIEW_FORBIDDEN"],
+    ["mixed case + spaces", " Agent-1 ", 400, "VALIDATION_ERROR"],
+  ];
+  for (const [label, actor, expectedStatus, expectedCode] of variants) {
+    const res = await submitReview(ctx, review.id, submitBody({ actor }));
+    assert.equal(res.status, expectedStatus, `${label}: ${res.text}`);
+    assert.equal(res.json.error.code, expectedCode, label);
+    if (expectedStatus === 400) {
+      assert.equal(res.json.error.details.reason, "actor-not-normalized", label);
+      assert.equal(res.json.error.details.actor, actor, label);
+    } else {
+      assert.equal(res.json.error.details.actor, actor, label);
+      assert.equal(res.json.error.details.authorAgentId, "agent-1", label);
+    }
+  }
+
+  // Zero writes from every rejected variant.
+  const reviews = await request(ctx.base, { path: "/api/v1/reviews?taskId=TASK-1", headers: readHeaders() });
+  assert.equal(reviews.json.items[0].status, "PENDING");
+  assert.equal(reviews.json.items[0].version, 0);
+  assert.equal((await request(ctx.base, { path: "/api/v1/tasks/TASK-1", headers: readHeaders() })).json.status, "REVIEWING");
+  const events = await request(ctx.base, { path: "/api/v1/events?afterSeq=0", headers: readHeaders() });
+  assert.equal(events.json.items.some((event) => event.type === "review.updated"), false);
+
+  // A differently-cased legitimate reviewer is still accepted (and canonicalized
+  // only for comparison; the stored actor is the declared value).
+  const legal = await submitReview(ctx, review.id, submitBody({ actor: "AGENT-2" }));
+  assert.equal(legal.status, 200, legal.text);
+  assert.equal(legal.json.review.status, "PASS");
+  assert.equal(legal.json.task.status, "INTEGRATING");
+});
+
+test("createApproval binds the Task's real candidate hash (no arbitrary targetHash)", async (t) => {
+  const ctx = await withServer(t, {
+    tasks: [
+      baseTask({ id: "TASK-TARGET", status: "AWAITING_ACCEPTANCE", targetHash: TARGET_HASH }),
+      baseTask({ id: "TASK-NOHASH", status: "AWAITING_ACCEPTANCE" }),
+    ],
+  });
+  const create = (taskId, targetHash) =>
+    request(ctx.base, {
+      method: "POST",
+      path: "/api/v1/approvals",
+      headers: write(ctx.base),
+      body: { taskId, scope: "acceptance", targetHash },
+    });
+
+  const ok = await create("TASK-TARGET", TARGET_HASH);
+  assert.equal(ok.status, 201, ok.text);
+  assert.equal(ok.json.targetHash, TARGET_HASH);
+
+  const wrong = await create("TASK-TARGET", OTHER_HASH);
+  assertErrorEnvelope(wrong, "APPROVAL_STALE", 409);
+  assert.deepEqual(wrong.json.error.details, {
+    taskId: "TASK-TARGET",
+    expectedTargetHash: TARGET_HASH,
+    receivedTargetHash: OTHER_HASH,
+  });
+
+  const missing = await create("TASK-NOHASH", TARGET_HASH);
+  assertErrorEnvelope(missing, "TASK_VERSION_CONFLICT", 409);
+  assert.equal(missing.json.error.details.reason, "target-hash-missing");
+  assert.equal(missing.json.error.details.taskId, "TASK-NOHASH");
 });
 
 test("PASS without evidence is 400 EVIDENCE_MISSING (manifestHash, tests, passed!==total)", async (t) => {
@@ -463,7 +538,7 @@ test("decide APPROVED with the correct hash is the only DONE entrance", async (t
 
 test("decide rejects stale Task target hash and REJECTED returns the Task to READY", async (t) => {
   const ctx = await withServer(t, {
-    tasks: [baseTask({ id: "TASK-AWAIT", status: "AWAITING_ACCEPTANCE", targetHash: OTHER_HASH })],
+    tasks: [baseTask({ id: "TASK-AWAIT", status: "AWAITING_ACCEPTANCE", targetHash: TARGET_HASH })],
   });
   const approval = (
     await request(ctx.base, {
@@ -473,6 +548,9 @@ test("decide rejects stale Task target hash and REJECTED returns the Task to REA
       body: { taskId: "TASK-AWAIT", scope: "acceptance", targetHash: TARGET_HASH },
     })
   ).json;
+  // The task target hash changes after the acceptance was recorded (e.g. a new
+  // integration produced a different artifact).
+  ctx.store._updateTask("TASK-AWAIT", { targetHash: OTHER_HASH });
   const stale = await request(ctx.base, {
     method: "POST",
     path: `/api/v1/approvals/${approval.id}/decide`,
@@ -481,6 +559,7 @@ test("decide rejects stale Task target hash and REJECTED returns the Task to REA
   });
   assertErrorEnvelope(stale, "APPROVAL_STALE", 409);
   assert.equal(stale.json.error.details.expectedTargetHash, OTHER_HASH);
+  assert.equal((await request(ctx.base, { path: "/api/v1/tasks/TASK-AWAIT", headers: readHeaders() })).json.status, "AWAITING_ACCEPTANCE");
 
   const rejectedCtx = await withServer(t, {
     tasks: [baseTask({ id: "TASK-REJ", status: "AWAITING_ACCEPTANCE", targetHash: TARGET_HASH })],

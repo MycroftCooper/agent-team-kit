@@ -374,6 +374,16 @@ export const TASK_PATCH_KEYS = Object.freeze([
 
 export function mergeTask(current, changes, { now } = {}) {
   ensurePlainObject(changes, "changes");
+  // Hard invariant (M4): human acceptance is the ONLY way into DONE. The store
+  // must enforce it too, not just the Backend route, so internal callers and
+  // future endpoints cannot bypass the approval gate.
+  if (changes.status === "DONE" && current.status !== "DONE") {
+    fail("TASK_VERSION_CONFLICT", "task DONE requires an APPROVED human approval", {
+      taskId: current.id,
+      reason: "human-approval-required",
+      requestedStatus: "DONE",
+    });
+  }
   for (const key of Object.keys(changes)) {
     if (!TASK_PATCH_KEYS.includes(key)) {
       fail("VALIDATION_ERROR", `task.changes.${key} is not patchable`, {
@@ -537,8 +547,10 @@ export function normalizeApproval(dto, { now, id } = {}) {
 export const REVIEW_M4_STATUSES = Object.freeze(["PENDING", "PASS", "CHANGES_REQUESTED", "BLOCKED"]);
 export const REVIEW_M4_VERDICTS = Object.freeze(["PASS", "CHANGES_REQUESTED", "BLOCKED"]);
 export const DEFAULT_MAX_REVIEW_ATTEMPTS = 3;
+/** Sanity bound for test evidence counters (QA-005): prevents absurd integers. */
+export const MAX_REVIEW_TEST_TOTAL = 1_000_000;
 
-/** A non-empty, bounded token (hashes, actors, commit shas). */
+/** A non-empty, bounded token (hashes, commit shas). */
 export function validateToken(value, label) {
   if (
     typeof value !== "string" ||
@@ -555,8 +567,29 @@ export function validateTargetHash(value, label = "targetHash") {
   return validateToken(value, label);
 }
 
+/**
+ * Canonical form used *only* for identity comparison (self-review): trim and
+ * casefold. Stored/displayed values keep the caller's exact spelling.
+ */
+export function canonicalAgentId(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+/**
+ * Actors must already be in normalised form: the string must equal its own
+ * trim(), otherwise a PASS could smuggle " agent-dev " past an exact-match
+ * self-review check (QA-005 MAJOR). Case is folded separately for comparison.
+ */
 export function validateActor(value, label = "actor") {
-  return validateToken(value, label);
+  validateToken(value, label);
+  if (value !== value.trim()) {
+    fail("VALIDATION_ERROR", `${label} must not have leading or trailing whitespace`, {
+      entity: label,
+      value,
+      reason: "actor-not-normalized",
+    });
+  }
+  return value;
 }
 
 export function validateReviewStatus(status) {
@@ -599,6 +632,13 @@ export function validateReviewEvidence(evidence) {
       tests,
     });
   }
+  if (tests.total > MAX_REVIEW_TEST_TOTAL) {
+    fail("EVIDENCE_MISSING", "review.evidence.tests.total is out of range", {
+      reason: "evidence-out-of-range",
+      tests,
+      maxTotal: MAX_REVIEW_TEST_TOTAL,
+    });
+  }
   return evidence;
 }
 
@@ -624,6 +664,16 @@ export function assertPassEvidence({ manifestHash, evidence, taskId, reviewId } 
       taskId: taskId ?? null,
       reviewId: reviewId ?? null,
       missing,
+    });
+  }
+  const { passed, total } = evidence.tests;
+  if (total > MAX_REVIEW_TEST_TOTAL || passed < 0 || passed > total) {
+    fail("EVIDENCE_MISSING", "a PASS review has out-of-range test counters", {
+      taskId: taskId ?? null,
+      reviewId: reviewId ?? null,
+      reason: "evidence-out-of-range",
+      tests: evidence.tests,
+      maxTotal: MAX_REVIEW_TEST_TOTAL,
     });
   }
   return { manifestHash, evidence };

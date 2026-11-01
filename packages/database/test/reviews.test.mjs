@@ -134,6 +134,7 @@ test("submitReview PASS requires evidence and advances REVIEWING -> INTEGRATING"
       verdict: "PASS",
       actor: "reviewer-1",
       attempt: 1,
+      targetHash: SHA,
     }, label);
 
     // A decided review cannot be submitted again.
@@ -433,4 +434,130 @@ test("review attempt audit rows are written internally", (t) => {
   const review = store.createReview({ taskId: "TASK-1", actor: "HUMAN" });
   assert.ok(store[INTERNAL]);
   assert.equal(typeof review.id, "string");
+});
+
+test("QA-005: canonical self-review blocks whitespace/case variants (zero writes)", (t) => {
+  const variants = ["agent-dev-1", " agent-dev-1", "agent-dev-1 ", "AGENT-DEV-1", " Agent-Dev-1 "];
+  for (const { label, store } of bothStores(t)) {
+    for (const [index, variant] of variants.entries()) {
+      const taskId = `TASK-SELF-${index}`;
+      seedReviewable(store, { taskId, agentId: "agent-dev-1" });
+      const review = store.createReview({ taskId, actor: "HUMAN" });
+      const before = fingerprint(store);
+      assert.throws(
+        () => store.submitReview({
+          id: review.id,
+          expectedVersion: 0,
+          verdict: "PASS",
+          manifestHash: SHA,
+          evidence: { tests: { passed: 1, total: 1 } },
+          actor: variant,
+        }),
+        (error) => error.code === "SELF_REVIEW_FORBIDDEN",
+        `${label}: ${JSON.stringify(variant)}`,
+      );
+      assert.deepEqual(fingerprint(store), before, `${label}: ${JSON.stringify(variant)} wrote nothing`);
+      assert.equal(store.getReview(review.id).status, "PENDING", label);
+    }
+
+    seedReviewable(store, { taskId: "TASK-LEGAL", agentId: "agent-dev-1" });
+    const legal = store.createReview({ taskId: "TASK-LEGAL", actor: "HUMAN" });
+    const result = store.submitReview({
+      id: legal.id,
+      expectedVersion: 0,
+      verdict: "PASS",
+      manifestHash: SHA,
+      evidence: { tests: { passed: 2, total: 2 } },
+      actor: "agent-qa-01",
+    });
+    assert.equal(result.review.status, "PASS", label);
+    assert.equal(result.task.status, "INTEGRATING", label);
+  }
+});
+
+test("QA-005: PASS writes tasks.target_hash and acceptance is bound to it", (t) => {
+  for (const { label, store } of bothStores(t)) {
+    seedReviewable(store);
+    const review = store.createReview({ taskId: "TASK-1", actor: "HUMAN" });
+    const passed = store.submitReview({
+      id: review.id,
+      expectedVersion: 0,
+      verdict: "PASS",
+      manifestHash: SHA,
+      evidence: { tests: { passed: 1, total: 1 } },
+      actor: "reviewer-1",
+    });
+    assert.equal(passed.task.status, "INTEGRATING", label);
+    assert.equal(passed.task.targetHash, SHA, `${label}: PASS persists the candidate hash on the Task`);
+    const event = store.listEvents({ limit: 1000 }).at(-1);
+    assert.equal(event.payload.targetHash, SHA, `${label}: review.updated carries the target hash`);
+
+    advanceTask(store, "TASK-1", "AWAITING_ACCEPTANCE");
+    const approval = store.createApproval({ taskId: "TASK-1", scope: "accept", targetHash: SHA, actor: "HUMAN" });
+    const otherHash = "b".repeat(64);
+    assert.throws(
+      () => store.decideApproval({ id: approval.id, decision: "APPROVED", actor: "HUMAN", targetHash: otherHash }),
+      (error) => error.code === "APPROVAL_STALE" && error.details.expectedTargetHash === SHA,
+      label,
+    );
+    assert.equal(store.getTask("TASK-1").status, "AWAITING_ACCEPTANCE", label);
+    const approved = store.decideApproval({ id: approval.id, decision: "APPROVED", actor: "HUMAN", targetHash: SHA });
+    assert.equal(approved.task.status, "DONE", label);
+  }
+});
+
+test("QA-005: absurd evidence counters are EVIDENCE_MISSING", (t) => {
+  for (const { label, store } of bothStores(t)) {
+    for (const [index, tests] of [
+      { passed: 1e15, total: 1e15 },
+      { passed: 1_000_001, total: 1_000_001 },
+      { passed: -1, total: 1 },
+    ].entries()) {
+      const taskId = `TASK-BOUNDS-${index}`;
+      seedReviewable(store, { taskId, agentId: "agent-dev-1" });
+      const review = store.createReview({ taskId, actor: "HUMAN" });
+      const before = fingerprint(store);
+      assert.throws(
+        () => store.submitReview({
+          id: review.id,
+          expectedVersion: 0,
+          verdict: "PASS",
+          manifestHash: SHA,
+          evidence: { tests },
+          actor: "reviewer-1",
+        }),
+        (error) => error.code === "EVIDENCE_MISSING",
+        `${label}: ${JSON.stringify(tests)}`,
+      );
+      assert.deepEqual(fingerprint(store), before, `${label}: ${JSON.stringify(tests)} wrote nothing`);
+    }
+  }
+});
+
+test("QA-005: one review attempt number per Task round, never duplicated", (t) => {
+  for (const { label, store } of bothStores(t)) {
+    seedReviewable(store);
+    const attempts = [];
+    for (let round = 0; round < 3; round += 1) {
+      const review = store.createReview({ taskId: "TASK-1", actor: "HUMAN" });
+      attempts.push(review.attempt);
+      store.submitReview({
+        id: review.id,
+        expectedVersion: 0,
+        verdict: "CHANGES_REQUESTED",
+        findings: [{ message: `round ${round}` }],
+        actor: "reviewer-1",
+      });
+      if (round < 2) {
+        store.reworkTask({ taskId: "TASK-1", reviewId: review.id, reason: "again", actor: "reviewer-1" });
+        advanceTask(store, "TASK-1", "REVIEWING");
+      }
+    }
+    assert.deepEqual(attempts, [1, 2, 3], `${label}: createReview attempt sequence`);
+    const reviewAttempts = store.listReviews({ taskId: "TASK-1" }).map((review) => review.attempt).sort();
+    assert.deepEqual(reviewAttempts, [1, 2, 3], `${label}: review rows`);
+    const audit = store[INTERNAL].listReviewAttempts("TASK-1").map((row) => row.attempt);
+    assert.deepEqual(audit, [1, 2, 3], `${label}: review_attempts audit rows`);
+    assert.equal(new Set(audit).size, audit.length, `${label}: attempts are unique`);
+  }
 });

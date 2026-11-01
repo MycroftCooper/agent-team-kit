@@ -46,7 +46,7 @@ decideApproval({ id, decision, actor, targetHash }) -> { approval, task }
 - Review 生命周期：`PENDING → PASS | CHANGES_REQUESTED | BLOCKED`；`reviews.status` 与 `reviews.verdict` 都使用同一组值（`REVIEW_STATUSES` / `REVIEW_VERDICTS` 已 append `CHANGES_REQUESTED`、`BLOCKED`，`FAIL` 保留）。
 - **`REJECTED` 是 M4 新增的 Task 状态**（contracts `TASK_STATUSES` 已 append），它是"返工等待态"，不在主链上：
   - `REVIEWING → REJECTED`（审查要求修改）
-  - `AWAITING_ACCEPTANCE → REJECTED`（人工验收拒绝）
+  - `AWAITING_ACCEPTANCE → READY`（人工验收拒绝；**不是** REJECTED——`REJECTED` 只能由 `reworkTask` 离开，而验收拒绝时 Review 已是 PASS，留在 REJECTED 就没有出口）
   - `REJECTED → READY`（返工重排，回到可调度）
   - `REJECTED → BLOCKED`（返工超限）
   - `REJECTED → CANCELLED`（通用非终态出口）
@@ -64,8 +64,12 @@ decideApproval({ id, decision, actor, targetHash }) -> { approval, task }
 - `decideApproval`：`targetHash` 必须等于 approval 里的值**且**等于 Task 当前 `targetHash`（若有）→ 否则 409 `APPROVAL_STALE`。
 
 **判定细则（M4 定稿）**：
+- **威胁模型（必须读）**：`actor` 是**客户端声明**，M4 没有身份认证；省略 `actor` 时默认 `HUMAN`。因此"Agent 不能自审/自批"在 M4 的准确含义是"**按声明的 actor 拒绝**"：它挡住误用与自报身份，**挡不住刻意伪造**。真正的隔离依赖 M1 的浏览器 token 只发给人类操作者、Agent 进程没有该 token（ADR-008）。身份认证与审计签名留给后续里程碑。
+- **actor 规范化**：`actor` 必须满足 `actor === actor.trim()`，否则 400 `VALIDATION_ERROR`（`reason=actor-not-normalized`）；自审比较前 `actor` 与作者 id 统一 `trim().toLowerCase()`。空格/大小写变体因此无法绕过（QA5-01）。
 - **自审的"作者"判定**：Task 没有 `assignee` 字段（M3 的 `claimTask` 没有写回，M4 也不临时加列）。因此作者 = `review.runId` 对应 Run 的 `agentId`；若未给 `runId`，取该 Task 最近一次 Run 的 `agentId`（优先非终态 Run，其次最新）。代码注释必须写明这是"缺少 assignee 字段时的代理判定"，M5 若引入 `tasks.assignee` 再收紧。
 - `reworkTask({ ..., maxAttempts? })`：`maxAttempts` 可选，默认 3。
+- **候选 hash 的唯一来源**：`submitReview(PASS)` 在同一事务里写 `tasks.target_hash = manifestHash`；`createApproval` 必须与 `task.target_hash` 严格相等（缺失 → `target-hash-missing`），否则 `APPROVAL_STALE`。这条保证"换版即失效"不是回显（QA5-02）。
+- **DONE 的唯一入口**：`store.patchTask` 本身也拒绝 `status=DONE`（`reason=human-approval-required`），除非走 `decideApproval(APPROVED)`。
 
 ---
 

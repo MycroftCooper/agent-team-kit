@@ -761,11 +761,29 @@ process.stdout.write(JSON.stringify(out));
     await internal.result(hostClaim.command.id, { ownerId: hostClaim.lease.ownerId, generation: hostClaim.lease.generation, status: "DONE", exitCode: 0 });
     const afterRun = env.store.getTask("ACC1");
     assert.equal(afterRun.status, "CLAIMED", "M3 has no automatic acceptance: a COMPLETED Run leaves the Task CLAIMED (documented in m3-status §5.1)");
-    // Manual legal chain, exactly as m3-smoke does it.
-    for (const status of ["RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE", "DONE"]) {
+    // Manual legal chain. Since M4, DONE is reachable only through a human
+    // approval, so the chain stops at AWAITING_ACCEPTANCE and the test goes
+    // through a real PASS review plus an APPROVED approval (Lead updated this
+    // file after QA-005 changed the invariant; QA was informed).
+    for (const status of ["RUNNING", "REVIEWING"]) {
       const current = env.store.getTask("ACC1");
       env.store.patchTask("ACC1", { expectedVersion: current.version, changes: { status } });
     }
+    const manifestHash = "a".repeat(64);
+    const review = env.store.createReview({ taskId: "ACC1", actor: "agent-QA-01" });
+    env.store.submitReview({
+      id: review.id,
+      expectedVersion: review.version,
+      verdict: "PASS",
+      manifestHash,
+      evidence: { tests: { passed: 1, total: 1 } },
+      actor: "agent-QA-01",
+    });
+    const integrating = env.store.getTask("ACC1");
+    env.store.patchTask("ACC1", { expectedVersion: integrating.version, changes: { status: "AWAITING_ACCEPTANCE" } });
+    const approval = env.store.createApproval({ taskId: "ACC1", scope: "candidate", targetHash: manifestHash, actor: "HUMAN" });
+    env.store.decideApproval({ id: approval.id, decision: "APPROVED", actor: "HUMAN", targetHash: manifestHash });
+    assert.equal(env.store.getTask("ACC1").status, "DONE", "the approved task must reach DONE");
     const scheduler = env.scheduler("acceptance-scheduler");
     const round = await scheduler.runOnce();
     await scheduler.stop();

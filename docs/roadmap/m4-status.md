@@ -99,3 +99,26 @@ PASS 8 人工验收拒绝：DB approval=REJECTED、task=READY、event payload.de
 | Web 剩余工作台 | Plan / Gate / Run 详情 / 事件流 |
 
 M5 门禁（规范）：一个命令启动本地系统；真实 3 Agent 协作；重启后可恢复；文档覆盖安装/升级/回滚。
+
+---
+
+## 7. 独立 QA（QA-005）结论与缺陷闭环
+
+审查对象：M4 冻结提交 `36c9b55`（隔离解包）。报告：[qa-review-m4.md](../architecture/qa-review-m4.md)，套件 `test/m4-qa-adversarial.test.mjs`（23 条）。
+
+**冻结 SHA 的结论：不能直接标记完成（2 MAJOR，无 BLOCKER）；修复后完成。** 当前所有缺陷已关闭（QA 在工作区复验：M4 套件 23/23、m4-smoke 9/9）。
+
+| 缺陷 | 严重度 | 状态 |
+|---|---|---|
+| QA5-01 自审可绕过：`" agent-1"` / `"agent-1 "` / `"AGENT-1"` 都能 PASS | MAJOR | 已修：actor 必须完全规范化（否则 400），自审比较 casefold |
+| QA5-02 验收 hash 是回显：生产代码从不写 `tasks.target_hash` | MAJOR | 已修：PASS 同事务写 hash；createApproval 必须等于它（缺失 409 `target-hash-missing`）；m4-smoke 新增换版失效 check |
+| QA5-03 证据 `passed=total=1e15` 被接受 | MINOR | 已修：数值上限 → `EVIDENCE_MISSING` |
+| QA5-04 rework 导致同一 Task 两条 attempt=2 | MINOR | 已修：attempt 由 review 行数推导、去重 |
+| QA5-05 `store.patchTask` 可直推 DONE | MINOR | 已修：store 层拒绝，唯一入口 `decideApproval(APPROVED)` |
+| QA5-06 m4-smoke 自证面（check4 回显、check6 库实例、check5 SKIP） | MINOR | 已修：check4 真绑定、check6 真实 CLI 进程、check5 改 FAIL；新增 check9 |
+
+**威胁模型（QA5-07）**：`actor` 是客户端声明、无认证；"Agent 不能自审"是**按声明拒绝**，真正隔离依赖浏览器 token 只发给人类（ADR-008）。已写入 m4-contracts §1。
+
+**变异测试（隔离冻结树，基线 29/29）**：3/3 被抓——去掉自审、放行 PATCH DONE、失效 hash 校验。
+
+**QA 观察项（不判缺陷）**：m4-smoke check5 的 SKIP 机制、`/api/v1/events` 无 `aggregateId` 过滤（Web 用 `afterSeq` 有界分页兜底，建议 M6 补）、词典计数口径 292 vs 293（两边一致）。

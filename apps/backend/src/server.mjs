@@ -227,13 +227,36 @@ export function createServer({
     return value;
   }
 
-  /** `actor` defaults to HUMAN for browser sessions; agents must be explicit. */
+  /**
+   * `actor` defaults to HUMAN for browser sessions; agents must be explicit.
+   *
+   * SECURITY BOUNDARY (m4-contracts §0.1): `actor` is a CLIENT-DECLARED identity,
+   * not an authenticated principal. The self-review invariant below is
+   * "refuse by declaration", not authentication: a malicious caller could
+   * declare a different actor. It stops accidental self-approval from a
+   * well-behaved client; real identity enforcement belongs to a later auth layer.
+   */
   function actorFrom(body, { required = false } = {}) {
     if (body.actor === undefined) {
       if (required) throw validationError("invalid actor", ["actor is required"]);
       return "HUMAN";
     }
-    return requireNonEmptyString(body.actor, "actor");
+    const actor = requireNonEmptyString(body.actor, "actor");
+    // Canonical form only: surrounding whitespace is a spoofing attempt, not an
+    // id. Mixed case is accepted and compared case-insensitively below.
+    if (actor !== actor.trim()) {
+      throw new ApiError("VALIDATION_ERROR", "actor must be canonical (no leading/trailing whitespace)", {
+        details: { reason: "actor-not-normalized", actor },
+      });
+    }
+    return actor;
+  }
+
+  /** Case/space-insensitive identity used only for the declared self-review check. */
+  function canonicalActor(value) {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim().toLowerCase();
+    return trimmed === "" ? null : trimmed;
   }
 
   function pumpSse() {
@@ -294,9 +317,11 @@ export function createServer({
       }
     }
     if (typeof task?.assignee === "string" && task.assignee !== "") authorIds.add(task.assignee);
-    if (authorIds.has(actor)) {
+    const canonical = canonicalActor(actor);
+    const self = [...authorIds].find((id) => canonicalActor(id) === canonical);
+    if (self !== undefined) {
       throw new ApiError("SELF_REVIEW_FORBIDDEN", "the author cannot review their own work", {
-        details: { actor, authorAgentId: [...authorIds].find((id) => id === actor) ?? null },
+        details: { actor, authorAgentId: self },
       });
     }
   }
@@ -683,6 +708,24 @@ export function createServer({
         requireNonEmptyString(body.targetHash, "targetHash");
         const task = store.getTask(body.taskId); // 404 NOT_FOUND
         if (task.status !== "AWAITING_ACCEPTANCE") throw taskStateConflict(task, "not-awaiting-acceptance");
+        // §0.3 binding: the acceptance must reference the Task's real candidate
+        // hash (written by submitReview(PASS)). A caller-supplied hash is never
+        // trusted on its own.
+        const taskTargetHash = typeof task.targetHash === "string" ? task.targetHash : "";
+        if (taskTargetHash.trim() === "") {
+          throw new ApiError("TASK_VERSION_CONFLICT", `task "${task.id}" has no candidate target hash; complete a PASS review first`, {
+            details: { taskId: task.id, status: task.status, reason: "target-hash-missing" },
+          });
+        }
+        if (body.targetHash !== taskTargetHash) {
+          throw new ApiError("APPROVAL_STALE", "target hash does not match the task's candidate hash", {
+            details: {
+              taskId: task.id,
+              expectedTargetHash: taskTargetHash,
+              receivedTargetHash: body.targetHash,
+            },
+          });
+        }
         const approval = store.createApproval({
           taskId: task.id,
           scope: body.scope,

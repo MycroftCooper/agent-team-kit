@@ -163,9 +163,10 @@ test("overview aggregates tasks, blocked/awaiting lists and recent events", (t) 
   assert.deepEqual(overview.blocked.map((task) => task.id), ["TASK-BLOCKED"]);
   assert.deepEqual(overview.awaitingAcceptance.map((task) => task.id), ["TASK-ACCEPT"]);
   assert.equal(overview.recentEvents.length, 20);
+  const latestSeq = store.latestSeq();
   assert.deepEqual(
     overview.recentEvents.map((event) => event.seq),
-    [25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6],
+    Array.from({ length: 20 }, (_, index) => latestSeq - index),
   );
   assert.equal(ready.status, "READY");
 

@@ -23,6 +23,7 @@ import {
   assertTaskTransition,
   buildOverview,
   canTransition,
+  canonicalAgentId,
   compareTasks,
   ensurePlainObject,
   filesIntersection,
@@ -718,13 +719,19 @@ export function openStore(options = {}) {
    * state machine and bumps the version with a CAS so a concurrent writer cannot
    * be silently overwritten.
    */
-  function transitionTaskInTx(taskId, to) {
+  function transitionTaskInTx(taskId, to, { targetHash } = {}) {
     const row = requireTaskRow(taskId);
     assertTaskTransition(row.status, to);
     const at = nowIso();
+    const sets = ["status = ?", "version = version + 1", "updated_at = ?"];
+    const params = [to, at];
+    if (targetHash !== undefined) {
+      sets.push("target_hash = ?");
+      params.push(targetHash);
+    }
     const result = stmt(
-      "UPDATE tasks SET status = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?",
-    ).run(to, at, taskId, Number(row.version));
+      `UPDATE tasks SET ${sets.join(", ")} WHERE id = ? AND version = ?`,
+    ).run(...params, taskId, Number(row.version));
     if (Number(result.changes) === 0) {
       const fresh = requireTaskRow(taskId);
       fail("TASK_VERSION_CONFLICT", `task "${taskId}" version conflict`, {
@@ -2034,12 +2041,13 @@ export function openStore(options = {}) {
         }
         const nextAttempt =
           Number(
-            stmt("SELECT COALESCE(MAX(attempt), 0) AS attempt FROM reviews WHERE task_id = ?").get(
-              taskRow.id,
-            ).attempt,
+            stmt("SELECT COUNT(*) AS count FROM reviews WHERE task_id = ?").get(taskRow.id).count,
           ) + 1;
         const at = nowIso();
-        const { review, actor } = normalizeReview(dto, { now: at, attempt: nextAttempt });
+        const { review, actor } = normalizeReview(
+          { taskId: dto.taskId, runId: dto.runId, actor: dto.actor },
+          { now: at, attempt: nextAttempt },
+        );
         stmt(
           `INSERT INTO reviews
              (id, task_id, run_id, status, verdict, manifest_hash, commit_sha, findings_json, attempt,
@@ -2069,7 +2077,17 @@ export function openStore(options = {}) {
       });
     },
 
-    submitReview({ id, expectedVersion, verdict, manifestHash, commitSha, findings, evidence, actor } = {}) {
+    submitReview({
+      id,
+      expectedVersion,
+      verdict,
+      manifestHash,
+      commitSha,
+      findings,
+      evidence,
+      actor,
+      targetHash,
+    } = {}) {
       requireId(id, "review.id");
       if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
         fail("VALIDATION_ERROR", "expectedVersion must be a non-negative integer", { expectedVersion });
@@ -2092,31 +2110,49 @@ export function openStore(options = {}) {
           });
         }
         const taskRow = requireTaskRow(row.task_id);
+        // QA-005: compare producer identity on canonical ids (trim + casefold)
+        // BEFORE actor-shape validation, so a whitespace/case variant of the
+        // author is still explicitly 403 SELF_REVIEW_FORBIDDEN instead of merely
+        // "invalid". The stored/displayed actor keeps the caller's spelling.
+        const rawActor = typeof actor === "string" ? actor : "";
+        const canonicalActor = canonicalAgentId(rawActor);
+        const authors = new Map();
+        if (row.run_id !== null && row.run_id !== undefined) {
+          const producerRow = getRunRow(row.run_id);
+          if (producerRow) authors.set(canonicalAgentId(producerRow.agent_id), producerRow.agent_id);
+        }
+        const latestProducer = latestProducerAgentId(row.task_id);
+        if (latestProducer) authors.set(canonicalAgentId(latestProducer), latestProducer);
+        if (canonicalActor !== "" && authors.has(canonicalActor)) {
+          fail("SELF_REVIEW_FORBIDDEN", "an actor cannot review their own work", {
+            actor: rawActor,
+            authorAgentId: authors.get(canonicalActor),
+            taskId: row.task_id,
+            reviewId: id,
+          });
+        }
         const current = reviewJson(row);
         const next = applyReviewVerdict(
           current,
           { verdict, manifestHash, commitSha, findings, evidence, actor },
           { now: nowIso() },
         );
-        // Self-review proxy (Lead ruling): the producer is the reviewed Run's
-        // agent, or (no assignee column) the Task's latest/active Run agent.
-        const authorAgentIds = new Set();
-        if (row.run_id !== null && row.run_id !== undefined) {
-          const producerRow = getRunRow(row.run_id);
-          if (producerRow) authorAgentIds.add(producerRow.agent_id);
-        }
-        const latestProducer = latestProducerAgentId(row.task_id);
-        if (latestProducer) authorAgentIds.add(latestProducer);
-        if (authorAgentIds.has(next.reviewer)) {
-          fail("SELF_REVIEW_FORBIDDEN", "an actor cannot review their own work", {
-            actor: next.reviewer,
-            authorAgentId: next.reviewer,
-            taskId: row.task_id,
-            reviewId: id,
-          });
+        // PASS binds the Task to the reviewed candidate hash (QA-005): the
+        // approval can only ever succeed against this same hash. An explicit
+        // targetHash wins; otherwise the manifestHash is the candidate identity.
+        let passTargetHash;
+        if (verdict === "PASS") {
+          passTargetHash =
+            targetHash !== undefined && targetHash !== null
+              ? validateTargetHash(targetHash, "review.targetHash")
+              : next.manifestHash;
         }
         const taskTo = verdict === "PASS" ? "INTEGRATING" : verdict === "CHANGES_REQUESTED" ? "REJECTED" : "BLOCKED";
-        const task = transitionTaskInTx(row.task_id, taskTo);
+        const task = transitionTaskInTx(
+          row.task_id,
+          taskTo,
+          verdict === "PASS" ? { targetHash: passTargetHash } : undefined,
+        );
         stmt(
           `UPDATE reviews
               SET status = ?, verdict = ?, manifest_hash = ?, commit_sha = ?, findings_json = ?,
@@ -2161,6 +2197,7 @@ export function openStore(options = {}) {
               verdict: next.verdict,
               actor: next.reviewer,
               attempt: Number(row.attempt),
+              ...(passTargetHash === undefined ? {} : { targetHash: passTargetHash }),
             },
             now: next.updatedAt,
           }),
@@ -2249,15 +2286,11 @@ export function openStore(options = {}) {
           };
         }
         const task = transitionTaskInTx(taskId, "READY");
-        // The finished review keeps its own attempt number (1 = first verdict);
-        // `nextAttempt` is the round the next review will use.
+        // QA-005: do NOT insert a new review_attempts row here. The next round's
+        // attempt row is created by the next createReview (attempt = number of
+        // review rows for this Task + 1), so a Task can never have two rows for
+        // the same attempt number. The finished review keeps its own attempt.
         stmt("UPDATE reviews SET version = version + 1, updated_at = ? WHERE id = ?").run(at, reviewId);
-        stmt(
-          `INSERT INTO review_attempts
-             (id, review_id, run_id, attempt, status, verdict, manifest_hash, findings_json,
-              evidence_json, created_at)
-           VALUES (?, ?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, ?)`,
-        ).run(generateId("RVA"), reviewId, reviewRow.run_id ?? null, nextAttempt, at);
         insertEvent(
           makeEvent({
             projectId: taskRow.project_id,
@@ -2581,6 +2614,21 @@ export function openStore(options = {}) {
       getDispatchCommand: (id) => {
         const row = stmt("SELECT * FROM dispatch_commands WHERE id = ?").get(id);
         return row ? commandJson(row) : null;
+      },
+      /** Review attempt audit rows for one Task (test diagnostics only). */
+      listReviewAttempts: (taskId) => {
+        requireId(taskId, "task.id");
+        return stmt(
+          `SELECT a.* FROM review_attempts a JOIN reviews r ON r.id = a.review_id
+            WHERE r.task_id = ? ORDER BY a.attempt ASC, a.id ASC`,
+        )
+          .all(taskId)
+          .map((row) => ({
+            id: row.id,
+            reviewId: row.review_id,
+            attempt: Number(row.attempt),
+            status: row.status,
+          }));
       },
       /**
        * Migration-only writer: sets a task's status exactly as recorded in the

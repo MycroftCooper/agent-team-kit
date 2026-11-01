@@ -9,6 +9,7 @@
 // `@atk/database` is imported dynamically: the database package is built in
 // parallel with this one, so a missing package must produce a clear message and
 // exit code 2, not a stack trace. `doctor` works without it.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -26,7 +27,7 @@ const DEFAULT_WEB_DIST = path.resolve(HERE, "..", "web", "dist");
 const USAGE = `Usage: atk-backend <command> [options]
 
 Commands:
-  serve    [--port 1421] [--data <file>] [--web-dist <dir>]
+  serve    [--port 1421] [--data <file>] [--web-dist <dir>] [--pidfile <file>]
            Start the HTTP API on 127.0.0.1 only (ADR-008).
   migrate  [--from <state.json>] [--data <file>] [--dry-run] [--json] [--config <file>]
            Import a legacy agent-flow state.json into SQLite
@@ -39,6 +40,12 @@ Commands:
            Exit 1 when at least one check FAILs (usable as a health gate).
   export   --out <file> [--data <file>] [--project <id>] [--json]
            Export the SQLite store back to a state JSON document.
+  backup   --data <db> --to <dir> [--force] [--json]
+           Write a consistent SQLite snapshot (read-only source + backup API)
+           plus manifest.json ({createdAt, schemaVersion, bytes, sha256, source}).
+  restore  --from <dir> --data <db> [--force] [--json]
+           Verify the manifest sha256/schemaVersion, then atomically install the
+           snapshot at --data (temp file + rename; target must not exist unless --force).
 
 Environment:
   LOCALAPPDATA (Windows) or XDG_DATA_HOME selects the per-user data directory.
@@ -61,6 +68,8 @@ function parseArgs(argv) {
       flags.json = true;
     } else if (arg === "--dry-run") {
       flags["dry-run"] = true;
+    } else if (arg === "--force") {
+      flags.force = true;
     } else if (arg === "--help" || arg === "-h") {
       flags.help = true;
     } else if (arg.startsWith("--")) {
@@ -165,8 +174,336 @@ function ensureDirFor(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
 }
 
+function writePidfile(file) {
+  const resolved = path.resolve(file);
+  ensureDirFor(resolved);
+  fs.writeFileSync(resolved, `${process.pid}\n`, "utf8");
+  return resolved;
+}
+
+/** Remove only a pidfile that still belongs to this process. */
+function removePidfile(file) {
+  if (!file) return;
+  try {
+    if (fs.readFileSync(file, "utf8").trim() === String(process.pid)) fs.rmSync(file, { force: true });
+  } catch {
+    // missing or already replaced: nothing to clean up
+  }
+}
+
 function printJson(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+// --- M5 backup / restore ----------------------------------------------------
+
+const BACKUP_DB_NAME = "atk.db";
+const BACKUP_MANIFEST_NAME = "manifest.json";
+const DATA_SIDECARS = ["-wal", "-shm", "-journal"];
+
+function sha256File(file) {
+  return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+/** Fingerprint the main DB + WAL/journal (proves backup did not touch source data).
+ *  `-shm` is a transient lock table touched by any reader, not database content. */
+function fileFingerprint(file) {
+  const fingerprint = {};
+  for (const suffix of ["", "-wal", "-journal"]) {
+    const candidate = `${file}${suffix}`;
+    if (!fs.existsSync(candidate)) continue;
+    const stat = fs.statSync(candidate);
+    fingerprint[suffix === "" ? "main" : suffix.slice(1)] = {
+      bytes: stat.size,
+      mtimeMs: Math.round(stat.mtimeMs),
+      sha256: sha256File(candidate),
+    };
+  }
+  return fingerprint;
+}
+
+function removeDataSidecars(file) {
+  for (const suffix of DATA_SIDECARS) {
+    try {
+      fs.rmSync(`${file}${suffix}`, { force: true });
+    } catch {
+      // best effort
+    }
+  }
+}
+
+function directoryNonEmpty(dir) {
+  try {
+    return fs.readdirSync(dir).length > 0;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function loadSqlite() {
+  try {
+    return await import("node:sqlite");
+  } catch (error) {
+    throw new CliError(
+      `node:sqlite is unavailable (${shortError(error)}); Node >= 22.5 is required for backup/restore`,
+      1,
+    );
+  }
+}
+
+/** Read the schema version out of the snapshot itself (migrate:false = read-only). */
+function readSnapshotSchemaVersion(database, file) {
+  const store = database.openStore({ file, migrate: false });
+  try {
+    const health = typeof store.health === "function" ? store.health() : null;
+    const version = Number(health?.schemaVersion);
+    if (!Number.isInteger(version) || version < 0) {
+      throw new CliError(`snapshot ${file} has no readable schemaVersion`, 1);
+    }
+    return version;
+  } finally {
+    try {
+      store.close?.();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function parseManifest(file) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    throw new CliError(`cannot read manifest ${file}: ${shortError(error)}`, 1);
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(raw);
+  } catch (error) {
+    throw new CliError(`manifest is not valid JSON (${file}): ${shortError(error)}`, 1);
+  }
+  const problems = [];
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) problems.push("manifest must be a JSON object");
+  else {
+    if (typeof manifest.createdAt !== "string" || Number.isNaN(Date.parse(manifest.createdAt))) problems.push("createdAt must be an ISO timestamp");
+    if (!Number.isInteger(manifest.schemaVersion) || manifest.schemaVersion < 0) problems.push("schemaVersion must be a non-negative integer");
+    if (!Number.isInteger(manifest.bytes) || manifest.bytes < 0) problems.push("bytes must be a non-negative integer");
+    if (typeof manifest.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(manifest.sha256)) problems.push("sha256 must be a 64-char hex digest");
+    if (manifest.source !== undefined && typeof manifest.source !== "string") problems.push("source must be a string when present");
+  }
+  if (problems.length > 0) throw new CliError(`invalid manifest ${file}: ${problems.join("; ")}`, 1);
+  return manifest;
+}
+
+async function backup(flags) {
+  if (!flags.to) throw new CliError("backup requires --to <dir>");
+  const paths = runtimePaths();
+  const sourceFile = flags.data ? path.resolve(flags.data) : paths.dbFile;
+  if (!fs.existsSync(sourceFile)) throw new CliError(`source database not found: ${sourceFile}`, 1);
+  if (fs.statSync(sourceFile).isDirectory()) throw new CliError(`--data must be a database file, not a directory: ${sourceFile}`, 1);
+
+  const toDir = path.resolve(flags.to);
+  const force = Boolean(flags.force);
+  if (fs.existsSync(toDir) && !fs.statSync(toDir).isDirectory()) {
+    throw new CliError(`--to must be a directory: ${toDir}`, 1);
+  }
+  if (directoryNonEmpty(toDir) && !force) {
+    throw new CliError(`destination directory is not empty: ${toDir} (pass --force to overwrite)`, 1);
+  }
+  fs.mkdirSync(toDir, { recursive: true });
+
+  const database = await loadDatabase();
+  const sqlite = await loadSqlite();
+  const targetDb = path.join(toDir, BACKUP_DB_NAME);
+  const targetManifest = path.join(toDir, BACKUP_MANIFEST_NAME);
+  const tempSnapshot = path.join(toDir, `.atk-snapshot-${process.pid}-${Date.now()}.db`);
+  const tempManifest = path.join(toDir, `.atk-manifest-${process.pid}-${Date.now()}.json`);
+  const before = fileFingerprint(sourceFile);
+  try {
+    // Consistency: a read-only connection + SQLite's backup API copy a
+    // transactionally consistent database, including committed WAL pages.
+    // Never `fs.copyFile` the .db: in WAL mode that can miss the WAL entirely.
+    const sourceDb = new sqlite.DatabaseSync(sourceFile, { readOnly: true });
+    try {
+      await sqlite.backup(sourceDb, tempSnapshot);
+    } finally {
+      try {
+        sourceDb.close();
+      } catch {
+        // ignore
+      }
+    }
+    const schemaVersion = readSnapshotSchemaVersion(database, tempSnapshot);
+    const bytes = fs.statSync(tempSnapshot).size;
+    const sha256 = sha256File(tempSnapshot);
+    const manifest = {
+      createdAt: new Date().toISOString(),
+      schemaVersion,
+      bytes,
+      sha256,
+      source: sourceFile,
+    };
+    const after = fileFingerprint(sourceFile);
+    // A read-only WAL open may create a transient -shm file; that is not a
+    // modification of the source database. Stability means every file that
+    // existed before the snapshot (main DB + committed WAL) is byte-identical.
+    const sourceUnchanged = Object.keys(before).every(
+      (key) => JSON.stringify(before[key]) === JSON.stringify(after[key]),
+    );
+    fs.writeFileSync(tempManifest, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+
+    // Install: overwrite only our two artifacts (--force), then rename into place.
+    for (const file of [targetDb, targetManifest]) {
+      if (fs.existsSync(file)) fs.rmSync(file, { force: true });
+    }
+    removeDataSidecars(targetDb);
+    fs.renameSync(tempSnapshot, targetDb);
+    fs.renameSync(tempManifest, targetManifest);
+    const installedSha = sha256File(targetDb);
+    if (installedSha !== sha256) {
+      throw new CliError(`snapshot verification failed after install: expected ${sha256}, got ${installedSha}`, 1);
+    }
+
+    if (flags.json) {
+      printJson({
+        ok: true,
+        command: "backup",
+        source: sourceFile,
+        to: toDir,
+        database: targetDb,
+        manifest,
+        sourceUnchanged,
+      });
+    } else {
+      process.stdout.write(`backup ok: ${sourceFile} -> ${targetDb}\n`);
+      process.stdout.write(`manifest: schema v${schemaVersion}, ${bytes} bytes, sha256 ${sha256}\n`);
+      process.stdout.write(`source unchanged: ${sourceUnchanged ? "yes" : "NO (a concurrent writer touched it)"}\n`);
+    }
+    return 0;
+  } finally {
+    for (const file of [tempSnapshot, tempManifest]) {
+      try {
+        fs.rmSync(file, { force: true });
+        removeDataSidecars(file);
+      } catch {
+        // best effort
+      }
+    }
+  }
+}
+
+async function restore(flags) {
+  if (!flags.from) throw new CliError("restore requires --from <dir>");
+  const fromDir = path.resolve(flags.from);
+  const snapshotFile = path.join(fromDir, BACKUP_DB_NAME);
+  const manifestFile = path.join(fromDir, BACKUP_MANIFEST_NAME);
+  if (!fs.existsSync(manifestFile)) throw new CliError(`manifest not found: ${manifestFile}`, 1);
+  if (!fs.existsSync(snapshotFile)) throw new CliError(`snapshot not found: ${snapshotFile}`, 1);
+  const manifest = parseManifest(manifestFile);
+
+  // Integrity first: a tampered snapshot is refused before any target write.
+  const actualBytes = fs.statSync(snapshotFile).size;
+  const actualSha = sha256File(snapshotFile);
+  if (actualBytes !== manifest.bytes || actualSha !== manifest.sha256.toLowerCase()) {
+    throw new CliError(
+      `snapshot integrity check failed: manifest sha256 ${manifest.sha256} / ${manifest.bytes} bytes, ` +
+        `but ${snapshotFile} is ${actualSha} / ${actualBytes} bytes`,
+      1,
+    );
+  }
+
+  const database = await loadDatabase();
+  const supported = Number(database.SCHEMA_VERSION);
+  if (Number.isInteger(supported) && manifest.schemaVersion > supported) {
+    throw new CliError(
+      `backup schemaVersion ${manifest.schemaVersion} is newer than this build (v${supported}); upgrade the code first`,
+      1,
+    );
+  }
+
+  const paths = runtimePaths();
+  const dataFile = flags.data ? path.resolve(flags.data) : paths.dbFile;
+  const force = Boolean(flags.force);
+  if (dataFile === snapshotFile) throw new CliError("restore target must differ from the snapshot file", 1);
+  if (fs.existsSync(dataFile) && fs.statSync(dataFile).isDirectory()) {
+    throw new CliError(`restore target is a directory, not a database file: ${dataFile}`, 1);
+  }
+  if (fs.existsSync(dataFile) && !force) {
+    throw new CliError(`target database already exists: ${dataFile} (pass --force to overwrite)`, 1);
+  }
+
+  ensureDirFor(dataFile);
+  const tempFile = `${dataFile}.restore.tmp`;
+  let oldFile = null;
+  try {
+    // Copy the verified snapshot beside the target, re-verify, then rename.
+    fs.copyFileSync(snapshotFile, tempFile);
+    const tempSha = sha256File(tempFile);
+    if (tempSha !== actualSha) {
+      throw new CliError(`restore temp copy failed integrity check: expected ${actualSha}, got ${tempSha}`, 1);
+    }
+    if (fs.existsSync(dataFile)) {
+      oldFile = `${dataFile}.restore.old-${process.pid}-${Date.now()}`;
+      fs.rmSync(oldFile, { force: true });
+      fs.renameSync(dataFile, oldFile); // keep the old DB until the swap succeeds
+    }
+    try {
+      fs.renameSync(tempFile, dataFile);
+    } catch (error) {
+      if (oldFile !== null) {
+        fs.renameSync(oldFile, dataFile);
+        oldFile = null;
+      }
+      throw error;
+    }
+    // Sidecars belong to the replaced database; never let a stale WAL attach.
+    removeDataSidecars(dataFile);
+    if (oldFile !== null) {
+      fs.rmSync(oldFile, { force: true });
+      removeDataSidecars(oldFile);
+      oldFile = null;
+    }
+    const installedSha = sha256File(dataFile);
+    if (installedSha !== actualSha) {
+      throw new CliError(`restored database failed integrity check: expected ${actualSha}, got ${installedSha}`, 1);
+    }
+    const migrationPending = manifest.schemaVersion < supported;
+    if (flags.json) {
+      printJson({
+        ok: true,
+        command: "restore",
+        from: fromDir,
+        data: dataFile,
+        manifest,
+        forced: force,
+        migrationPending,
+      });
+    } else {
+      process.stdout.write(`restore ok: ${fromDir} -> ${dataFile}\n`);
+      process.stdout.write(`manifest: schema v${manifest.schemaVersion}, ${manifest.bytes} bytes, sha256 ${manifest.sha256}\n`);
+      if (migrationPending) process.stdout.write(`note: schema v${manifest.schemaVersion} < v${supported}; the next start migrates it\n`);
+    }
+    return 0;
+  } finally {
+    try {
+      fs.rmSync(tempFile, { force: true });
+    } catch {
+      // best effort
+    }
+    if (oldFile !== null) {
+      try {
+        if (!fs.existsSync(dataFile)) fs.renameSync(oldFile, dataFile);
+        else {
+          fs.rmSync(oldFile, { force: true });
+          removeDataSidecars(oldFile);
+        }
+      } catch {
+        // best effort
+      }
+    }
+  }
 }
 
 async function serve(flags) {
@@ -197,6 +534,22 @@ async function serve(flags) {
 
   process.stdout.write(`atk backend listening on ${info.url}\n`);
   process.stdout.write(`data: ${dataFile}\n`);
+  let pidfile = null;
+  if (flags.pidfile !== undefined) {
+    if (typeof flags.pidfile !== "string" || flags.pidfile.trim() === "") {
+      await server.close();
+      store.close?.();
+      throw new CliError("--pidfile requires a non-empty path");
+    }
+    try {
+      pidfile = writePidfile(flags.pidfile);
+      process.stdout.write(`pidfile: ${pidfile}\n`);
+    } catch (error) {
+      await server.close();
+      store.close?.();
+      throw new CliError(`cannot write --pidfile: ${shortError(error)}`, 1);
+    }
+  }
   process.stdout.write(
     server.tokenFile
       ? `session token file: ${server.tokenFile}${server.tokenPersisted ? "" : " (NOT persisted: in-memory fallback, see warning above)"}\n`
@@ -226,10 +579,13 @@ async function serve(flags) {
       } catch (error) {
         process.stderr.write(`[atk] store close failed: ${shortError(error)}\n`);
       }
+      removePidfile(pidfile);
       resolve(0);
     };
     process.once("SIGINT", () => void shutdown("SIGINT"));
     process.once("SIGTERM", () => void shutdown("SIGTERM"));
+    // Last-resort cleanup if the process exits through another path.
+    process.once("exit", () => removePidfile(pidfile));
   });
 }
 
@@ -430,6 +786,10 @@ export async function run(argv = process.argv.slice(2)) {
       return doctor(flags);
     case "export":
       return exportCommand(flags);
+    case "backup":
+      return backup(flags);
+    case "restore":
+      return restore(flags);
     default:
       throw new CliError(`unknown command "${command}"\n\n${USAGE}`);
   }

@@ -25,6 +25,7 @@ import {
   assertTaskTransition,
   buildOverview,
   canTransition,
+  canonicalAgentId,
   compareTasks,
   ensurePlainObject,
   filesIntersection,
@@ -158,7 +159,7 @@ export function createMemoryStore() {
   }
 
   /** Validate + apply a Task transition inside the caller's write path. */
-  function transitionTaskEntry(taskId, to) {
+  function transitionTaskEntry(taskId, to, { targetHash } = {}) {
     const current = requireTaskEntry(taskId);
     assertTaskTransition(current.status, to);
     const next = {
@@ -167,6 +168,7 @@ export function createMemoryStore() {
       version: current.version + 1,
       updatedAt: nowIso(),
     };
+    if (targetHash !== undefined) next.targetHash = targetHash;
     tasks.set(taskId, next);
     return clone(next);
   }
@@ -1208,9 +1210,12 @@ export function createMemoryStore() {
         });
       }
       const nextAttempt =
-        Math.max(0, ...[...reviews.values()].filter((review) => review.taskId === task.id).map((review) => review.attempt)) + 1;
+        [...reviews.values()].filter((review) => review.taskId === task.id).length + 1;
       const at = nowIso();
-      const { review } = normalizeReview(dto, { now: at, attempt: nextAttempt });
+      const { review } = normalizeReview(
+        { taskId: dto.taskId, runId: dto.runId, actor: dto.actor },
+        { now: at, attempt: nextAttempt },
+      );
       reviews.set(review.id, clone(review));
       const attemptId = generateId("RVA");
       reviewAttempts.set(attemptId, {
@@ -1238,7 +1243,17 @@ export function createMemoryStore() {
       return clone(requireReviewEntry(review.id));
     },
 
-    submitReview({ id, expectedVersion, verdict, manifestHash, commitSha, findings, evidence, actor } = {}) {
+    submitReview({
+      id,
+      expectedVersion,
+      verdict,
+      manifestHash,
+      commitSha,
+      findings,
+      evidence,
+      actor,
+      targetHash,
+    } = {}) {
       requireId(id, "review.id");
       if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
         fail("VALIDATION_ERROR", "expectedVersion must be a non-negative integer", { expectedVersion });
@@ -1259,25 +1274,40 @@ export function createMemoryStore() {
           status: row.status,
         });
       }
-      const next = applyReviewVerdict(row, { verdict, manifestHash, commitSha, findings, evidence, actor }, { now: nowIso() });
       const task = requireTaskEntry(row.taskId);
-      const authorAgentIds = new Set();
+      // QA-005: canonical identity comparison (trim + casefold) before actor
+      // shape validation, so whitespace/case variants of the author are 403.
+      const rawActor = typeof actor === "string" ? actor : "";
+      const canonicalActor = canonicalAgentId(rawActor);
+      const authors = new Map();
       if (row.runId !== undefined && row.runId !== null) {
         const producer = getRunEntry(row.runId);
-        if (producer) authorAgentIds.add(producer.agentId);
+        if (producer) authors.set(canonicalAgentId(producer.agentId), producer.agentId);
       }
       const latestProducer = latestProducerAgentId(row.taskId);
-      if (latestProducer) authorAgentIds.add(latestProducer);
-      if (authorAgentIds.has(next.reviewer)) {
+      if (latestProducer) authors.set(canonicalAgentId(latestProducer), latestProducer);
+      if (canonicalActor !== "" && authors.has(canonicalActor)) {
         fail("SELF_REVIEW_FORBIDDEN", "an actor cannot review their own work", {
-          actor: next.reviewer,
-          authorAgentId: next.reviewer,
+          actor: rawActor,
+          authorAgentId: authors.get(canonicalActor),
           taskId: row.taskId,
           reviewId: id,
         });
       }
+      const next = applyReviewVerdict(row, { verdict, manifestHash, commitSha, findings, evidence, actor }, { now: nowIso() });
+      let passTargetHash;
+      if (verdict === "PASS") {
+        passTargetHash =
+          targetHash !== undefined && targetHash !== null
+            ? validateTargetHash(targetHash, "review.targetHash")
+            : next.manifestHash;
+      }
       const taskTo = verdict === "PASS" ? "INTEGRATING" : verdict === "CHANGES_REQUESTED" ? "REJECTED" : "BLOCKED";
-      const updatedTask = transitionTaskEntry(row.taskId, taskTo);
+      const updatedTask = transitionTaskEntry(
+        row.taskId,
+        taskTo,
+        verdict === "PASS" ? { targetHash: passTargetHash } : undefined,
+      );
       const persisted = { ...next, actor: next.reviewer };
       reviews.set(id, clone(persisted));
       for (const [attemptId, attempt] of reviewAttempts) {
@@ -1305,6 +1335,7 @@ export function createMemoryStore() {
             verdict: next.verdict,
             actor: next.reviewer,
             attempt: row.attempt,
+            ...(passTargetHash === undefined ? {} : { targetHash: passTargetHash }),
           },
           now: next.updatedAt,
         }),
@@ -1392,25 +1423,14 @@ export function createMemoryStore() {
         });
       }
       const revived = transitionTaskEntry(taskId, "READY");
+      // QA-005: no new review_attempts row here; the next createReview owns the
+      // next attempt number (= number of review rows for this Task + 1), so a
+      // Task can never have two rows for the same attempt.
       const advancedReview = {
         ...requireReviewEntry(reviewId),
         version: requireReviewEntry(reviewId).version + 1,
         updatedAt: at,
       };
-      reviews.set(reviewId, advancedReview);
-      const nextAttemptId = generateId("RVA");
-      reviewAttempts.set(nextAttemptId, {
-        id: nextAttemptId,
-        reviewId,
-        runId: reviewRow.runId ?? null,
-        attempt: nextAttempt,
-        status: "PENDING",
-        verdict: null,
-        manifestHash: null,
-        findings: null,
-        evidence: null,
-        createdAt: at,
-      });
       appendEventEntry(
         makeEvent({
           projectId: task.projectId,
@@ -1650,6 +1670,22 @@ export function createMemoryStore() {
       getDispatchCommand: (id) => {
         const command = dispatchCommands.get(id);
         return command === undefined ? null : clone(command);
+      },
+      /** Review attempt audit rows for one Task (test diagnostics only). */
+      listReviewAttempts: (taskId) => {
+        requireId(taskId, "task.id");
+        const reviewIds = new Set(
+          [...reviews.values()].filter((review) => review.taskId === taskId).map((review) => review.id),
+        );
+        return [...reviewAttempts.values()]
+          .filter((attempt) => reviewIds.has(attempt.reviewId))
+          .sort((a, b) => a.attempt - b.attempt || a.id.localeCompare(b.id))
+          .map((attempt) => ({
+            id: attempt.id,
+            reviewId: attempt.reviewId,
+            attempt: attempt.attempt,
+            status: attempt.status,
+          }));
       },
       /**
        * Migration-only writer (see sqlite.mjs): writes a legacy status without

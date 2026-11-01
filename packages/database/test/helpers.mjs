@@ -74,6 +74,24 @@ export const MAIN_CHAIN = Object.freeze([
  * accidentally rely on an illegal jump.
  */
 export function advanceTask(store, id, target) {
+  const current0 = store.getTask(id);
+  if (current0.status === target) return current0;
+  // M4 hard invariant: DONE has exactly one entrance, a human APPROVED
+  // approval. Fixtures must use that path too; patchTask(status:"DONE") is
+  // deliberately rejected by the store.
+  if (target === "DONE") {
+    advanceTask(store, id, "AWAITING_ACCEPTANCE");
+    const awaiting = store.getTask(id);
+    const hash = awaiting.targetHash ?? "f".repeat(64);
+    const approval = store.createApproval({
+      taskId: id,
+      scope: "test acceptance",
+      targetHash: hash,
+      actor: "HUMAN",
+    });
+    store.decideApproval({ id: approval.id, decision: "APPROVED", actor: "HUMAN", targetHash: hash });
+    return store.getTask(id);
+  }
   for (let guard = 0; guard < 16; guard += 1) {
     const task = store.getTask(id);
     if (task.status === target) return task;
