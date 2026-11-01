@@ -14,12 +14,15 @@ import { INTERNAL } from "./internal.mjs";
 import {
   DEFAULT_LEASE_MS,
   MAX_EVENT_LIMIT,
+  MAX_LIST_LIMIT,
   MAX_OVERVIEW_EVENTS,
   SCHEMA_VERSION,
   assertEnumFilter,
   buildOverview,
+  canTransition,
   compareTasks,
   ensurePlainObject,
+  filesIntersection,
   generateId,
   isPlainObject,
   leaseExpiryAfter,
@@ -32,6 +35,7 @@ import {
   normalizeApproval,
   normalizeLimit,
   normalizeProject,
+  normalizeProjectPolicy,
   normalizeRequirement,
   normalizeRun,
   normalizeTask,
@@ -44,6 +48,7 @@ import {
   validateIdempotencyKey,
   validateLeaseMs,
   validateOwnerId,
+  validateSchedulingPolicies,
   validateTaskStatus,
 } from "./model.mjs";
 
@@ -318,6 +323,8 @@ export function openStore(options = {}) {
     };
     if (row.acceptance !== null && row.acceptance !== undefined) task.acceptance = row.acceptance;
     if (row.plan_id !== null && row.plan_id !== undefined) task.planId = row.plan_id;
+    const files = parseJsonColumn(row.files_json);
+    if (Array.isArray(files) && files.length > 0) task.files = files;
     return task;
   }
 
@@ -338,6 +345,8 @@ export function openStore(options = {}) {
     if (row.started_at !== null && row.started_at !== undefined) run.startedAt = row.started_at;
     if (row.ended_at !== null && row.ended_at !== undefined) run.endedAt = row.ended_at;
     if (row.exit_code !== null && row.exit_code !== undefined) run.exitCode = Number(row.exit_code);
+    const files = parseJsonColumn(row.files_json);
+    if (Array.isArray(files) && files.length > 0) run.files = files;
     const error = parseJsonColumn(row.error_json);
     if (error !== null) run.error = error;
     return run;
@@ -623,10 +632,13 @@ export function openStore(options = {}) {
           fail("VALIDATION_ERROR", `project "${dto.id}" already exists`, { entity: "project", id: dto.id });
         }
         const project = normalizeProject(dto, { now: nowIso() });
+        // M3 scheduling policy (optional, additive to the M1 Project DTO).
+        const policy = normalizeProjectPolicy(dto.policy, "project.policy");
         stmt(
           `INSERT INTO projects
-             (id, name, repo_path, default_branch, policy_version, version, legacy_json, settings_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (id, name, repo_path, default_branch, policy_version, version, legacy_json, settings_json,
+              policy_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           project.id,
           project.name,
@@ -636,6 +648,7 @@ export function openStore(options = {}) {
           project.version,
           safeJson(dto.legacy, "project.legacy"),
           safeJson(dto.settings, "project.settings"),
+          Object.keys(policy).length > 0 ? safeJson(policy, "project.policy") : null,
           project.createdAt,
           project.updatedAt,
         );
@@ -742,8 +755,8 @@ export function openStore(options = {}) {
         stmt(
           `INSERT INTO tasks
              (id, project_id, title, description, function_required, role_required, priority, status,
-              acceptance, plan_id, parent_id, version, legacy_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              acceptance, plan_id, parent_id, version, legacy_json, files_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           task.id,
           task.projectId,
@@ -758,6 +771,7 @@ export function openStore(options = {}) {
           dto.parentId ?? null,
           task.version,
           safeJson(dto.legacy, "task.legacy"),
+          task.files === undefined ? null : JSON.stringify(task.files),
           task.createdAt,
           task.updatedAt,
         );
@@ -779,7 +793,7 @@ export function openStore(options = {}) {
         const result = stmt(
           `UPDATE tasks
               SET title = ?, description = ?, function_required = ?, role_required = ?, priority = ?,
-                  acceptance = ?, plan_id = ?, status = ?, version = ?, updated_at = ?
+                  acceptance = ?, plan_id = ?, status = ?, files_json = ?, version = ?, updated_at = ?
             WHERE id = ? AND version = ?`,
         ).run(
           merged.title,
@@ -790,6 +804,7 @@ export function openStore(options = {}) {
           merged.acceptance ?? null,
           merged.planId ?? null,
           merged.status,
+          merged.files === undefined ? null : JSON.stringify(merged.files),
           merged.version,
           merged.updatedAt,
           id,
@@ -851,8 +866,8 @@ export function openStore(options = {}) {
         stmt(
           `INSERT INTO runs
              (id, task_id, agent_id, function, status, attempt, started_at, ended_at, error_json,
-              version, role, workspace_id, exit_code, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              version, role, workspace_id, exit_code, files_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           run.id,
           run.taskId,
@@ -867,6 +882,7 @@ export function openStore(options = {}) {
           run.role,
           run.workspaceId ?? null,
           null,
+          run.files === undefined ? null : JSON.stringify(run.files),
           run.createdAt,
           run.updatedAt,
         );
@@ -1262,6 +1278,325 @@ export function openStore(options = {}) {
       const run = runJson(requireRunRow(runId));
       const lease = getLeaseRow(runId);
       return { run, lease: lease === null ? null : leaseJson(lease), sessions: [] };
+    },
+
+    // --- Scheduling (m3-contracts §2: snapshot + atomic claim) ------------
+    /**
+     * Consistent read model for the Scheduler (it is stateless and rebuilds from
+     * this on every round). `version` = MAX(events.seq): every successful
+     * claimTask appends task.updated + run.created, so the sequence strictly
+     * increases on each claim and a Scheduler can detect a newer snapshot.
+     * Read in one transaction so tasks/runs/leases cannot be a torn mix.
+     */
+    schedulingSnapshot({ projectId } = {}) {
+      if (projectId !== undefined && projectId !== null) requireId(projectId, "project.id");
+      return transaction(() => {
+        const generatedAt = nowIso();
+        const version = Number(stmt("SELECT COALESCE(MAX(seq), 0) AS seq FROM events").get().seq);
+        const projectRows =
+          projectId === undefined || projectId === null
+            ? stmt("SELECT * FROM projects ORDER BY id ASC").all()
+            : stmt("SELECT * FROM projects WHERE id = ?").all(projectId);
+        const projects = projectRows.map((row) => {
+          const stored = parseJsonColumn(row.policy_json);
+          return { id: row.id, policy: isPlainObject(stored) ? stored : {} };
+        });
+        const tasks = filterTasks({ projectId: projectId ?? undefined, limit: MAX_LIST_LIMIT });
+        const agents = store.listAgents();
+        const projectFilter = projectId !== undefined && projectId !== null;
+        const runRows = projectFilter
+          ? stmt(
+              `SELECT r.* FROM runs r JOIN tasks t ON t.id = r.task_id
+                WHERE t.project_id = ? AND r.status IN ('QUEUED', 'STARTING', 'RUNNING')
+                ORDER BY r.created_at ASC, r.id ASC`,
+            ).all(projectId)
+          : stmt(
+              `SELECT * FROM runs WHERE status IN ('QUEUED', 'STARTING', 'RUNNING')
+                ORDER BY created_at ASC, id ASC`,
+            ).all();
+        const leaseRows = projectFilter
+          ? stmt(
+              `SELECT l.* FROM run_leases l
+                 JOIN runs r ON r.id = l.run_id
+                 JOIN tasks t ON t.id = r.task_id
+                WHERE t.project_id = ? ORDER BY l.run_id ASC`,
+            ).all(projectId)
+          : stmt("SELECT * FROM run_leases ORDER BY run_id ASC").all();
+        return {
+          generatedAt,
+          version,
+          projects,
+          tasks,
+          agents,
+          runs: runRows.map(runJson),
+          leases: leaseRows.map(leaseJson),
+        };
+      });
+    },
+
+    /**
+     * Atomic task claim (m3-contracts §2, 7 ordered checks). Runs in ONE
+     * transaction: any failed check (or the CAS losing a race) rolls back to
+     * byte-for-byte no change. Same idempotencyKey replays the original result.
+     */
+    claimTask({ taskId, agentId, expectedTaskVersion, policies, idempotencyKey, workspacePolicy } = {}) {
+      requireId(taskId, "task.id");
+      requireId(agentId, "agent.id");
+      if (!Number.isInteger(expectedTaskVersion) || expectedTaskVersion < 0) {
+        fail("VALIDATION_ERROR", "expectedTaskVersion must be a non-negative integer", {
+          expectedTaskVersion: expectedTaskVersion ?? null,
+        });
+      }
+      const limits = validateSchedulingPolicies(policies);
+      const key = validateIdempotencyKey(idempotencyKey);
+      let workspacePolicyValue = null;
+      if (workspacePolicy !== undefined && workspacePolicy !== null) {
+        if (!isPlainObject(workspacePolicy)) {
+          fail("VALIDATION_ERROR", "workspacePolicy must be an object", { value: workspacePolicy });
+        }
+        workspacePolicyValue = workspacePolicy;
+      }
+      return transaction(() => {
+        // Idempotent replay: the same key returns the original run/command/task
+        // even though the task is CLAIMED and its version moved on.
+        const existingCommand = stmt("SELECT * FROM dispatch_commands WHERE idempotency_key = ?").get(key);
+        if (existingCommand) {
+          const existingRun = runJson(requireRunRow(existingCommand.run_id));
+          if (existingRun.taskId !== taskId) {
+            fail("VALIDATION_ERROR", "idempotencyKey was already used for another task", {
+              idempotencyKey: key,
+              taskId,
+              existingTaskId: existingRun.taskId,
+            });
+          }
+          return {
+            run: existingRun,
+            command: commandJson(existingCommand),
+            task: taskJson(requireTaskRow(taskId)),
+          };
+        }
+
+        // 1. Task exists, READY, expected version.
+        const taskRow = getTaskRow(taskId);
+        if (!taskRow) {
+          fail("TASK_VERSION_CONFLICT", `task "${taskId}" is not claimable`, {
+            taskId,
+            currentVersion: null,
+            expectedVersion: expectedTaskVersion,
+            reason: "task-not-found",
+          });
+        }
+        const task = taskJson(taskRow);
+        if (task.status !== "READY") {
+          fail("TASK_VERSION_CONFLICT", `task "${taskId}" is not READY`, {
+            taskId,
+            status: task.status,
+            currentVersion: task.version,
+            expectedVersion: expectedTaskVersion,
+            reason: "not-ready",
+          });
+        }
+        if (task.version !== expectedTaskVersion) {
+          fail("TASK_VERSION_CONFLICT", `task "${taskId}" version conflict`, {
+            taskId,
+            currentVersion: task.version,
+            expectedVersion: expectedTaskVersion,
+            reason: "version-mismatch",
+          });
+        }
+
+        // 2. Every dependency must exist and be DONE (missing = not done).
+        const blockingTaskIds = task.deps.filter((dep) => {
+          const depRow = getTaskRow(dep);
+          return !depRow || depRow.status !== "DONE";
+        });
+        if (blockingTaskIds.length > 0) {
+          fail("TASK_DEPENDENCY_BLOCKED", `task "${taskId}" has unfinished dependencies`, {
+            taskId,
+            blockingTaskIds,
+          });
+        }
+
+        // 3. Agent exists, IDLE, role/Function match the task.
+        const agentRow = stmt("SELECT * FROM agent_instances WHERE id = ?").get(agentId);
+        if (!agentRow) {
+          fail("CAPABILITY_UNAVAILABLE", `agent "${agentId}" is not registered`, {
+            reason: "agent-not-found",
+            agentId,
+            taskId,
+          });
+        }
+        const agent = agentJson(agentRow);
+        if (agent.status !== "IDLE") {
+          fail("CAPABILITY_UNAVAILABLE", `agent "${agentId}" is not IDLE`, {
+            reason: "agent-not-idle",
+            agentId,
+            status: agent.status,
+            taskId,
+          });
+        }
+        if (agent.role !== task.roleRequired) {
+          fail("CAPABILITY_UNAVAILABLE", `agent "${agentId}" has the wrong role`, {
+            reason: "role-mismatch",
+            agentId,
+            agentRole: agent.role,
+            roleRequired: task.roleRequired,
+            taskId,
+          });
+        }
+        if (!agent.capabilities.includes(task.functionRequired)) {
+          fail("CAPABILITY_UNAVAILABLE", `agent "${agentId}" lacks the required Function`, {
+            reason: "function-mismatch",
+            agentId,
+            capabilities: agent.capabilities,
+            functionRequired: task.functionRequired,
+            taskId,
+          });
+        }
+
+        // 4. At most one active Run per task.
+        const activeRun = stmt(
+          "SELECT id FROM runs WHERE task_id = ? AND status IN ('QUEUED', 'STARTING', 'RUNNING') ORDER BY created_at DESC LIMIT 1",
+        ).get(taskId);
+        if (activeRun) {
+          fail("TASK_VERSION_CONFLICT", `task "${taskId}" already has an active run`, {
+            taskId,
+            currentVersion: task.version,
+            expectedVersion: expectedTaskVersion,
+            activeRunId: activeRun.id,
+            reason: "active-run",
+          });
+        }
+
+        // 5. Capacity (limits travel with the claim; absent = unchecked).
+        if (limits.maxConcurrentPerProject !== undefined) {
+          const projectActive = Number(
+            stmt(
+              `SELECT COUNT(*) AS c FROM runs r JOIN tasks t ON t.id = r.task_id
+                WHERE t.project_id = ? AND r.status IN ('QUEUED', 'STARTING', 'RUNNING')`,
+            ).get(task.projectId).c,
+          );
+          if (projectActive + 1 > limits.maxConcurrentPerProject) {
+            fail("CAPABILITY_UNAVAILABLE", "project concurrency capacity reached", {
+              reason: "capacity",
+              scope: "project",
+              projectId: task.projectId,
+              active: projectActive,
+              limit: limits.maxConcurrentPerProject,
+              taskId,
+            });
+          }
+        }
+        if (limits.maxPerAgent !== undefined) {
+          const agentActive = Number(
+            stmt(
+              `SELECT COUNT(*) AS c FROM runs
+                WHERE agent_id = ? AND status IN ('QUEUED', 'STARTING', 'RUNNING')`,
+            ).get(agentId).c,
+          );
+          if (agentActive + 1 > limits.maxPerAgent) {
+            fail("CAPABILITY_UNAVAILABLE", "agent concurrency capacity reached", {
+              reason: "capacity",
+              scope: "agent",
+              agentId,
+              active: agentActive,
+              limit: limits.maxPerAgent,
+              taskId,
+            });
+          }
+        }
+
+        // 6. Write-scope conflict with active runs of the same project (run
+        //    files are snapshotted from the task at claim time; fall back to the
+        //    run's task files for rows written before this snapshot existed).
+        const candidateFiles = task.files ?? [];
+        if (candidateFiles.length > 0) {
+          const activeRunRows = stmt(
+            `SELECT r.id AS run_id, COALESCE(r.files_json, t.files_json) AS files_json
+               FROM runs r JOIN tasks t ON t.id = r.task_id
+              WHERE t.project_id = ? AND r.status IN ('QUEUED', 'STARTING', 'RUNNING')`,
+          ).all(task.projectId);
+          const conflictFiles = [];
+          const conflictRunIds = [];
+          for (const row of activeRunRows) {
+            const files = parseJsonColumn(row.files_json);
+            if (!Array.isArray(files)) continue;
+            const overlap = filesIntersection(candidateFiles, files);
+            if (overlap.length > 0) {
+              conflictFiles.push(...overlap);
+              conflictRunIds.push(row.run_id);
+            }
+          }
+          if (conflictRunIds.length > 0) {
+            fail("CAPABILITY_UNAVAILABLE", `task "${taskId}" write scope conflicts with an active run`, {
+              reason: "write-scope-conflict",
+              taskId,
+              files: [...new Set(conflictFiles)].sort((a, b) => a.localeCompare(b)),
+              activeRunIds: [...new Set(conflictRunIds)].sort((a, b) => a.localeCompare(b)),
+            });
+          }
+        }
+
+        // 7. Commit: CAS task -> CLAIMED, run (STARTING), durable command, events.
+        if (!canTransition(task.status, "CLAIMED")) {
+          fail("VALIDATION_ERROR", `task.status cannot transition from ${task.status} to CLAIMED`, {
+            from: task.status,
+            to: "CLAIMED",
+            allowed: ["CLAIMED"],
+          });
+        }
+        const at = nowIso();
+        const update = stmt(
+          "UPDATE tasks SET status = 'CLAIMED', version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND status = 'READY'",
+        ).run(at, taskId, expectedTaskVersion);
+        if (Number(update.changes) === 0) {
+          const latest = getTaskRow(taskId);
+          fail("TASK_VERSION_CONFLICT", `task "${taskId}" was claimed concurrently`, {
+            taskId,
+            currentVersion: latest ? Number(latest.version) : null,
+            expectedVersion: expectedTaskVersion,
+            reason: "cas-lost",
+          });
+        }
+        const run = store.createRun({
+          taskId,
+          agentId,
+          function: task.functionRequired,
+          role: task.roleRequired,
+          files: candidateFiles,
+        });
+        const command = store.enqueueDispatchCommand({
+          runId: run.id,
+          commandType: "RUN_TASK",
+          payload: {
+            taskId,
+            agentId,
+            functionRequired: task.functionRequired,
+            roleRequired: task.roleRequired,
+            workspacePolicy: workspacePolicyValue,
+            files: candidateFiles,
+          },
+          idempotencyKey: key,
+        });
+        insertEvent(
+          makeEvent({
+            projectId: task.projectId,
+            aggregateType: "task",
+            aggregateId: taskId,
+            type: "task.updated",
+            payload: {
+              taskId,
+              status: "CLAIMED",
+              previousStatus: "READY",
+              version: task.version + 1,
+              runId: run.id,
+              agentId,
+            },
+            now: at,
+          }),
+        );
+        return { run, command, task: taskJson(requireTaskRow(taskId)) };
+      });
     },
 
     listAgents() {

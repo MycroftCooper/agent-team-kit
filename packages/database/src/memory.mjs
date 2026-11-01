@@ -16,11 +16,14 @@ import {
   DEFAULT_LEASE_MS,
   MAX_EVENT_LIMIT,
   MAX_OVERVIEW_EVENTS,
+  ACTIVE_RUN_STATUSES,
   SCHEMA_VERSION,
   assertEnumFilter,
   buildOverview,
+  canTransition,
   compareTasks,
   ensurePlainObject,
+  filesIntersection,
   generateId,
   isPlainObject,
   leaseExpiryAfter,
@@ -33,6 +36,7 @@ import {
   normalizeApproval,
   normalizeLimit,
   normalizeProject,
+  normalizeProjectPolicy,
   normalizeRequirement,
   normalizeRun,
   normalizeTask,
@@ -44,6 +48,7 @@ import {
   validateIdempotencyKey,
   validateLeaseMs,
   validateOwnerId,
+  validateSchedulingPolicies,
   validateTaskStatus,
 } from "./model.mjs";
 
@@ -226,6 +231,7 @@ export function createMemoryStore() {
       projectMeta.set(project.id, {
         legacy: jsonClone(dto.legacy, "project.legacy"),
         settings: jsonClone(dto.settings, "project.settings"),
+        policy: jsonClone(normalizeProjectPolicy(dto.policy, "project.policy"), "project.policy"),
       });
       return clone(project);
     },
@@ -668,6 +674,324 @@ export function createMemoryStore() {
       const run = requireRunEntry(runId);
       const lease = leaseOf(runId);
       return { run: clone(run), lease: lease === null ? null : clone(lease), sessions: [] };
+    },
+
+    // --- Scheduling (m3-contracts §2: snapshot + atomic claim) ------------
+    schedulingSnapshot({ projectId } = {}) {
+      if (projectId !== undefined && projectId !== null) requireId(projectId, "project.id");
+      const generatedAt = nowIso();
+      const matchesProject = (project) => projectId === undefined || projectId === null || project.id === projectId;
+      const projectList = [...projects.values()]
+        .filter(matchesProject)
+        .sort((a, b) => a.id.localeCompare(b.id))
+        .map((project) => ({
+          id: project.id,
+          policy: clone(projectMeta.get(project.id)?.policy ?? {}),
+        }));
+      const taskList = [...tasks.values()]
+        .filter(
+          (task) =>
+            projectId === undefined || projectId === null || task.projectId === projectId,
+        )
+        .sort(compareTasks)
+        .map(clone);
+      const runList = [...runs.values()]
+        .filter((run) => ACTIVE_RUN_STATUSES.includes(run.status))
+        .filter((run) => {
+          if (projectId === undefined || projectId === null) return true;
+          const task = tasks.get(run.taskId);
+          return task !== undefined && task.projectId === projectId;
+        })
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+        .map(clone);
+      const leaseList = [...runLeases.values()]
+        .filter((lease) => {
+          if (projectId === undefined || projectId === null) return true;
+          const run = runs.get(lease.runId);
+          const task = run === undefined ? undefined : tasks.get(run.taskId);
+          return task !== undefined && task.projectId === projectId;
+        })
+        .sort((a, b) => a.runId.localeCompare(b.runId))
+        .map(clone);
+      return {
+        generatedAt,
+        version: seq,
+        projects: projectList,
+        tasks: taskList,
+        agents: [...agents.values()].sort((a, b) => a.id.localeCompare(b.id)).map(clone),
+        runs: runList,
+        leases: leaseList,
+      };
+    },
+
+    claimTask({ taskId, agentId, expectedTaskVersion, policies, idempotencyKey, workspacePolicy } = {}) {
+      requireId(taskId, "task.id");
+      requireId(agentId, "agent.id");
+      if (!Number.isInteger(expectedTaskVersion) || expectedTaskVersion < 0) {
+        fail("VALIDATION_ERROR", "expectedTaskVersion must be a non-negative integer", {
+          expectedTaskVersion: expectedTaskVersion ?? null,
+        });
+      }
+      const limits = validateSchedulingPolicies(policies);
+      const key = validateIdempotencyKey(idempotencyKey);
+      let workspacePolicyValue = null;
+      if (workspacePolicy !== undefined && workspacePolicy !== null) {
+        if (!isPlainObject(workspacePolicy)) {
+          fail("VALIDATION_ERROR", "workspacePolicy must be an object", { value: workspacePolicy });
+        }
+        workspacePolicyValue = workspacePolicy;
+      }
+
+      // Idempotent replay first (task may already be CLAIMED/version bumped).
+      const existingId = commandIdempotency.get(key);
+      if (existingId !== undefined) {
+        const command = dispatchCommands.get(existingId);
+        const run = requireRunEntry(command.runId);
+        if (run.taskId !== taskId) {
+          fail("VALIDATION_ERROR", "idempotencyKey was already used for another task", {
+            idempotencyKey: key,
+            taskId,
+            existingTaskId: run.taskId,
+          });
+        }
+        return { run: clone(run), command: clone(command), task: clone(requireTaskEntry(taskId)) };
+      }
+
+      // 1. Task exists, READY, expected version.
+      const task = tasks.get(taskId);
+      if (!task) {
+        fail("TASK_VERSION_CONFLICT", `task "${taskId}" is not claimable`, {
+          taskId,
+          currentVersion: null,
+          expectedVersion: expectedTaskVersion,
+          reason: "task-not-found",
+        });
+      }
+      if (task.status !== "READY") {
+        fail("TASK_VERSION_CONFLICT", `task "${taskId}" is not READY`, {
+          taskId,
+          status: task.status,
+          currentVersion: task.version,
+          expectedVersion: expectedTaskVersion,
+          reason: "not-ready",
+        });
+      }
+      if (task.version !== expectedTaskVersion) {
+        fail("TASK_VERSION_CONFLICT", `task "${taskId}" version conflict`, {
+          taskId,
+          currentVersion: task.version,
+          expectedVersion: expectedTaskVersion,
+          reason: "version-mismatch",
+        });
+      }
+
+      // 2. Dependencies must exist and be DONE.
+      const blockingTaskIds = task.deps.filter((dep) => {
+        const dependency = tasks.get(dep);
+        return !dependency || dependency.status !== "DONE";
+      });
+      if (blockingTaskIds.length > 0) {
+        fail("TASK_DEPENDENCY_BLOCKED", `task "${taskId}" has unfinished dependencies`, {
+          taskId,
+          blockingTaskIds,
+        });
+      }
+
+      // 3. Agent exists, IDLE, role/Function match.
+      const agent = agents.get(agentId);
+      if (!agent) {
+        fail("CAPABILITY_UNAVAILABLE", `agent "${agentId}" is not registered`, {
+          reason: "agent-not-found",
+          agentId,
+          taskId,
+        });
+      }
+      if (agent.status !== "IDLE") {
+        fail("CAPABILITY_UNAVAILABLE", `agent "${agentId}" is not IDLE`, {
+          reason: "agent-not-idle",
+          agentId,
+          status: agent.status,
+          taskId,
+        });
+      }
+      if (agent.role !== task.roleRequired) {
+        fail("CAPABILITY_UNAVAILABLE", `agent "${agentId}" has the wrong role`, {
+          reason: "role-mismatch",
+          agentId,
+          agentRole: agent.role,
+          roleRequired: task.roleRequired,
+          taskId,
+        });
+      }
+      if (!agent.capabilities.includes(task.functionRequired)) {
+        fail("CAPABILITY_UNAVAILABLE", `agent "${agentId}" lacks the required Function`, {
+          reason: "function-mismatch",
+          agentId,
+          capabilities: [...agent.capabilities],
+          functionRequired: task.functionRequired,
+          taskId,
+        });
+      }
+
+      // 4. At most one active Run per task.
+      const activeRun = [...runs.values()].find(
+        (run) => run.taskId === taskId && ACTIVE_RUN_STATUSES.includes(run.status),
+      );
+      if (activeRun) {
+        fail("TASK_VERSION_CONFLICT", `task "${taskId}" already has an active run`, {
+          taskId,
+          currentVersion: task.version,
+          expectedVersion: expectedTaskVersion,
+          activeRunId: activeRun.id,
+          reason: "active-run",
+        });
+      }
+
+      // 5. Capacity (limits travel with the claim; absent = unchecked).
+      if (limits.maxConcurrentPerProject !== undefined) {
+        const projectActive = [...runs.values()].filter((run) => {
+          if (!ACTIVE_RUN_STATUSES.includes(run.status)) return false;
+          const runTask = tasks.get(run.taskId);
+          return runTask !== undefined && runTask.projectId === task.projectId;
+        }).length;
+        if (projectActive + 1 > limits.maxConcurrentPerProject) {
+          fail("CAPABILITY_UNAVAILABLE", "project concurrency capacity reached", {
+            reason: "capacity",
+            scope: "project",
+            projectId: task.projectId,
+            active: projectActive,
+            limit: limits.maxConcurrentPerProject,
+            taskId,
+          });
+        }
+      }
+      if (limits.maxPerAgent !== undefined) {
+        const agentActive = [...runs.values()].filter(
+          (run) => run.agentId === agentId && ACTIVE_RUN_STATUSES.includes(run.status),
+        ).length;
+        if (agentActive + 1 > limits.maxPerAgent) {
+          fail("CAPABILITY_UNAVAILABLE", "agent concurrency capacity reached", {
+            reason: "capacity",
+            scope: "agent",
+            agentId,
+            active: agentActive,
+            limit: limits.maxPerAgent,
+            taskId,
+          });
+        }
+      }
+
+      // 6. Write-scope conflict with active runs of the same project.
+      const candidateFiles = task.files ?? [];
+      if (candidateFiles.length > 0) {
+        const conflictFiles = [];
+        const conflictRunIds = [];
+        for (const run of runs.values()) {
+          if (!ACTIVE_RUN_STATUSES.includes(run.status)) continue;
+          const runTask = tasks.get(run.taskId);
+          if (runTask === undefined || runTask.projectId !== task.projectId) continue;
+          const runFiles = run.files ?? runTask.files ?? [];
+          const overlap = filesIntersection(candidateFiles, runFiles);
+          if (overlap.length > 0) {
+            conflictFiles.push(...overlap);
+            conflictRunIds.push(run.id);
+          }
+        }
+        if (conflictRunIds.length > 0) {
+          fail("CAPABILITY_UNAVAILABLE", `task "${taskId}" write scope conflicts with an active run`, {
+            reason: "write-scope-conflict",
+            taskId,
+            files: [...new Set(conflictFiles)].sort((a, b) => a.localeCompare(b)),
+            activeRunIds: [...new Set(conflictRunIds)].sort((a, b) => a.localeCompare(b)),
+          });
+        }
+      }
+
+      // 7. Commit: build every row first, then mutate + append the two events.
+      if (!canTransition(task.status, "CLAIMED")) {
+        fail("VALIDATION_ERROR", `task.status cannot transition from ${task.status} to CLAIMED`, {
+          from: task.status,
+          to: "CLAIMED",
+          allowed: ["CLAIMED"],
+        });
+      }
+      const at = nowIso();
+      const attempt = [...runs.values()].filter((run) => run.taskId === taskId).length + 1;
+      const run = normalizeRun(
+        {
+          taskId,
+          agentId,
+          function: task.functionRequired,
+          role: task.roleRequired,
+          files: candidateFiles,
+        },
+        { now: at, attempt },
+      );
+      const updatedTask = { ...task, status: "CLAIMED", version: task.version + 1, updatedAt: at };
+      const command = {
+        id: generateId("CMD"),
+        runId: run.id,
+        taskId,
+        commandType: "RUN_TASK",
+        payload: clone({
+          taskId,
+          agentId,
+          functionRequired: task.functionRequired,
+          roleRequired: task.roleRequired,
+          workspacePolicy: workspacePolicyValue,
+          files: candidateFiles,
+        }),
+        status: "PENDING",
+        idempotencyKey: key,
+        ownerId: null,
+        generation: 0,
+        claimedUntil: null,
+        attempts: 0,
+        createdAt: at,
+        updatedAt: at,
+      };
+      tasks.set(taskId, updatedTask);
+      runs.set(run.id, run);
+      dispatchCommands.set(command.id, command);
+      commandIdempotency.set(key, command.id);
+      appendEventEntry(
+        makeEvent({
+          projectId: task.projectId,
+          aggregateType: "run",
+          aggregateId: run.id,
+          type: "run.created",
+          payload: {
+            runId: run.id,
+            taskId,
+            agentId,
+            function: run.function,
+            role: run.role,
+            status: run.status,
+            attempt: run.attempt,
+            version: run.version,
+            ...(run.files === undefined ? {} : { files: run.files }),
+          },
+          now: at,
+        }),
+      );
+      appendEventEntry(
+        makeEvent({
+          projectId: task.projectId,
+          aggregateType: "task",
+          aggregateId: taskId,
+          type: "task.updated",
+          payload: {
+            taskId,
+            status: "CLAIMED",
+            previousStatus: "READY",
+            version: updatedTask.version,
+            runId: run.id,
+            agentId,
+          },
+          now: at,
+        }),
+      );
+      return { run: clone(run), command: clone(command), task: clone(updatedTask) };
     },
 
     listAgents() {

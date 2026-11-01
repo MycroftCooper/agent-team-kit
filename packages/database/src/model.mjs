@@ -22,7 +22,7 @@ import {
 import { fail } from "./errors.mjs";
 
 /** Schema version written by the latest migration file. */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 export const DEFAULT_LIST_LIMIT = 100;
 export const MAX_LIST_LIMIT = 10000;
 export const MAX_EVENT_LIMIT = 10000;
@@ -333,6 +333,9 @@ export function normalizeTask(dto, { now, status = "READY", version = 0 } = {}) 
   };
   if (dto.acceptance !== undefined && dto.acceptance !== null) task.acceptance = dto.acceptance;
   if (dto.planId !== undefined && dto.planId !== null) task.planId = dto.planId;
+  // M3 write scope (optional). An empty list is stored as "no files", not as [].
+  const taskFiles = validateFiles(dto.files, "task.files");
+  if (taskFiles.length > 0) task.files = taskFiles;
   return task;
 }
 
@@ -346,6 +349,7 @@ export const TASK_PATCH_KEYS = Object.freeze([
   "planId",
   "status",
   "deps",
+  "files",
 ]);
 
 export function mergeTask(current, changes, { now } = {}) {
@@ -369,6 +373,10 @@ export function mergeTask(current, changes, { now } = {}) {
         });
       }
       merged.deps = dedupeIds(value);
+    } else if (key === "files") {
+      const files = validateFiles(value, "task.changes.files");
+      if (files.length === 0) delete merged.files;
+      else merged.files = files;
     } else if (key === "acceptance" || key === "planId") {
       if (value === null || value === undefined) delete merged[key];
       else merged[key] = value;
@@ -553,6 +561,9 @@ export { EVENT_SCHEMA_VERSION };
 // The table lives here, next to the Task machine, and is used by both stores.
 export const RUN_TERMINAL_STATUSES = Object.freeze(["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"]);
 
+/** Runs that still occupy an agent/task slot ("active" for scheduling). */
+export const ACTIVE_RUN_STATUSES = Object.freeze(["QUEUED", "STARTING", "RUNNING"]);
+
 const RUN_TRANSITIONS = Object.freeze({
   QUEUED: Object.freeze(["STARTING"]),
   STARTING: Object.freeze(["RUNNING", "FAILED", "INTERRUPTED"]),
@@ -650,6 +661,89 @@ export function validateCommandPayload(value) {
   return value;
 }
 
+// ---------------------------------------------------------------------------
+// M3 scheduling metadata: write scope (files) + per-project policy
+// ---------------------------------------------------------------------------
+
+/**
+ * Write scope is a list of repo-relative paths. Kept small and safe: no absolute
+ * paths, no `..` segments, no NUL, deduplicated, at most 1000 entries. `undefined`
+ * means "no declared write scope" and normalises to [].
+ */
+export function validateFiles(value, label = "files") {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    fail("VALIDATION_ERROR", `${label} must be an array of paths`, { entity: label, value: value ?? null });
+  }
+  if (value.length > 1000) {
+    fail("VALIDATION_ERROR", `${label} accepts at most 1000 paths`, { entity: label, length: value.length });
+  }
+  const files = [];
+  const seen = new Set();
+  for (const [index, file] of value.entries()) {
+    if (typeof file !== "string" || file.trim() === "") {
+      fail("VALIDATION_ERROR", `${label}[${index}] must be a non-empty string`, { entity: label, index });
+    }
+    if (file.length > 512) {
+      fail("VALIDATION_ERROR", `${label}[${index}] must be at most 512 characters`, { entity: label, index });
+    }
+    const normalised = file.replace(/\\/g, "/");
+    if (normalised.includes("\0")) {
+      fail("VALIDATION_ERROR", `${label}[${index}] must not contain NUL bytes`, { entity: label, index });
+    }
+    if (/^[A-Za-z]:/.test(normalised) || normalised.startsWith("/") || normalised.split("/").includes("..")) {
+      fail("VALIDATION_ERROR", `${label}[${index}] must be a repo-relative path`, {
+        entity: label,
+        index,
+        path: file,
+      });
+    }
+    if (seen.has(file)) continue;
+    seen.add(file);
+    files.push(file);
+  }
+  return files;
+}
+
+/** `projects.policy_json` payload; NULL/missing → {}. */
+export function normalizeProjectPolicy(value, label = "project.policy") {
+  if (value === undefined || value === null) return {};
+  if (!isPlainObject(value)) {
+    fail("VALIDATION_ERROR", `${label} must be an object`, { entity: label, value: value ?? null });
+  }
+  return value;
+}
+
+const SCHEDULING_LIMIT_KEYS = Object.freeze(["maxConcurrentPerProject", "maxPerAgent"]);
+
+/**
+ * Capacity limits travel with each claim (Backend env/config → claimTask). An
+ * omitted limit means "no capacity check"; a provided one must be a
+ * non-negative integer (0 blocks all new claims for that scope).
+ */
+export function validateSchedulingPolicies(policies) {
+  if (policies === undefined || policies === null) return {};
+  if (!isPlainObject(policies)) {
+    fail("VALIDATION_ERROR", "policies must be an object", { value: policies ?? null });
+  }
+  const effective = {};
+  for (const key of SCHEDULING_LIMIT_KEYS) {
+    const value = policies[key];
+    if (value === undefined || value === null) continue;
+    if (!Number.isInteger(value) || value < 0) {
+      fail("VALIDATION_ERROR", `${key} must be a non-negative integer`, { field: key, value });
+    }
+    effective[key] = value;
+  }
+  return effective;
+}
+
+/** Sorted intersection of two write scopes (used by the claim conflict check). */
+export function filesIntersection(left, right) {
+  const rightSet = new Set(right);
+  return [...new Set(left.filter((file) => rightSet.has(file)))].sort((a, b) => a.localeCompare(b));
+}
+
 export function leaseExpiryAfter(now, leaseMs) {
   return new Date(Date.parse(now) + leaseMs).toISOString();
 }
@@ -680,6 +774,7 @@ export function normalizeRun(dto, { now, attempt, id } = {}) {
     }
   }
   if (!Number.isInteger(attempt) || attempt < 1) errors.push("run.attempt could not be resolved");
+  const runFiles = validateFiles(dto.files, "run.files");
   if (errors.length > 0) {
     fail("VALIDATION_ERROR", `run is invalid: ${errors.join("; ")}`, { entity: "run", errors });
   }
@@ -697,6 +792,7 @@ export function normalizeRun(dto, { now, attempt, id } = {}) {
     updatedAt: at,
   };
   if (dto.workspaceId !== undefined && dto.workspaceId !== null) run.workspaceId = dto.workspaceId;
+  if (runFiles.length > 0) run.files = runFiles;
   return run;
 }
 
