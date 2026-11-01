@@ -1,7 +1,7 @@
 // Launcher state machine against fake children: ordering, env-only token, no
 // double start, stale cleanup, ordered/idempotent stop and DB-free status.
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -157,10 +157,46 @@ test("status marks a dead child and returns non-zero; it never leaks the token",
   const started = await launcher.start();
   alive.alive.delete(started.state.children[0].pid); // kill the backend on paper
   const status = await launcher.status();
-  assert.equal(status.running, true);
+  // QA6-02: a dead backend must not keep `running: true`.
+  assert.equal(status.running, false);
   assert.equal(status.code, 1);
+  assert.equal(status.statePresent, true);
   assert.equal(status.children.find((child) => child.role === "backend").alive, false);
   assert.doesNotMatch(JSON.stringify(status), new RegExp(FAKE_TOKEN));
+});
+
+test("stop recovers tracked children when launcher.json is corrupt (QA6-01)", async () => {
+  const { launcher, dataDir, alive, spawn } = makeHarness();
+  await launcher.start();
+  const pidOf = (name) => spawn.calls.find((call) => call.name === name).child.pid;
+  writeFileSync(statePathFor(dataDir), "{ this is not valid json");
+  const result = await launcher.stop();
+  assert.equal(result.code, 0);
+  assert.equal(result.recovered, true);
+  assert.deepEqual(
+    alive.kills.map((kill) => kill.pid),
+    [pidOf("host-2"), pidOf("host-1"), pidOf("scheduler"), pidOf("backend")],
+    "in-memory children must still stop in hosts -> scheduler -> backend order",
+  );
+  assert.equal(launcher.readState(), null);
+});
+
+test("status refuses to claim 'not running' while a corrupt state file / pidfile points at children", async () => {
+  const { launcher, dataDir, alive } = makeHarness();
+  writeFileSync(statePathFor(dataDir), '{"version":1,"children":"broken"}');
+  const runtimeDir = path.join(dataDir, "runtime");
+  mkdirSync(runtimeDir, { recursive: true });
+  const pidFile = path.join(runtimeDir, "launcher.pid");
+  writeFileSync(pidFile, JSON.stringify({ pid: 606_060, startedAt: "2026-01-01T00:00:00.000Z" }));
+  alive.alive.add(606_060);
+  const status = await launcher.status();
+  assert.equal(status.running, false);
+  assert.equal(status.code, 1);
+  assert.equal(status.statePresent, true);
+  assert.equal(status.supervisor?.alive, true);
+  assert.match(status.health.error, /corrupt/i);
+  assert.ok(existsSync(statePathFor(dataDir)), "status must not delete the corrupt state file");
+  assert.ok(existsSync(pidFile), "status must not delete launcher.pid");
 });
 
 test("stop is ordered hosts -> scheduler -> backend and idempotent", async () => {

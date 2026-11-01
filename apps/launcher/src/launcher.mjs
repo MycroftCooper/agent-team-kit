@@ -111,6 +111,7 @@ export function createLauncher(options = {}) {
   const runtimeDir = path.join(dataDir, "runtime");
   const logsDir = path.join(dataDir, "logs");
   const stateFile = statePathFor(dataDir);
+  const supervisorPidFile = path.join(runtimeDir, "launcher.pid");
   const baseUrl = loopbackUrl(port);
   const webDist = options.webDist === undefined ? path.join(repoRoot, "apps", "web", "dist") : options.webDist;
 
@@ -241,6 +242,17 @@ export function createLauncher(options = {}) {
     }
   }
 
+  /** Best-effort supervisor pid (written by the CLI; token-free). */
+  function readSupervisorInfo() {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(supervisorPidFile, "utf8"));
+      if (!Number.isInteger(parsed?.pid) || parsed.pid <= 0) return null;
+      return { pid: parsed.pid, alive: isAliveImpl(parsed.pid) };
+    } catch {
+      return null;
+    }
+  }
+
   function stopOrder(state) {
     const hostsFirst = state.children.filter((child) => child.role === HOST_ROLE).reverse();
     const scheduler = state.children.filter((child) => child.role === SCHEDULER_ROLE);
@@ -248,15 +260,10 @@ export function createLauncher(options = {}) {
     return [...hostsFirst, ...scheduler, ...backend];
   }
 
-  async function stop(options = {}) {
-    const force = options.force === true;
-    const state = options.state ?? readState(stateFile);
-    if (!state) {
-      removeState(stateFile);
-      return { code: 0, stopped: [], message: "not running" };
-    }
+  /** Send SIGTERM (or SIGKILL when forced), wait, escalate, and report per child. */
+  async function stopEntries(entries, force) {
     const stopped = [];
-    for (const child of stopOrder(state)) {
+    for (const child of entries) {
       if (!isAliveImpl(child.pid)) {
         stopped.push({ name: child.name, pid: child.pid, action: "already-exited" });
         continue;
@@ -283,6 +290,29 @@ export function createLauncher(options = {}) {
       stopped.push({ name: child.name, pid: child.pid, action: signalled ? signal.toLowerCase() : "already-exited", forced, exited });
     }
     removeState(stateFile);
+    return stopped;
+  }
+
+  async function stop(options = {}) {
+    const force = options.force === true;
+    const state = options.state ?? readState(stateFile);
+    if (!state) {
+      // QA6-01: a corrupt/missing launcher.json must not make a live process tree
+      // unmanageable. A supervisor still has its children in memory; stop them
+      // here so `atk stop` can recover instead of silently reporting success.
+      const tracked = [...children.values()].map((entry) => ({ name: entry.name, pid: entry.pid, role: entry.role }));
+      if (tracked.length === 0) {
+        return { code: 0, stopped: [], message: "not running" };
+      }
+      const stopped = await stopEntries(stopOrder({ children: tracked }), force);
+      return {
+        code: 0,
+        stopped,
+        recovered: true,
+        message: "stopped in-memory child processes (launcher.json was corrupt or missing)",
+      };
+    }
+    const stopped = await stopEntries(stopOrder(state), force);
     return { code: 0, stopped, message: `stopped ${stopped.length} recorded child process(es)` };
   }
 
@@ -301,7 +331,11 @@ export function createLauncher(options = {}) {
 
   async function inspect() {
     const state = readState(stateFile);
-    if (!state) return { running: false, state: null, health: null, aliveChildren: [] };
+    const statePresent = fs.existsSync(stateFile);
+    const supervisor = readSupervisorInfo();
+    if (!state) {
+      return { running: false, state: null, health: null, aliveChildren: [], statePresent, corrupt: statePresent, supervisor };
+    }
     const aliveChildren = state.children.filter((child) => isAliveImpl(child.pid));
     let health = null;
     try {
@@ -309,7 +343,15 @@ export function createLauncher(options = {}) {
     } catch (error) {
       health = { ok: false, error: String(error?.message ?? error) };
     }
-    return { running: aliveChildren.length > 0 && health?.ok === true, state, health, aliveChildren };
+    return {
+      running: aliveChildren.length > 0 && health?.ok === true,
+      state,
+      health,
+      aliveChildren,
+      statePresent: true,
+      corrupt: false,
+      supervisor,
+    };
   }
 
   async function start() {
@@ -322,11 +364,28 @@ export function createLauncher(options = {}) {
         { code: 2, details: { port: existing.state.port, children: existing.state.children } },
       );
     }
+    if (!existing.state && existing.statePresent) {
+      // QA6-01: fail closed. Without a readable state file we cannot enumerate
+      // the old children, so blindly starting could double-run the port while the
+      // previous tree is still alive.
+      throw new LauncherError(
+        `launcher.json at ${stateFile} is corrupt or unreadable; refusing to start because the running child tree cannot be verified. ` +
+          `Run \`atk stop\` (a live supervisor can recover its children), or remove the file after ensuring no Agent Team Kit processes are running.`,
+        { code: 1, details: { stateFile, supervisor: existing.supervisor } },
+      );
+    }
     if (existing.state) {
       // Stale state: PIDs are dead or the backend is not answering. Clean up the
       // remaining children (if any are alive but unhealthy) and remove the file
       // before starting fresh — never kill a healthy instance and call it "start".
       await stop({ state: existing.state });
+      const survivors = existing.state.children.filter((child) => isAliveImpl(child.pid));
+      if (survivors.length > 0) {
+        throw new LauncherError(
+          `could not stop the stale instance (still alive: ${survivors.map((child) => `${child.name}=${child.pid}`).join(", ")}); refusing to start a second tree`,
+          { code: 1 },
+        );
+      }
     }
 
     ensureDirs();
@@ -392,14 +451,28 @@ export function createLauncher(options = {}) {
   function status() {
     return (async () => {
       const state = readState(stateFile);
+      const statePresent = fs.existsSync(stateFile);
+      const supervisor = readSupervisorInfo();
       if (!state) {
+        // QA6-01/QA6-02: a corrupt state file is not "not running". Report it as a
+        // degraded/unmanaged state and exit non-zero; never claim success.
+        const managed = statePresent || Boolean(supervisor?.alive);
         return {
-          code: 0,
+          code: managed ? 1 : 0,
           running: false,
+          statePresent,
+          supervisor: supervisor ? { pid: supervisor.pid, alive: supervisor.alive } : null,
           version: null,
           port: null,
           startedAt: null,
-          health: { ok: false, error: "not running" },
+          health: {
+            ok: false,
+            error: statePresent
+              ? "launcher.json is corrupt or unreadable; child processes may still be running"
+              : supervisor?.alive
+                ? "a supervisor is running but launcher.json is missing"
+                : "not running",
+          },
           children: [],
         };
       }
@@ -411,9 +484,14 @@ export function createLauncher(options = {}) {
       }));
       const health = await checkHealth({ baseUrl: loopbackUrl(state.port), fetchImpl, timeoutMs: 3_000, now });
       const allAlive = childrenStatus.length > 0 && childrenStatus.every((child) => child.alive);
+      // QA6-02: `running` means the system is actually usable: every child alive
+      // AND the backend healthy. A dead backend must not look "running: true".
+      const running = allAlive && health.ok === true;
       return {
-        code: allAlive && health.ok ? 0 : 1,
-        running: true,
+        code: running ? 0 : 1,
+        running,
+        statePresent: true,
+        supervisor: supervisor ? { pid: supervisor.pid, alive: supervisor.alive } : null,
         version: state.version,
         port: state.port,
         startedAt: state.startedAt,

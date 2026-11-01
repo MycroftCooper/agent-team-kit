@@ -177,6 +177,21 @@ function tailFile(file, lines = 30) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Ask a live supervisor to stop its (in-memory) children through the token-free
+ * request file; true when the supervisor process is gone afterwards. This is the
+ * fallback for QA6-01: even with a corrupt `launcher.json`, a running supervisor
+ * still knows its children and can stop them in order.
+ */
+async function requestSupervisorStop(paths, pid, timeoutMs) {
+  fs.mkdirSync(paths.runtimeDir, { recursive: true });
+  fs.writeFileSync(paths.stopRequest, `${JSON.stringify({ requestedAt: new Date().toISOString() })}\n`);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && isProcessAlive(pid)) await sleep(STOP_WAIT_POLL_MS);
+  removeFile(paths.stopRequest);
+  return !isProcessAlive(pid);
+}
+
 function childPids(state) {
   return state ? state.children.map((child) => `${child.name}=${child.pid}`).join(", ") : "";
 }
@@ -221,17 +236,46 @@ async function commandStart(flags) {
   if (existing.state) {
     process.stdout.write(`atk: cleaning stale launcher state from a previous run\n`);
     await probe.stop({ state: existing.state });
+    const survivors = existing.state.children.filter((child) => isProcessAlive(child.pid));
+    if (survivors.length > 0) {
+      process.stderr.write(
+        `atk: could not stop the stale instance (still alive: ${survivors.map((child) => `${child.name}=${child.pid}`).join(", ")}); refusing to start\n`,
+      );
+      return 1;
+    }
+  }
+  const corruptState = fs.existsSync(paths.stateFile) && !existing.state;
+  if (corruptState) {
+    // QA6-01: a corrupt launcher.json must not lead to a blind second start.
+    const pidEntry = readPidFile(paths.pidFile);
+    if (pidEntry && isProcessAlive(pidEntry.pid)) {
+      const stopped = await requestSupervisorStop(paths, pidEntry.pid, 5_000);
+      if (!stopped || fs.existsSync(paths.stateFile)) {
+        process.stderr.write(
+          `atk: launcher.json is corrupt and the running supervisor did not finish stopping; refusing to start a second tree (launcher.pid preserved)\n`,
+        );
+        return 1;
+      }
+      process.stdout.write(`atk: recovered a corrupt launcher.json via the running supervisor\n`);
+    } else {
+      process.stderr.write(
+        `atk: launcher.json at ${paths.stateFile} is corrupt/unreadable and no live supervisor is recording children; ` +
+          `refusing to start because the running tree cannot be verified. Ensure no Agent Team Kit processes are running, then remove the file.\n`,
+      );
+      return 1;
+    }
   }
   // A supervisor without a state file is a crashed/aborted start; make it exit
   // before spawning another one, so two supervisors can never race on the port.
   const stalePid = readPidFile(paths.pidFile);
   if (stalePid && isProcessAlive(stalePid.pid)) {
-    fs.writeFileSync(paths.stopRequest, `${JSON.stringify({ requestedAt: new Date().toISOString(), reason: "stale-supervisor" })}\n`);
-    const deadline = Date.now() + 3_000;
-    while (Date.now() < deadline && isProcessAlive(stalePid.pid)) await sleep(100);
-    removeFile(paths.stopRequest);
+    const stopped = await requestSupervisorStop(paths, stalePid.pid, 5_000);
+    if (!stopped) {
+      process.stderr.write(`atk: a supervisor (pid ${stalePid.pid}) is still running and did not stop; refusing to start a second one\n`);
+      return 1;
+    }
   }
-  removeFile(paths.pidFile);
+  if (!stalePid || !isProcessAlive(stalePid.pid)) removeFile(paths.pidFile);
 
   const logFd = fs.openSync(paths.supervisorLog, "a");
   const supervisorArgs = [CLI_FILE, "__supervise", "--port", String(port), "--data", dataDir, "--hosts", String(hosts), "--runtime", runtime];
@@ -286,11 +330,39 @@ async function commandStop(flags) {
   const paths = supervisorPaths(dataDir);
   const launcher = createLauncher({ dataDir, repoRoot: ROOT });
   const state = readState(paths.stateFile);
+  const stateFileExists = fs.existsSync(paths.stateFile);
+  const pidEntry = readPidFile(paths.pidFile);
+  const supervisorAlive = Boolean(pidEntry && isProcessAlive(pidEntry.pid));
+
   if (!state) {
-    removeFile(paths.stopRequest);
-    removeFile(paths.pidFile);
-    process.stdout.write("atk: not running\n");
-    return 0;
+    if (!stateFileExists && !supervisorAlive) {
+      removeFile(paths.stopRequest);
+      if (pidEntry) removeFile(paths.pidFile); // dead supervisor pid, nothing to manage
+      process.stdout.write("atk: not running\n");
+      return 0;
+    }
+    if (supervisorAlive) {
+      // QA6-01 fallback: the supervisor holds the child PIDs in memory and can
+      // stop them in order even when launcher.json is corrupt.
+      const stopped = await requestSupervisorStop(paths, pidEntry.pid, STOP_WAIT_TIMEOUT_MS);
+      if (stopped && !fs.existsSync(paths.stateFile)) {
+        removeFile(paths.pidFile);
+        process.stdout.write("atk: stopped (recovered a corrupt launcher.json via the running supervisor)\n");
+        return 0;
+      }
+      process.stderr.write(
+        `atk: launcher.json is corrupt and the supervisor (pid ${pidEntry.pid}) did not finish stopping; ` +
+          `refusing to report success (launcher.pid and launcher.json preserved)\n`,
+      );
+      return 1;
+    }
+    // QA6-01: corrupt state with no live supervisor — never silently succeed and
+    // never delete the pidfile: children may still be running with unknown PIDs.
+    process.stderr.write(
+      `atk: launcher.json at ${paths.stateFile} is corrupt/unreadable and no supervisor is alive to enumerate the children; ` +
+        `refusing to report success. Inspect/stop any remaining Agent Team Kit processes manually, then remove the state file.\n`,
+    );
+    return 1;
   }
 
   if (flags.force) {
@@ -318,14 +390,27 @@ async function commandStop(flags) {
   // Fallback: if the supervisor is gone or wedged, stop the recorded PIDs in the
   // same order. This makes `atk stop` idempotent and crash-safe.
   if (readState(paths.stateFile)) await launcher.stop();
+  const survivors = state.children.filter((child) => isProcessAlive(child.pid));
   removeFile(paths.stopRequest);
+  if (survivors.length > 0) {
+    process.stderr.write(
+      `atk: stop did not finish (still alive: ${survivors.map((child) => `${child.name}=${child.pid}`).join(", ")}); launcher.pid preserved\n`,
+    );
+    return 1;
+  }
   removeFile(paths.pidFile);
   process.stdout.write("atk: stopped\n");
   return 0;
 }
 
 function formatStatusText(status) {
-  if (!status.running) return "atk: not running\n";
+  if (!status.running) {
+    const reason = status.health?.error ? ` (${status.health.error})` : "";
+    const children = (status.children ?? []).map(
+      (child) => `  ${child.role.padEnd(9)} ${child.name.padEnd(10)} pid ${String(child.pid).padEnd(8)} ${child.alive ? "alive" : "DOWN"}`,
+    );
+    return `atk: not running${reason}\n${children.length > 0 ? `${children.join("\n")}\n` : ""}`;
+  }
   const lines = [`atk: running on port ${status.port} since ${status.startedAt}`, `health: ${status.health?.ok ? "ok" : "down"}${status.health?.error ? ` (${status.health.error})` : ""}`];
   for (const child of status.children) {
     lines.push(`  ${child.role.padEnd(9)} ${child.name.padEnd(10)} pid ${String(child.pid).padEnd(8)} ${child.alive ? "alive" : "DOWN"}`);

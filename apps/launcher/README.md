@@ -19,8 +19,10 @@ atk logs   [--data <dir>] [--follow]
 |---|---|---|
 | `start` | 拉起 backend → 等 health → 读 token → scheduler → hosts；写 `launcher.json` | 0 ok / 1 失败 / **2 已有存活实例** |
 | `stop` | hosts → scheduler → backend；SIGTERM 等 5s，超时 SIGKILL；幂等 | 0（无实例也 0） |
-| `status` | 每个子进程的 PID/存活/端口/健康；`--json` 机器可读 | 0 全健康 / 1 有 down / 0 未运行 |
+| `status` | 每个子进程的 PID/存活/端口/健康；`--json` 机器可读 | 0 全健康 / 1 有 down 或 state 损坏 / 0 未运行 |
 | `logs` | 打印 `logs/*.log`；`--follow` 追加 | 0 |
+
+`status` 的 `running` 语义（QA6-02）：**所有 child 都 alive 且 health.ok** 才为 true；backend 被杀时 `running:false`、exit 1，同时保留 `statePresent:true` 和每个 child 的 `alive` 供排查。
 
 数据目录默认 `%LOCALAPPDATA%\AgentTeamKit`（`ATK_DATA_DIR` 覆盖）：
 
@@ -50,6 +52,7 @@ atk logs   [--data <dir>] [--follow]
 - 原子写：临时文件 + fsync + rename；读侧对缺失/损坏/超范围文件一律返回 `null`。
 - **闭集校验**：多出字段（尤其任何 token/secret/credential 键）直接抛错，避免未来重构把凭据写盘。
 - PID 是 `status`/`stop` 的唯一依据；进程死了 → `start` 清理陈旧状态后重启。
+- **损坏状态（QA6-01）**：`launcher.json` 无法解析但 `runtime/launcher.pid` 存活时，`stop` 通过该 supervisor 的**内存子进程清单**按序清理；没有存活 supervisor 时 `stop`/`status` 明确 exit 1 并**保留** `launcher.json` 与 `launcher.pid`，`start` 也拒绝盲启（fail closed）。
 
 ## 内部 token 的处理（评审重点）
 
@@ -57,6 +60,7 @@ atk logs   [--data <dir>] [--follow]
 2. 只放进 scheduler 与 hosts 的 **子进程 env**（`ATK_INTERNAL_TOKEN`），backend 自己的 env 永远没有它；
 3. token 不写 `launcher.json`、不写日志、不进 `status` 输出：
    - backend 的 token 行被特殊处理，日志只记 “internal credential received …”；
+   - 任何包含 `internal token:` 或 `x-atk-internal` 的行都不写原文，统一替换为 `[redacted] internal credential line filtered`；
    - 之后所有子进程输出还会按已知 token 做 `[REDACTED]` 替换；
    - 单测断言 state/日志/`status` JSON 都不含 token 字符串。
 
@@ -86,4 +90,4 @@ node --test apps/launcher/test/*.test.mjs
 node apps/launcher/cli.mjs --help
 ```
 
-单测覆盖：状态文件往返/原子写/闭集；start 幂等 + 存活实例 exit 2；死 PID 陈旧清理；SIGTERM 忽略时的 SIGKILL 升级；backend 未打印 token 即退出；health 超时；stop 顺序（hosts→scheduler→backend）与二次 stop 幂等；token 不落盘；CLI `--help`/未知参数/空 status 的进程级退出码。
+单测覆盖：状态文件往返/原子写/闭集；start 幂等 + 存活实例 exit 2；死 PID 陈旧清理；损坏 `launcher.json` 的 stop/status/start fail-closed；SIGTERM 忽略时的 SIGKILL 升级；backend 未打印 token 即退出；health 超时；stop 顺序（hosts→scheduler→backend）与二次 stop 幂等；token 不落盘；CLI `--help`/未知参数/空 status/损坏状态退出码。

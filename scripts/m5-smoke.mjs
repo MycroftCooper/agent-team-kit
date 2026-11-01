@@ -10,11 +10,12 @@
 // Usage: node scripts/m5-smoke.mjs [--verbose]
 // Exit: 0 = all checks pass, 1 = a check failed, 2 = prerequisites missing.
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -144,6 +145,25 @@ function readRuns() {
     store.close();
   }
 }
+/** True while the PID is still running; `process.kill(pid, 0)` semantics. */
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+/** Exact business counts, read straight from the SQLite file (no HTTP). */
+function dbCounts(file) {
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    const count = (table) => Number(db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get().c);
+    return { tasks: count("tasks"), runs: count("runs"), events: count("events") };
+  } finally {
+    db.close();
+  }
+}
 
 let started = false;
 try {
@@ -185,9 +205,11 @@ try {
     expect(!/"[^"]*token[^"]*"\s*:/i.test(statusText), `status --json leaks a token field: ${statusText.slice(0, 400)}`);
     const stateText = readFileSync(path.join(dataDir, "launcher.json"), "utf8");
     expect(!/x-atk-internal|internal token/i.test(stateText), "launcher.json mentions the internal credential");
-    // The phrase "internal token:" itself may legitimately appear (the backend's
-    // banner); what must never be persisted is the credential VALUE. A 43-char
-    // base64url string is the token shape, and an unredacted line is a leak.
+    // QA6-04: the scan scope is explicitly logs/ + launcher.json + status output.
+    // It deliberately does NOT scan the whole data directory: agent-flow:sqlite
+    // internal strings / legacy exports would create false positives, and the
+    // credential lives in child env only. A 43-char base64url string is the token
+    // shape, and an unredacted "internal token:" line is a leak.
     const offenders = [];
     for (const file of walkFiles(path.join(dataDir, "logs"))) {
       const text = readFileSync(file, "utf8");
@@ -203,6 +225,7 @@ try {
   // -----------------------------------------------------------------------
   check("a killed host is reported down and atk stop is idempotent", async () => {
     const before = status();
+    const recordedPids = before.children.map((child) => child.pid);
     const host = before.children.find((child) => child.role === "host");
     expect(host?.pid, "no host pid in the status output");
     process.kill(host.pid);
@@ -216,16 +239,22 @@ try {
     started = false;
     const after = status();
     expect(after.running === false, `expected not running after stop, got ${JSON.stringify(after)}`);
+    // QA6-03: the real "stop waits" proof is PID-level, not status/port-level.
+    // A stop that merely deletes launcher.json would pass the old assertions.
+    await waitFor(() => recordedPids.every((pid) => !pidAlive(pid)), 5000, "every recorded child PID to exit");
+    const survivors = recordedPids.filter((pid) => pidAlive(pid));
+    expect(survivors.length === 0, `stop returned while these recorded PIDs were still alive: ${survivors.join(",")}`);
     runCli(["stop", "--data", dataDir]); // idempotent: must still exit 0
     const leaked = await fetch(`${base}/api/v1/system/health`).then(() => true).catch(() => false);
     expect(!leaked, "the backend port is still answering after stop");
-    return `host ${host.pid} reported down; stop idempotent; port released`;
+    return `host ${host.pid} reported down; ${recordedPids.length} recorded PID(s) confirmed dead; stop idempotent; port released`;
   });
 
   // -----------------------------------------------------------------------
   // 4. backup -> restore -> start on the restored database
   // -----------------------------------------------------------------------
-  check("a backup can be restored and started", async () => {
+  check("a backup can be restored, but a tampered snapshot is refused", async () => {
+    const originalCounts = dbCounts(dbFile);
     const backupDir = path.join(tmp, "backup");
     const backup = spawnSync(process.execPath, [BACKEND, "backup", "--data", dbFile, "--to", backupDir, "--json"], {
       cwd: ROOT,
@@ -236,6 +265,23 @@ try {
     const manifest = JSON.parse(readFileSync(path.join(backupDir, "manifest.json"), "utf8"));
     expect(manifest.sha256 && manifest.schemaVersion > 0, `bad manifest: ${JSON.stringify(manifest)}`);
 
+    // QA6-03: a tampered snapshot must be refused and must not create/overwrite
+    // the restore target (the sha256 in the manifest is the integrity check).
+    const tamperedDir = path.join(tmp, "backup-tampered");
+    cpSync(backupDir, tamperedDir, { recursive: true });
+    const tamperedManifestPath = path.join(tamperedDir, "manifest.json");
+    const tamperedManifest = JSON.parse(readFileSync(tamperedManifestPath, "utf8"));
+    tamperedManifest.sha256 = "0".repeat(64);
+    writeFileSync(tamperedManifestPath, `${JSON.stringify(tamperedManifest, null, 2)}\n`);
+    const tamperedTarget = path.join(tmp, "tampered-restore", "data", "atk.db");
+    const tamperedRestore = spawnSync(process.execPath, [BACKEND, "restore", "--from", tamperedDir, "--data", tamperedTarget, "--json"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    expect(tamperedRestore.status !== 0, `restore of a tampered snapshot must fail, got ${tamperedRestore.status}: ${tamperedRestore.stdout}`);
+    expect(!existsSync(tamperedTarget), "restore of a tampered snapshot must not create the target database");
+
     const restored = spawnSync(process.execPath, [BACKEND, "restore", "--from", backupDir, "--data", path.join(restoredDir, "data", "atk.db"), "--json"], {
       cwd: ROOT,
       encoding: "utf8",
@@ -243,7 +289,16 @@ try {
     });
     expect(restored.status === 0, `restore failed (${restored.status}): ${restored.stdout}\n${restored.stderr}`);
 
-    const before = readRuns().length;
+    // QA6-03: exact counts of the restored database, before any launcher starts
+    // (starting hosts legitimately creates new runs, so compare the artifact).
+    const restoredCounts = dbCounts(path.join(restoredDir, "data", "atk.db"));
+    for (const table of ["tasks", "runs", "events"]) {
+      expect(
+        restoredCounts[table] === originalCounts[table],
+        `restored ${table} count ${restoredCounts[table]} != original ${originalCounts[table]}`,
+      );
+    }
+
     const restoredPort = await freePort();
     const startRestored = spawnSync(process.execPath, [LAUNCHER, "start", "--port", String(restoredPort), "--data", restoredDir, "--hosts", "1"], {
       cwd: ROOT,
@@ -256,9 +311,8 @@ try {
     try {
       const response = await fetch(`http://127.0.0.1:${restoredPort}/api/v1/system/health`);
       expect(response.ok, `health on restored data: ${response.status}`);
-      const body = await response.json();
-      expect(body.db.counts.runs >= before, `restored run count ${body.db.counts.runs} < original ${before}`);
-      return `manifest schemaVersion ${manifest.schemaVersion}, ${body.db.counts.runs} run(s) preserved`;
+      await response.json();
+      return `manifest schemaVersion ${manifest.schemaVersion}; tampered snapshot refused; restored counts tasks=${restoredCounts.tasks} runs=${restoredCounts.runs} events=${restoredCounts.events} exact`;
     } finally {
       spawnSync(process.execPath, [LAUNCHER, "stop", "--data", restoredDir], { cwd: ROOT, encoding: "utf8", windowsHide: true, env: { ...process.env, ATK_DATA_DIR: restoredDir } });
     }
