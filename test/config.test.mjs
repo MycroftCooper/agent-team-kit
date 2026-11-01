@@ -3,6 +3,7 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   ConfigError,
   DEFAULT_CONFIG,
@@ -93,7 +94,7 @@ test("toProjectRelative normalises absolute and relative input", async () => {
 });
 
 test("bundled presets validate and resolve to their documented layout", async () => {
-  const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
+  const here = path.dirname(fileURLToPath(import.meta.url));
   const presetsDir = path.resolve(here, "..", "presets");
   for (const name of ["generic.json", "p4deck.json"]) {
     const raw = JSON.parse(await readFile(path.join(presetsDir, name), "utf8"));
@@ -139,7 +140,7 @@ test("ownership.mode rejects unknown values and non-object ownership", () => {
 });
 
 test("agent-flow.config.schema.json declares the ownership.mode enum", async () => {
-  const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
+  const here = path.dirname(fileURLToPath(import.meta.url));
   const schema = JSON.parse(await readFile(path.resolve(here, "..", "agent-flow.config.schema.json"), "utf8"));
   const ownership = schema.properties.ownership;
   assert.equal(ownership.type, "object");

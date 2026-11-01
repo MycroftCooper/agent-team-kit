@@ -164,3 +164,23 @@ node scripts/m2-smoke.mjs                        # Lead 写的端到端门禁
 | `GET /internal/v1/runs/:id/reconcile` | 200 `{ run, lease\|null, sessions: [] }`（M2 `sessions` 恒为空数组） |
 
 **门禁实测（`node scripts/m2-smoke.mjs`）**：3/3 通过——COMPLETED 且 `run.updated` 恰好 2 条（RUNNING→COMPLETED）无重复；死 Host 的命令被回收后 `INTERRUPTED` 且恢复 Host **0 次启动**；过期 generation → `409 STALE_GENERATION` 且 Run 保持 `STARTING v0`。
+
+> 该段为初版门禁记录（3 项）。QA-003 后门禁扩展为 4 项（新增"事件已落库、result 未发出的崩溃窗口"），见 §7。
+
+---
+
+## 7. QA-003 之后的补充裁决
+
+独立复核在 M2 冻结版本上发现 2 个 MAJOR / 5 个 MINOR，下面是修正后的**契约补充**（代码与测试以此为准）：
+
+| # | 裁决 |
+|---|---|
+| 8 | **租约过期即失效**：`updateRunStatus(..., {generation})` 与 `completeDispatchCommand(...)` 必须在同一事务内同时校验 `generation` **与** `claimed_until > now`；过期 → `STALE_GENERATION`，`details.reason = "lease-expired"`，零写入。原先只比 generation，导致租约过期后、他人 reclaim 前旧 Host 仍能写终态 |
+| 9 | **命令终态可从 Run 终态推导**：`sweepDispatchCommands({ now })` 关闭所有 `CLAIMED` 且 Run 已终态的命令（Run `COMPLETED` → 命令 `DONE`；其余终态 → `FAILED`），`result_json = {derivedFrom:"run-terminal", runStatus}`。Backend 在**每次 claim 之前**先 sweep，并暴露 `POST /internal/v1/dispatch/sweep`。这填补"事件已落库、result 未发出"的崩溃窗口——否则命令会永久停在 CLAIMED |
+| 10 | **空 `events: []` 是纯 fence，但也必须校验 generation**：合法时 200，stale 时 409。路由不能在"没有事件要写"时跳过 store 调用 |
+| 11 | **409 details 形状统一**：`{runId | commandId, generation, currentGeneration, reason}`，`reason ∈ generation-mismatch | lease-missing | lease-expired` |
+| 12 | **迁移 runner 容错**：`duplicate column name` 视为"该迁移已应用"（记 WARN 后继续），使 0002/0003 在记账行丢失或手工重跑时自愈，与 0001 的 `IF NOT EXISTS` 风格一致 |
+| 13 | **Host 重启必须 reconcile**：Host 在启动后、领取新命令前，先对持久化的在途记录逐个调用 `reconcile`；终态记录清除，未终态记录保留交给 reclaim 路径（`attempts > 1` → `INTERRUPTED`）。**绝不**根据本地记录猜"完成" |
+| 14 | **门禁必须断言最终业务事实**：`m2-smoke` 必须断言 dispatch command 的最终状态（`DONE` / `FAILED` + reason）、不允许残留 `PENDING`/`CLAIMED`、且 `host.stats.errors === 0`。只断言 Run 状态会让"被吞掉的 400"看起来是绿的（QA-003 BLOCKER 的根因） |
+
+**§5 覆盖说明（诚实版）**：§5 列出的 6 项中，门禁脚本直接覆盖 1/2/3/4/5；`startFails` 与 `neverEnds` 由 `apps/runtime-host` 的包测试覆盖（不在门禁里重复），`reconcile` 由 Host 的 `recover()` 测试 + Backend 的 sweep 路径覆盖。门禁（4 项）与包测试的分工以此为准，不再声称"门禁覆盖全部 6 项"。

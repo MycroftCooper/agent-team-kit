@@ -264,7 +264,37 @@ try {
   });
 
   // -------------------------------------------------------------------------
-  // 3. generation fencing: an outdated holder cannot append events
+  // 3. the "events landed, result never sent" window (QA-003 MAJOR-2)
+  // -------------------------------------------------------------------------
+  check("a command whose run already finished is closed by the backend sweep", async () => {
+    const internal = createInternalClient({ baseUrl: base, token: internalToken });
+    const orphan = seedRun(seed, "orphan");
+    const victim = await internal.claim({ ownerId: "host-d3", leaseMs: 5000 });
+    expect(victim?.command?.id === orphan.command.id, `expected to claim the orphan command, got ${victim?.command?.id}`);
+    // The run reaches COMPLETED (through the legal STARTING -> RUNNING ->
+    // COMPLETED chain), but the host dies before sending the result.
+    await internal.events(victim.run.id, {
+      generation: victim.lease.generation,
+      events: [
+        { type: "session.started", sessionId: "d3", at: new Date().toISOString() },
+        { type: "session.ended", sessionId: "d3", reason: "completed", exitCode: 0, at: new Date().toISOString() },
+      ],
+    });
+    expect((await getRun(victim.run.id)).status === "COMPLETED", "the run should be COMPLETED before the command is closed");
+    expect((await commandRow(orphan.command.id)).status === "CLAIMED", "the command must still be CLAIMED right after the crash window");
+
+    // Any later claim sweeps first: the command is derived from the run's terminal state.
+    const next = seedRun(seed, "after-orphan");
+    await internal.claim({ ownerId: "host-sweep", leaseMs: 5000 });
+    const closed = await commandRow(orphan.command.id);
+    expect(closed.status === "DONE", `expected the orphan command swept to DONE, got ${closed.status}`);
+    expect(String(closed.resultJson ?? "").includes("run-terminal"), `expected derivedFrom run-terminal, got ${closed.resultJson}`);
+    expect(closed.completedAt, "a swept command must carry completed_at");
+    return `orphan command DONE (${closed.resultJson}); next command ${next.command.id} still claimable`;
+  });
+
+  // -------------------------------------------------------------------------
+  // 4. generation fencing: an outdated holder cannot append events
   // -------------------------------------------------------------------------
   check("an outdated generation is refused and leaves the run untouched", async () => {
     const fenced = seedRun(seed, "fenced");
