@@ -17,6 +17,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/database
 
+  apps/runtime-host:
+    dependencies:
+      '@atk/runtime-sdk':
+        specifier: workspace:*
+        version: link:../../packages/runtime-sdk
+
   apps/web:
     dependencies:
       '@atk/contracts':
@@ -52,6 +58,14 @@ importers:
       '@atk/contracts':
         specifier: workspace:*
         version: link:../contracts
+
+  packages/runtime-sdk:
+    dependencies:
+      '@atk/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+
+  packages/workspace: {}
 
 packages:
 
