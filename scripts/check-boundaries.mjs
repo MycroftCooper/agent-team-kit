@@ -16,13 +16,14 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PACKAGES = ["web", "backend", "database", "contracts", "runtime-sdk", "workspace"];
-const APP_PREFIXES = { web: "apps/web", backend: "apps/backend" };
+const PACKAGES = ["web", "backend", "database", "contracts", "runtime-sdk", "workspace", "scheduler", "scheduler-core"];
+const APP_PREFIXES = { web: "apps/web", backend: "apps/backend", scheduler: "apps/scheduler" };
 const PKG_PREFIXES = {
   database: "packages/database",
   contracts: "packages/contracts",
   "runtime-sdk": "packages/runtime-sdk",
   workspace: "packages/workspace",
+  "scheduler-core": "packages/scheduler-core",
 };
 
 const ALLOWED = {
@@ -32,6 +33,8 @@ const ALLOWED = {
   contracts: new Set(),
   "runtime-sdk": new Set(["contracts"]),
   workspace: new Set([]),
+  scheduler: new Set(["scheduler-core", "contracts"]),
+  "scheduler-core": new Set([]),
 };
 
 const IMPORT_RE = /(?:^|\n)\s*(?:import|export)[^;]*?from\s+["']([^"']+)["']|(?:^|\n)\s*import\s+["']([^"']+)["']|import\(\s*["']([^"']+)["']\s*\)/g;
