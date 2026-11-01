@@ -57,6 +57,38 @@ export function taskDto(projectId, overrides = {}) {
   };
 }
 
+export const MAIN_CHAIN = Object.freeze([
+  "DRAFT",
+  "READY",
+  "CLAIMED",
+  "RUNNING",
+  "REVIEWING",
+  "INTEGRATING",
+  "AWAITING_ACCEPTANCE",
+  "DONE",
+]);
+
+/**
+ * Move a task to `target` using only legal §5.2 transitions (fixture setup for
+ * later states). Throws if the target is not reachable, so setup code can never
+ * accidentally rely on an illegal jump.
+ */
+export function advanceTask(store, id, target) {
+  for (let guard = 0; guard < 16; guard += 1) {
+    const task = store.getTask(id);
+    if (task.status === target) return task;
+    const currentIndex = MAIN_CHAIN.indexOf(task.status);
+    const targetIndex = MAIN_CHAIN.indexOf(target);
+    let next;
+    if (currentIndex >= 0 && targetIndex > currentIndex) next = MAIN_CHAIN[currentIndex + 1];
+    else if (target === "BLOCKED" || target === "CANCELLED") next = target;
+    else if (task.status === "BLOCKED" && targetIndex >= 0) next = "READY";
+    else throw new Error(`advanceTask: cannot move ${task.status} -> ${target}`);
+    store.patchTask(id, { expectedVersion: task.version, changes: { status: next } });
+  }
+  throw new Error(`advanceTask: transition guard exceeded for ${id} -> ${target}`);
+}
+
 /** Legacy state.json fixture modelled on examples/minimal plus archived data. */
 export function sampleState(overrides = {}) {
   return {

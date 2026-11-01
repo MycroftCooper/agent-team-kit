@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 
 import { createServer } from "./src/server.mjs";
 import { runtimePaths } from "./src/paths.mjs";
+import { readJsonFile } from "./src/json.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_WEB_DIST = path.resolve(HERE, "..", "web", "dist");
@@ -31,9 +32,11 @@ Commands:
            Import a legacy agent-flow state.json into SQLite
            (default source: .agent-flow/state.json + sibling ownership/runtime;
             --config defaults to ./agent-flow.config.json when present).
+           JSON files may carry a UTF-8 BOM (Windows editors add one).
   doctor   [--json]
            Read-only diagnostics: node, paths, database availability, web build,
            port availability and the security configuration summary.
+           Exit 1 when at least one check FAILs (usable as a health gate).
   export   --out <file> [--data <file>] [--project <id>] [--json]
            Export the SQLite store back to a state JSON document.
 
@@ -120,12 +123,25 @@ function openStore(database, file) {
   return database.openStore({ file, migrate: true });
 }
 
+/**
+ * Read an optional JSON sidecar (ownership/runtime/config). `readJsonFile`
+ * tolerates a UTF-8 BOM (QA2-04) and names the file in every failure.
+ */
 function readOptionalJson(file) {
-  if (!file || !fs.existsSync(file)) return null;
+  if (!file) return null;
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
+    return readJsonFile(file, { optional: true });
   } catch (error) {
-    throw new CliError(`cannot parse ${file}: ${shortError(error)}`);
+    throw new CliError(error.message);
+  }
+}
+
+/** Read required JSON; parsing/read failures keep the exit-2 usage-error semantics. */
+function readRequiredJson(file) {
+  try {
+    return readJsonFile(file);
+  } catch (error) {
+    throw new CliError(error.message);
   }
 }
 
@@ -216,15 +232,7 @@ async function migrate(flags) {
   const paths = runtimePaths();
   const dryRun = Boolean(flags["dry-run"]);
   const fromFile = flags.from ? path.resolve(flags.from) : path.resolve(".agent-flow", "state.json");
-  if (!fs.existsSync(fromFile)) {
-    throw new CliError(`state file not found: ${fromFile}`);
-  }
-  let stateJson;
-  try {
-    stateJson = JSON.parse(fs.readFileSync(fromFile, "utf8"));
-  } catch (error) {
-    throw new CliError(`cannot parse state JSON ${fromFile}: ${shortError(error)}`);
-  }
+  const stateJson = readRequiredJson(fromFile);
   const sourceDir = path.dirname(fromFile);
   const ownership = readOptionalJson(path.join(sourceDir, "ownership.json"));
   const runtime = readOptionalJson(path.join(sourceDir, "runtime.json"));
@@ -364,7 +372,10 @@ async function doctor(flags) {
     process.stdout.write("security: bind 127.0.0.1; Host allow-list; write Origin+CSRF; session token (health/session exempt)\n");
     process.stdout.write(`result: ${report.ok ? "OK" : "ATTENTION"}\n`);
   }
-  return 0;
+  // A diagnostic command used by operators/CI must fail when something is
+  // actually wrong: exit 1 couples the exit code to `report.ok` (Lead decision
+  // on QA2-04). `--json` follows the same rule.
+  return report.ok ? 0 : 1;
 }
 
 async function exportCommand(flags) {

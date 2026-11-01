@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EVENT_SCHEMA_VERSION, validateEvent } from "@atk/contracts";
-import { projectDto, taskDto, useStore } from "./helpers.mjs";
+import { advanceTask, projectDto, taskDto, useStore } from "./helpers.mjs";
 
 function openProject(t) {
   const { store } = useStore(t);
@@ -131,13 +131,13 @@ test("overview aggregates tasks, blocked/awaiting lists and recent events", (t) 
   const blocked = store.createTask(
     taskDto("proj-1", { id: "TASK-BLOCKED", title: "blocked", priority: 1 }),
   );
-  store.patchTask("TASK-BLOCKED", { expectedVersion: 0, changes: { status: "BLOCKED" } });
+  advanceTask(store, "TASK-BLOCKED", "BLOCKED");
   store.createTask(taskDto("proj-1", { id: "TASK-REVIEW", title: "reviewing" }));
-  store.patchTask("TASK-REVIEW", { expectedVersion: 0, changes: { status: "REVIEWING" } });
+  advanceTask(store, "TASK-REVIEW", "REVIEWING");
   store.createTask(taskDto("proj-1", { id: "TASK-ACCEPT", title: "accept" }));
-  store.patchTask("TASK-ACCEPT", { expectedVersion: 0, changes: { status: "AWAITING_ACCEPTANCE" } });
+  advanceTask(store, "TASK-ACCEPT", "AWAITING_ACCEPTANCE");
   store.createTask(taskDto("proj-1", { id: "TASK-DONE", title: "done" }));
-  store.patchTask("TASK-DONE", { expectedVersion: 0, changes: { status: "DONE" } });
+  advanceTask(store, "TASK-DONE", "DONE");
 
   for (let index = 0; index < 25; index += 1) {
     store.appendEvent({

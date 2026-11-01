@@ -644,13 +644,24 @@ export function importStateJson(store, options = {}) {
         createdRecords.push(record);
       }
       for (const record of createdRecords) {
-        const changes = {};
         const deps = depPlans.get(record.mapped.id) ?? [];
-        if (deps.length > 0) changes.deps = deps;
-        if (record.mapped.status !== "READY") changes.status = record.mapped.status;
-        if (Object.keys(changes).length === 0) continue;
-        const task = store.getTask(record.mapped.id);
-        store.patchTask(record.mapped.id, { expectedVersion: task.version, changes });
+        // Legacy statuses are a *snapshot*, not a client transition: a package
+        // that was already DONE did not walk READY→…→DONE in this store. The
+        // migration-only writer bypasses the §5.2 chain deliberately; public
+        // patchTask (Backend/Web) always enforces it.
+        if (record.mapped.status !== "READY") {
+          const internal = store[INTERNAL];
+          if (typeof internal?.setTaskStatus !== "function") {
+            fail("INTERNAL_ERROR", "store implementation does not expose the migration status writer", {
+              taskId: record.mapped.id,
+            });
+          }
+          internal.setTaskStatus(record.mapped.id, record.mapped.status);
+        }
+        if (deps.length > 0) {
+          const task = store.getTask(record.mapped.id);
+          store.patchTask(record.mapped.id, { expectedVersion: task.version, changes: { deps } });
+        }
       }
       for (const agent of agentPlans) {
         if (existingAgentIds.has(agent.id)) continue;

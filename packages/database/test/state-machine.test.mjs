@@ -1,0 +1,266 @@
+// Task lifecycle state machine (implementation spec §5.2, QA2-01):
+// the pure transition table plus the behaviour both stores must share.
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { TASK_STATUSES } from "@atk/contracts";
+import { createMemoryStore } from "@atk/database";
+import {
+  TASK_MAIN_CHAIN,
+  TASK_TERMINAL_STATUSES,
+  allowedTransitionsFrom,
+  canTransition,
+  taskStatusMachine,
+} from "../src/model.mjs";
+import { advanceTask, projectDto, taskDto, useStore } from "./helpers.mjs";
+
+/** Canonical table (what will be documented in m1-contracts). */
+const EXPECTED_TRANSITIONS = {
+  DRAFT: ["READY", "BLOCKED", "CANCELLED"],
+  READY: ["CLAIMED", "BLOCKED", "CANCELLED"],
+  CLAIMED: ["RUNNING", "BLOCKED", "CANCELLED"],
+  RUNNING: ["REVIEWING", "BLOCKED", "CANCELLED"],
+  REVIEWING: ["INTEGRATING", "BLOCKED", "CANCELLED"],
+  INTEGRATING: ["AWAITING_ACCEPTANCE", "BLOCKED", "CANCELLED"],
+  AWAITING_ACCEPTANCE: ["DONE", "BLOCKED", "CANCELLED"],
+  BLOCKED: ["READY", "CANCELLED"],
+  DONE: [],
+  CANCELLED: [],
+};
+
+function openBothStores(t) {
+  const { store: sqlite } = useStore(t);
+  const memory = createMemoryStore();
+  for (const store of [sqlite, memory]) store.createProject(projectDto());
+  t.after(() => memory.close());
+  return [sqlite, memory];
+}
+
+test("canTransition is a pure total function matching the documented table", () => {
+  assert.deepEqual([...TASK_MAIN_CHAIN], [
+    "DRAFT",
+    "READY",
+    "CLAIMED",
+    "RUNNING",
+    "REVIEWING",
+    "INTEGRATING",
+    "AWAITING_ACCEPTANCE",
+    "DONE",
+  ]);
+  assert.deepEqual([...TASK_TERMINAL_STATUSES], ["DONE", "CANCELLED"]);
+  assert.equal(taskStatusMachine.canTransition, canTransition);
+  assert.equal(taskStatusMachine.allowedTransitions, allowedTransitionsFrom);
+
+  for (const from of TASK_STATUSES) {
+    assert.deepEqual(allowedTransitionsFrom(from), EXPECTED_TRANSITIONS[from], `allowed(${from})`);
+    assert.deepEqual(
+      taskStatusMachine.transitions[from],
+      EXPECTED_TRANSITIONS[from],
+      `table(${from})`,
+    );
+    for (const to of TASK_STATUSES) {
+      const expected = from === to || EXPECTED_TRANSITIONS[from].includes(to);
+      assert.equal(canTransition(from, to), expected, `canTransition(${from}, ${to})`);
+    }
+  }
+
+  // Self-transitions are allowed (patchTask treats them as idempotent success),
+  // but they are not part of the "what changes are legal" table.
+  for (const status of TASK_STATUSES) {
+    assert.equal(canTransition(status, status), true);
+    assert.ok(!allowedTransitionsFrom(status).includes(status));
+  }
+  // DRAFT is the initial state only: nothing transitions into it.
+  for (const from of TASK_STATUSES) {
+    if (from !== "DRAFT") assert.equal(canTransition(from, "DRAFT"), false, `${from} -> DRAFT`);
+  }
+  // DONE/CANCELLED are terminal.
+  for (const terminal of TASK_TERMINAL_STATUSES) {
+    assert.deepEqual(allowedTransitionsFrom(terminal), []);
+    for (const to of TASK_STATUSES) {
+      if (to !== terminal) assert.equal(canTransition(terminal, to), false, `${terminal} -> ${to}`);
+    }
+  }
+  // Unknown values never throw and never pass.
+  assert.equal(canTransition("NOPE", "READY"), false);
+  assert.equal(canTransition("READY", "NOPE"), false);
+  assert.deepEqual(allowedTransitionsFrom("NOPE"), []);
+});
+
+test("both stores walk the legal main chain step by step", (t) => {
+  for (const [index, store] of openBothStores(t).entries()) {
+    const label = index === 0 ? "sqlite" : "memory";
+    store.createTask(taskDto("proj-1", { id: "TASK-CHAIN" }));
+    let expectedVersion = store.getTask("TASK-CHAIN").version;
+    assert.equal(store.getTask("TASK-CHAIN").status, "READY");
+    // Same-state is an idempotent success (READY -> READY), not an error.
+    const selfPatch = store.patchTask("TASK-CHAIN", {
+      expectedVersion,
+      changes: { status: "READY" },
+    });
+    assert.equal(selfPatch.status, "READY", label);
+    expectedVersion = selfPatch.version;
+    for (const next of ["CLAIMED", "RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE", "DONE"]) {
+      const before = store.getTask("TASK-CHAIN");
+      const updated = store.patchTask("TASK-CHAIN", {
+        expectedVersion: before.version,
+        changes: { status: next },
+      });
+      expectedVersion += 1;
+      assert.equal(updated.status, next, `${label}: ${next}`);
+      assert.equal(updated.version, expectedVersion, `${label}: version after ${next}`);
+    }
+    assert.equal(store.getTask("TASK-CHAIN").status, "DONE");
+  }
+});
+
+test("both stores reject illegal jumps, backwards moves and DRAFT", (t) => {
+  for (const [index, store] of openBothStores(t).entries()) {
+    const label = index === 0 ? "sqlite" : "memory";
+    store.createTask(taskDto("proj-1", { id: "TASK-JUMPS" }));
+    const before = store.getTask("TASK-JUMPS");
+
+    for (const [from, to] of [
+      ["READY", "DONE"],
+      ["READY", "RUNNING"],
+      ["READY", "REVIEWING"],
+      ["READY", "AWAITING_ACCEPTANCE"],
+      ["READY", "DRAFT"],
+      ["READY", "INTEGRATING"],
+    ]) {
+      assert.throws(
+        () => store.patchTask("TASK-JUMPS", { expectedVersion: before.version, changes: { status: to } }),
+        (error) =>
+          error.code === "VALIDATION_ERROR" &&
+          error.details.from === from &&
+          error.details.to === to &&
+          assert.deepEqual(error.details.allowed, EXPECTED_TRANSITIONS[from]) === undefined,
+        `${label}: ${from} -> ${to}`,
+      );
+    }
+    // Rejected transitions must not write anything (version/title unchanged).
+    const after = store.getTask("TASK-JUMPS");
+    assert.equal(after.status, "READY", label);
+    assert.equal(after.version, before.version, label);
+
+    // An illegal transition in a mixed patch must not apply the other fields.
+    const titleBefore = after.title;
+    assert.throws(
+      () =>
+        store.patchTask("TASK-JUMPS", {
+          expectedVersion: after.version,
+          changes: { title: "should not apply", priority: 0, status: "DONE" },
+        }),
+      (error) => error.code === "VALIDATION_ERROR",
+    );
+    const unchanged = store.getTask("TASK-JUMPS");
+    assert.equal(unchanged.title, titleBefore, label);
+    assert.equal(unchanged.priority, 2, label);
+    assert.equal(unchanged.version, after.version, label);
+
+    // DONE is terminal: it can neither go back nor be "cancelled away".
+    advanceTask(store, "TASK-JUMPS", "DONE");
+    const done = store.getTask("TASK-JUMPS");
+    for (const to of ["READY", "CANCELLED", "RUNNING", "DRAFT"]) {
+      assert.throws(
+        () => store.patchTask("TASK-JUMPS", { expectedVersion: done.version, changes: { status: to } }),
+        (error) => error.code === "VALIDATION_ERROR" && error.details.from === "DONE",
+        `${label}: DONE -> ${to}`,
+      );
+    }
+    // Same-state is an idempotent success (version still advances).
+    const idempotent = store.patchTask("TASK-JUMPS", {
+      expectedVersion: done.version,
+      changes: { status: "DONE" },
+    });
+    assert.equal(idempotent.status, "DONE", label);
+    assert.equal(idempotent.version, done.version + 1, label);
+  }
+});
+
+test("BLOCKED is a branch state with exactly one way back (READY)", (t) => {
+  for (const [index, store] of openBothStores(t).entries()) {
+    const label = index === 0 ? "sqlite" : "memory";
+    store.createTask(taskDto("proj-1", { id: "TASK-BLOCK" }));
+    const ready = store.getTask("TASK-BLOCK");
+    const blocked = store.patchTask("TASK-BLOCK", {
+      expectedVersion: ready.version,
+      changes: { status: "BLOCKED" },
+    });
+    assert.equal(blocked.status, "BLOCKED", label);
+
+    // BLOCKED → READY is the sanctioned re-entry.
+    const reopened = store.patchTask("TASK-BLOCK", {
+      expectedVersion: blocked.version,
+      changes: { status: "READY" },
+    });
+    assert.equal(reopened.status, "READY", label);
+
+    // Re-block and verify the rest of the exits.
+    const blockedAgain = store.patchTask("TASK-BLOCK", {
+      expectedVersion: reopened.version,
+      changes: { status: "BLOCKED" },
+    });
+    for (const to of ["RUNNING", "DONE", "DRAFT", "CLAIMED", "AWAITING_ACCEPTANCE"]) {
+      assert.throws(
+        () =>
+          store.patchTask("TASK-BLOCK", {
+            expectedVersion: blockedAgain.version,
+            changes: { status: to },
+          }),
+        (error) => error.code === "VALIDATION_ERROR" && error.details.from === "BLOCKED",
+        `${label}: BLOCKED -> ${to}`,
+      );
+    }
+    const cancelled = store.patchTask("TASK-BLOCK", {
+      expectedVersion: blockedAgain.version,
+      changes: { status: "CANCELLED" },
+    });
+    assert.equal(cancelled.status, "CANCELLED", label);
+
+    // CANCELLED is terminal.
+    for (const to of ["READY", "RUNNING", "BLOCKED", "DONE", "DRAFT"]) {
+      assert.throws(
+        () =>
+          store.patchTask("TASK-BLOCK", {
+            expectedVersion: cancelled.version,
+            changes: { status: to },
+          }),
+        (error) => error.code === "VALIDATION_ERROR" && error.details.from === "CANCELLED",
+        `${label}: CANCELLED -> ${to}`,
+      );
+    }
+    const cancelledAgain = store.patchTask("TASK-BLOCK", {
+      expectedVersion: cancelled.version,
+      changes: { status: "CANCELLED" },
+    });
+    assert.equal(cancelledAgain.status, "CANCELLED", label);
+  }
+});
+
+test("any non-terminal state can be cancelled; DONE cannot", (t) => {
+  for (const [index, store] of openBothStores(t).entries()) {
+    const label = index === 0 ? "sqlite" : "memory";
+    const states = ["READY", "CLAIMED", "RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE"];
+    states.forEach((state, position) => {
+      const id = `TASK-CANCEL-${position}`;
+      store.createTask(taskDto("proj-1", { id }));
+      advanceTask(store, id, state);
+      const task = store.getTask(id);
+      const cancelled = store.patchTask(id, { expectedVersion: task.version, changes: { status: "CANCELLED" } });
+      assert.equal(cancelled.status, "CANCELLED", `${label}: ${state} -> CANCELLED`);
+    });
+    // DONE → CANCELLED is not an allowed exit.
+    store.createTask(taskDto("proj-1", { id: "TASK-DONE-CANCEL" }));
+    advanceTask(store, "TASK-DONE-CANCEL", "DONE");
+    const done = store.getTask("TASK-DONE-CANCEL");
+    assert.throws(
+      () =>
+        store.patchTask("TASK-DONE-CANCEL", {
+          expectedVersion: done.version,
+          changes: { status: "CANCELLED" },
+        }),
+      (error) => error.code === "VALIDATION_ERROR" && error.details.allowed.length === 0,
+      `${label}: DONE -> CANCELLED`,
+    );
+  }
+});

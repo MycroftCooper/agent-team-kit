@@ -130,6 +130,113 @@ export function validateTaskStatus(status) {
 }
 
 // ---------------------------------------------------------------------------
+// Task lifecycle state machine (implementation spec §5.2)
+// ---------------------------------------------------------------------------
+//
+// This is a *pure* description of the legal task transitions, shared by the
+// SQLite and the in-memory store: there is exactly one table in this package.
+// See docs/architecture/m1-contracts.md §1 ("spec §5.2 状态机").
+//
+// Main chain (forward only):
+//   DRAFT → READY → CLAIMED → RUNNING → REVIEWING → INTEGRATING
+//         → AWAITING_ACCEPTANCE → DONE
+//
+// Branches:
+//   * every non-terminal state may become BLOCKED;
+//   * BLOCKED may re-enter the main chain at READY (the scheduler re-dispatches
+//     from READY; there is no previous-state memory in schema v1);
+//   * every non-DONE state may become CANCELLED (including BLOCKED);
+//   * DONE and CANCELLED are terminal: nothing transitions out of them.
+//
+// `from === to` is always allowed and is handled as an idempotent success by
+// `patchTask` (it is not listed in the transition table, which only says what a
+// *change* to another state may be).
+//
+// Deliberately NOT allowed in M1 (no edges):
+//   * skipping a main-chain step (READY → DONE, READY → REVIEWING, ...);
+//   * going backwards (DONE → READY, REVIEWING → RUNNING, BLOCKED → RUNNING);
+//   * DONE → CANCELLED (a finished task is not cancellable);
+//   * any state → DRAFT (DRAFT is the initial state only).
+// Rework loops (REVIEWING → RUNNING, INTEGRATING → RUNNING) need run/session
+// knowledge and belong to the scheduler (M3); adding them here without that
+// context would let a client re-open reviewed work.
+export const TASK_MAIN_CHAIN = Object.freeze([
+  "DRAFT",
+  "READY",
+  "CLAIMED",
+  "RUNNING",
+  "REVIEWING",
+  "INTEGRATING",
+  "AWAITING_ACCEPTANCE",
+  "DONE",
+]);
+
+export const TASK_TERMINAL_STATUSES = Object.freeze(["DONE", "CANCELLED"]);
+
+const TASK_STATUS_ORDER = new Map(TASK_STATUSES.map((status, index) => [status, index]));
+
+const TASK_TRANSITIONS = Object.freeze(
+  (() => {
+    /** @type {Record<string, string[]>} */
+    const table = Object.fromEntries(TASK_STATUSES.map((status) => [status, []]));
+    const add = (from, to) => {
+      if (from === to) return;
+      if (!table[from].includes(to)) table[from].push(to);
+    };
+    for (let index = 0; index < TASK_MAIN_CHAIN.length - 1; index += 1) {
+      add(TASK_MAIN_CHAIN[index], TASK_MAIN_CHAIN[index + 1]);
+    }
+    for (const status of TASK_STATUSES) {
+      if (TASK_TERMINAL_STATUSES.includes(status)) continue;
+      add(status, "BLOCKED");
+      add(status, "CANCELLED");
+    }
+    add("BLOCKED", "READY");
+    for (const status of TASK_STATUSES) {
+      table[status].sort((a, b) => TASK_STATUS_ORDER.get(a) - TASK_STATUS_ORDER.get(b));
+      Object.freeze(table[status]);
+    }
+    return Object.freeze(table);
+  })(),
+);
+
+/**
+ * Pure predicate: may a task move from `from` to `to`?
+ * Same-state (`from === to`) is allowed (idempotent/no-op change); unknown
+ * values return `false` instead of throwing, so callers can probe safely.
+ */
+export function canTransition(from, to) {
+  if (!TASK_STATUSES.includes(from) || !TASK_STATUSES.includes(to)) return false;
+  if (from === to) return true;
+  return TASK_TRANSITIONS[from].includes(to);
+}
+
+/** The transitions out of `from` to a *different* state, in enum order. */
+export function allowedTransitionsFrom(from) {
+  if (!TASK_STATUSES.includes(from)) return [];
+  return [...TASK_TRANSITIONS[from]];
+}
+
+/** Throw the contract error for an illegal transition (never a version clash). */
+export function assertTaskTransition(from, to) {
+  if (canTransition(from, to)) return true;
+  fail("VALIDATION_ERROR", `task.status cannot transition from ${from} to ${to}`, {
+    from,
+    to,
+    allowed: allowedTransitionsFrom(from),
+  });
+}
+
+/** Named, frozen view of the machine (pure functions only, no state). */
+export const taskStatusMachine = Object.freeze({
+  mainChain: TASK_MAIN_CHAIN,
+  terminal: TASK_TERMINAL_STATUSES,
+  transitions: TASK_TRANSITIONS,
+  canTransition,
+  allowedTransitions: allowedTransitionsFrom,
+});
+
+// ---------------------------------------------------------------------------
 // Project
 // ---------------------------------------------------------------------------
 
@@ -268,6 +375,10 @@ export function mergeTask(current, changes, { now } = {}) {
     } else merged[key] = value;
   }
   validateTaskStatus(merged.status);
+  // spec §5.2: transitions are validated by the pure state machine above, so a
+  // client cannot jump READY → DONE / CANCELLED or reopen a terminal task.
+  // Both store implementations call mergeTask, so they share this one judgement.
+  assertTaskTransition(current.status, merged.status);
   assertValid(validateTask, merged, "task");
   return {
     ...merged,

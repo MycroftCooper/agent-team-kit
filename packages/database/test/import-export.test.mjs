@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { exportStateJson, importStateJson } from "@atk/database";
-import { sampleOwnership, sampleRuntime, sampleState, taskDto, useStore } from "./helpers.mjs";
+import { advanceTask, sampleOwnership, sampleRuntime, sampleState, taskDto, useStore } from "./helpers.mjs";
 
 const CONFIG = { project: "demo-project" };
 
@@ -283,13 +283,8 @@ test("export synthesizes legacy entries for tasks created after migration", (t) 
   const store = openStoreFor(t);
   store.createProject({ id: "p-api", name: "API project", repoPath: "E:\\demo", defaultBranch: "main" });
   store.createTask(taskDto("p-api", { id: "API-01", title: "First", priority: 1 }));
-  const dependent = store.createTask(
-    taskDto("p-api", { id: "API-02", title: "Second", priority: 2, deps: ["API-01"] }),
-  );
-  store.patchTask("API-02", {
-    expectedVersion: dependent.version,
-    changes: { status: "DONE" },
-  });
+  store.createTask(taskDto("p-api", { id: "API-02", title: "Second", priority: 2, deps: ["API-01"] }));
+  advanceTask(store, "API-02", "DONE");
 
   const { state } = exportStateJson(store, { projectId: "p-api" });
   assert.equal(state.packages.length, 2);
@@ -368,8 +363,7 @@ test("export requires a project when the store is ambiguous", (t) => {
 test("export reflects post-import status changes in the legacy vocabulary", (t) => {
   const store = openStoreFor(t);
   importer(store)(sampleState());
-  const slice = store.getTask("SLICE-01");
-  store.patchTask(slice.id, { expectedVersion: slice.version, changes: { status: "DONE" } });
+  advanceTask(store, "SLICE-01", "DONE");
   const task = store.getTask("DEMO-02");
   store.patchTask(task.id, { expectedVersion: task.version, changes: { status: "CANCELLED" } });
   const { state } = exportStateJson(store);

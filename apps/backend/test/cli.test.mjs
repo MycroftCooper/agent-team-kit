@@ -1,7 +1,7 @@
-// CLI smoke tests: usage, doctor, and the stack-free failure mode for
-// migrate when @atk/database (a parallel worker's package) is not available.
+// CLI tests: usage, doctor exit-code semantics, and migrate's JSON inputs
+// (QA2-04: UTF-8 BOM tolerance; broken JSON stays a clean exit-2 error).
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,17 @@ import { fileURLToPath } from "node:url";
 
 const CLI = fileURLToPath(new URL("../cli.mjs", import.meta.url));
 
+// migrate needs the database package; its tests skip (not pass) while it is
+// unavailable, so this file never depends on another worker's progress.
+let databaseAvailable = false;
+try {
+  const database = await import("@atk/database");
+  databaseAvailable = typeof database.openStore === "function" && typeof database.importStateJson === "function";
+} catch {
+  databaseAvailable = false;
+}
+const DB_SKIP = databaseAvailable ? false : "@atk/database is not available in this checkout";
+
 function runCli(args, { cwd } = {}) {
   return spawnSync(process.execPath, [CLI, ...args], {
     encoding: "utf8",
@@ -17,6 +28,45 @@ function runCli(args, { cwd } = {}) {
     timeout: 30_000,
     windowsHide: true,
   });
+}
+
+function writeJson(file, value, { bom = false } = {}) {
+  fs.writeFileSync(file, `${bom ? "\uFEFF" : ""}${JSON.stringify(value)}`, "utf8");
+}
+
+/** Legacy flow fixture; when `bom` is true every JSON file starts with U+FEFF. */
+function createFlowFixture({ bom = false } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "atk-cli-flow-"));
+  const flow = path.join(root, ".agent-flow");
+  fs.mkdirSync(flow, { recursive: true });
+  writeJson(path.join(flow, "state.json"), { schemaVersion: 1 }, { bom });
+  writeJson(
+    path.join(flow, "ownership.json"),
+    { schemaVersion: 1, roles: ["LEAD"], rules: [{ prefix: "apps/", role: "LEAD" }], ignoredPrefixes: [] },
+    { bom },
+  );
+  writeJson(
+    path.join(flow, "runtime.json"),
+    { schemaVersion: 3, agents: [{ id: "agent-bom-01", role: "LEAD", capabilities: ["ORCHESTRATOR"], status: "idle" }] },
+    { bom },
+  );
+  const config = path.join(root, "agent-flow.config.json");
+  writeJson(config, { schemaVersion: 1, project: "bom-project" }, { bom });
+  return { root, flow, config, db: path.join(root, "state.db") };
+}
+
+function migrateArgs(fixture) {
+  return [
+    "migrate",
+    "--from",
+    path.join(fixture.flow, "state.json"),
+    "--config",
+    fixture.config,
+    "--data",
+    fixture.db,
+    "--dry-run",
+    "--json",
+  ];
 }
 
 test("cli.mjs --help prints usage and exits 0", () => {
@@ -29,9 +79,9 @@ test("cli.mjs --help prints usage and exits 0", () => {
   assert.match(result.stdout, /export/);
 });
 
-test("cli.mjs doctor --json is diagnostic JSON and exits 0", () => {
+test("cli.mjs doctor --json reports checks and couples its exit code to report.ok", () => {
   const result = runCli(["doctor", "--json"]);
-  assert.equal(result.status, 0, result.stderr);
+  assert.ok([0, 1].includes(result.status), `unexpected exit ${result.status}: ${result.stderr}`);
   const report = JSON.parse(result.stdout);
   assert.equal(typeof report.ok, "boolean");
   assert.ok(Array.isArray(report.checks) && report.checks.length > 0);
@@ -42,6 +92,35 @@ test("cli.mjs doctor --json is diagnostic JSON and exits 0", () => {
   for (const check of report.checks) {
     assert.ok(["PASS", "FAIL", "SKIPPED"].includes(check.status), `bad check status ${check.status}`);
   }
+  assert.equal(result.status === 0, report.ok, "doctor exit code must mirror report.ok");
+});
+
+test("doctor exits 1 when a check FAILs (port 1421 occupied)", async (t) => {
+  // Hold 127.0.0.1:1421 from a separate process so doctor's port probe FAILs.
+  // If the port is already occupied by something else, the outcome is the same.
+  const blocker = spawn(
+    process.execPath,
+    [
+      "-e",
+      "const net=require('node:net');const s=net.createServer();s.on('error',()=>process.exit(0));s.listen(1421,'127.0.0.1',()=>setTimeout(()=>process.exit(0),20000));",
+    ],
+    { stdio: "ignore", windowsHide: true },
+  );
+  t.after(() => {
+    try {
+      blocker.kill();
+    } catch {
+      // already gone
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  const result = runCli(["doctor", "--json"]);
+  const report = JSON.parse(result.stdout);
+  const portCheck = report.checks.find((check) => check.id === "port-1421");
+  assert.equal(portCheck.status, "FAIL");
+  assert.equal(report.ok, false);
+  assert.equal(result.status, 1, "a failing doctor check must produce a non-zero exit code");
 });
 
 test("cli.mjs migrate with a missing state file fails cleanly (exit 2, no stack trace)", () => {
@@ -49,7 +128,7 @@ test("cli.mjs migrate with a missing state file fails cleanly (exit 2, no stack 
   try {
     const result = runCli(["migrate", "--from", "does-not-exist.json", "--json"], { cwd });
     assert.equal(result.status, 2, result.stdout);
-    assert.match(result.stderr, /state file not found/);
+    assert.match(result.stderr, /JSON file not found/);
     assert.match(result.stderr, /does-not-exist\.json/);
     assert.doesNotMatch(result.stderr, /\n\s+at /, "no stack trace");
   } finally {
@@ -61,5 +140,60 @@ test("cli.mjs rejects an unknown command with exit 2 and a clean message", () =>
   const result = runCli(["frobnicate"]);
   assert.equal(result.status, 2);
   assert.match(result.stderr, /unknown command "frobnicate"/);
+  assert.doesNotMatch(result.stderr, /\n\s+at /, "no stack trace");
+});
+
+test("migrate accepts BOM-prefixed state/ownership/runtime/config (QA2-04)", { skip: DB_SKIP }, (t) => {
+  const fixture = createFlowFixture({ bom: true });
+  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+
+  const result = runCli(migrateArgs(fixture), { cwd: fixture.root });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.status, "PASS");
+  assert.equal(report.manifest.project.id, "bom-project", "BOM config.json was read");
+  assert.equal(report.manifest.ownership.rules, 1, "BOM ownership.json was read");
+  assert.equal(report.manifest.runtime.agents, 1, "BOM runtime.json was read");
+  assert.equal(report.problems.some((problem) => problem.level === "error"), false);
+});
+
+test("migrate still accepts the same files without a BOM (no regression)", { skip: DB_SKIP }, (t) => {
+  const fixture = createFlowFixture({ bom: false });
+  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+
+  const result = runCli(migrateArgs(fixture), { cwd: fixture.root });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.status, "PASS");
+  assert.equal(report.manifest.project.id, "bom-project");
+});
+
+test("migrate rejects broken state JSON with file name, location and exit 2", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "atk-cli-badstate-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateFile = path.join(root, ".agent-flow", "state.json");
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, '\uFEFF{\n  "schemaVersion": 1,\n  bad\n}', "utf8");
+
+  const result = runCli(["migrate", "--from", stateFile, "--json"], { cwd: root });
+  assert.equal(result.status, 2, result.stdout);
+  assert.match(result.stderr, /Invalid JSON in/);
+  assert.ok(result.stderr.includes(stateFile), "message names the broken file");
+  assert.match(result.stderr, /line \d+|position \d+|offset \d+/, "message locates the problem");
+  assert.doesNotMatch(result.stderr, /\n\s+at /, "no stack trace");
+});
+
+test("migrate rejects broken ownership.json with the sidecar file name", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "atk-cli-badown-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const flow = path.join(root, ".agent-flow");
+  fs.mkdirSync(flow, { recursive: true });
+  writeJson(path.join(flow, "state.json"), { schemaVersion: 1 });
+  fs.writeFileSync(path.join(flow, "ownership.json"), "{ not json", "utf8");
+
+  const result = runCli(["migrate", "--from", path.join(flow, "state.json"), "--json"], { cwd: root });
+  assert.equal(result.status, 2, result.stdout);
+  assert.match(result.stderr, /Invalid JSON in/);
+  assert.match(result.stderr, /ownership\.json/);
   assert.doesNotMatch(result.stderr, /\n\s+at /, "no stack trace");
 });

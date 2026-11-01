@@ -110,6 +110,24 @@ export function exportStateJson(store, { projectId? }): { state: object, manifes
 | project 映射 | project id 取 `agent-flow.config.json` 的 `project`，缺失则 `"default"` |
 | memory store | `createMemoryStore()`，可从 `@atk/database/memory` 导入（backend/QA 用来避开 SQLite） |
 
+**Task 状态迁移（M1 已实现，`packages/database/src/model.mjs` 纯函数，SQLite 与 memory 共用）**
+
+`PATCH /tasks/:id` 只能沿下表迁移；非法迁移 → `400 VALIDATION_ERROR`，`details: { from, to, allowed }`，**version 与其它字段都不落地**。`from === to` 视为幂等成功（version +1，沿用 CAS touch 语义）。`POST /tasks` 仍恒为 `READY`（服务端决定）。
+
+| from | 允许的 to |
+|---|---|
+| `DRAFT` | `READY`, `BLOCKED`, `CANCELLED` |
+| `READY` | `CLAIMED`, `BLOCKED`, `CANCELLED` |
+| `CLAIMED` | `RUNNING`, `BLOCKED`, `CANCELLED` |
+| `RUNNING` | `REVIEWING`, `BLOCKED`, `CANCELLED` |
+| `REVIEWING` | `INTEGRATING`, `BLOCKED`, `CANCELLED` |
+| `INTEGRATING` | `AWAITING_ACCEPTANCE`, `BLOCKED`, `CANCELLED` |
+| `AWAITING_ACCEPTANCE` | `DONE`, `BLOCKED`, `CANCELLED` |
+| `BLOCKED` | `READY`, `CANCELLED` |
+| `DONE` / `CANCELLED` | （终止，无出边） |
+
+禁止：`→ DRAFT`、`DONE → CANCELLED`、任何跳步或回退。返工环（`REVIEWING → RUNNING`、`INTEGRATING → RUNNING`）**故意留到 M3**：开放它们等于允许客户端重开已审工作，需要 Run/session 上下文。
+
 ---
 
 ## 2. HTTP API（`@atk/backend`，绑定 `127.0.0.1:1421`）
@@ -126,7 +144,7 @@ export function exportStateJson(store, { projectId? }): { state: object, manifes
 | GET | `/api/v1/tasks?projectId=&status=&q=&limit=` | `{ items: Task[] }` |
 | POST | `/api/v1/tasks` | 建任务（`status` 由服务端定 READY） |
 | GET | `/api/v1/tasks/:id` | 详情 + `allowedActions` |
-| PATCH | `/api/v1/tasks/:id` | 必须带 `expectedVersion`；冲突 `409 TASK_VERSION_CONFLICT` |
+| PATCH | `/api/v1/tasks/:id` | 必须带 `expectedVersion`；冲突 `409 TASK_VERSION_CONFLICT`；非法状态迁移 `400 VALIDATION_ERROR`（`details.from/to/allowed`） |
 | GET | `/api/v1/runs?taskId=&limit=` | `{ items: Run[] }` |
 | GET | `/api/v1/runs/:id` | Run 详情 |
 | GET | `/api/v1/agents` | `{ items: Agent[] }` |

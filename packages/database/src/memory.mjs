@@ -394,6 +394,17 @@ export function createMemoryStore() {
       getProjectLegacy: (id) => clone(projectMeta.get(id)?.legacy ?? null),
       getProjectSettings: (id) => clone(projectMeta.get(id)?.settings ?? null),
       getTaskLegacy: (id) => clone(taskMeta.get(id)?.legacy ?? null),
+      /**
+       * Migration-only writer (see sqlite.mjs): writes a legacy status without
+       * the §5.2 transition check. Only importStateJson may use it.
+       */
+      setTaskStatus: (id, status) => {
+        validateTaskStatus(status);
+        const task = requireTaskEntry(id);
+        const next = { ...task, status, version: task.version + 1, updatedAt: nowIso() };
+        tasks.set(id, next);
+        return clone(next);
+      },
       listTasksAll: (projectId) =>
         [...tasks.values()]
           .filter((task) => task.projectId === projectId)

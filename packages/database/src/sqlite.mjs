@@ -969,6 +969,25 @@ export function openStore(options = {}) {
         const row = getTaskRow(id);
         return row ? parseJsonColumn(row.legacy_json) : null;
       },
+      /**
+       * Migration-only writer: sets a task's status exactly as recorded in the
+       * legacy file (e.g. a package that was already DONE) without pretending it
+       * walked the §5.2 chain. It is NOT part of the public Store contract and
+       * only `importStateJson` (same package) may call it; Backend/Web must use
+       * patchTask, which always enforces the state machine.
+       */
+      setTaskStatus: (id, status) => {
+        validateTaskStatus(status);
+        return transaction(() => {
+          requireTaskRow(id);
+          stmt("UPDATE tasks SET status = ?, version = version + 1, updated_at = ? WHERE id = ?").run(
+            status,
+            nowIso(),
+            id,
+          );
+          return taskJson(requireTaskRow(id));
+        });
+      },
       listTasksAll: (projectId) =>
         stmt("SELECT * FROM tasks WHERE project_id = ? ORDER BY priority ASC, created_at ASC, id ASC")
           .all(projectId)

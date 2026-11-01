@@ -11,7 +11,7 @@
 // Usage: node scripts/m1-smoke.mjs [--verbose]
 // Exit: 0 = all checks pass, 1 = a check failed, 2 = prerequisites missing.
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -94,6 +94,24 @@ function json(body) {
   }
 }
 
+/** Read an SSE body until `predicate(text)` is true or the deadline passes. */
+async function readFor(reader, timeoutMs, predicate = null) {
+  const decoder = new TextDecoder();
+  const deadline = Date.now() + timeoutMs;
+  let text = "";
+  while (Date.now() < deadline) {
+    const remaining = Math.max(1, deadline - Date.now());
+    const chunk = await Promise.race([
+      reader.read(),
+      new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), remaining)),
+    ]);
+    if (chunk.timeout || chunk.done) break;
+    text += decoder.decode(chunk.value ?? new Uint8Array(), { stream: true });
+    if (predicate && predicate(text)) break;
+  }
+  return text;
+}
+
 /** Minimal raw HTTP/1.1 GET so the harness can send a forged Host header
  *  (`fetch` refuses to override Host, and the DNS-rebinding guard is exactly
  *  about that header). Returns the status code and the body text. */
@@ -150,11 +168,20 @@ if (migrate.code !== 0 || !migrateReport) {
   process.exit(1);
 }
 
-check("migrate reports PASS and maps the legacy state", () => {
+check("migrate reports PASS and maps every task the legacy state carries", () => {
   expect(migrateReport.status === "PASS", `expected status PASS, got ${JSON.stringify(migrateReport.status)}`);
   const counts = migrateReport.counts ?? {};
   expect(Number.isInteger(counts.projects) && counts.projects >= 1, `expected >=1 project, got ${counts.projects}`);
-  return `projects=${counts.projects} tasks=${counts.tasks} agents=${counts.agents}`;
+  // The legacy state maps every slice + package + subitem to a task, so a silent
+  // drop (the failure mode a "projects >= 1" assertion would miss) shows up here.
+  const legacy = JSON.parse(readFileSync(STATE, "utf8").replace(/^\uFEFF/, ""));
+  const expectedTasks = (legacy.batch?.slices?.length ?? 0) + (legacy.packages?.length ?? 0) + (legacy.subitems?.length ?? 0);
+  expect(expectedTasks > 0, "the source state.json carries no tasks; the fixture is not useful");
+  expect(
+    counts.tasks === expectedTasks,
+    `expected ${expectedTasks} migrated tasks (slices+packages+subitems), got ${counts.tasks}`,
+  );
+  return `projects=${counts.projects} tasks=${counts.tasks}/${expectedTasks} agents=${counts.agents}`;
 });
 
 // ---------------------------------------------------------------------------
@@ -163,7 +190,14 @@ check("migrate reports PASS and maps the legacy state", () => {
 const server = spawn(
   process.execPath,
   [CLI, "serve", "--port", String(port), "--data", dbFile, "--web-dist", DIST],
-  { cwd: ROOT, windowsHide: true },
+  {
+    cwd: ROOT,
+    windowsHide: true,
+    // Keep the session-token file inside the throwaway directory: the backend
+    // writes it under %LOCALAPPDATA%, and a smoke run must not overwrite the
+    // token of the user's running instance (QA finding QA2-03).
+    env: { ...process.env, LOCALAPPDATA: tmp },
+  },
 );
 let serverOut = "";
 server.stdout.on("data", (chunk) => {
@@ -206,6 +240,13 @@ try {
   });
 
   let session;
+  check("the token file stays inside the throwaway data directory", () => {
+    const tokenFile = path.join(tmp, "AgentTeamKit", "runtime", "session-token");
+    expect(existsSync(tokenFile), `expected the session token at ${tokenFile}`);
+    const userTokenFile = path.join(process.env.LOCALAPPDATA ?? "", "AgentTeamKit", "runtime", "session-token");
+    expect(path.resolve(tokenFile) !== path.resolve(userTokenFile), "the smoke run must not touch the user's token file");
+    return `isolated at ${path.join("...", "AgentTeamKit", "runtime", "session-token")}`;
+  });
   check("session bootstrap returns a token and a csrf value", async () => {
     const response = await fetch(`${base}/api/v1/session`);
     expect(response.ok, `expected 200, got ${response.status}`);
@@ -238,7 +279,9 @@ try {
     const body = json(await list.text());
     const tasks = body?.items ?? [];
     expect(Array.isArray(tasks), "expected items[]");
-    if (tasks.length === 0) return "0 tasks (maintained project has no tasks yet)";
+    // A zero-task list must not be reported as a pass: it would hide a migration
+    // that silently dropped everything (QA finding QA2-02).
+    expect(tasks.length >= 1, `expected at least one task, got ${tasks.length}`);
     const patch = await fetch(`${base}/api/v1/tasks/${encodeURIComponent(tasks[0].id)}`, {
       method: "PATCH",
       headers: writeHeaders(),
@@ -250,24 +293,94 @@ try {
     return `tasks=${tasks.length}, PATCH without expectedVersion -> 400 ${patchBody.error.code}`;
   });
 
-  check("the event stream opens and delivers a keep-alive or an event frame", async () => {
-    const controller = new AbortController();
-    const response = await fetch(`${base}/api/v1/events/stream`, {
-      headers: authed(),
-      signal: controller.signal,
+  check("a write without the csrf header is refused", async () => {
+    const list = await fetch(`${base}/api/v1/tasks`, { headers: authed() });
+    const tasks = json(await list.text())?.items ?? [];
+    expect(tasks.length >= 1, "expected a task to patch");
+    const { "x-atk-csrf": _csrf, ...noCsrf } = writeHeaders();
+    const response = await fetch(`${base}/api/v1/tasks/${encodeURIComponent(tasks[0].id)}`, {
+      method: "PATCH",
+      headers: noCsrf,
+      body: JSON.stringify({ title: "smoke" }),
     });
+    expect(response.status === 403, `expected 403 without csrf, got ${response.status}`);
+    const body = json(await response.text());
+    expect(body?.error?.code === "NOT_AUTHORIZED", `expected NOT_AUTHORIZED, got ${body?.error?.code}`);
+    return `403 ${body.error.details?.reason ?? body.error.code}`;
+  });
+
+  check("the write path works: create 201, patch 200 with the returned version, stale patch 409", async () => {
+    const projects = json(await (await fetch(`${base}/api/v1/projects`, { headers: authed() })).text());
+    const projectId = (projects?.items ?? projects)[0]?.id;
+    expect(projectId, "expected a project id");
+    const created = await fetch(`${base}/api/v1/tasks`, {
+      method: "POST",
+      headers: writeHeaders(),
+      body: JSON.stringify({
+        projectId,
+        title: "smoke task",
+        description: "created by scripts/m1-smoke.mjs",
+        functionRequired: "WORKER",
+        roleRequired: "DEV",
+        priority: 2,
+        deps: [],
+        acceptance: "the smoke gate can write",
+      }),
+    });
+    const createdText = await created.text();
+    expect(created.status === 201, `expected 201, got ${created.status}: ${createdText}`);
+    const task = json(createdText);
+    expect(task?.id, "expected a created task id");
+    expect(task?.status === "READY", `expected the server to own status READY, got ${task?.status}`);
+
+    const patched = await fetch(`${base}/api/v1/tasks/${encodeURIComponent(task.id)}`, {
+      method: "PATCH",
+      headers: writeHeaders(),
+      body: JSON.stringify({ expectedVersion: task.version, title: "patched by the smoke gate" }),
+    });
+    const patchedText = await patched.text();
+    expect(patched.status === 200, `expected 200, got ${patched.status}: ${patchedText}`);
+    const updated = json(patchedText);
+    expect(updated?.version === task.version + 1, `expected version ${task.version + 1}, got ${updated?.version}`);
+
+    const stale = await fetch(`${base}/api/v1/tasks/${encodeURIComponent(task.id)}`, {
+      method: "PATCH",
+      headers: writeHeaders(),
+      body: JSON.stringify({ expectedVersion: task.version, title: "stale write" }),
+    });
+    expect(stale.status === 409, `expected 409 for a stale version, got ${stale.status}`);
+    const staleBody = json(await stale.text());
+    expect(staleBody?.error?.code === "TASK_VERSION_CONFLICT", `expected TASK_VERSION_CONFLICT, got ${staleBody?.error?.code}`);
+    return `201 -> 200 (v${task.version}→v${updated.version}) -> 409 ${staleBody.error.code}`;
+  });
+
+  check("the event stream opens with a heartbeat", async () => {
+    const controller = new AbortController();
+    const response = await fetch(`${base}/api/v1/events/stream`, { headers: authed(), signal: controller.signal });
     expect(response.ok, `expected 200, got ${response.status}`);
     expect(String(response.headers.get("content-type")).includes("text/event-stream"), "expected text/event-stream");
     const reader = response.body.getReader();
-    const chunk = await Promise.race([
-      reader.read(),
-      new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), 5000)),
-    ]);
+    const text = await readFor(reader, 5000);
     controller.abort();
-    expect(!chunk.timeout, "no SSE bytes within 5s");
-    const text = new TextDecoder().decode(chunk.value ?? new Uint8Array());
-    expect(text.includes(":") || text.includes("event:"), `expected SSE framing, got ${JSON.stringify(text.slice(0, 80))}`);
-    return "stream open, first chunk received";
+    expect(text.length > 0, "no SSE bytes within 5s");
+    // A heartbeat/comment frame proves the stream is alive; business events need a
+    // producer, which M1 does not have yet (that is M2/M3).
+    expect(/^: /m.test(text), `expected an SSE comment frame, got ${JSON.stringify(text.slice(0, 120))}`);
+    return "heartbeat frame received";
+  });
+
+  check("a last-event-id past the log asks the client to resync instead of skipping", async () => {
+    const controller = new AbortController();
+    const response = await fetch(`${base}/api/v1/events/stream`, {
+      headers: { ...authed(), "last-event-id": "999999" },
+      signal: controller.signal,
+    });
+    expect(response.ok, `expected 200, got ${response.status}`);
+    const reader = response.body.getReader();
+    const text = await readFor(reader, 5000);
+    controller.abort();
+    expect(/event: system\.resync-required/.test(text), `expected a resync frame, got ${JSON.stringify(text.slice(0, 200))}`);
+    return "system.resync-required received";
   });
 
   if (hasDist) {

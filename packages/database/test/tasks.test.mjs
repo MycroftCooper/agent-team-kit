@@ -156,14 +156,15 @@ test("patchTask is a real CAS: version conflict keeps the old version and data",
     (error) => error.code === "NOT_FOUND",
   );
 
-  const status = store.patchTask("TASK-CAS", { expectedVersion: 1, changes: { status: "DONE" } });
-  assert.equal(status.status, "DONE");
+  // READY → CLAIMED is a legal §5.2 transition; DONE would be a jump.
+  const status = store.patchTask("TASK-CAS", { expectedVersion: 1, changes: { status: "CLAIMED" } });
+  assert.equal(status.status, "CLAIMED");
   assert.equal(status.version, 2);
 
   // An empty patch still bumps the version (a successful CAS touch).
   const touched = store.patchTask("TASK-CAS", { expectedVersion: 2, changes: {} });
   assert.equal(touched.version, 3);
-  assert.equal(touched.status, "DONE");
+  assert.equal(touched.status, "CLAIMED");
 });
 
 test("listTasks filters, escapes LIKE wildcards and sorts by priority", (t) => {
