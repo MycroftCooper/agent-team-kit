@@ -17,7 +17,7 @@
 //     silent overwrite of other data;
 //   * any `level: "error"` problem means `status !== "PASS"`.
 import { createHash } from "node:crypto";
-import { FUNCTIONS, ID_RE } from "@atk/contracts";
+import { FUNCTIONS, ID_RE, TASK_STATUSES } from "@atk/contracts";
 import { fail, notFound } from "./errors.mjs";
 import { INTERNAL } from "./internal.mjs";
 import { MAX_LIST_LIMIT, isPlainObject, isoOrNull, nowIso } from "./model.mjs";
@@ -237,6 +237,12 @@ function legacyDeps(item, report, context) {
 }
 
 function legacyStatusOf(item, kind, report, context) {
+  // Round-trip fidelity (QA-007 B1): stage/status are not a bijection
+  // (CLAIMED and RUNNING both map to "in-progress"). Exports therefore carry
+  // the exact store status in `statusRaw`; trust it when it is a real Task
+  // status instead of re-deriving a lossy legacy stage.
+  const rawStatus = typeof item.statusRaw === "string" ? item.statusRaw.trim() : "";
+  if (rawStatus !== "" && TASK_STATUSES.includes(rawStatus)) return rawStatus;
   if (kind === "slice") {
     const status = typeof item.status === "string" ? item.status.trim() : "";
     const mapped = SLICE_STATUS_TO_STATUS[status];
@@ -486,29 +492,70 @@ export function importStateJson(store, options = {}) {
     counts: new Set(["total", "byStage"]),
   });
   const WHITELISTED_STATE_ARRAYS = new Set(["packages", "subitems", "batch.slices", "batch.openQuestions"]);
+  const COLLECTION_LIKE_KEY_RE = /^(tasks?|requirements?|agents?|runs?|events?|slices?|packages?|subitems?)$/i;
   const unsupportedCollections = [];
-  const scanUnsupportedCollections = (value, path) => {
-    if (Array.isArray(value)) {
-      if (value.length > 0) unsupportedCollections.push({ path, count: value.length });
-      return;
+  const malformedCollections = [];
+  /** First non-empty array path beneath an unknown value (records the leaf). */
+  const firstNestedArray = (value, path, depth = 0) => {
+    if (depth > 50) return null;
+    if (Array.isArray(value)) return value.length > 0 ? { path, count: value.length } : null;
+    if (!isPlainObject(value)) return null;
+    for (const [key, child] of Object.entries(value)) {
+      const childPath = path === "" ? key : `${path}.${key}`;
+      const found = firstNestedArray(child, childPath, depth + 1);
+      if (found) return found;
     }
+    return null;
+  };
+  const scanUnsupportedCollections = (value, path) => {
     if (!isPlainObject(value)) return;
     const allowedKeys = WHITELISTED_STATE_KEYS[path];
     for (const [key, child] of Object.entries(value)) {
       const childPath = path === "" ? key : `${path}.${key}`;
-      if (WHITELISTED_STATE_ARRAYS.has(childPath)) continue;
-      if (allowedKeys && allowedKeys.has(key) && isPlainObject(child)) {
-        scanUnsupportedCollections(child, childPath);
+      if (WHITELISTED_STATE_ARRAYS.has(childPath)) {
+        if (!Array.isArray(child)) {
+          malformedCollections.push({ collection: childPath, reason: "must be an array" });
+        }
         continue;
       }
-      if (allowedKeys && allowedKeys.has(key) && !Array.isArray(child)) continue;
-      scanUnsupportedCollections(child, childPath);
+      if (allowedKeys && allowedKeys.has(key)) {
+        if (isPlainObject(child) && WHITELISTED_STATE_KEYS[childPath]) {
+          scanUnsupportedCollections(child, childPath);
+          continue;
+        }
+        if (Array.isArray(child)) {
+          if (child.length > 0) unsupportedCollections.push({ collection: childPath, path: childPath, count: child.length });
+        }
+        continue;
+      }
+      // Unknown key. A collection-shaped name must be an array; any other key
+      // may not carry data arrays at any depth.
+      if (Array.isArray(child)) {
+        if (child.length > 0) unsupportedCollections.push({ collection: childPath, path: childPath, count: child.length });
+        continue;
+      }
+      if (COLLECTION_LIKE_KEY_RE.test(key) && child !== undefined && child !== null) {
+        malformedCollections.push({ collection: childPath, reason: "must be an array" });
+        continue;
+      }
+      if (isPlainObject(child)) {
+        const nested = firstNestedArray(child, childPath);
+        if (nested) {
+          unsupportedCollections.push({ collection: childPath, path: nested.path, count: nested.count });
+        }
+      }
     }
   };
   if (isPlainObject(state)) scanUnsupportedCollections(state, "");
+  for (const collection of malformedCollections) {
+    report("error", "INVALID_RECORD", {
+      collection: collection.collection,
+      reason: collection.reason,
+    });
+  }
   for (const collection of unsupportedCollections) {
     report("error", "IMPORT_WRITE_FAILED", {
-      collection: collection.path,
+      collection: collection.collection,
       path: collection.path,
       count: collection.count,
       reason:
@@ -868,9 +915,17 @@ function syncLegacyItem(template, task, kind) {
   if (typeof item.priority === "string" && item.priority !== `P${task.priority}`) {
     item.priority = `P${task.priority}`;
   }
+  // The legacy stage/status vocabulary is lossy (CLAIMED and RUNNING are both
+  // "in-progress", REVIEWING/INTEGRATING have no package-stage equivalent), so
+  // carry the exact DB status ONLY when the template's stage cannot reproduce
+  // it. This keeps ordinary round-trips byte-identical while making ambiguous
+  // states restorable.
   if (expected !== task.status) {
+    item.statusRaw = task.status;
     if (kind === "slice") item.status = STATUS_TO_SLICE[task.status] ?? item.status;
     else item.stage = STATUS_TO_STAGE[task.status] ?? item.stage;
+  } else {
+    delete item.statusRaw;
   }
   return item;
 }

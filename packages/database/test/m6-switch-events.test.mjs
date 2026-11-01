@@ -349,8 +349,11 @@ test("QA-007: every unknown non-empty legacy collection is rejected before any c
         now: T,
       });
       assert.equal(report.status, "SKIPPED", `${label}: ${path}`);
+      // Nested unknown containers report the top unknown key as the collection
+      // (QA-007 A3 expects `batch.nested`) and the array as `path`.
+      const expectedCollection = path === "batch.nested.tasks" ? "batch.nested" : path;
       const problem = report.problems.find(
-        (candidate) => candidate.code === "IMPORT_WRITE_FAILED" && candidate.detail?.collection === path,
+        (candidate) => candidate.code === "IMPORT_WRITE_FAILED" && candidate.detail?.collection === expectedCollection,
       );
       assert.ok(problem, `${label}: ${path}: problems=${JSON.stringify(report.problems)}`);
       assert.equal(problem.detail.path, path, `${label}: ${path}`);
