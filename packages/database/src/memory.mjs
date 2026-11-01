@@ -13,6 +13,7 @@ import { EVENT_SCHEMA_VERSION } from "@atk/contracts";
 import { fail, notFound } from "./errors.mjs";
 import { INTERNAL } from "./internal.mjs";
 import {
+  DEFAULT_LEASE_MS,
   MAX_EVENT_LIMIT,
   MAX_OVERVIEW_EVENTS,
   SCHEMA_VERSION,
@@ -20,19 +21,29 @@ import {
   buildOverview,
   compareTasks,
   ensurePlainObject,
+  generateId,
+  isPlainObject,
+  leaseExpiryAfter,
   makeEvent,
   mergeAgent,
   mergeProject,
+  mergeRunStatus,
   mergeTask,
   normalizeAgent,
   normalizeApproval,
   normalizeLimit,
   normalizeProject,
   normalizeRequirement,
+  normalizeRun,
   normalizeTask,
   nowIso,
   requireId,
   safeJson,
+  validateCommandPayload,
+  validateCommandType,
+  validateIdempotencyKey,
+  validateLeaseMs,
+  validateOwnerId,
   validateTaskStatus,
 } from "./model.mjs";
 
@@ -56,7 +67,18 @@ export function createMemoryStore() {
   const projectMeta = new Map();
   const taskMeta = new Map();
   const runs = new Map();
+  const runLeases = new Map();
+  const dispatchCommands = new Map();
+  const commandIdempotency = new Map();
   let seq = 0;
+
+  /** Insert one already-built event and return a defensive copy. */
+  function appendEventEntry(event) {
+    seq += 1;
+    const persisted = { ...event, seq, schemaVersion: EVENT_SCHEMA_VERSION };
+    events.push(persisted);
+    return clone(persisted);
+  }
 
   function getProjectEntry(id) {
     requireId(id, "project.id");
@@ -78,6 +100,26 @@ export function createMemoryStore() {
     const task = getTaskEntry(id);
     if (!task) notFound("task", id);
     return task;
+  }
+
+  function getRunEntry(id) {
+    requireId(id, "run.id");
+    return runs.get(id) ?? null;
+  }
+
+  function requireRunEntry(id) {
+    const run = getRunEntry(id);
+    if (!run) notFound("run", id);
+    return run;
+  }
+
+  function leaseOf(runId) {
+    return runLeases.get(runId) ?? null;
+  }
+
+  function commandEntry(id) {
+    requireId(id, "dispatchCommand.id");
+    return dispatchCommands.get(id) ?? null;
   }
 
   function assertDepsExist(deps, selfId) {
@@ -289,6 +331,345 @@ export function createMemoryStore() {
       return clone(run);
     },
 
+    // --- Run lifecycle (m2-contracts §2/§3) -------------------------------
+    createRun(dto) {
+      ensurePlainObject(dto, "run");
+      const task = requireTaskEntry(dto.taskId);
+      const attempt = [...runs.values()].filter((run) => run.taskId === dto.taskId).length + 1;
+      const at = nowIso();
+      const run = normalizeRun(dto, { now: at, attempt, id: dto.id });
+      if (runs.has(run.id)) {
+        fail("VALIDATION_ERROR", `run "${run.id}" already exists`, { entity: "run", id: run.id });
+      }
+      runs.set(run.id, run);
+      appendEventEntry(
+        makeEvent({
+          projectId: task.projectId,
+          aggregateType: "run",
+          aggregateId: run.id,
+          type: "run.created",
+          payload: {
+            runId: run.id,
+            taskId: run.taskId,
+            agentId: run.agentId,
+            function: run.function,
+            role: run.role,
+            status: run.status,
+            attempt: run.attempt,
+            version: run.version,
+            ...(run.workspaceId === undefined ? {} : { workspaceId: run.workspaceId }),
+          },
+          now: at,
+        }),
+      );
+      return clone(run);
+    },
+
+    updateRunStatus(id, { status, exitCode, endedAt, generation } = {}) {
+      requireId(id, "run.id");
+      if (generation !== undefined && generation !== null) {
+        if (!Number.isInteger(generation) || generation < 1) {
+          fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
+        }
+        const lease = leaseOf(id);
+        if (!lease) {
+          fail("STALE_GENERATION", `run "${id}" state report is fenced out`, {
+            runId: id,
+            generation,
+            currentGeneration: null,
+            reason: "lease-missing",
+          });
+        }
+        if (lease.generation !== generation) {
+          fail("STALE_GENERATION", `run "${id}" state report is fenced out`, {
+            runId: id,
+            generation,
+            currentGeneration: lease.generation,
+            reason: "generation-mismatch",
+          });
+        }
+      }
+      const current = requireRunEntry(id);
+      const at = nowIso();
+      const merge = mergeRunStatus(current, { status, exitCode, endedAt }, { now: at });
+      if (!merge.updated) return clone(current);
+      const next = merge.run;
+      runs.set(id, next);
+      const task = requireTaskEntry(next.taskId);
+      appendEventEntry(
+        makeEvent({
+          projectId: task.projectId,
+          aggregateType: "run",
+          aggregateId: id,
+          type: "run.updated",
+          payload: {
+            runId: id,
+            taskId: next.taskId,
+            status: next.status,
+            previousStatus: current.status,
+            version: next.version,
+            ...(next.exitCode === undefined ? {} : { exitCode: next.exitCode }),
+            ...(next.endedAt === undefined ? {} : { endedAt: next.endedAt }),
+          },
+          now: at,
+        }),
+      );
+      return clone(next);
+    },
+
+    // --- Durable dispatch commands + leases (ADR-003 / m2-contracts §3) ---
+    enqueueDispatchCommand({ runId, commandType, payload, idempotencyKey } = {}) {
+      const commandTypeValue = validateCommandType(commandType);
+      const key = validateIdempotencyKey(idempotencyKey);
+      const payloadValue = validateCommandPayload(payload);
+      const run = requireRunEntry(runId);
+      const existingId = commandIdempotency.get(key);
+      if (existingId !== undefined) return clone(dispatchCommands.get(existingId));
+      const at = nowIso();
+      const command = {
+        id: generateId("CMD"),
+        runId: run.id,
+        taskId: run.taskId,
+        commandType: commandTypeValue,
+        payload: clone(payloadValue),
+        status: "PENDING",
+        idempotencyKey: key,
+        ownerId: null,
+        generation: 0,
+        claimedUntil: null,
+        attempts: 0,
+        createdAt: at,
+        updatedAt: at,
+      };
+      dispatchCommands.set(command.id, command);
+      commandIdempotency.set(key, command.id);
+      return clone(command);
+    },
+
+    claimDispatchCommand({ ownerId, leaseMs } = {}) {
+      const owner = validateOwnerId(ownerId);
+      const ttl = validateLeaseMs(leaseMs, { fallback: DEFAULT_LEASE_MS });
+      const now = nowIso();
+      const candidate = [...dispatchCommands.values()]
+        .filter((command) => {
+          const run = runs.get(command.runId);
+          if (!run || !["QUEUED", "STARTING", "RUNNING"].includes(run.status)) return false;
+          const lease = leaseOf(command.runId);
+          const leaseIsLive = lease !== null && lease.claimedUntil > now;
+          // A run must never have two effective holders (ADR-003): a fresh
+          // command may only be claimed when no live lease exists.
+          if (command.status === "PENDING") return !leaseIsLive;
+          return command.status === "CLAIMED" && command.claimedUntil !== null && command.claimedUntil <= now;
+        })
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))[0];
+      if (!candidate) return null;
+      const existingLease = leaseOf(candidate.runId);
+      const generation = existingLease === null ? 1 : existingLease.generation + 1;
+      const claimedUntil = leaseExpiryAfter(now, ttl);
+      const command = {
+        ...candidate,
+        status: "CLAIMED",
+        ownerId: owner,
+        generation,
+        claimedUntil,
+        attempts: candidate.attempts + 1,
+        updatedAt: now,
+      };
+      dispatchCommands.set(command.id, command);
+      const lease = {
+        runId: command.runId,
+        ownerId: owner,
+        generation,
+        claimedUntil,
+        lastHeartbeatAt: now,
+        createdAt: existingLease?.createdAt ?? now,
+        updatedAt: now,
+      };
+      runLeases.set(lease.runId, lease);
+      return { command: clone(command), lease: clone(lease) };
+    },
+
+    completeDispatchCommand({ id, ownerId, generation, status, result } = {}) {
+      requireId(id, "dispatchCommand.id");
+      const owner = validateOwnerId(ownerId);
+      if (!Number.isInteger(generation) || generation < 1) {
+        fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
+      }
+      if (status !== "DONE" && status !== "FAILED") {
+        fail("VALIDATION_ERROR", "dispatch result status must be DONE or FAILED", {
+          status: status ?? null,
+          allowed: ["DONE", "FAILED"],
+        });
+      }
+      if (result !== undefined && result !== null && !isPlainObject(result)) {
+        fail("VALIDATION_ERROR", "dispatch result must be an object", { resultType: typeof result });
+      }
+      const command = commandEntry(id);
+      if (!command) notFound("dispatchCommand", id);
+      const stale = (details) => {
+        fail("STALE_GENERATION", `dispatch command "${id}" report is fenced out`, {
+          commandId: id,
+          ownerId: owner,
+          generation,
+          ...details,
+        });
+      };
+      if (command.status === "DONE" || command.status === "FAILED") {
+        if (command.generation === generation && command.ownerId === owner) return clone(command);
+        stale({
+          expectedGeneration: command.generation,
+          currentOwnerId: command.ownerId,
+          reason: "command-already-finished",
+        });
+      }
+      if (command.status !== "CLAIMED") {
+        stale({ expectedGeneration: command.generation, reason: "command-not-claimed" });
+      }
+      const lease = leaseOf(command.runId);
+      if (!lease) stale({ reason: "lease-missing" });
+      if (lease.generation !== generation || lease.ownerId !== owner) {
+        stale({
+          expectedGeneration: lease.generation,
+          currentOwnerId: lease.ownerId,
+          reason: "lease-mismatch",
+        });
+      }
+      const now = nowIso();
+      const done = {
+        ...command,
+        status,
+        result: clone(result ?? {}),
+        completedAt: now,
+        claimedUntil: now,
+        updatedAt: now,
+      };
+      dispatchCommands.set(id, done);
+      // "Release" the lease by EXPIRING it, never by deleting it: the monotonic
+      // generation must survive completion so a later claim of the same run
+      // bumps past the finished holder (deleting restarts at 1 and a stale host
+      // could match again). reconcileRun therefore reports this expired lease.
+      runLeases.set(lease.runId, {
+        ...lease,
+        claimedUntil: now,
+        lastHeartbeatAt: now,
+        updatedAt: now,
+      });
+      return clone(done);
+    },
+
+    renewRunLease({ runId, ownerId, generation, leaseMs } = {}) {
+      requireId(runId, "run.id");
+      const owner = validateOwnerId(ownerId);
+      if (!Number.isInteger(generation) || generation < 1) {
+        fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
+      }
+      const ttl = validateLeaseMs(leaseMs, { fallback: DEFAULT_LEASE_MS });
+      const now = nowIso();
+      const lease = leaseOf(runId);
+      const stale = (details) => {
+        fail("STALE_GENERATION", `run "${runId}" lease is fenced out`, {
+          runId,
+          ownerId: owner,
+          generation,
+          ...details,
+        });
+      };
+      if (!lease) stale({ reason: "lease-missing" });
+      if (lease.ownerId !== owner) stale({ reason: "holder-mismatch", currentHolderId: lease.ownerId });
+      if (lease.generation !== generation) {
+        stale({ reason: "generation-mismatch", currentGeneration: lease.generation });
+      }
+      if (lease.claimedUntil <= now) stale({ reason: "lease-expired", claimedUntil: lease.claimedUntil });
+      const nextGeneration = generation + 1;
+      const claimedUntil = leaseExpiryAfter(now, ttl);
+      const renewed = {
+        ...lease,
+        generation: nextGeneration,
+        claimedUntil,
+        lastHeartbeatAt: now,
+        updatedAt: now,
+      };
+      runLeases.set(runId, renewed);
+      for (const [id, command] of dispatchCommands) {
+        if (command.runId === runId && command.status === "CLAIMED") {
+          dispatchCommands.set(id, {
+            ...command,
+            generation: nextGeneration,
+            claimedUntil,
+            updatedAt: now,
+          });
+        }
+      }
+      return clone(renewed);
+    },
+
+    appendRunEvent({ runId, generation, events: inputEvents } = {}) {
+      requireId(runId, "run.id");
+      if (!Number.isInteger(generation) || generation < 1) {
+        fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
+      }
+      // An empty array is a valid pure-fence call (see sqlite.mjs).
+      if (!Array.isArray(inputEvents)) {
+        fail("VALIDATION_ERROR", "run.events must be an array", { events: inputEvents ?? null });
+      }
+      if (inputEvents.length > 1000) {
+        fail("VALIDATION_ERROR", "run.events accepts at most 1000 events per call", {
+          length: inputEvents.length,
+        });
+      }
+      const run = requireRunEntry(runId);
+      const task = requireTaskEntry(run.taskId);
+      const now = nowIso();
+      const lease = leaseOf(runId);
+      const stale = (details) => {
+        fail("STALE_GENERATION", `run "${runId}" event report is fenced out`, {
+          runId,
+          generation,
+          ...details,
+        });
+      };
+      if (!lease) stale({ reason: "lease-missing" });
+      if (lease.generation !== generation) {
+        stale({ reason: "generation-mismatch", currentGeneration: lease.generation });
+      }
+      if (lease.claimedUntil <= now) stale({ reason: "lease-expired", claimedUntil: lease.claimedUntil });
+      // Build/validate every event before mutating so a bad event cannot leave a
+      // partial batch behind (SQLite gets the same from its transaction).
+      const built = inputEvents.map((raw, index) => {
+        if (!isPlainObject(raw)) {
+          fail("VALIDATION_ERROR", `run.events[${index}] must be an object`, { index });
+        }
+        if (typeof raw.type !== "string" || raw.type.trim() === "") {
+          fail("VALIDATION_ERROR", `run.events[${index}].type is required`, { index });
+        }
+        const payload = raw.payload ?? {};
+        if (!isPlainObject(payload)) {
+          fail("VALIDATION_ERROR", `run.events[${index}].payload must be an object`, { index });
+        }
+        return makeEvent({
+          projectId: task.projectId,
+          aggregateType: "run",
+          aggregateId: runId,
+          type: raw.type,
+          payload,
+          now,
+        });
+      });
+      return built.map((event) => appendEventEntry(event));
+    },
+
+    /**
+     * Reconcile facts for a restarted Host (see sqlite.mjs): a completed run's
+     * lease is reported as EXPIRED with its monotonic generation retained, not
+     * as null. sessions stays empty in M2.
+     */
+    reconcileRun({ runId } = {}) {
+      requireId(runId, "run.id");
+      const run = requireRunEntry(runId);
+      const lease = leaseOf(runId);
+      return { run: clone(run), lease: lease === null ? null : clone(lease), sessions: [] };
+    },
+
     listAgents() {
       return [...agents.values()].sort((a, b) => a.id.localeCompare(b.id)).map(clone);
     },
@@ -341,6 +722,8 @@ export function createMemoryStore() {
       requireId(projectId, "project.id");
       const project = requireProject(projectId);
       const projectTasks = [...tasks.values()].filter((task) => task.projectId === projectId);
+      const projectTaskIds = new Set(projectTasks.map((task) => task.id));
+      const projectRuns = [...runs.values()].filter((run) => projectTaskIds.has(run.taskId));
       const recentEvents = events
         .filter((event) => event.projectId === projectId)
         .slice(-MAX_OVERVIEW_EVENTS)
@@ -350,19 +733,15 @@ export function createMemoryStore() {
         project: clone(project),
         tasks: projectTasks.map(clone),
         recentEvents,
-        runsRunning: 0,
-        runsTotal: 0,
+        runsRunning: projectRuns.filter((run) => run.status === "STARTING" || run.status === "RUNNING").length,
+        runsTotal: projectRuns.length,
       });
     },
 
     // --- Events -----------------------------------------------------------
     appendEvent(input) {
       ensurePlainObject(input, "event");
-      const event = makeEvent({ ...input, now: nowIso() });
-      seq += 1;
-      const persisted = { ...event, seq, schemaVersion: EVENT_SCHEMA_VERSION };
-      events.push(persisted);
-      return clone(persisted);
+      return appendEventEntry(makeEvent({ ...input, now: nowIso() }));
     },
 
     listEvents({ projectId, afterSeq, limit } = {}) {
@@ -394,6 +773,11 @@ export function createMemoryStore() {
       getProjectLegacy: (id) => clone(projectMeta.get(id)?.legacy ?? null),
       getProjectSettings: (id) => clone(projectMeta.get(id)?.settings ?? null),
       getTaskLegacy: (id) => clone(taskMeta.get(id)?.legacy ?? null),
+      /** Read a dispatch command as JSON (test/fencing diagnostics only). */
+      getDispatchCommand: (id) => {
+        const command = dispatchCommands.get(id);
+        return command === undefined ? null : clone(command);
+      },
       /**
        * Migration-only writer (see sqlite.mjs): writes a legacy status without
        * the §5.2 transition check. Only importStateJson may use it.

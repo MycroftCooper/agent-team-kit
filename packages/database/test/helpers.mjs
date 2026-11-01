@@ -2,7 +2,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { openStore } from "@atk/database";
+import { createMemoryStore, openStore } from "@atk/database";
 
 /**
  * Open a Store on a fresh temp database and guarantee the file is released
@@ -87,6 +87,39 @@ export function advanceTask(store, id, target) {
     store.patchTask(id, { expectedVersion: task.version, changes: { status: next } });
   }
   throw new Error(`advanceTask: transition guard exceeded for ${id} -> ${target}`);
+}
+
+export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Seed one project + one READY task in a fresh SQLite store and an in-memory
+ * store, so the same M2 scenario can run against both implementations.
+ * Returns `[{ label, store }]` in a stable order.
+ */
+export function bothStores(t, { taskId = "TASK-SEED", title = "Seed task" } = {}) {
+  const { store: sqlite } = useStore(t);
+  const memory = createMemoryStore();
+  t.after(() => memory.close());
+  for (const store of [sqlite, memory]) {
+    store.createProject(projectDto());
+    store.createTask(taskDto("proj-1", { id: taskId, title }));
+  }
+  return [
+    { label: "sqlite", store: sqlite },
+    { label: "memory", store: memory },
+  ];
+}
+
+/** Create a Run in STARTING on the seeded task. */
+export function seedRun(store, { taskId = "TASK-SEED", agentId = "agent-dev-01", role = "DEV", workspaceId } = {}) {
+  const dto = { taskId, agentId, function: "WORKER", role };
+  if (workspaceId !== undefined) dto.workspaceId = workspaceId;
+  return store.createRun(dto);
+}
+
+/** Enqueue one dispatch command for a run. */
+export function seedDispatch(store, runId, { idempotencyKey = `idem-${runId}`, commandType = "RUN_TASK", payload = {} } = {}) {
+  return store.enqueueDispatchCommand({ runId, commandType, payload, idempotencyKey });
 }
 
 /** Legacy state.json fixture modelled on examples/minimal plus archived data. */

@@ -3,11 +3,16 @@
 // applied exactly once and re-opening a store neither re-creates tables nor
 // duplicates schema_migrations rows.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import { openStore } from "@atk/database";
 import { INTERNAL } from "../src/internal.mjs";
 import { projectDto, taskDto, useStore } from "./helpers.mjs";
+
+const MIGRATIONS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "migrations");
 
 const REQUIRED_TABLES = [
   "projects",
@@ -34,14 +39,16 @@ function rawOpen(file) {
 
 test("migrations are applied once and recorded in schema_migrations", (t) => {
   const { store, file } = useStore(t);
-  assert.equal(store.health().schemaVersion, 1);
+  assert.equal(store.health().schemaVersion, 2);
   assert.equal(store.health().ok, true);
   const raw = rawOpen(file);
   try {
     const rows = raw.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all();
-    assert.equal(rows.length, 1);
+    assert.equal(rows.length, 2);
     assert.equal(Number(rows[0].version), 1);
     assert.equal(rows[0].name, "0001_init.sql");
+    assert.equal(Number(rows[1].version), 2);
+    assert.equal(rows[1].name, "0002_runs_dispatch.sql");
   } finally {
     raw.close();
   }
@@ -54,7 +61,7 @@ test("re-opening a store does not re-run migrations or lose data", (t) => {
   store.close();
 
   const second = open();
-  assert.equal(second.health().schemaVersion, 1);
+  assert.equal(second.health().schemaVersion, 2);
   assert.deepEqual(second.health().counts, { projects: 1, tasks: 1, runs: 0, events: 0, agents: 0 });
   assert.equal(second.listProjects().length, 1);
   assert.equal(second.listTasks({ projectId: "proj-1" }).length, 1);
@@ -62,7 +69,7 @@ test("re-opening a store does not re-run migrations or lose data", (t) => {
 
   const raw = rawOpen(file);
   try {
-    assert.equal(Number(raw.prepare("SELECT COUNT(*) AS c FROM schema_migrations").get().c), 1);
+    assert.equal(Number(raw.prepare("SELECT COUNT(*) AS c FROM schema_migrations").get().c), 2);
   } finally {
     raw.close();
   }
@@ -79,7 +86,7 @@ test("migrate:false opens without touching the schema; migrate:true repairs it",
   empty.close();
 
   const migrated = open({ migrate: true });
-  assert.equal(migrated.health().schemaVersion, 1);
+  assert.equal(migrated.health().schemaVersion, 2);
   assert.deepEqual(migrated.listProjects(), []);
 });
 
@@ -173,7 +180,105 @@ test("the database file may live in a non-ASCII path", (t) => {
   const { store } = useStore(t, { prefix: "atk-\u4e2d\u6587\u76ee\u5f55-", subdir: "\u6570\u636e" });
   store.createProject(projectDto());
   assert.equal(store.listProjects().length, 1);
-  assert.equal(store.health().schemaVersion, 1);
+  assert.equal(store.health().schemaVersion, 2);
+});
+
+test("schema v2 adds the M2 execution columns to the M1 tables", (t) => {
+  const { store, file } = useStore(t);
+  store.close();
+  const raw = rawOpen(file);
+  try {
+    const columnsOf = (table) =>
+      raw
+        .prepare(`PRAGMA table_info(${table})`)
+        .all()
+        .map((column) => column.name);
+    assert.deepEqual(
+      columnsOf("runs").filter((name) => ["role", "workspace_id", "exit_code"].includes(name)).sort(),
+      ["exit_code", "role", "workspace_id"],
+    );
+    assert.ok(columnsOf("run_leases").includes("last_heartbeat_at"));
+    assert.deepEqual(
+      columnsOf("dispatch_commands")
+        .filter((name) => ["command_type", "attempts", "result_json", "completed_at"].includes(name))
+        .sort(),
+      ["attempts", "command_type", "completed_at", "result_json"],
+    );
+    const indexes = raw
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+      .all()
+      .map((row) => row.name);
+    assert.ok(indexes.includes("idx_dispatch_commands_claim"));
+  } finally {
+    raw.close();
+  }
+});
+
+test("an M1 (v1) database upgrades in place and keeps its rows", (t) => {
+  const { store, file, open } = useStore(t, { migrate: false });
+  store.close();
+  const initSql = readFileSync(path.join(MIGRATIONS_DIR, "0001_init.sql"), "utf8");
+  const at = "2026-01-01T00:00:00.000Z";
+  const raw = rawOpen(file);
+  try {
+    raw.exec(initSql);
+    raw.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)");
+    raw.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, '0001_init.sql', ?)").run(at);
+    raw.prepare(
+      "INSERT INTO projects (id, name, repo_path, default_branch, policy_version, version, created_at, updated_at) VALUES (?, ?, ?, ?, 0, 0, ?, ?)",
+    ).run("legacy-proj", "Legacy", ".", "main", at, at);
+    raw.prepare(
+      `INSERT INTO tasks (id, project_id, title, description, function_required, role_required, priority, status, version, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'WORKER', 'DEV', 2, 'READY', 0, ?, ?)`,
+    ).run("legacy-task", "legacy-proj", "Legacy task", "from M1", at, at);
+    raw.prepare(
+      `INSERT INTO runs (id, task_id, agent_id, function, status, attempt, version, created_at, updated_at)
+       VALUES (?, ?, ?, 'WORKER', 'STARTING', 1, 0, ?, ?)`,
+    ).run("legacy-run", "legacy-task", "agent-dev-01", at, at);
+    raw.prepare(
+      `INSERT INTO dispatch_commands (id, task_id, run_id, status, idempotency_key, generation, created_at, updated_at)
+       VALUES (?, ?, ?, 'PENDING', ?, 0, ?, ?)`,
+    ).run("legacy-cmd", "legacy-task", "legacy-run", "legacy-key", at, at);
+    raw.prepare(
+      `INSERT INTO run_leases (run_id, owner_id, generation, claimed_until, created_at, updated_at)
+       VALUES (?, 'host-old', 1, ?, ?, ?)`,
+    ).run("legacy-run", at, at, at);
+  } finally {
+    raw.close();
+  }
+
+  const upgraded = open({ migrate: true });
+  assert.equal(upgraded.health().schemaVersion, 2);
+  assert.equal(upgraded.getProject("legacy-proj").name, "Legacy");
+  assert.equal(upgraded.getTask("legacy-task").title, "Legacy task");
+  const run = upgraded.getRun("legacy-run");
+  assert.equal(run.status, "STARTING");
+  assert.equal(run.taskId, "legacy-task");
+  assert.equal(run.attempt, 1);
+  // New columns are usable on the old row (NULL role/workspace before any write).
+  assert.equal(run.role, null);
+  upgraded.close();
+
+  const verify = rawOpen(file);
+  try {
+    const rows = verify
+      .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
+      .all();
+    assert.deepEqual(
+      rows.map((row) => [Number(row.version), row.name]),
+      [
+        [1, "0001_init.sql"],
+        [2, "0002_runs_dispatch.sql"],
+      ],
+    );
+    const command = verify.prepare("SELECT * FROM dispatch_commands WHERE id = 'legacy-cmd'").get();
+    assert.equal(command.command_type, "RUN_TASK");
+    assert.equal(Number(command.attempts), 0);
+    const lease = verify.prepare("SELECT * FROM run_leases WHERE run_id = 'legacy-run'").get();
+    assert.ok(Object.prototype.hasOwnProperty.call(lease, "last_heartbeat_at"));
+  } finally {
+    verify.close();
+  }
 });
 
 test("openStore validates its arguments with contract errors", () => {
@@ -207,3 +312,4 @@ test("errors are contract-shaped objects with code/message/details", (t) => {
     });
   }
 });
+

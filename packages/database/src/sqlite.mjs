@@ -1,4 +1,4 @@
-// SQLite Store implementation (M1, ATK-104).
+// SQLite Store implementation (M1/M2: schema, migrations, repositories).
 //
 // Driver: built-in `node:sqlite` DatabaseSync (ADR-009). No native module, no
 // ORM. Every write statement is a parameterised prepared statement; the only
@@ -12,6 +12,7 @@ import { EVENT_SCHEMA_VERSION, FUNCTIONS } from "@atk/contracts";
 import { StoreError, fail, notFound } from "./errors.mjs";
 import { INTERNAL } from "./internal.mjs";
 import {
+  DEFAULT_LEASE_MS,
   MAX_EVENT_LIMIT,
   MAX_OVERVIEW_EVENTS,
   SCHEMA_VERSION,
@@ -19,20 +20,30 @@ import {
   buildOverview,
   compareTasks,
   ensurePlainObject,
+  generateId,
+  isPlainObject,
+  leaseExpiryAfter,
   makeEvent,
   mergeAgent,
   mergeProject,
+  mergeRunStatus,
   mergeTask,
   normalizeAgent,
   normalizeApproval,
   normalizeLimit,
   normalizeProject,
   normalizeRequirement,
+  normalizeRun,
   normalizeTask,
   nowIso,
   parseJsonColumn,
   requireId,
   safeJson,
+  validateCommandPayload,
+  validateCommandType,
+  validateIdempotencyKey,
+  validateLeaseMs,
+  validateOwnerId,
   validateTaskStatus,
 } from "./model.mjs";
 
@@ -186,6 +197,15 @@ export function openStore(options = {}) {
       exec("BEGIN IMMEDIATE");
       transactionDepth = 1;
       try {
+        // Two processes may open the same fresh database at the same time: the
+        // write lock serialises them, so re-check inside the transaction that
+        // the other opener did not already apply this migration.
+        const already = stmt("SELECT version FROM schema_migrations WHERE version = ?").get(version);
+        if (already) {
+          exec("COMMIT");
+          applied.add(version);
+          continue;
+        }
         exec(sql);
         stmt("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(
           version,
@@ -307,17 +327,57 @@ export function openStore(options = {}) {
       taskId: row.task_id,
       agentId: row.agent_id,
       function: row.function,
+      role: row.role ?? null,
       status: row.status,
       attempt: Number(row.attempt),
       version: Number(row.version),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
+    if (row.workspace_id !== null && row.workspace_id !== undefined) run.workspaceId = row.workspace_id;
     if (row.started_at !== null && row.started_at !== undefined) run.startedAt = row.started_at;
     if (row.ended_at !== null && row.ended_at !== undefined) run.endedAt = row.ended_at;
+    if (row.exit_code !== null && row.exit_code !== undefined) run.exitCode = Number(row.exit_code);
     const error = parseJsonColumn(row.error_json);
     if (error !== null) run.error = error;
     return run;
+  }
+
+  function commandJson(row) {
+    const command = {
+      id: row.id,
+      runId: row.run_id,
+      taskId: row.task_id ?? null,
+      commandType: row.command_type ?? "RUN_TASK",
+      payload: parseJsonColumn(row.payload_json) ?? {},
+      status: row.status,
+      idempotencyKey: row.idempotency_key,
+      ownerId: row.owner_id ?? null,
+      generation: Number(row.generation ?? 0),
+      claimedUntil: row.claimed_until ?? null,
+      attempts: Number(row.attempts ?? 0),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+    const result = parseJsonColumn(row.result_json);
+    if (result !== null) command.result = result;
+    if (row.completed_at !== null && row.completed_at !== undefined) command.completedAt = row.completed_at;
+    return command;
+  }
+
+  function leaseJson(row) {
+    // Lease JSON uses the names the internal API forwards to the Runtime Host
+    // (m2-contracts §2: `{ ownerId, generation, claimedUntil }`); the DB columns
+    // are the §3 names (`owner_id` / `claimed_until`).
+    return {
+      runId: row.run_id,
+      ownerId: row.owner_id,
+      generation: Number(row.generation),
+      claimedUntil: row.claimed_until,
+      lastHeartbeatAt: row.last_heartbeat_at ?? null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
   }
 
   function agentJson(row) {
@@ -383,6 +443,24 @@ export function openStore(options = {}) {
     };
   }
 
+  /** Insert one event (caller owns the transaction) and return its JSON. */
+  function insertEvent(event) {
+    const result = stmt(
+      `INSERT INTO events
+         (schema_version, project_id, aggregate_type, aggregate_id, type, payload_json, happened_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      EVENT_SCHEMA_VERSION,
+      event.projectId,
+      event.aggregateType,
+      event.aggregateId,
+      event.type,
+      JSON.stringify(event.payload),
+      event.happenedAt,
+    );
+    return eventJson(stmt("SELECT * FROM events WHERE seq = ?").get(Number(result.lastInsertRowid)));
+  }
+
   // -------------------------------------------------------------------------
   // Lookup helpers
   // -------------------------------------------------------------------------
@@ -395,6 +473,21 @@ export function openStore(options = {}) {
   function getTaskRow(id) {
     requireId(id, "task.id");
     return stmt("SELECT * FROM tasks WHERE id = ?").get(id) ?? null;
+  }
+
+  function getRunRow(id) {
+    requireId(id, "run.id");
+    return stmt("SELECT * FROM runs WHERE id = ?").get(id) ?? null;
+  }
+
+  function requireRunRow(id) {
+    const row = getRunRow(id);
+    if (!row) notFound("run", id);
+    return row;
+  }
+
+  function getLeaseRow(runId) {
+    return stmt("SELECT * FROM run_leases WHERE run_id = ?").get(runId) ?? null;
   }
 
   function requireProject(id) {
@@ -743,6 +836,434 @@ export function openStore(options = {}) {
       return runJson(row);
     },
 
+    // --- Run lifecycle (m2-contracts §2/§3) -------------------------------
+    createRun(dto) {
+      ensurePlainObject(dto, "run");
+      return transaction(() => {
+        // The task is the anchor of a Run: it must exist (and gives us the
+        // projectId the run.created event is streamed under).
+        const taskRow = requireTaskRow(dto.taskId);
+        const attempt = Number(stmt("SELECT COUNT(*) AS c FROM runs WHERE task_id = ?").get(dto.taskId).c) + 1;
+        const run = normalizeRun(dto, { now: nowIso(), attempt, id: dto.id });
+        if (getRunRow(run.id)) {
+          fail("VALIDATION_ERROR", `run "${run.id}" already exists`, { entity: "run", id: run.id });
+        }
+        stmt(
+          `INSERT INTO runs
+             (id, task_id, agent_id, function, status, attempt, started_at, ended_at, error_json,
+              version, role, workspace_id, exit_code, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          run.id,
+          run.taskId,
+          run.agentId,
+          run.function,
+          run.status,
+          run.attempt,
+          null,
+          null,
+          null,
+          run.version,
+          run.role,
+          run.workspaceId ?? null,
+          null,
+          run.createdAt,
+          run.updatedAt,
+        );
+        insertEvent(
+          makeEvent({
+            projectId: taskRow.project_id,
+            aggregateType: "run",
+            aggregateId: run.id,
+            type: "run.created",
+            payload: {
+              runId: run.id,
+              taskId: run.taskId,
+              agentId: run.agentId,
+              function: run.function,
+              role: run.role,
+              status: run.status,
+              attempt: run.attempt,
+              version: run.version,
+              ...(run.workspaceId === undefined ? {} : { workspaceId: run.workspaceId }),
+            },
+            now: run.createdAt,
+          }),
+        );
+        return runJson(requireRunRow(run.id));
+      });
+    },
+
+    /**
+     * Advance a Run along the §2 state machine. Illegal transitions throw
+     * VALIDATION_ERROR + {from,to,allowed}; every legal transition appends one
+     * `run.updated` event (the SSE/UI producer). Same-status calls are an
+     * idempotent no-op (no version bump, no duplicate event).
+     *
+     * Optional `generation` (m2-integration): when the caller reports a state
+     * change from a Runtime Host, the current lease is checked **inside the same
+     * transaction** before any write; a stale generation throws STALE_GENERATION
+     * and leaves status/version/events byte-for-byte unchanged. This makes even
+     * a pure state batch (no run.log to append) fenced, without read-then-act.
+     * Omitting `generation` keeps the user/tool-facing behaviour unchanged.
+     */
+    updateRunStatus(id, { status, exitCode, endedAt, generation } = {}) {
+      requireId(id, "run.id");
+      if (generation !== undefined && generation !== null) {
+        if (!Number.isInteger(generation) || generation < 1) {
+          fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
+        }
+      }
+      return transaction(() => {
+        if (generation !== undefined && generation !== null) {
+          const lease = getLeaseRow(id);
+          if (!lease) {
+            fail("STALE_GENERATION", `run "${id}" state report is fenced out`, {
+              runId: id,
+              generation,
+              currentGeneration: null,
+              reason: "lease-missing",
+            });
+          }
+          if (Number(lease.generation) !== generation) {
+            fail("STALE_GENERATION", `run "${id}" state report is fenced out`, {
+              runId: id,
+              generation,
+              currentGeneration: Number(lease.generation),
+              reason: "generation-mismatch",
+            });
+          }
+        }
+        const row = requireRunRow(id);
+        const current = runJson(row);
+        const merge = mergeRunStatus(current, { status, exitCode, endedAt }, { now: nowIso() });
+        if (!merge.updated) return current;
+        const next = merge.run;
+        const result = stmt(
+          `UPDATE runs
+              SET status = ?, exit_code = ?, started_at = ?, ended_at = ?, version = ?, updated_at = ?
+            WHERE id = ? AND version = ?`,
+        ).run(
+          next.status,
+          next.exitCode ?? null,
+          next.startedAt ?? null,
+          next.endedAt ?? null,
+          next.version,
+          next.updatedAt,
+          id,
+          current.version,
+        );
+        if (Number(result.changes) === 0) {
+          const latest = requireRunRow(id);
+          fail("VERSION_CONFLICT", `run "${id}" version conflict`, {
+            entity: "run",
+            id,
+            expectedVersion: current.version,
+            currentVersion: Number(latest.version),
+          });
+        }
+        const taskRow = requireTaskRow(next.taskId);
+        insertEvent(
+          makeEvent({
+            projectId: taskRow.project_id,
+            aggregateType: "run",
+            aggregateId: id,
+            type: "run.updated",
+            payload: {
+              runId: id,
+              taskId: next.taskId,
+              status: next.status,
+              previousStatus: current.status,
+              version: next.version,
+              ...(next.exitCode === undefined ? {} : { exitCode: next.exitCode }),
+              ...(next.endedAt === undefined ? {} : { endedAt: next.endedAt }),
+            },
+            now: next.updatedAt,
+          }),
+        );
+        return runJson(requireRunRow(id));
+      });
+    },
+
+    // --- Durable dispatch commands + leases (ADR-003 / m2-contracts §3) ---
+    enqueueDispatchCommand({ runId, commandType, payload, idempotencyKey } = {}) {
+      const commandTypeValue = validateCommandType(commandType);
+      const key = validateIdempotencyKey(idempotencyKey);
+      const payloadValue = validateCommandPayload(payload);
+      return transaction(() => {
+        const run = runJson(requireRunRow(runId));
+        const existing = stmt("SELECT * FROM dispatch_commands WHERE idempotency_key = ?").get(key);
+        if (existing) return commandJson(existing);
+        const id = generateId("CMD");
+        const at = nowIso();
+        stmt(
+          `INSERT INTO dispatch_commands
+             (id, task_id, run_id, agent_id, status, idempotency_key, owner_id, generation,
+              claimed_until, payload_json, command_type, attempts, result_json, completed_at,
+              created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'PENDING', ?, NULL, 0, NULL, ?, ?, 0, NULL, NULL, ?, ?)`,
+        ).run(
+          id,
+          run.taskId,
+          run.id,
+          run.agentId,
+          key,
+          JSON.stringify(payloadValue),
+          commandTypeValue,
+          at,
+          at,
+        );
+        return commandJson(stmt("SELECT * FROM dispatch_commands WHERE id = ?").get(id));
+      });
+    },
+
+    /**
+     * Atomically claim the oldest runnable command. BEGIN IMMEDIATE serialises
+     * writers across connections, so two hosts (or two processes) can never get
+     * the same command: the loser blocks on the write lock and then finds it
+     * CLAIMED and not yet expired. Expired claims are re-claimable and bump
+     * `attempts`; the lease generation is monotonic across claims so the old
+     * holder is fenced out (ADR-003).
+     */
+    claimDispatchCommand({ ownerId, leaseMs } = {}) {
+      const owner = validateOwnerId(ownerId);
+      const ttl = validateLeaseMs(leaseMs, { fallback: DEFAULT_LEASE_MS });
+      return transaction(() => {
+        const now = nowIso();
+        const row = stmt(
+          `SELECT c.* FROM dispatch_commands c
+             JOIN runs r ON r.id = c.run_id
+             LEFT JOIN run_leases l ON l.run_id = c.run_id
+            WHERE r.status IN ('QUEUED', 'STARTING', 'RUNNING')
+              AND (
+                    -- fresh command: only when the run has no live lease (a run
+                    -- must never have two effective holders; ADR-003)
+                    (c.status = 'PENDING' AND (l.run_id IS NULL OR l.claimed_until <= ?))
+                    -- abandoned claim: the lease expired and may be re-claimed
+                 OR (c.status = 'CLAIMED' AND c.claimed_until IS NOT NULL AND c.claimed_until <= ?)
+              )
+            ORDER BY c.created_at ASC, c.id ASC
+            LIMIT 1`,
+        ).get(now, now);
+        if (!row) return null;
+        const existingLease = getLeaseRow(row.run_id);
+        const generation = existingLease === null ? 1 : Number(existingLease.generation) + 1;
+        const claimedUntil = leaseExpiryAfter(now, ttl);
+        stmt(
+          `UPDATE dispatch_commands
+              SET status = 'CLAIMED', owner_id = ?, generation = ?, claimed_until = ?,
+                  attempts = attempts + 1, updated_at = ?
+            WHERE id = ?`,
+        ).run(owner, generation, claimedUntil, now, row.id);
+        stmt(
+          `INSERT INTO run_leases
+             (run_id, owner_id, generation, claimed_until, last_heartbeat_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(run_id) DO UPDATE SET
+             owner_id = excluded.owner_id,
+             generation = excluded.generation,
+             claimed_until = excluded.claimed_until,
+             last_heartbeat_at = excluded.last_heartbeat_at,
+             updated_at = excluded.updated_at`,
+        ).run(row.run_id, owner, generation, claimedUntil, now, now, now);
+        return {
+          command: commandJson(stmt("SELECT * FROM dispatch_commands WHERE id = ?").get(row.id)),
+          lease: leaseJson(getLeaseRow(row.run_id)),
+        };
+      });
+    },
+
+    /**
+     * Persist a command result under generation fencing. A stale generation
+     * throws STALE_GENERATION before any write (the row is byte-for-byte
+     * unchanged). Repeating the call with the winning generation is idempotent:
+     * it returns the stored command and writes no event.
+     */
+    completeDispatchCommand({ id, ownerId, generation, status, result } = {}) {
+      requireId(id, "dispatchCommand.id");
+      const owner = validateOwnerId(ownerId);
+      if (!Number.isInteger(generation) || generation < 1) {
+        fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
+      }
+      if (status !== "DONE" && status !== "FAILED") {
+        fail("VALIDATION_ERROR", "dispatch result status must be DONE or FAILED", {
+          status: status ?? null,
+          allowed: ["DONE", "FAILED"],
+        });
+      }
+      if (result !== undefined && result !== null && !isPlainObject(result)) {
+        fail("VALIDATION_ERROR", "dispatch result must be an object", { resultType: typeof result });
+      }
+      return transaction(() => {
+        const row = stmt("SELECT * FROM dispatch_commands WHERE id = ?").get(id);
+        if (!row) notFound("dispatchCommand", id);
+        const stale = (details) => {
+          fail("STALE_GENERATION", `dispatch command "${id}" report is fenced out`, {
+            commandId: id,
+            ownerId: owner,
+            generation,
+            ...details,
+          });
+        };
+        if (row.status === "DONE" || row.status === "FAILED") {
+          if (Number(row.generation) === generation && row.owner_id === owner) return commandJson(row);
+          stale({
+            expectedGeneration: Number(row.generation),
+            currentOwnerId: row.owner_id,
+            reason: "command-already-finished",
+          });
+        }
+        if (row.status !== "CLAIMED") {
+          stale({ expectedGeneration: Number(row.generation), reason: "command-not-claimed" });
+        }
+        const lease = getLeaseRow(row.run_id);
+        if (!lease) stale({ reason: "lease-missing" });
+        if (Number(lease.generation) !== generation || lease.owner_id !== owner) {
+          stale({
+            expectedGeneration: Number(lease.generation),
+            currentOwnerId: lease.owner_id,
+            reason: "lease-mismatch",
+          });
+        }
+        const now = nowIso();
+        // FAILED keeps its error summary in the same result_json column.
+        stmt(
+          `UPDATE dispatch_commands
+              SET status = ?, result_json = ?, completed_at = ?, claimed_until = ?, updated_at = ?
+            WHERE id = ?`,
+        ).run(status, JSON.stringify(result ?? {}), now, now, now, id);
+        // "Release" the lease by EXPIRING it, never by deleting the row: the
+        // monotonic generation must survive completion so a later claim of the
+        // same run bumps past the finished holder. Deleting would restart the
+        // sequence at 1 and let a stale host match again (fencing lost). This is
+        // why reconcileRun reports this expired lease instead of null.
+        stmt(
+          "UPDATE run_leases SET claimed_until = ?, last_heartbeat_at = ?, updated_at = ? WHERE run_id = ?",
+        ).run(now, now, now, row.run_id);
+        return commandJson(stmt("SELECT * FROM dispatch_commands WHERE id = ?").get(id));
+      });
+    },
+
+    renewRunLease({ runId, ownerId, generation, leaseMs } = {}) {
+      requireId(runId, "run.id");
+      const owner = validateOwnerId(ownerId);
+      if (!Number.isInteger(generation) || generation < 1) {
+        fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
+      }
+      const ttl = validateLeaseMs(leaseMs, { fallback: DEFAULT_LEASE_MS });
+      return transaction(() => {
+        const now = nowIso();
+        const lease = getLeaseRow(runId);
+        const stale = (details) => {
+          fail("STALE_GENERATION", `run "${runId}" lease is fenced out`, {
+            runId,
+            ownerId: owner,
+            generation,
+            ...details,
+          });
+        };
+        if (!lease) stale({ reason: "lease-missing" });
+        if (lease.owner_id !== owner) {
+          stale({ reason: "holder-mismatch", currentHolderId: lease.owner_id });
+        }
+        if (Number(lease.generation) !== generation) {
+          stale({ reason: "generation-mismatch", currentGeneration: Number(lease.generation) });
+        }
+        if (lease.claimed_until <= now) {
+          stale({ reason: "lease-expired", claimedUntil: lease.claimed_until });
+        }
+        const nextGeneration = generation + 1;
+        const claimedUntil = leaseExpiryAfter(now, ttl);
+        stmt(
+          `UPDATE run_leases
+              SET generation = ?, claimed_until = ?, last_heartbeat_at = ?, updated_at = ?
+            WHERE run_id = ?`,
+        ).run(nextGeneration, claimedUntil, now, now, runId);
+        // Keep the command's lease window/generation in step so the claim scan
+        // never hands a live run to a second host.
+        stmt(
+          "UPDATE dispatch_commands SET generation = ?, claimed_until = ?, updated_at = ? WHERE run_id = ? AND status = 'CLAIMED'",
+        ).run(nextGeneration, claimedUntil, now, runId);
+        return leaseJson(getLeaseRow(runId));
+      });
+    },
+
+    /**
+     * Append runtime events under generation fencing. Does NOT advance the Run
+     * status (Backend owns that via updateRunStatus, single responsibility).
+     * An empty `events` array is a valid *pure fence* call: it proves the caller
+     * still holds the current generation without writing anything, which lets
+     * Backend order "verify generation → updateRunStatus" safely.
+     * Unknown event types are rejected by contracts.createEvent(), never dropped.
+     */
+    appendRunEvent({ runId, generation, events } = {}) {
+      requireId(runId, "run.id");
+      if (!Number.isInteger(generation) || generation < 1) {
+        fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
+      }
+      if (!Array.isArray(events)) {
+        fail("VALIDATION_ERROR", "run.events must be an array", { events: events ?? null });
+      }
+      if (events.length > 1000) {
+        fail("VALIDATION_ERROR", "run.events accepts at most 1000 events per call", { length: events.length });
+      }
+      return transaction(() => {
+        const run = runJson(requireRunRow(runId));
+        const taskRow = requireTaskRow(run.taskId);
+        const now = nowIso();
+        const lease = getLeaseRow(runId);
+        const stale = (details) => {
+          fail("STALE_GENERATION", `run "${runId}" event report is fenced out`, {
+            runId,
+            generation,
+            ...details,
+          });
+        };
+        if (!lease) stale({ reason: "lease-missing" });
+        if (Number(lease.generation) !== generation) {
+          stale({ reason: "generation-mismatch", currentGeneration: Number(lease.generation) });
+        }
+        if (lease.claimed_until <= now) stale({ reason: "lease-expired", claimedUntil: lease.claimed_until });
+        const inserted = [];
+        events.forEach((raw, index) => {
+          if (!isPlainObject(raw)) {
+            fail("VALIDATION_ERROR", `run.events[${index}] must be an object`, { index });
+          }
+          if (typeof raw.type !== "string" || raw.type.trim() === "") {
+            fail("VALIDATION_ERROR", `run.events[${index}].type is required`, { index });
+          }
+          const payload = raw.payload ?? {};
+          if (!isPlainObject(payload)) {
+            fail("VALIDATION_ERROR", `run.events[${index}].payload must be an object`, { index });
+          }
+          const event = makeEvent({
+            projectId: taskRow.project_id,
+            aggregateType: "run",
+            aggregateId: runId,
+            type: raw.type,
+            payload,
+            now,
+          });
+          inserted.push(insertEvent(event));
+        });
+        return inserted;
+      });
+    },
+
+    /**
+     * Reconcile facts for a restarted Host. `sessions` stays empty in M2 (M4
+     * fills it). A run that was claimed and then completed reports its lease as
+     * EXPIRED with the generation retained — not null — because "release" means
+     * expiry here (see completeDispatchCommand): the Host compares the reported
+     * generation to the authoritative one before doing anything.
+     */
+    reconcileRun({ runId } = {}) {
+      requireId(runId, "run.id");
+      const run = runJson(requireRunRow(runId));
+      const lease = getLeaseRow(runId);
+      return { run, lease: lease === null ? null : leaseJson(lease), sessions: [] };
+    },
+
     listAgents() {
       return stmt("SELECT * FROM agent_instances ORDER BY id ASC").all().map(agentJson);
     },
@@ -883,23 +1404,7 @@ export function openStore(options = {}) {
     appendEvent(input) {
       ensurePlainObject(input, "event");
       const event = makeEvent({ ...input, now: nowIso() });
-      return transaction(() => {
-        const result = stmt(
-          `INSERT INTO events
-             (schema_version, project_id, aggregate_type, aggregate_id, type, payload_json, happened_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          EVENT_SCHEMA_VERSION,
-          event.projectId,
-          event.aggregateType,
-          event.aggregateId,
-          event.type,
-          JSON.stringify(event.payload),
-          event.happenedAt,
-        );
-        const row = stmt("SELECT * FROM events WHERE seq = ?").get(Number(result.lastInsertRowid));
-        return eventJson(row);
-      });
+      return transaction(() => insertEvent(event));
     },
 
     listEvents({ projectId, afterSeq, limit } = {}) {
@@ -968,6 +1473,11 @@ export function openStore(options = {}) {
       getTaskLegacy: (id) => {
         const row = getTaskRow(id);
         return row ? parseJsonColumn(row.legacy_json) : null;
+      },
+      /** Read a dispatch command row as JSON (test/fencing diagnostics only). */
+      getDispatchCommand: (id) => {
+        const row = stmt("SELECT * FROM dispatch_commands WHERE id = ?").get(id);
+        return row ? commandJson(row) : null;
       },
       /**
        * Migration-only writer: sets a task's status exactly as recorded in the

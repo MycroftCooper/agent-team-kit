@@ -22,7 +22,7 @@ import {
 import { fail } from "./errors.mjs";
 
 /** Schema version written by the latest migration file. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const DEFAULT_LIST_LIMIT = 100;
 export const MAX_LIST_LIMIT = 10000;
 export const MAX_EVENT_LIMIT = 10000;
@@ -535,6 +535,220 @@ export function makeEvent({ projectId = null, aggregateType, aggregateId, type, 
 }
 
 export { EVENT_SCHEMA_VERSION };
+
+// ---------------------------------------------------------------------------
+// Run lifecycle state machine (m2-contracts §2)
+// ---------------------------------------------------------------------------
+//
+//   QUEUED → STARTING → RUNNING → COMPLETED | FAILED | CANCELLED | INTERRUPTED
+//
+//   * STARTING may go to RUNNING | FAILED | INTERRUPTED: a session that never
+//     started cannot "complete"; it failed/interrupted on the way up.
+//   * RUNNING may go to any terminal state.
+//   * COMPLETED/FAILED/CANCELLED/INTERRUPTED are terminal: nothing transitions
+//     out of them (a finished run is history, not a branch).
+//   * Same-state (`from === to`) is an idempotent no-op handled by
+//     updateRunStatus (returns the current row, never a second event).
+//
+// The table lives here, next to the Task machine, and is used by both stores.
+export const RUN_TERMINAL_STATUSES = Object.freeze(["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"]);
+
+const RUN_TRANSITIONS = Object.freeze({
+  QUEUED: Object.freeze(["STARTING"]),
+  STARTING: Object.freeze(["RUNNING", "FAILED", "INTERRUPTED"]),
+  RUNNING: Object.freeze(["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"]),
+  COMPLETED: Object.freeze([]),
+  FAILED: Object.freeze([]),
+  CANCELLED: Object.freeze([]),
+  INTERRUPTED: Object.freeze([]),
+});
+
+const RUN_STATUS_ORDER = new Map(RUN_STATUSES.map((status, index) => [status, index]));
+
+export function canTransitionRun(from, to) {
+  if (!RUN_STATUSES.includes(from) || !RUN_STATUSES.includes(to)) return false;
+  if (from === to) return true;
+  return RUN_TRANSITIONS[from].includes(to);
+}
+
+export function allowedRunTransitionsFrom(from) {
+  if (!RUN_STATUSES.includes(from)) return [];
+  return [...RUN_TRANSITIONS[from]];
+}
+
+/** Illegal Run transition → VALIDATION_ERROR + details {from,to,allowed}. */
+export function assertRunTransition(from, to) {
+  if (canTransitionRun(from, to)) return true;
+  fail("VALIDATION_ERROR", `run.status cannot transition from ${from} to ${to}`, {
+    from,
+    to,
+    allowed: allowedRunTransitionsFrom(from),
+  });
+}
+
+export const runStatusMachine = Object.freeze({
+  terminal: RUN_TERMINAL_STATUSES,
+  transitions: RUN_TRANSITIONS,
+  canTransition: canTransitionRun,
+  allowedTransitions: allowedRunTransitionsFrom,
+  statusOrder: RUN_STATUS_ORDER,
+});
+
+// ---------------------------------------------------------------------------
+// Run / dispatch / lease DTO helpers (m2-contracts §3)
+// ---------------------------------------------------------------------------
+
+export const MAX_LEASE_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_LEASE_MS = 30_000;
+export const MAX_IDEMPOTENCY_KEY_LENGTH = 256;
+
+function requireNonEmptyString(value, label, { maxLength = 256 } = {}) {
+  if (typeof value !== "string" || value.trim() === "") {
+    fail("VALIDATION_ERROR", `${label} must be a non-empty string`, { entity: label, value: value ?? null });
+  }
+  if (value.length > maxLength) {
+    fail("VALIDATION_ERROR", `${label} must be at most ${maxLength} characters`, {
+      entity: label,
+      length: value.length,
+    });
+  }
+  if (/[\u0000-\u001f]/.test(value)) {
+    fail("VALIDATION_ERROR", `${label} must not contain control characters`, { entity: label });
+  }
+  return value;
+}
+
+/** Runtime host identity; also used as the lease holder. */
+export function validateOwnerId(value) {
+  return requireNonEmptyString(value, "ownerId", { maxLength: 128 });
+}
+
+export function validateLeaseMs(value, { fallback = undefined } = {}) {
+  const leaseMs = value === undefined || value === null ? fallback : value;
+  if (leaseMs === undefined) {
+    fail("VALIDATION_ERROR", "leaseMs is required", { leaseMs: value ?? null });
+  }
+  if (!Number.isInteger(leaseMs) || leaseMs < 1 || leaseMs > MAX_LEASE_MS) {
+    fail("VALIDATION_ERROR", `leaseMs must be an integer between 1 and ${MAX_LEASE_MS}`, { leaseMs });
+  }
+  return leaseMs;
+}
+
+export function validateIdempotencyKey(value) {
+  return requireNonEmptyString(value, "idempotencyKey", { maxLength: MAX_IDEMPOTENCY_KEY_LENGTH });
+}
+
+export function validateCommandType(value) {
+  return requireNonEmptyString(value, "commandType", { maxLength: 64 });
+}
+
+export function validateCommandPayload(value) {
+  if (value === undefined || value === null) return {};
+  if (!isPlainObject(value)) {
+    fail("VALIDATION_ERROR", "command.payload must be an object", { payloadType: typeof value });
+  }
+  return value;
+}
+
+export function leaseExpiryAfter(now, leaseMs) {
+  return new Date(Date.parse(now) + leaseMs).toISOString();
+}
+
+/**
+ * Build a new Run in STARTING (m2-contracts §3 / §2). `attempt` is resolved by
+ * the store (same task, N-th run) and passed in; `dto.attempt` is validated but
+ * the store's counter wins so two clients cannot collide on the same attempt.
+ */
+export function normalizeRun(dto, { now, attempt, id } = {}) {
+  ensurePlainObject(dto, "run");
+  const errors = [];
+  if (typeof dto.taskId !== "string" || !ID_RE.test(dto.taskId)) errors.push("run.taskId must be an id string");
+  if (typeof dto.agentId !== "string" || !ID_RE.test(dto.agentId)) errors.push("run.agentId must be an id string");
+  if (!FUNCTIONS.includes(dto.function)) errors.push("run.function must be one of the Function enum values");
+  if (typeof dto.role !== "string" || !ROLE_RE.test(dto.role)) {
+    errors.push("run.role must be an upper-case role identifier");
+  }
+  if (dto.id !== undefined) {
+    if (typeof dto.id !== "string" || !ID_RE.test(dto.id)) errors.push("run.id must be an id string");
+  }
+  if (dto.attempt !== undefined && (!Number.isInteger(dto.attempt) || dto.attempt < 1)) {
+    errors.push("run.attempt must be a positive integer");
+  }
+  if (dto.workspaceId !== undefined && dto.workspaceId !== null) {
+    if (typeof dto.workspaceId !== "string" || dto.workspaceId.trim() === "" || dto.workspaceId.length > 512) {
+      errors.push("run.workspaceId must be a non-empty string");
+    }
+  }
+  if (!Number.isInteger(attempt) || attempt < 1) errors.push("run.attempt could not be resolved");
+  if (errors.length > 0) {
+    fail("VALIDATION_ERROR", `run is invalid: ${errors.join("; ")}`, { entity: "run", errors });
+  }
+  const at = nowIso(now);
+  const run = {
+    id: id ?? dto.id ?? generateId("RUN"),
+    taskId: dto.taskId,
+    agentId: dto.agentId,
+    function: dto.function,
+    role: dto.role,
+    status: "STARTING",
+    attempt,
+    version: 0,
+    createdAt: at,
+    updatedAt: at,
+  };
+  if (dto.workspaceId !== undefined && dto.workspaceId !== null) run.workspaceId = dto.workspaceId;
+  return run;
+}
+
+/**
+ * Validate one Run status transition. Returns `{ updated: false, run }` for a
+ * same-state call (idempotent success, no version bump, no duplicate event) or
+ * `{ updated: true, run }` with version+1 timestamps applied.
+ */
+export function mergeRunStatus(current, changes, { now } = {}) {
+  ensurePlainObject(changes, "run status changes");
+  const { status, exitCode, endedAt } = changes;
+  if (typeof status !== "string" || !RUN_STATUSES.includes(status)) {
+    fail("VALIDATION_ERROR", "run.status must be one of the run enum values", {
+      status: status ?? null,
+      allowed: RUN_STATUSES,
+    });
+  }
+  // Transition first: an illegal jump is the primary error even if the caller
+  // also sent a nonsensical exitCode/endedAt.
+  assertRunTransition(current.status, status);
+  if (exitCode !== undefined && exitCode !== null && !Number.isInteger(exitCode)) {
+    fail("VALIDATION_ERROR", "run.exitCode must be an integer or null", { exitCode });
+  }
+  if (endedAt !== undefined && endedAt !== null) {
+    if (typeof endedAt !== "string" || Number.isNaN(Date.parse(endedAt))) {
+      fail("VALIDATION_ERROR", "run.endedAt must be an ISO-8601 timestamp or null", { endedAt });
+    }
+    if (!RUN_TERMINAL_STATUSES.includes(status)) {
+      fail("VALIDATION_ERROR", "run.endedAt is only valid for a terminal run status", { status });
+    }
+  }
+  if (current.status === status) return { updated: false, run: current };
+
+  const at = nowIso(now);
+  const run = { ...current, status, version: current.version + 1, updatedAt: at };
+  if (status === "RUNNING" && run.startedAt === undefined) run.startedAt = at;
+  if (RUN_TERMINAL_STATUSES.includes(status)) {
+    run.endedAt = endedAt ?? at;
+  } else if (endedAt !== undefined) {
+    run.endedAt = endedAt;
+  }
+  if (exitCode !== undefined) {
+    if (exitCode === null) delete run.exitCode;
+    else run.exitCode = exitCode;
+  }
+  return { updated: true, run };
+}
+
+/** Sort helper for listRuns (newest first, then id for stable output). */
+export function compareRunsNewestFirst(a, b) {
+  return b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id);
+}
 
 // ---------------------------------------------------------------------------
 // Ordering and projections
