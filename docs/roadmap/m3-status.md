@@ -19,12 +19,12 @@ Changed: 新增 packages/scheduler-core、apps/scheduler、scripts/m3-smoke.mjs�
          packages/database 加 0003 迁移 + schedulingSnapshot/claimTask；
          apps/backend 加 scheduling/snapshot、tasks/:id/claim、scheduler/heartbeat
 Build: 无构建步骤；scheduler-core 零依赖零 import（纯函数）
-Tests: node scripts/test.mjs             -> 350 / 350 pass
-       node scripts/test-workspace.mjs   -> 423 / 423 pass（40 文件）
+Tests: node scripts/test.mjs             -> 400 / 400 pass（含 QA-004 对抗 25 条）
+       node scripts/test-workspace.mjs   -> 507 / 507 pass（隔离冻结树为 433/433）
        node scripts/check-boundaries.mjs -> PASS（8 packages / 6 edges / 0 cycles）
        node scripts/m1-smoke.mjs         -> 16 / 16（M1 无回归）
-       node scripts/m2-smoke.mjs         -> 3 / 3（M2 无回归）
-       node scripts/m3-smoke.mjs         -> 5 / 5（见 §3）
+       node scripts/m2-smoke.mjs         -> 4 / 4（M2 无回归）
+       node scripts/m3-smoke.mjs         -> 6 / 6（见 §3）
 Contracts: scheduler-core 返回形状、快照 version=MAX(events.seq)、task.files/run.files、
            claim 7 步错误码（见 m3-contracts §2/§5）
 Security: Scheduler 只提建议、不写业务状态；claim 必须走 store 单事务；内部凭据隔离沿用 M2
@@ -61,8 +61,12 @@ PASS  a restarted scheduler does not dispatch an already claimed task twice
       no duplicate claim; 0 active run(s) unchanged
 PASS  after the root is accepted, the next task is dispatched
       M3-A accepted by legal transitions; claimed M3-B
-5/5 checks passed
+PASS  the scheduler CLI process starts and completes a round
+      CLI exit 0, round ok (0 proposal(s), 1 skipped)
+6/6 checks passed
 ```
+
+> 冻结时门禁是 5/5。QA-004 的 BLOCKER（`apps/scheduler/cli.mjs` 与 `apps/runtime-host/cli.mjs` 的 import 路径写错，两个进程入口都起不来，而库级测试与门禁全绿）修复后新增第 6 条——**spawn 真实 Scheduler CLI 进程**。见 §9。
 
 要点：门禁用**真实 Backend + 真实 SQLite + 真实 Scheduler + 真实 Host**，只有 Agent 会话是 MockRuntime；"接受"用公开 API 走 Task 状态机的合法链（`RUNNING→REVIEWING→INTEGRATING→AWAITING_ACCEPTANCE→DONE`），因为 **M3 不做自动验收**。
 
@@ -87,6 +91,34 @@ PASS  after the root is accepted, the next task is dispatched
 4. **workspace 未接入 Host**：`createWorktree` 已实现，但 claim 后自动建 worktree 留给 M4/M5（需要 base ref 策略）。
 5. **真实 DSH 仍不可用**：能力全 false 占位。
 6. **M3 未做独立 QA**；M2 的独立复核进行中。
+
+> 该条已被 QA-004 取代，见 §9。
+
+---
+
+## 9. 独立 QA（QA-004）结论与缺陷闭环
+
+审查对象：M3 冻结提交 `bc8b2b0`..`550b552`（隔离 `git archive` + 每包 `@atk/*` 指向解包树）。报告：[qa-review-m3.md](../architecture/qa-review-m3.md)，套件：`test/m3-qa-adversarial.test.mjs`（25 条）。
+
+**冻结 SHA 的结论：不能标记完成（1 BLOCKER）**；修复后可以。当前状态：**1 BLOCKER + 6 MINOR 中 4 条已关闭，2 条（QA4-02/03）在修，1 条文档（QA4-07）已更新**。
+
+| 缺陷 | 严重度 | 状态 |
+|---|---|---|
+| QA4-01 两个 CLI 入口（scheduler / runtime-host）import 路径写错（`./client.mjs` 应为 `./src/client.mjs`），`--help` 都起不来，而库测试与门禁全绿 | BLOCKER | 已修；新增两个进程级 `cli.test.mjs` 与 m3-smoke 第 6 条真实 CLI check |
+| QA4-02 `idempotencyKey` 重放不跨 Backend 重启（route 进程内 Map 先于 store 持久幂等预检） | MINOR | 修中（改为先尝试 store.claimTask） |
+| QA4-03 写域精确字符串比较，`./`、反斜杠、**目录前缀** 可绕过 | MINOR | 规范化已修；目录前缀（segment-aware overlap）修中 |
+| QA4-04 `detectCycles` 漏报共享节点的简单环 | MINOR | 已修（枚举 SCC 内全部简单环，有上限与确定性） |
+| QA4-05 `readyCandidates.missingDeps` 形状不符契约 §5 | MINOR | 已修（`{taskId, missing[]}`） |
+| QA4-06 m3-smoke 的自证面：环拒绝用合成快照、check5 的 Host 步骤未被断言、不覆盖双 Scheduler 并发 | MINOR（诚实性） | 已补：真实 CLI 进程 check；check5 改走 M4 人工验收；双进程并发由 QA 独立实测（3 task/3 run/3 command，无重复派发） |
+| QA4-07 `m3-status` 数字过期 | MINOR（文档） | 已更新（§1/§3） |
+
+**变异测试（冻结隔离树，基线 66/66）**：3/3 被抓——跳过 claimTask 依赖检查、环时仍返回非环 proposals、去掉 claimTask 持久幂等重放。
+
+**QA 的观察项（不判缺陷）**：route 7 步预检与 store 事务重检重复（安全）；store 缺 `claimTask` 时 500 拒绝（正确）；`claimTask` 的 `function/role` 入参被忽略（以 DB 为准）；`planDispatch` 对已有活跃 Run 的 READY task 静默丢弃（无 skipped 原因）；Scheduler 循环不捕获 `planDispatch` 抛错（非法 `MAX_PER_AGENT` 会崩溃而非 exit 2）；双 Scheduler 计量会高估 claimed（DB 不重复）。
+
+**教训（与 M2 的 QA3-01 同类）**：**库级测试全绿不等于产品入口可运行**。从此 M2/M3 门禁都必须包含"真实进程"检查，而不只是 import 库。
+
+**边界（QA PASS ≠ 生产可用）**：真实 DSH 不可用、无预算/限流、Scheduler 单实例无选主、workspace 未接入 Host、无自动验收、JSON 仍是旧 CLI 事实源。
 7. **写域 `files` 是可选的**：未声明即不判冲突；M4 起应强制声明。
 
 ---
