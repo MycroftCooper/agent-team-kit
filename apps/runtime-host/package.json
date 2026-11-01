@@ -1,0 +1,21 @@
+{
+  "name": "@atk/runtime-host",
+  "version": "0.1.0",
+  "private": true,
+  "description": "M2: Runtime Host - claims dispatch commands, drives an AgentRuntime session and reports facts to the backend. Never writes the database.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/host.mjs",
+  "bin": {
+    "atk-runtime-host": "./cli.mjs"
+  },
+  "scripts": {
+    "start": "node ./cli.mjs"
+  },
+  "dependencies": {
+    "@atk/runtime-sdk": "workspace:*"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
