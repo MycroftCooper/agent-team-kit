@@ -107,6 +107,41 @@ export function createSseHub({ store, heartbeatMs = 25_000, pollMs = 300, logger
     return client.cursor;
   }
 
+  /** Push any events newer than the client cursor (used by polling and by the internal API). */
+  function catchUp(client) {
+    if (client.closed) return;
+    const latestNow = latestSeq();
+    if (latestNow <= client.cursor) return;
+    const oldestNow = oldestSeq();
+    if (client.cursor + 1 < oldestNow) {
+      const previous = client.cursor;
+      client.cursor = latestNow;
+      writeFrame(
+        client,
+        resyncFrame({ lastEventId: previous, oldestAvailable: oldestNow, latest: latestNow, reason: "gap-while-connected" }),
+      );
+      return;
+    }
+    replayFrom(client, client.cursor + 1);
+  }
+
+  /**
+   * Immediate flush hook for event producers (M2 internal API): after the
+   * Backend persists business events it calls `pump()` so connected browsers get
+   * them without waiting for the next poll. Polling stays as the safety net.
+   */
+  function pump() {
+    for (const client of [...clients]) {
+      if (client.closed) continue;
+      try {
+        catchUp(client);
+      } catch (error) {
+        logger?.error?.(`[atk] SSE pump failed: ${error?.message ?? error}`);
+        cleanup(client);
+      }
+    }
+  }
+
   /**
    * Attach an HTTP response as an SSE stream. The caller has already completed
    * authentication; this function owns the response from here on.
@@ -169,19 +204,7 @@ export function createSseHub({ store, heartbeatMs = 25_000, pollMs = 300, logger
     client.pollTimer = setInterval(() => {
       if (client.closed) return;
       try {
-        const latestNow = latestSeq();
-        if (latestNow <= client.cursor) return;
-        const oldestNow = oldestSeq();
-        if (client.cursor + 1 < oldestNow) {
-          const previous = client.cursor;
-          client.cursor = latestNow;
-          writeFrame(
-            client,
-            resyncFrame({ lastEventId: previous, oldestAvailable: oldestNow, latest: latestNow, reason: "gap-while-connected" }),
-          );
-          return;
-        }
-        replayFrom(client, client.cursor + 1);
+        catchUp(client);
       } catch (error) {
         logger?.error?.(`[atk] SSE poll failed: ${error?.message ?? error}`);
         cleanup(client);
@@ -206,5 +229,5 @@ export function createSseHub({ store, heartbeatMs = 25_000, pollMs = 300, logger
     return clients.size;
   }
 
-  return { attach, closeAll, size };
+  return { attach, closeAll, size, pump };
 }

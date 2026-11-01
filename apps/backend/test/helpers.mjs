@@ -9,6 +9,7 @@ import { createFakeStore } from "./fake-store.mjs";
 
 export const TEST_TOKEN = "test-session-token";
 export const TEST_CSRF = "test-csrf-token";
+export const TEST_INTERNAL_TOKEN = "test-internal-token";
 
 export const SILENT_LOGGER = Object.freeze({
   info() {},
@@ -38,6 +39,7 @@ export async function startServer(options = {}) {
   const server = createServer({
     token: TEST_TOKEN,
     csrf: TEST_CSRF,
+    internalToken: TEST_INTERNAL_TOKEN,
     logger: SILENT_LOGGER,
     persistToken: false,
     ssePollMs: 25,
@@ -46,7 +48,12 @@ export async function startServer(options = {}) {
     store,
   });
   const info = await server.listen({ port: 0 });
-  return { server, store, base: info.url, info };
+  return { server, store, base: info.url, info, internalToken: server.internalToken };
+}
+
+/** Header set for `/internal/v1/*` calls (never the browser token). */
+export function internalHeaders(token = TEST_INTERNAL_TOKEN) {
+  return { "x-atk-internal": token };
 }
 
 export function request(base, { method = "GET", path = "/", headers = {}, body } = {}) {

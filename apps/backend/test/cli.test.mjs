@@ -136,6 +136,75 @@ test("cli.mjs migrate with a missing state file fails cleanly (exit 2, no stack 
   }
 });
 
+test("cli serve prints the internal token once and enforces it on /internal/v1", { skip: DB_SKIP }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "atk-cli-serve-"));
+  const child = spawn(process.execPath, [CLI, "serve", "--port", "0", "--data", path.join(dir, "serve.db")], {
+    cwd: dir,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  t.after(async () => {
+    try {
+      child.kill();
+    } catch {
+      // already gone
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best effort on Windows file locks
+    }
+  });
+
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline && !(/internal token: \S+/.test(stdout) && /listening on http/.test(stdout))) {
+    if (child.exitCode !== null) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.match(stdout, /listening on http:\/\/127\.0\.0\.1:\d+/, `server did not start: ${stdout} ${stderr}`);
+
+  const tokenLines = stdout.match(/^internal token: (.+)$/gm) ?? [];
+  assert.equal(tokenLines.length, 1, "the internal token is printed exactly once");
+  const token = tokenLines[0].replace("internal token: ", "").trim();
+  assert.match(token, /^[A-Za-z0-9_-]{40,}$/);
+
+  const base = stdout.match(/listening on (http:\/\/127\.0\.0\.1:\d+)/)[1];
+  const heartbeatBody = JSON.stringify({ ownerId: "host-1", status: "IDLE", capabilities: {}, sessions: [] });
+
+  const authorized = await fetch(`${base}/internal/v1/runtime/heartbeat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-atk-internal": token },
+    body: heartbeatBody,
+  });
+  assert.equal(authorized.status, 200);
+  assert.equal((await authorized.json()).ok, true);
+
+  const unauthorized = await fetch(`${base}/internal/v1/runtime/heartbeat`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: heartbeatBody,
+  });
+  assert.equal(unauthorized.status, 403);
+  const errorText = await unauthorized.text();
+  assert.equal(errorText.includes(token), false, "the internal token never appears in a response");
+  assert.match(errorText, /internal-token-missing/);
+
+  // The browser session plane must not accept the internal credential either.
+  const browserToken = await fetch(`${base}/api/v1/tasks`, { headers: { "x-atk-internal": token } });
+  assert.equal(browserToken.status, 403);
+});
+
 test("cli.mjs rejects an unknown command with exit 2 and a clean message", () => {
   const result = runCli(["frobnicate"]);
   assert.equal(result.status, 2);

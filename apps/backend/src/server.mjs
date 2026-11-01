@@ -36,6 +36,8 @@ import {
   sendJson,
   toApiError,
 } from "./http.mjs";
+import { INTERNAL_TOKEN_HEADER, checkInternalToken, createInternalToken } from "./internal.mjs";
+import { createInternalRouter } from "./routes-internal.mjs";
 import { createSseHub } from "./sse.mjs";
 import { createStaticHandler } from "./static.mjs";
 
@@ -107,7 +109,8 @@ const ROUTES = [
  * @param {string} [options.tokenFile]      override the on-disk token path
  * @param {boolean} [options.persistToken]  force/disable token persistence
  * @param {string[]} [options.allowedOrigins] extra write origins (default: none)
- * @returns {{ listen: Function, close: Function, stats: Function, url: string|null, session: object }}
+ * @param {string} [options.internalToken] fixed internal credential (tests / tooling)
+ * @returns {{ listen: Function, close: Function, stats: Function, url: string|null, session: object, internalToken: string }}
  */
 export function createServer({
   store,
@@ -122,6 +125,7 @@ export function createServer({
   allowedOrigins = [],
   sseHeartbeatMs = 25_000,
   ssePollMs = 300,
+  internalToken,
 } = {}) {
   if (!store || typeof store !== "object") {
     throw new TypeError(
@@ -133,6 +137,14 @@ export function createServer({
   const startedAt = now();
   const session = createSession({ now: startedAt, ttlMs: sessionTtlMs, token, csrf });
 
+  // ADR-008 §5: internal credential is a separate secret for `/internal/v1/*`.
+  // It is minted per process, never persisted, never logged and never returned
+  // by an HTTP response. Tests/CLI may inject a deterministic one.
+  const resolvedInternalToken = internalToken ?? createInternalToken();
+  if (typeof resolvedInternalToken !== "string" || resolvedInternalToken === "") {
+    throw new TypeError("@atk/backend: internalToken must be a non-empty string when provided");
+  }
+
   // A caller-provided token is deterministic tooling input; only a server-minted
   // token is persisted to the user-scoped token file unless overridden.
   const shouldPersist = typeof persistToken === "boolean" ? persistToken : token === undefined;
@@ -141,6 +153,7 @@ export function createServer({
     : { persisted: false, tokenFile: tokenFile ?? null, warning: null };
 
   const hub = createSseHub({ store, heartbeatMs: sseHeartbeatMs, pollMs: ssePollMs, logger, now });
+  const internalRouter = createInternalRouter({ store, hub, now, logger });
   const staticHandler = createStaticHandler({
     webDist: webDist === undefined ? DEFAULT_WEB_DIST : webDist,
     logger,
@@ -398,6 +411,22 @@ export function createServer({
       }
       const pathname = url.pathname;
       const method = req.method ?? "GET";
+
+      // ADR-008 §5 / ADR-010 §2: `/internal/v1/*` is a separate credential
+      // plane. It never accepts the browser session token, and the browser API
+      // above never accepts `x-atk-internal`.
+      const isInternal = pathname === "/internal" || pathname.startsWith("/internal/");
+      if (isInternal) {
+        const internalCheck = checkInternalToken(resolvedInternalToken, req.headers[INTERNAL_TOKEN_HEADER]);
+        if (!internalCheck.ok) {
+          throw new ApiError("NOT_AUTHORIZED", "missing or invalid internal credential", {
+            details: { reason: internalCheck.reason },
+          });
+        }
+        await internalRouter.handle({ req, res, method, pathname, url });
+        return;
+      }
+
       const isApi = pathname === "/api" || pathname.startsWith("/api/");
 
       if (!isApi) {
@@ -556,6 +585,10 @@ export function createServer({
     tokenFile: tokenPersistence.tokenFile,
     tokenPersisted: tokenPersistence.persisted,
     tokenWarning: tokenPersistence.warning,
+    /** Internal credential for in-process callers (CLI prints it once; never in HTTP). */
+    get internalToken() {
+      return resolvedInternalToken;
+    },
     httpServer,
   };
 }

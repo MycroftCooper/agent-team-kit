@@ -24,9 +24,11 @@ export function createFakeStore(seed = {}) {
   const agents = new Map();
   const reviews = new Map();
   const approvals = new Map();
+  const dispatchCommands = new Map();
+  const leases = new Map();
   let events = [];
   let seq = 0;
-  let counters = { task: 0, run: 0, requirement: 0, approval: 0 };
+  let counters = { task: 0, run: 0, requirement: 0, approval: 0, command: 0 };
 
   for (const project of seed.projects ?? []) projects.set(project.id, { version: 0, createdAt: nowIso(), ...clone(project) });
   for (const requirement of seed.requirements ?? []) {
@@ -53,6 +55,23 @@ export function createFakeStore(seed = {}) {
       throw error;
     }
     return task;
+  }
+
+  function requireRun(id) {
+    const run = runs.get(id);
+    if (!run) {
+      const error = new Error(`run ${id} not found`);
+      error.code = "NOT_FOUND";
+      throw error;
+    }
+    return run;
+  }
+
+  function staleGeneration(details) {
+    const error = new Error(`stale generation: ${JSON.stringify(details)}`);
+    error.code = "STALE_GENERATION";
+    error.details = details;
+    throw error;
   }
 
   return {
@@ -179,13 +198,260 @@ export function createFakeStore(seed = {}) {
       return items.map(clone);
     },
     getRun(id) {
-      const run = runs.get(id);
-      if (!run) {
-        const error = new Error(`run ${id} not found`);
+      return clone(requireRun(id));
+    },
+
+    // ---- M2: Run lifecycle, dispatch commands and leases (m2-contracts §3) ----
+    createRun(dto) {
+      counters.run += 1;
+      const id = dto.id ?? `RUN-${counters.run.toString(36).toUpperCase()}`;
+      if (runs.has(id)) {
+        const error = new Error(`run ${id} already exists`);
+        error.code = "VERSION_CONFLICT";
+        error.details = { entity: "run", id, currentVersion: runs.get(id).version ?? 0 };
+        throw error;
+      }
+      const now = nowIso();
+      const run = {
+        agentId: "agent-unassigned",
+        function: "WORKER",
+        attempt: 1,
+        ...clone(dto),
+        id,
+        // The command is already persisted; the run starts STARTING.
+        status: "STARTING",
+        version: 0,
+        exitCode: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      runs.set(id, run);
+      const task = tasks.get(run.taskId);
+      seq += 1;
+      events.push(
+        createEvent({
+          seq,
+          projectId: task?.projectId ?? null,
+          aggregateType: "run",
+          aggregateId: id,
+          type: "run.created",
+          payload: {
+            runId: id,
+            taskId: run.taskId,
+            agentId: run.agentId,
+            function: run.function,
+            role: run.role,
+            status: run.status,
+            attempt: run.attempt,
+            version: run.version,
+          },
+        }),
+      );
+      return clone(run);
+    },
+    updateRunStatus(id, { status, exitCode, endedAt, generation } = {}) {
+      const run = requireRun(id);
+      // Optional generation turns the status change into a fenced operation
+      // (mirrors the database M2 signature): validate the lease in the same
+      // "transaction" before touching anything.
+      if (generation !== undefined) {
+        if (!Number.isInteger(generation) || generation < 1) {
+          const error = new Error("generation must be a positive integer");
+          error.code = "VALIDATION_ERROR";
+          error.details = { generation };
+          throw error;
+        }
+        const lease = leases.get(id);
+        if (!lease) staleGeneration({ runId: id, generation, reason: "lease-missing", currentGeneration: null });
+        if (lease.generation !== generation) {
+          staleGeneration({ runId: id, generation, reason: "generation-mismatch", currentGeneration: lease.generation });
+        }
+        if (Date.parse(lease.expiresAt) <= Date.now()) {
+          staleGeneration({ runId: id, generation, reason: "lease-expired", currentGeneration: lease.generation });
+        }
+      }
+      const allowed = {
+        QUEUED: ["STARTING", "FAILED", "CANCELLED", "INTERRUPTED"],
+        STARTING: ["RUNNING", "FAILED", "INTERRUPTED"],
+        RUNNING: ["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"],
+        COMPLETED: [],
+        FAILED: [],
+        CANCELLED: [],
+        INTERRUPTED: [],
+      };
+      if (run.status === status) return clone(run);
+      const transitions = allowed[run.status] ?? [];
+      if (!transitions.includes(status)) {
+        const error = new Error(`run ${id} cannot transition ${run.status} -> ${status}`);
+        error.code = "VALIDATION_ERROR";
+        error.details = { from: run.status, to: status, allowed: transitions };
+        throw error;
+      }
+      const previousStatus = run.status;
+      run.status = status;
+      run.version += 1;
+      run.updatedAt = nowIso();
+      if (exitCode !== undefined) run.exitCode = exitCode;
+      if (endedAt !== undefined) run.endedAt = endedAt;
+      if (["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"].includes(status) && run.endedAt == null) {
+        run.endedAt = endedAt ?? nowIso();
+      }
+      // Mirrors the database: the status change and its single run.updated event
+      // are committed together, so SSE never sees an event ahead of the state.
+      const task = tasks.get(run.taskId);
+      seq += 1;
+      events.push(
+        createEvent({
+          seq,
+          projectId: task?.projectId ?? null,
+          aggregateType: "run",
+          aggregateId: id,
+          type: "run.updated",
+          payload: {
+            runId: id,
+            taskId: run.taskId,
+            status: run.status,
+            previousStatus,
+            version: run.version,
+            ...(run.exitCode === undefined ? {} : { exitCode: run.exitCode }),
+            ...(run.endedAt === undefined ? {} : { endedAt: run.endedAt }),
+          },
+        }),
+      );
+      return clone(run);
+    },
+    enqueueDispatchCommand({ runId, commandType = "start_run", payload = {}, idempotencyKey = null } = {}) {
+      requireRun(runId);
+      if (idempotencyKey) {
+        for (const command of dispatchCommands.values()) {
+          if (command.idempotencyKey === idempotencyKey) return clone(command);
+        }
+      }
+      counters.command += 1;
+      const now = nowIso();
+      const command = {
+        id: `CMD-${counters.command.toString(36).toUpperCase()}`,
+        runId,
+        commandType,
+        payload: clone(payload) ?? {},
+        idempotencyKey,
+        status: "PENDING",
+        ownerId: null,
+        generation: 0,
+        claimedUntil: null,
+        attempts: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+      dispatchCommands.set(command.id, command);
+      return clone(command);
+    },
+    claimDispatchCommand({ ownerId, leaseMs = 30_000 } = {}) {
+      const command = [...dispatchCommands.values()].find((candidate) => candidate.status === "PENDING");
+      if (!command) return null;
+      const now = Date.now();
+      const claimedUntil = new Date(now + leaseMs).toISOString();
+      command.status = "CLAIMED";
+      command.ownerId = ownerId;
+      command.generation = (command.generation ?? 0) + 1;
+      command.claimedUntil = claimedUntil;
+      command.attempts += 1;
+      command.updatedAt = nowIso();
+      const lease = {
+        runId: command.runId,
+        ownerId,
+        holderId: ownerId,
+        generation: command.generation,
+        claimedUntil,
+        expiresAt: claimedUntil,
+        lastHeartbeatAt: nowIso(),
+      };
+      leases.set(command.runId, lease);
+      return { command: clone(command), lease: clone(lease) };
+    },
+    completeDispatchCommand({ id, ownerId, generation, status, result = {} } = {}) {
+      const command = dispatchCommands.get(id);
+      if (!command) {
+        const error = new Error(`dispatch command ${id} not found`);
         error.code = "NOT_FOUND";
         throw error;
       }
-      return clone(run);
+      if (command.status === "DONE" || command.status === "FAILED") {
+        if (command.status === status) return clone(command); // idempotent retry
+        const error = new Error(`dispatch command ${id} already finalized as ${command.status}`);
+        error.code = "VALIDATION_ERROR";
+        error.details = { errors: [`command already finalized as ${command.status}`] };
+        throw error;
+      }
+      if (command.ownerId !== ownerId || command.generation !== generation) {
+        staleGeneration({ commandId: id, expectedGeneration: command.generation, receivedGeneration: generation });
+      }
+      command.status = status;
+      command.result = clone(result);
+      command.updatedAt = nowIso();
+      return clone(command);
+    },
+    renewRunLease({ runId, ownerId, generation, leaseMs = 30_000 } = {}) {
+      const lease = leases.get(runId);
+      if (!lease) staleGeneration({ runId, expectedGeneration: null, receivedGeneration: generation });
+      if (lease.ownerId !== ownerId || lease.generation !== generation) {
+        staleGeneration({ runId, expectedGeneration: lease.generation, receivedGeneration: generation });
+      }
+      if (Date.parse(lease.expiresAt) <= Date.now()) {
+        staleGeneration({ runId, expectedGeneration: lease.generation, receivedGeneration: generation });
+      }
+      lease.generation += 1;
+      lease.expiresAt = new Date(Date.now() + leaseMs).toISOString();
+      lease.claimedUntil = lease.expiresAt;
+      lease.lastHeartbeatAt = nowIso();
+      return clone(lease);
+    },
+    appendRunEvent({ runId, generation, events: mappedEvents = [] } = {}) {
+      const run = requireRun(runId);
+      if (!Number.isInteger(generation) || generation < 1) {
+        const error = new Error("generation must be a positive integer");
+        error.code = "VALIDATION_ERROR";
+        error.details = { generation };
+        throw error;
+      }
+      if (!Array.isArray(mappedEvents) || mappedEvents.length === 0) {
+        const error = new Error("run.events must be a non-empty array");
+        error.code = "VALIDATION_ERROR";
+        error.details = { events: mappedEvents ?? null };
+        throw error;
+      }
+      const lease = leases.get(runId);
+      if (!lease || lease.generation !== generation) {
+        staleGeneration({
+          runId,
+          generation,
+          reason: lease ? "generation-mismatch" : "lease-missing",
+          currentGeneration: lease?.generation ?? null,
+        });
+      }
+      if (Date.parse(lease.expiresAt) <= Date.now()) {
+        staleGeneration({ runId, generation, reason: "lease-expired", currentGeneration: lease.generation });
+      }
+      const task = tasks.get(run.taskId);
+      const inserted = mappedEvents.map((mapped) => {
+        seq += 1;
+        const event = createEvent({
+          seq,
+          projectId: task?.projectId ?? null,
+          aggregateType: "run",
+          aggregateId: runId,
+          type: mapped.type,
+          payload: mapped.payload,
+        });
+        events.push(event);
+        return clone(event);
+      });
+      return inserted;
+    },
+    reconcileRun({ runId } = {}) {
+      const run = requireRun(runId);
+      // M2 contract: sessions are an empty array until M4 records them.
+      return { run: clone(run), lease: clone(leases.get(runId) ?? null), sessions: [] };
     },
 
     listAgents() {
