@@ -68,6 +68,18 @@
         }
       }
     },
+    "ownership": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Mode of the write-scope check. \"loose\" keeps the v0.2 behaviour; \"strict\" requires a Role, rejects unknown Roles, blocks unmapped paths and reports SKIPPED for an empty file list.",
+      "properties": {
+        "mode": {
+          "enum": ["loose", "strict"],
+          "default": "loose",
+          "description": "Ownership check mode. Default loose; set strict for execution/integration gates."
+        }
+      }
+    },
     "gates": {
       "type": "object",
       "additionalProperties": false,

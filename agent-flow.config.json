@@ -28,6 +28,9 @@
     },
     "enforceNoSelfReview": true
   },
+  "ownership": {
+    "mode": "loose"
+  },
   "gates": {
     "fast": {
       "parallel": true,

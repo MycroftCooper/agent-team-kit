@@ -43,6 +43,7 @@ real TCP port, and plugin identifiers must be valid.
 | `language` | `"en"` \| `"zh-CN"` | Label language for boards, tasks and generated docs. |
 | `roles` | string[] | Role identifiers, e.g. `["LEAD","DEV","QA"]`. Order is the display order. |
 | `functions` | object | Role -> Function(s) plus `enforceNoSelfReview`; see below. |
+| `ownership` | object | Write-scope check mode (`mode`: `loose` \| `strict`); see below. |
 | `todoSource` | string \| null | Shortcut for `paths.todoSource`. |
 | `handoffDoc` | string \| null | Shortcut for `paths.handoffDoc`. |
 
@@ -124,6 +125,35 @@ separation-of-duties checks are documented in [ENTITIES.md](ENTITIES.md).
 The subject x operation permission matrix is **not** configurable: it lives in
 `lib/permission-registry.mjs`, is deny-by-default, and `atk permit matrix` is its
 only source. See [PERMISSIONS.md](PERMISSIONS.md).
+
+## `ownership`
+
+Mode of the write-scope check (`atk ownership check`). `loose` keeps the v0.2
+behaviour; `strict` is the fail-closed mode execution and integration gates use.
+
+```jsonc
+"ownership": { "mode": "loose" }
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mode` | `"loose"` | `"loose"` keeps the v0.2 behaviour; `"strict"` fails closed (see below). |
+
+`"strict"` changes four things for `atk ownership check`:
+
+- **Role required**: `--role <ROLE>` or `$AGENT_ROLE` must be present. Missing is
+  a usage error (exit `2`), not a violation.
+- **Known Role only**: a Role not listed in `ownership.json.roles` is a config
+  error (exit `2`).
+- **Unmapped paths block**: a path with no ownership rule becomes a violation
+  (exit `1`) instead of an informational hint.
+- **Empty file list is `SKIPPED`**: prints `SKIPPED` (never `PASS`), reports
+  `status: "SKIPPED"` with `ok: false`, and exits `0`; it does not satisfy a gate.
+
+`--strict` on the command line overrides the configured value (`--no-strict`
+forces loose). The pre-fix loose behaviour and its reproduction are recorded in
+[current-state.md](architecture/current-state.md) §6 (P0-1); the strict-mode
+regression tests live in `test/ownership-strict.test.mjs`.
 
 ## `gates`
 

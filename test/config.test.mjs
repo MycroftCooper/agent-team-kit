@@ -115,3 +115,37 @@ test("bundled presets validate and resolve to their documented layout", async ()
     }
   }
 });
+
+test("ownership.mode defaults to loose", () => {
+  assert.deepEqual(DEFAULT_CONFIG.ownership, { mode: "loose" });
+  const config = validateConfig({ roles: ["LEAD"] });
+  assert.equal(config.ownership.mode, "loose");
+  // An empty ownership block keeps the default instead of becoming invalid.
+  assert.equal(validateConfig({ roles: ["LEAD"], ownership: {} }).ownership.mode, "loose");
+});
+
+test("ownership.mode accepts an explicit strict value", () => {
+  const config = validateConfig({ roles: ["LEAD"], ownership: { mode: "strict" } });
+  assert.equal(config.ownership.mode, "strict");
+});
+
+test("ownership.mode rejects unknown values and non-object ownership", () => {
+  assert.throws(
+    () => validateConfig({ roles: ["LEAD"], ownership: { mode: "paranoid" } }),
+    (error) => error instanceof ConfigError && /ownership\.mode must be "loose" or "strict"/.test(error.message),
+  );
+  assert.throws(() => validateConfig({ roles: ["LEAD"], ownership: "strict" }), /ownership must be an object/);
+  assert.throws(() => validateConfig({ roles: ["LEAD"], ownership: null }), /ownership must be an object/);
+});
+
+test("agent-flow.config.schema.json declares the ownership.mode enum", async () => {
+  const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
+  const schema = JSON.parse(await readFile(path.resolve(here, "..", "agent-flow.config.schema.json"), "utf8"));
+  const ownership = schema.properties.ownership;
+  assert.equal(ownership.type, "object");
+  assert.equal(ownership.additionalProperties, false);
+  assert.deepEqual(ownership.properties.mode.enum, ["loose", "strict"]);
+  assert.equal(ownership.properties.mode.default, "loose");
+  assert.match(ownership.description, /loose/i);
+  assert.match(ownership.description, /strict/i);
+});
