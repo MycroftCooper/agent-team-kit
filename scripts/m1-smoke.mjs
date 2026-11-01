@@ -218,7 +218,10 @@ try {
   check("health answers without a token and reports the schema", async () => {
     const body = json(await healthResponse.text());
     expect(body?.ok === true, `expected ok:true, got ${JSON.stringify(body)}`);
-    expect(body?.db?.schemaVersion === 1, `expected schemaVersion 1, got ${body?.db?.schemaVersion}`);
+    // Assert that the schema was migrated, not which generation it is on: later
+    // milestones add migrations, and pinning the number here would make an
+    // additive migration look like an M1 regression.
+    expect(body?.db?.schemaVersion >= 1, `expected a migrated schema, got ${body?.db?.schemaVersion}`);
     return `schemaVersion=${body.db.schemaVersion}`;
   });
 
