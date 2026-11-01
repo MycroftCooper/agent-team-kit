@@ -184,6 +184,148 @@ export function openStore(options = {}) {
     return Number(db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get().version);
   }
 
+  // Migration self-heal bookkeeping (QA-003): if a migration's bookkeeping row
+  // is lost but its columns already exist, we must not die on "duplicate column
+  // name". Warnings are recorded here and exposed via the INTERNAL diagnostics.
+  const migrationWarnings = [];
+
+  /** Split a .sql file into statements (ignores -- comments and quoted ';'). */
+  function splitSqlStatements(sql) {
+    const statements = [];
+    let current = "";
+    let inString = false;
+    let inLineComment = false;
+    for (let index = 0; index < sql.length; index += 1) {
+      const char = sql[index];
+      const next = sql[index + 1];
+      if (inLineComment) {
+        if (char === "\n") {
+          inLineComment = false;
+          current += char;
+        }
+        continue;
+      }
+      if (!inString && char === "-" && next === "-") {
+        inLineComment = true;
+        index += 1;
+        continue;
+      }
+      if (char === "'") {
+        if (inString && next === "'") {
+          current += "''";
+          index += 1;
+          continue;
+        }
+        inString = !inString;
+        current += char;
+        continue;
+      }
+      if (!inString && char === ";") {
+        const statement = current.trim();
+        if (statement !== "") statements.push(statement);
+        current = "";
+        continue;
+      }
+      current += char;
+    }
+    const tail = current.trim();
+    if (tail !== "") statements.push(tail);
+    return statements;
+  }
+
+  function hasColumn(table, column) {
+    try {
+      return db
+        .prepare(`PRAGMA table_info(${table})`)
+        .all()
+        .some((row) => row.name === column);
+    } catch {
+      return false;
+    }
+  }
+
+  const ALTER_ADD_COLUMN_RE =
+    /^\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?["`]?(\w+)["`]?\s+ADD\s+COLUMN\s+["`]?(\w+)["`]?/i;
+
+  /** Drop ALTER ... ADD COLUMN statements whose column already exists. */
+  function prepareMigrationStatements(rawSql) {
+    const kept = [];
+    const skipped = [];
+    for (const statement of splitSqlStatements(rawSql)) {
+      const alter = ALTER_ADD_COLUMN_RE.exec(statement);
+      if (alter && hasColumn(alter[1], alter[2])) {
+        skipped.push({ table: alter[1], column: alter[2] });
+        continue;
+      }
+      kept.push(statement);
+    }
+    return { statements: kept, skipped };
+  }
+
+  function isDuplicateColumnError(error) {
+    const text = `${error?.details?.sqlite?.errstr ?? ""} ${error?.message ?? ""}`;
+    return /duplicate column name/i.test(text);
+  }
+
+  /** Run one migration's statements + bookkeeping row in one transaction. */
+  function runMigration(version, name, statements) {
+    exec("BEGIN IMMEDIATE");
+    transactionDepth = 1;
+    try {
+      // Two processes may open the same fresh database at the same time: the
+      // write lock serialises them, so re-check inside the transaction that the
+      // other opener did not already apply this migration.
+      const already = stmt("SELECT version FROM schema_migrations WHERE version = ?").get(version);
+      if (already) {
+        exec("COMMIT");
+        return "already";
+      }
+      for (const statement of statements) exec(statement);
+      stmt("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(
+        version,
+        name,
+        nowIso(),
+      );
+      exec("COMMIT");
+      return "applied";
+    } catch (error) {
+      try {
+        exec("ROLLBACK");
+      } catch {
+        // ignore: see transaction()
+      }
+      throw mapSqliteError(error);
+    } finally {
+      transactionDepth = 0;
+    }
+  }
+
+  /** Repair only the bookkeeping row when the schema is already complete. */
+  function recordMigrationOnly(version, name) {
+    exec("BEGIN IMMEDIATE");
+    transactionDepth = 1;
+    try {
+      const already = stmt("SELECT version FROM schema_migrations WHERE version = ?").get(version);
+      if (!already) {
+        stmt("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(
+          version,
+          name,
+          nowIso(),
+        );
+      }
+      exec("COMMIT");
+    } catch (error) {
+      try {
+        exec("ROLLBACK");
+      } catch {
+        // ignore
+      }
+      throw mapSqliteError(error);
+    } finally {
+      transactionDepth = 0;
+    }
+  }
+
   function applyMigrations() {
     exec(
       `CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -198,35 +340,35 @@ export function openStore(options = {}) {
     for (const name of migrationFiles()) {
       const version = Number.parseInt(name, 10);
       if (applied.has(version)) continue;
-      const sql = readFileSync(path.join(MIGRATIONS_DIR, name), "utf8");
-      exec("BEGIN IMMEDIATE");
-      transactionDepth = 1;
-      try {
-        // Two processes may open the same fresh database at the same time: the
-        // write lock serialises them, so re-check inside the transaction that
-        // the other opener did not already apply this migration.
-        const already = stmt("SELECT version FROM schema_migrations WHERE version = ?").get(version);
-        if (already) {
-          exec("COMMIT");
-          applied.add(version);
-          continue;
-        }
-        exec(sql);
-        stmt("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(
-          version,
-          name,
-          nowIso(),
+      const rawSql = readFileSync(path.join(MIGRATIONS_DIR, name), "utf8");
+      let prepared = prepareMigrationStatements(rawSql);
+      if (prepared.skipped.length > 0) {
+        migrationWarnings.push({
+          migration: name,
+          code: "MIGRATION_EXISTING_COLUMN",
+          skipped: prepared.skipped,
+        });
+        console.warn(
+          `[atk/database] WARN ${name}: bookkeeping row was missing but column(s) already exist; ` +
+            `skipping ${prepared.skipped.map((entry) => `${entry.table}.${entry.column}`).join(", ")}`,
         );
-        exec("COMMIT");
+      }
+      try {
+        runMigration(version, name, prepared.statements);
       } catch (error) {
+        if (!isDuplicateColumnError(error)) throw error;
+        // Raced with another opener between the pre-check and the ALTER: inspect
+        // again and retry once. If it still reports a duplicate, the schema is
+        // complete and only the bookkeeping row needs repairing.
+        migrationWarnings.push({ migration: name, code: "MIGRATION_DUPLICATE_COLUMN_RETRY" });
+        prepared = prepareMigrationStatements(rawSql);
         try {
-          exec("ROLLBACK");
-        } catch {
-          // ignore: see transaction()
+          runMigration(version, name, prepared.statements);
+        } catch (retryError) {
+          if (!isDuplicateColumnError(retryError)) throw retryError;
+          migrationWarnings.push({ migration: name, code: "MIGRATION_BOOKKEEPING_REPAIRED" });
+          recordMigrationOnly(version, name);
         }
-        throw mapSqliteError(error);
-      } finally {
-        transactionDepth = 0;
       }
       applied.add(version);
     }
@@ -918,10 +1060,11 @@ export function openStore(options = {}) {
      *
      * Optional `generation` (m2-integration): when the caller reports a state
      * change from a Runtime Host, the current lease is checked **inside the same
-     * transaction** before any write; a stale generation throws STALE_GENERATION
-     * and leaves status/version/events byte-for-byte unchanged. This makes even
-     * a pure state batch (no run.log to append) fenced, without read-then-act.
-     * Omitting `generation` keeps the user/tool-facing behaviour unchanged.
+     * transaction** before any write; a stale generation OR an expired lease
+     * throws STALE_GENERATION and leaves status/version/events byte-for-byte
+     * unchanged. This makes even a pure state batch (no run.log to append)
+     * fenced, without read-then-act. Omitting `generation` keeps the
+     * user/tool-facing behaviour unchanged.
      */
     updateRunStatus(id, { status, exitCode, endedAt, generation } = {}) {
       requireId(id, "run.id");
@@ -931,6 +1074,7 @@ export function openStore(options = {}) {
         }
       }
       return transaction(() => {
+        const now = nowIso();
         if (generation !== undefined && generation !== null) {
           const lease = getLeaseRow(id);
           if (!lease) {
@@ -949,10 +1093,22 @@ export function openStore(options = {}) {
               reason: "generation-mismatch",
             });
           }
+          // QA-003 MAJOR-1: a slow/partitioned host with a *matching but
+          // expired* generation must not finish the Run. The lease must still
+          // be live; otherwise another host may re-claim it after this write.
+          if (lease.claimed_until <= now) {
+            fail("STALE_GENERATION", `run "${id}" lease has expired`, {
+              runId: id,
+              generation,
+              currentGeneration: Number(lease.generation),
+              claimedUntil: lease.claimed_until,
+              reason: "lease-expired",
+            });
+          }
         }
         const row = requireRunRow(id);
         const current = runJson(row);
-        const merge = mergeRunStatus(current, { status, exitCode, endedAt }, { now: nowIso() });
+        const merge = mergeRunStatus(current, { status, exitCode, endedAt }, { now });
         if (!merge.updated) return current;
         const next = merge.run;
         const result = stmt(
@@ -1111,11 +1267,13 @@ export function openStore(options = {}) {
         fail("VALIDATION_ERROR", "dispatch result must be an object", { resultType: typeof result });
       }
       return transaction(() => {
+        const now = nowIso();
         const row = stmt("SELECT * FROM dispatch_commands WHERE id = ?").get(id);
         if (!row) notFound("dispatchCommand", id);
         const stale = (details) => {
           fail("STALE_GENERATION", `dispatch command "${id}" report is fenced out`, {
             commandId: id,
+            runId: row.run_id,
             ownerId: owner,
             generation,
             ...details,
@@ -1124,24 +1282,33 @@ export function openStore(options = {}) {
         if (row.status === "DONE" || row.status === "FAILED") {
           if (Number(row.generation) === generation && row.owner_id === owner) return commandJson(row);
           stale({
-            expectedGeneration: Number(row.generation),
+            currentGeneration: Number(row.generation),
             currentOwnerId: row.owner_id,
-            reason: "command-already-finished",
+            reason: "generation-mismatch",
           });
         }
         if (row.status !== "CLAIMED") {
-          stale({ expectedGeneration: Number(row.generation), reason: "command-not-claimed" });
+          stale({ currentGeneration: Number(row.generation), reason: "command-not-claimed" });
         }
         const lease = getLeaseRow(row.run_id);
-        if (!lease) stale({ reason: "lease-missing" });
+        if (!lease) stale({ currentGeneration: null, reason: "lease-missing" });
         if (Number(lease.generation) !== generation || lease.owner_id !== owner) {
           stale({
-            expectedGeneration: Number(lease.generation),
+            currentGeneration: Number(lease.generation),
             currentOwnerId: lease.owner_id,
-            reason: "lease-mismatch",
+            reason: "generation-mismatch",
           });
         }
-        const now = nowIso();
+        // QA-003 MAJOR-1: an expired lease must not be able to finish the
+        // command (slow host / GC pause / partition). Checked BEFORE the write
+        // that expires the lease itself, so the winning call above still works.
+        if (lease.claimed_until <= now) {
+          stale({
+            currentGeneration: Number(lease.generation),
+            claimedUntil: lease.claimed_until,
+            reason: "lease-expired",
+          });
+        }
         // FAILED keeps its error summary in the same result_json column.
         stmt(
           `UPDATE dispatch_commands
@@ -1157,6 +1324,54 @@ export function openStore(options = {}) {
           "UPDATE run_leases SET claimed_until = ?, last_heartbeat_at = ?, updated_at = ? WHERE run_id = ?",
         ).run(now, now, now, row.run_id);
         return commandJson(stmt("SELECT * FROM dispatch_commands WHERE id = ?").get(id));
+      });
+    },
+
+    /**
+     * D3 crash-window sweeper (QA-003): a Run can be terminal while its command
+     * is still CLAIMED (the Host died before writing the result). The truth is
+     * the Run, so close those commands without needing lease/owner: COMPLETED →
+     * DONE, FAILED/INTERRUPTED/CANCELLED → FAILED. Already-terminal commands are
+     * untouched (idempotent). Single transaction, one indexed scan.
+     */
+    sweepDispatchCommands({ now } = {}) {
+      let requestedNow = null;
+      if (now !== undefined && now !== null) {
+        if (typeof now !== "string" || Number.isNaN(Date.parse(now))) {
+          fail("VALIDATION_ERROR", "now must be an ISO-8601 timestamp", { now });
+        }
+        requestedNow = now;
+      }
+      return transaction(() => {
+        const at = requestedNow ?? nowIso();
+        const rows = stmt(
+          `SELECT c.id AS command_id, c.run_id, r.status AS run_status
+             FROM dispatch_commands c JOIN runs r ON r.id = c.run_id
+            WHERE c.status = 'CLAIMED'
+              AND r.status IN ('COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED')
+            ORDER BY c.created_at ASC, c.id ASC`,
+        ).all();
+        if (rows.length === 0) return { closed: [], count: 0 };
+        const updateCommand = stmt(
+          `UPDATE dispatch_commands
+              SET status = ?, result_json = ?, completed_at = ?, claimed_until = ?, updated_at = ?
+            WHERE id = ? AND status = 'CLAIMED'`,
+        );
+        const expireLease = stmt(
+          "UPDATE run_leases SET claimed_until = ?, last_heartbeat_at = ?, updated_at = ? WHERE run_id = ?",
+        );
+        const closed = [];
+        for (const row of rows) {
+          const status = row.run_status === "COMPLETED" ? "DONE" : "FAILED";
+          const result = { derivedFrom: "run-terminal", runStatus: row.run_status };
+          const changes = Number(
+            updateCommand.run(status, JSON.stringify(result), at, at, at, row.command_id).changes,
+          );
+          if (changes === 0) continue; // another connection won the same sweep
+          expireLease.run(at, at, at, row.run_id);
+          closed.push({ commandId: row.command_id, runId: row.run_id, status });
+        }
+        return { closed, count: closed.length };
       });
     },
 
@@ -1178,15 +1393,23 @@ export function openStore(options = {}) {
             ...details,
           });
         };
-        if (!lease) stale({ reason: "lease-missing" });
+        if (!lease) stale({ currentGeneration: null, reason: "lease-missing" });
         if (lease.owner_id !== owner) {
-          stale({ reason: "holder-mismatch", currentHolderId: lease.owner_id });
+          stale({
+            currentGeneration: Number(lease.generation),
+            currentHolderId: lease.owner_id,
+            reason: "holder-mismatch",
+          });
         }
         if (Number(lease.generation) !== generation) {
-          stale({ reason: "generation-mismatch", currentGeneration: Number(lease.generation) });
+          stale({ currentGeneration: Number(lease.generation), reason: "generation-mismatch" });
         }
         if (lease.claimed_until <= now) {
-          stale({ reason: "lease-expired", claimedUntil: lease.claimed_until });
+          stale({
+            currentGeneration: Number(lease.generation),
+            claimedUntil: lease.claimed_until,
+            reason: "lease-expired",
+          });
         }
         const nextGeneration = generation + 1;
         const claimedUntil = leaseExpiryAfter(now, ttl);
@@ -1235,11 +1458,17 @@ export function openStore(options = {}) {
             ...details,
           });
         };
-        if (!lease) stale({ reason: "lease-missing" });
+        if (!lease) stale({ currentGeneration: null, reason: "lease-missing" });
         if (Number(lease.generation) !== generation) {
-          stale({ reason: "generation-mismatch", currentGeneration: Number(lease.generation) });
+          stale({ currentGeneration: Number(lease.generation), reason: "generation-mismatch" });
         }
-        if (lease.claimed_until <= now) stale({ reason: "lease-expired", claimedUntil: lease.claimed_until });
+        if (lease.claimed_until <= now) {
+          stale({
+            currentGeneration: Number(lease.generation),
+            claimedUntil: lease.claimed_until,
+            reason: "lease-expired",
+          });
+        }
         const inserted = [];
         events.forEach((raw, index) => {
           if (!isPlainObject(raw)) {
@@ -1797,6 +2026,8 @@ export function openStore(options = {}) {
         busyTimeout: Number(db.prepare("PRAGMA busy_timeout").get()?.timeout ?? -1),
         inTransaction: transactionDepth > 0,
       }),
+      /** Migration self-heal warnings recorded while opening this store. */
+      migrationWarnings: () => migrationWarnings.map((warning) => structuredClone(warning)),
       getProjectLegacy: (id) => {
         const row = getProjectRow(id);
         return row ? parseJsonColumn(row.legacy_json) : null;

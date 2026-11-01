@@ -304,6 +304,56 @@ test("an M1 (v1) database upgrades in place and keeps its rows", (t) => {
   }
 });
 
+test("migration runner self-heals when bookkeeping rows are lost (QA-003)", (t) => {
+  const { store, file, open } = useStore(t);
+  store.createProject(projectDto());
+  store.createTask(taskDto("proj-1", { id: "TASK-KEEP" }));
+  store.close();
+
+  // Simulate a lost/rolled-back bookkeeping rows while the columns exist.
+  const raw = rawOpen(file);
+  raw.exec("DELETE FROM schema_migrations WHERE version IN (2, 3)");
+  raw.close();
+
+  const reopened = open();
+  assert.equal(reopened.health().schemaVersion, 3);
+  assert.equal(reopened.getProject("proj-1").id, "proj-1");
+  assert.equal(reopened.getTask("TASK-KEEP").title, "Task title");
+  const warnings = reopened[INTERNAL].migrationWarnings();
+  assert.ok(
+    warnings.some((warning) => warning.migration === "0002_runs_dispatch.sql" && warning.code === "MIGRATION_EXISTING_COLUMN"),
+    JSON.stringify(warnings),
+  );
+  assert.ok(
+    warnings.some((warning) => warning.migration === "0003_scheduling.sql" && warning.code === "MIGRATION_EXISTING_COLUMN"),
+    JSON.stringify(warnings),
+  );
+  reopened.close();
+
+  // A second loss (only the v3 row) is also repaired.
+  const rawAgain = rawOpen(file);
+  rawAgain.exec("DELETE FROM schema_migrations WHERE version = 3");
+  rawAgain.close();
+  const third = open();
+  assert.equal(third.health().schemaVersion, 3);
+  assert.equal(third.getTask("TASK-KEEP").title, "Task title");
+  assert.ok(
+    third[INTERNAL].migrationWarnings().some((warning) => warning.migration === "0003_scheduling.sql"),
+    JSON.stringify(third[INTERNAL].migrationWarnings()),
+  );
+  third.close();
+
+  const verify = rawOpen(file);
+  try {
+    const rows = verify.prepare("SELECT version FROM schema_migrations ORDER BY version").all();
+    assert.deepEqual(rows.map((row) => Number(row.version)), [1, 2, 3]);
+    assert.equal(Number(verify.prepare("SELECT COUNT(*) AS c FROM tasks").get().c), 1);
+    assert.equal(Number(verify.prepare("SELECT COUNT(*) AS c FROM projects").get().c), 1);
+  } finally {
+    verify.close();
+  }
+});
+
 test("openStore validates its arguments with contract errors", () => {
   assert.throws(
     () => openStore({}),

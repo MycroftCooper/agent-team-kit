@@ -17,6 +17,7 @@ import {
   MAX_EVENT_LIMIT,
   MAX_OVERVIEW_EVENTS,
   ACTIVE_RUN_STATUSES,
+  RUN_TERMINAL_STATUSES,
   SCHEMA_VERSION,
   assertEnumFilter,
   buildOverview,
@@ -373,6 +374,7 @@ export function createMemoryStore() {
 
     updateRunStatus(id, { status, exitCode, endedAt, generation } = {}) {
       requireId(id, "run.id");
+      const at = nowIso();
       if (generation !== undefined && generation !== null) {
         if (!Number.isInteger(generation) || generation < 1) {
           fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
@@ -394,9 +396,18 @@ export function createMemoryStore() {
             reason: "generation-mismatch",
           });
         }
+        // QA-003 MAJOR-1: matching but expired generation is still stale.
+        if (lease.claimedUntil <= at) {
+          fail("STALE_GENERATION", `run "${id}" lease has expired`, {
+            runId: id,
+            generation,
+            currentGeneration: lease.generation,
+            claimedUntil: lease.claimedUntil,
+            reason: "lease-expired",
+          });
+        }
       }
       const current = requireRunEntry(id);
-      const at = nowIso();
       const merge = mergeRunStatus(current, { status, exitCode, endedAt }, { now: at });
       if (!merge.updated) return clone(current);
       const next = merge.run;
@@ -512,9 +523,11 @@ export function createMemoryStore() {
       }
       const command = commandEntry(id);
       if (!command) notFound("dispatchCommand", id);
+      const now = nowIso();
       const stale = (details) => {
         fail("STALE_GENERATION", `dispatch command "${id}" report is fenced out`, {
           commandId: id,
+          runId: command.runId,
           ownerId: owner,
           generation,
           ...details,
@@ -523,24 +536,32 @@ export function createMemoryStore() {
       if (command.status === "DONE" || command.status === "FAILED") {
         if (command.generation === generation && command.ownerId === owner) return clone(command);
         stale({
-          expectedGeneration: command.generation,
+          currentGeneration: command.generation,
           currentOwnerId: command.ownerId,
-          reason: "command-already-finished",
+          reason: "generation-mismatch",
         });
       }
       if (command.status !== "CLAIMED") {
-        stale({ expectedGeneration: command.generation, reason: "command-not-claimed" });
+        stale({ currentGeneration: command.generation, reason: "command-not-claimed" });
       }
       const lease = leaseOf(command.runId);
-      if (!lease) stale({ reason: "lease-missing" });
+      if (!lease) stale({ currentGeneration: null, reason: "lease-missing" });
       if (lease.generation !== generation || lease.ownerId !== owner) {
         stale({
-          expectedGeneration: lease.generation,
+          currentGeneration: lease.generation,
           currentOwnerId: lease.ownerId,
-          reason: "lease-mismatch",
+          reason: "generation-mismatch",
         });
       }
-      const now = nowIso();
+      // QA-003 MAJOR-1: an expired lease must not finish the command. Checked
+      // before the write that expires the lease (successful call unaffected).
+      if (lease.claimedUntil <= now) {
+        stale({
+          currentGeneration: lease.generation,
+          claimedUntil: lease.claimedUntil,
+          reason: "lease-expired",
+        });
+      }
       const done = {
         ...command,
         status,
@@ -563,6 +584,48 @@ export function createMemoryStore() {
       return clone(done);
     },
 
+    /**
+     * D3 crash-window sweeper (see sqlite.mjs): a terminal Run means any of its
+     * still-CLAIMED commands can be closed from the Run truth. Idempotent, no
+     * lease/owner required.
+     */
+    sweepDispatchCommands({ now } = {}) {
+      let requestedNow = null;
+      if (now !== undefined && now !== null) {
+        if (typeof now !== "string" || Number.isNaN(Date.parse(now))) {
+          fail("VALIDATION_ERROR", "now must be an ISO-8601 timestamp", { now });
+        }
+        requestedNow = now;
+      }
+      const at = requestedNow ?? nowIso();
+      const closed = [];
+      for (const [id, command] of dispatchCommands) {
+        if (command.status !== "CLAIMED") continue;
+        const run = runs.get(command.runId);
+        if (!run || !RUN_TERMINAL_STATUSES.includes(run.status)) continue;
+        const status = run.status === "COMPLETED" ? "DONE" : "FAILED";
+        dispatchCommands.set(id, {
+          ...command,
+          status,
+          result: { derivedFrom: "run-terminal", runStatus: run.status },
+          completedAt: at,
+          claimedUntil: at,
+          updatedAt: at,
+        });
+        const lease = runLeases.get(command.runId);
+        if (lease) {
+          runLeases.set(command.runId, {
+            ...lease,
+            claimedUntil: at,
+            lastHeartbeatAt: at,
+            updatedAt: at,
+          });
+        }
+        closed.push({ commandId: id, runId: command.runId, status });
+      }
+      return { closed, count: closed.length };
+    },
+
     renewRunLease({ runId, ownerId, generation, leaseMs } = {}) {
       requireId(runId, "run.id");
       const owner = validateOwnerId(ownerId);
@@ -580,12 +643,24 @@ export function createMemoryStore() {
           ...details,
         });
       };
-      if (!lease) stale({ reason: "lease-missing" });
-      if (lease.ownerId !== owner) stale({ reason: "holder-mismatch", currentHolderId: lease.ownerId });
-      if (lease.generation !== generation) {
-        stale({ reason: "generation-mismatch", currentGeneration: lease.generation });
+      if (!lease) stale({ currentGeneration: null, reason: "lease-missing" });
+      if (lease.ownerId !== owner) {
+        stale({
+          currentGeneration: lease.generation,
+          currentHolderId: lease.ownerId,
+          reason: "holder-mismatch",
+        });
       }
-      if (lease.claimedUntil <= now) stale({ reason: "lease-expired", claimedUntil: lease.claimedUntil });
+      if (lease.generation !== generation) {
+        stale({ currentGeneration: lease.generation, reason: "generation-mismatch" });
+      }
+      if (lease.claimedUntil <= now) {
+        stale({
+          currentGeneration: lease.generation,
+          claimedUntil: lease.claimedUntil,
+          reason: "lease-expired",
+        });
+      }
       const nextGeneration = generation + 1;
       const claimedUntil = leaseExpiryAfter(now, ttl);
       const renewed = {
@@ -634,11 +709,17 @@ export function createMemoryStore() {
           ...details,
         });
       };
-      if (!lease) stale({ reason: "lease-missing" });
+      if (!lease) stale({ currentGeneration: null, reason: "lease-missing" });
       if (lease.generation !== generation) {
-        stale({ reason: "generation-mismatch", currentGeneration: lease.generation });
+        stale({ currentGeneration: lease.generation, reason: "generation-mismatch" });
       }
-      if (lease.claimedUntil <= now) stale({ reason: "lease-expired", claimedUntil: lease.claimedUntil });
+      if (lease.claimedUntil <= now) {
+        stale({
+          currentGeneration: lease.generation,
+          claimedUntil: lease.claimedUntil,
+          reason: "lease-expired",
+        });
+      }
       // Build/validate every event before mutating so a bad event cannot leave a
       // partial batch behind (SQLite gets the same from its transaction).
       const built = inputEvents.map((raw, index) => {
