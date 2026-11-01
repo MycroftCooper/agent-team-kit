@@ -152,9 +152,56 @@ test("a bad record rolls the whole replace back and leaves the target untouched"
   const target = seedDatabase(dir, "target.db", ["OLD-1", "OLD-2"]);
   const before = contentHash(target);
   const result = runCli(["import", "--from", brokenFile, "--data", target, "--mode", "replace", "--force", "--json"]);
-  assert.equal(result.status, 1, `bad record must fail: ${result.stdout}`);
+  // CI only reads the exit code: a non-PASS report (SKIPPED/FAIL) must never
+  // look like success.
+  assert.equal(result.status, 1, `bad record must exit 1: ${result.stdout}`);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.ok, false);
+  assert.notEqual(parsed.report.status, "PASS");
+  assert.ok(Array.isArray(parsed.report.problems) && parsed.report.problems.length > 0);
   assert.equal(contentHash(target), before, "a failed replace must roll back every write");
   assert.deepEqual(taskIds(target), ["OLD-1", "OLD-2"]);
+});
+
+test("a rejected write-phase import exits non-zero with SKIPPED + IMPORT_WRITE_FAILED (no fake success)", { skip: DB_SKIP }, () => {
+  const dir = tempDir();
+  const target = seedDatabase(dir, "target.db", ["OLD-1", "OLD-2"]);
+  const before = contentHash(target);
+  const beforeTasks = taskIds(target);
+
+  // A non-empty legacy task collection that the old importer used to ignore:
+  // it must be refused BEFORE the clear phase, not silently "succeed" with an
+  // empty import (that was the M6 gate's data-loss bug).
+  const brokenFile = path.join(dir, "broken-write.json");
+  fs.writeFileSync(
+    brokenFile,
+    `${JSON.stringify({
+      stateJson: {
+        schemaVersion: 1,
+        project: { id: "BROKEN", name: "broken" },
+        batch: { id: "B", tasks: [{ id: "DUP", status: "READY" }, { id: "DUP", status: "READY" }] },
+        packages: [],
+        subitems: [],
+        slices: [],
+        counts: {},
+      },
+      runtime: { schemaVersion: 3, agents: [] },
+    })}\n`,
+    "utf8",
+  );
+
+  const result = runCli(["import", "--from", brokenFile, "--data", target, "--mode", "replace", "--force", "--json"]);
+  // Scripts/CI only see the exit code: SKIPPED must never look like success.
+  assert.equal(result.status, 1, `a write-phase failure must exit 1: ${result.stdout}`);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.report.status, "SKIPPED");
+  assert.ok(
+    parsed.report.problems.some((problem) => problem.code === "IMPORT_WRITE_FAILED"),
+    `expected IMPORT_WRITE_FAILED, got ${JSON.stringify(parsed.report.problems)}`,
+  );
+  assert.equal(contentHash(target), before, "the failed replace must not clear or rewrite the database");
+  assert.deepEqual(taskIds(target), beforeTasks);
 });
 
 test("import usage errors exit 2; human output names mode/status", { skip: DB_SKIP }, () => {
