@@ -33,8 +33,27 @@ function packageDir(name) {
   return name in APP_PREFIXES ? APP_PREFIXES[name] : PKG_PREFIXES[name];
 }
 
-function walk(dir, out = []) {
-  let entries;
+const DECLARED_CACHE = new Map();
+
+/** Bare module specifiers this package is allowed to import, per its package.json. */
+function declaredDependencies(name) {
+  if (DECLARED_CACHE.has(name)) return DECLARED_CACHE.get(name);
+  const manifestPath = path.join(ROOT, packageDir(name), "package.json");
+  let manifest = {};
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch {
+    /* an unreadable manifest means nothing is declared */
+  }
+  const declared = new Set();
+  for (const field of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+    for (const key of Object.keys(manifest[field] ?? {})) declared.add(key);
+  }
+  DECLARED_CACHE.set(name, declared);
+  return declared;
+}
+
+function walk(dir, out = []) {  let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
   } catch {
@@ -94,11 +113,14 @@ for (const name of PACKAGES) {
         }
         continue;
       }
-      // Node builtins are fine; anything else would be an unlisted dependency.
+      // Node builtins are fine; anything else must be a declared dependency of
+      // this package (dependencies / devDependencies / peerDependencies).
       if (!specifier.startsWith("node:")) {
         const bare = specifier.startsWith("@") ? specifier.split("/").slice(0, 2).join("/") : specifier.split("/")[0];
-        if (!["react", "react-dom"].includes(bare)) {
-          problems.push(`${relative}: "${specifier}" is not a declared workspace dependency (add it to the package or use node: builtins)`);
+        if (!declaredDependencies(name).has(bare)) {
+          problems.push(
+            `${relative}: "${specifier}" is not declared in ${packageDir(name)}/package.json dependencies (declared: ${[...declaredDependencies(name)].sort().join(", ") || "none"})`,
+          );
         }
       }
     }

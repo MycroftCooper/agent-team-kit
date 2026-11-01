@@ -6,7 +6,45 @@ semantic versioning.
 
 ## [Unreleased]
 
-### Added
+### Added (M1 / v0.4)
+
+- pnpm workspace: `apps/backend`, `apps/web`, `packages/database`, `packages/contracts`.
+  `scripts/check-boundaries.mjs` enforces the allowed dependency edges (web →
+  contracts, backend → contracts + database, database → contracts) and rejects
+  cycles, undeclared packages and imports that escape a package root.
+  `scripts/test-workspace.mjs` runs the package tests and prints SKIPPED (never
+  PASS) below Node 22.5, because `node:sqlite` does not exist there.
+- `packages/database`: SQLite schema v1 (16 tables) on built-in `node:sqlite`,
+  WAL + `busy_timeout` + foreign keys verified at open (a failed PRAGMA is an
+  error, not a silent downgrade), ordered idempotent migrations, transactional
+  writes, CAS version conflicts (`TASK_VERSION_CONFLICT` / `VERSION_CONFLICT`),
+  a behaviour-identical in-memory store, and `importStateJson` /
+  `exportStateJson` for the legacy `state.json` (dry-run, idempotent, path-escape
+  and duplicate-id refusal).
+- `apps/backend`: HTTP API on `127.0.0.1:1421` covering the M1 read/write subset,
+  SSE with `Last-Event-ID` replay and `system.resync-required` on a gap, loopback
+  `Host` guard, `Origin` / CSRF / `x-atk-token` enforcement, a session token file
+  with an in-memory fallback, static SPA serving with client-side-route fallback,
+  and a CLI (`serve`, `migrate`, `doctor`, `export`).
+- `apps/web`: React 19 + Vite + TypeScript SPA with **zh-CN / en** dictionaries
+  (217 keys each, compile-time and runtime key-parity checks) and a top-bar
+  language toggle persisted to `localStorage`; dark design tokens; overview,
+  task list/board, task detail, agents, reviews and settings pages; SSE consumed
+  through `fetch` + `ReadableStream` so the token never lands in a URL;
+  per-error-code readable failure states.
+- `scripts/m1-smoke.mjs`: end-to-end gate (migrate the repository's own state →
+  serve → 12 assertions incl. a forged `Host`, a tokenless 403, the SSE stream
+  and the SPA deep link).
+- ADR-009 (M1 stack: `node:sqlite` + `node:http` + React/Vite, bilingual UI) and
+  `docs/architecture/m1-contracts.md` (store interface, API, SSE, i18n rules).
+
+### Changed (M1 / v0.4)
+
+- CI: a separate `workspace` job (Node 24 + pnpm) runs boundary checks, workspace
+  tests, the web build and a backend health smoke; the legacy matrix keeps testing
+  the zero-dependency CLI on Node 20/22/24.
+
+### Added (M0 / v0.3)
 
 - Self-hosted development setup ([docs/SELFHOSTING.md](docs/SELFHOSTING.md)):
   the repository now has real `fast`/`quick`/`local` gates, complete

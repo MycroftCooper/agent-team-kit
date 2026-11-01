@@ -66,7 +66,12 @@ Store = {
   // 概览（Backend /projects/:id/overview 直接返回）
   overview(projectId): {
     project: Project,
-    counts: { tasksByStatus: Record<string, number>, runsRunning: number, awaitingAcceptance: number },
+    counts: {
+      tasksByStatus: Record<string, number>,
+      runsRunning: number,      // status ∈ {STARTING, RUNNING}（“在飞”）
+      runsTotal: number,
+      awaitingAcceptance: number
+    },
     blocked: Task[],
     awaitingAcceptance: Task[],
     recentEvents: Event[]      // 最近 20 条，seq 降序
@@ -92,6 +97,18 @@ export function exportStateJson(store, { projectId? }): { state: object, manifes
 **表（schema v1，最小可行集）**
 `projects, requirements, tasks, task_dependencies, agent_profiles, agent_instances, runs, run_leases, dispatch_commands, plans, reviews(review_attempts), approvals, gate_results, events, schema_migrations`
 每表含 `id TEXT PRIMARY KEY`（`events` 用 `seq INTEGER PRIMARY KEY AUTOINCREMENT`）、`created_at TEXT NOT NULL`、需要并发的实体带 `version INTEGER NOT NULL DEFAULT 0`。WAL + `busy_timeout` 开启。
+
+**已裁决的实现细节（M1，双方按此对齐）**
+
+| 项 | 决定 |
+|---|---|
+| 实体 JSON 字段 | 见 `packages/database` 的 JSDoc；`Task.deps` 是 task id 数组；`Event` 由 `contracts.createEvent()` 产出并由库里回填 `seq` |
+| 并发冲突错误码 | Task 用 `TASK_VERSION_CONFLICT`；Project/Run 等用 `VERSION_CONFLICT`；两者都带 `details.currentVersion` |
+| `createTask` | 忽略客户端 `status`，新建恒为 `READY`；缺 `id` 时服务端生成 `TASK-<base36>`；`deps` 指向不存在任务 → `VALIDATION_ERROR` + `details.missingDeps` |
+| import 幂等 | 同一行重复导入不产生重复记录；**但重复 id 不得静默覆盖**：记 `problems: [{level:"error", code:"DUPLICATE_ID"}]`，`status` 不为 `PASS` |
+| 旧数据无 Run | 旧 `state.json`/`runtime.json` 没有 Run 记录 → `runs` 表为空、`counts.runsTotal=0`，这是**如实为空**，不是迁移失败，必须写进 `manifest` |
+| project 映射 | project id 取 `agent-flow.config.json` 的 `project`，缺失则 `"default"` |
+| memory store | `createMemoryStore()`，可从 `@atk/database/memory` 导入（backend/QA 用来避开 SQLite） |
 
 ---
 
@@ -124,9 +141,12 @@ export function exportStateJson(store, { projectId? }): { state: object, manifes
 
 **鉴权（ADR-008）**
 - 绑定 `127.0.0.1`；校验 `Host` ∈ {`127.0.0.1`, `localhost`（可带端口）}，否则 403。
-- 状态变更请求必须校验 `Origin`（同源或缺失且在 CLI 白名单）→ 否则 403。
 - 除 `/system/health` 与 `/session` 外，所有请求需 `x-atk-token`；`/session` 下发 token（进程内随机，写盘 `%LOCALAPPDATA%\AgentTeamKit\runtime\session-token`，权限收紧）。
+- **写请求**（POST/PATCH/DELETE）额外需要 `x-atk-csrf`（值 = `/session` 返回的 `csrf`），缺失或错误 403。
+- **Origin 规则**：浏览器请求必须同源；无 `Origin` 的写请求仅当带 `x-atk-client: cli` 时放行（CLI 场景），否则 403。测试必须覆盖"缺 Origin → 403"。
+- 状态码：`POST` 创建 → 201；`GET`/`PATCH` → 200。
 - SPA 通过 `/session` 自举；**禁止**把 token 放进 URL。
+- **SSE 必须用 `fetch` + `ReadableStream` 消费**（`EventSource` 无法设置 `x-atk-token` 头，而 token 不允许进 URL）：手动解析 `id:`/`event:`/`data:`/心跳注释帧，重连带 `Last-Event-ID` 头。
 
 ---
 
@@ -149,7 +169,7 @@ data: {"taskId":"T-1","status":"REVIEWING","version":3}
 3. 状态色只表达语义（成功/警告/错误），元数据用中性色；深色专业工具风；设计令牌集中在 `src/styles/tokens.css`。
 4. 数据：`useApi` hook（fetch + token + 错误码处理）；SSE 触发重新拉取（`resync-required` 时全量刷新）。
 5. 不使用第三方 UI 库；React 19 + TS 严格模式（`noUnusedLocals`/`noUnusedParameters` 已开）。
-6. 测试：i18n 字典完整性（en 与 zh-CN 的 key 集合必须完全相同）、`t()` 插值、语言解析/持久化、状态→颜色/标签映射。放 `apps/web/src/**/*.test.mjs`（node:test，不依赖 DOM）。
+6. 测试：i18n 字典完整性（en 与 zh-CN 的 key 集合必须完全相同）、`t()` 插值与缺失 key 兜底、语言解析/持久化、状态→标签/颜色映射、SSE 帧解析与 resync 判定。放 **`apps/web/test/*.test.mjs`**（node:test，不依赖 DOM；`scripts/test-workspace.mjs` 只收集 `<pkg>/test/**`，不放 `src/`）。
 
 ---
 
