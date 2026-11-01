@@ -1,0 +1,253 @@
+# M6 独立 QA 复核报告（QA-007）
+
+- 文档类型：独立复核报告（Reviewer / QA Function，身份隔离）
+- 审查对象：**M6 冻结 `0abdee1`**（`bf8e443` 事件过滤/v5/replace/readiness、`4a9c80b` backend events/export-import/health、`e509ed9` fail-closed 修复 + m6-smoke + m6-status、`0abdee1` switch 测试适配）。HEAD `3f4183d` 的 Phase C（旧 CLI 只读视图）**不在 M6 范围内**，仅作“切换期分叉风险”旁证。
+- 审查者：`qa-reviewer`（REVIEWER/QA），未参与 M6 实现。
+- 环境：Windows 11，Node v24.16.0。
+- 冻结树口径：审查期间工作区干净（HEAD 3f4183d）；为避免 Phase C 的代码影响，所有 M6 数字都来自 `git archive 0abdee1` 隔离树 `E:\CodeProject\atk-qa-m6-frozen`（包内 `@atk/*` 均指向解包树）。
+- 未动 1421；全部临时库/随机端口；未改产品代码/他人测试，未 commit。
+- 交付：`test/m6-qa-adversarial.test.mjs`（19 条）、本报告。
+
+> **结论：M6 在冻结 SHA 上不能标记完成，v1.0 不宜宣发。** 门禁 7/7 全绿，但独立复核发现 **3 个 MAJOR + 4 个 MINOR**：replace 的 fail-closed 仍漏掉 requirements/大小写/嵌套/agents（清库后 PASS）；有活跃 RUNNING Run 时 CLI 切换不拒绝（switchReadiness 只是健康字段）；真实 HTTP 事件分页会丢/跳事件（Web 时间线的唯一数据源）。另有导出/导入状态漂移、store 参数校验不一致、契约 API 缺失、m6-smoke 覆盖缺口。**v1.0 可用 ≠ 生产可用**，边界见 §7。
+
+---
+
+## 1. 执行清单（冻结树 `0abdee1`）
+
+| # | 命令 | 退出码 | 关键输出 |
+|---|---|---|---|
+| 1 | `node scripts/test.mjs` | 0 | **447 tests / 447 pass / 0 fail / 0 skipped** |
+| 2 | `node scripts/test-workspace.mjs` | 0 | 59 文件 / **601 tests / 601 pass** |
+| 3 | `node scripts/check-boundaries.mjs` | 0 | **PASS：9 package(s) / 6 edge(s) / 0 cycle(s)** |
+| 4 | `node scripts/m1-smoke.mjs` | 0 | **16/16** |
+| 5 | `node scripts/m2-smoke.mjs` | 0 | **4/4** |
+| 6 | `node scripts/m3-smoke.mjs` | 0 | **6/6** |
+| 7 | `node scripts/m4-smoke.mjs` | 0 | **9/9** |
+| 8 | `node scripts/m5-smoke.mjs` | 0 | **4/4** |
+| 9 | `node scripts/m6-smoke.mjs` | 0 | **7/7, 0 skipped**（门禁自审见 §2） |
+| 10 | `node --test test/m6-qa-adversarial.test.mjs` | 1 | **19 tests / 14 pass / 5 fail**：A2 requirements、A3 大小写/嵌套、B1 CLAIMED→RUNNING、B3 活跃 Run 切换、C2 HTTP 分页 |
+| 11 | 变异测试（隔离树 `atk-qa-m6-mut`，见 §5） | — | **3/3 被 QA 测试抓到** |
+| 12 | 真实链路探针（临时库） | — | replace 变体/回滚/切换/事件/升级/backup 全部实测 |
+
+---
+
+## 2. `m6-smoke` 门禁自审（把门禁当被测物）
+
+m6-smoke 7 条 check，FAIL→exit1、缺 backend→exit2；我逐条复核：
+
+| # | 门禁点 | 实际做法 | 自审结论 |
+|---|---|---|---|
+| 1 | events filter/page | 用 store 直接查 **105** 条事件；`listEvents` 数组 + `.items`；`listEventsPage` 分页 40/40/25；limit 0 拒绝 | **契约 §3.1 要求“真实库 >1000 事件”**，实际只 105；不测 HTTP（真实客户端路径）、不测组合过滤/正好 limit/空结果；`limit` 上限 1000 由 store cap，未验证 |
+| 2 | readiness | 直接调 `verifySwitchReadiness`：idle→active-run→idle | 只验证“函数报告”，**不验证 CLI 是否拒绝切换**（见 §4 QA7-02） |
+| 3 | export→import | export→空库 merge import→counts 比较 projects/tasks/agents | 不比较 events/runs/requirements/deps/status/title；`>=` 风险（本处用 ===）；不验证 export 文档结构 |
+| 4 | **failing replace** | 构造 `batch.tasks:[{DUP},{DUP}]` → 期望拒绝 | **payload 在“写前校验”阶段就被拒（IMPORT_WRITE_FAILED），根本没到 clear/写入事务**，因此证明不了回滚路径；只比较 tasks/events，projects/agents/migrations 未进 fingerprint。m6-status 自己承认“旧测试只覆盖写入前校验失败”，但门禁本身仍未改。 |
+| 5 | successful replace | replace 后 schemaVersion===5、migrationWarnings===[] | 不验证导入内容（任务/事件/顺序/依赖） |
+| 6 | backup/tamper/restore | 真 backup；篡改 manifest sha；restore 拒绝且 target 不存在；恢复后 counts 精确（projects/tasks/events/agents） | **真实**，是本轮最扎实的一条 |
+| 7 | v1→v5 | 只断言 `schemaVersion===5` 与 project 行保留 | **不验证行为等价**（tasks/events 是否保留、旧事件按 aggregateId 是否可查、v4→v5）——见 §3 D 组：我独立验证了行为，门禁没有 |
+
+**结论**：check6 真实；check1/2/3/4/5/7 都是“部分断言”。尤其 check4 的坏 payload 不进写入阶段、check7 只对版本号，属于典型“看起来通过其实没验证”。**7/7 绿与 3 个 MAJOR 同时存在，正是门禁覆盖不足**。
+
+---
+
+## 3. A–F 结论表（期望 · 实际 · 判定）
+
+判定：**PASS** = 冻结满足；**FAIL** = 违反契约（缺陷）；**OBSERVATION** = 记录项。
+
+### A. replace fail-closed（5 条：3 PASS、2 FAIL）
+
+| 项 | 期望 | 实际（冻结 `0abdee1`） | 判定 |
+|---|---|---|---|
+| A1 `batch.tasks` / 顶层 `tasks` / 非数组 | 拒绝且零写入 | SKIPPED `IMPORT_WRITE_FAILED` / `INVALID_RECORD`，全量 fingerprint（13 表 + migrations）不变 | PASS |
+| A2 **`requirements` 变体** | 视为未知集合，拒绝且零写入 | **PASS**，清除 tasks/agents/events，requirements 写入 1 条（数据丢失） | **FAIL / MAJOR** |
+| A3 **`batch.requirements` / `Tasks`（大写）/ `batch.Tasks` / 顶层 `agents` / 嵌套未知集合** | 拒绝且零写入 | **全部 PASS 并清库**（tasks 1→0、agents 1→0、events 1→0） | **FAIL / MAJOR** |
+| A4 空数组（`tasks:[]`、`batch.tasks:[]`） | 无害，可继续 | PASS，清库后导入空集（预期） | PASS |
+| A5 写入中途失败（独立注入第 2 个 `createTask` 抛错） | 单事务回滚、账本不变、reopen 不重跑 | SKIPPED `IMPORT_WRITE_FAILED`；**13 表 + schema_migrations 全量 deepEqual 前后一致**；reopen schema5、无 migrationWarnings | PASS |
+
+### B. 切换安全 / 导出导入（3 条：1 PASS、2 FAIL）
+
+| 项 | 期望 | 实际 | 判定 |
+|---|---|---|---|
+| B1 export→replace 内容精确一致 | 任务 id/状态/依赖/项目/agent 一致 | 任务 id/依赖/项目/agent 一致，但 **CLAIMED 导出为 `in-progress`，再导入变 RUNNING**（legacy 词汇有损） | **FAIL / MINOR（QA7-04）** |
+| B2 merge 幂等 | 两次导入不重复 | 全量 fingerprint 第二次不变 | PASS |
+| B3 有活跃 RUNNING Run/命令时 CLI 切换 | 拒绝 | `verifySwitchReadiness()` 已返回 `{ok:false,blockers:["active-run"]}`，但 `import --mode replace --force` **exit 0**；runs 1→0、dispatch_commands 1→0、events 3→0 | **FAIL / MAJOR** |
+
+### C. 事件过滤/分页（3 条：2 PASS、1 FAIL）
+
+| 项 | 期望 | 实际 | 判定 |
+|---|---|---|---|
+| C1 组合过滤、空结果、正好 limit、memory/sqlite 一致 | 一致 | 全部一致（seq 升序、空结果 `hasMore:false` 无 next、memory==sqlite） | PASS |
+| C2 **HTTP 分页完整性** | `hasMore/nextAfterSeq` 必须与返回 items 一致、无重无漏 | 4 条事件 `limit=2`：items=[1,2] 但 nextAfterSeq=**3**（续页从 4 开始 → **seq 3 丢失**）；3 条事件 `limit=2`：items=[1,2]、hasMore=false（**seq 3 永久丢失**）；默认 100/105 同样跳 seq101 | **FAIL / MAJOR** |
+| C3 1000 上限/非法参数 | store cap 1000；HTTP >1000/0/非法 400 | store 5000→1000 且 hasMore；HTTP 全部 400 `VALIDATION_ERROR`（具体错误字段）；memory 同一套校验 | PASS |
+
+（补充：store 层 `aggregateId` 不做 ID 校验，`"bad id!"` 可查并返回空；HTTP 才 400——QA7-05 MINOR。）
+
+### D. 升级（2 条，全 PASS）
+
+| 项 | 期望 | 实际 | 判定 |
+|---|---|---|---|
+| D1 v1→v5、v4→v5 数据保留 + 行为等价 | schema5、项目/任务/事件保留、旧事件按 aggregateId 可查、索引存在、账本 1..5 | 全部一致（v1/v4 两种真实旧库；`listEvents({aggregateId})` 返回旧事件） | PASS |
+| D2 v5 记账行丢失自愈 | reopen 不重跑、schema5、索引在 | 一致 | PASS |
+
+### E. backup/restore 交叉（4 条，全 PASS）
+
+| 项 | 期望 | 实际 | 判定 |
+|---|---|---|---|
+| E1 tamper 快照 | 拒绝且不改/不建 target | exit1，target 保持 `KEEP`（--force 也不动） | PASS |
+| E2 restore 后精确 counts + health | counts 全等、health 200 且 counts 同 | 一致（真实 backend 起在恢复库上） | PASS |
+| E3 manifest schemaVersion 过高 | 拒绝 | exit1，错误含 schemaVersion/newer | PASS |
+| E4 **live WAL 一致性** | WAL 未 checkpoint 的写入必须进快照 | 保持 store 打开时 backup→restore，counts 全等（直接复制 .db 会红，见变异 M3） | PASS |
+
+### F. 文档 / CLI / 隐私（2 条，全 PASS）
+
+| 项 | 期望 | 实际 | 判定 |
+|---|---|---|---|
+| F1 契约 surface/CLI/退出码 | export/import/backup/restore、mode、非 PASS exit1 | 一致；非 PASS import 实测 exit1 且 report SKIPPED | PASS |
+| F2 隐私 | 新源码/文档无 token、无本机路径 | 0 命中 | PASS |
+
+---
+
+## 4. 缺陷清单
+
+### QA7-01（MAJOR）replace 的 fail-closed 仍漏掉 requirements/大小写/嵌套/agents，清库后 PASS
+
+- 位置：`packages/database/src/import-export.mjs` 477-498：只检查 `batch.tasks`、顶层 `state.tasks`；其它“未认识的非空集合”不校验。`replace` 走 `internal.transaction(clearBusinessTables + writeAll)`，未知集合被忽略即 PASS。
+- 复现（真实 SQLite，初始库 tasks/agents/events 各 1 + 迁移账本 1..5）：`importStateJson(store,{stateJson:{requirements:[...]},mode:"replace",force:true})` → `status:"PASS"`，tasks/agents/events 归零；`batch.requirements`、`Tasks`（大写）、`batch.Tasks`、顶层 `agents`、`batch.nested.tasks` 同样 PASS 清库。测试 A2/A3。
+- 规范依据：m6-contracts §0.1（replace 任一步失败整体回滚、原数据仍在）、§0.2；m6-status §3 的“fail-closed 不认识的集合”声明。这个缺陷与它自己描述并“修复”的 `batch.tasks` 缺陷同源，只是覆盖面不足。
+- 归属：worker-database（importer）/ Lead。
+- 建议：对 legacy state 允许的键做白名单，任何未知的、非空的“集合形状”（数组/对象数组）在 clear 前 fail-closed，至少覆盖 requirements/agents/runs/events/tasks 的大小写与嵌套变体，并在错误里给出完整 key 路径。
+
+### QA7-02（MAJOR）有活跃 RUNNING Run/命令时，CLI 切换不拒绝（switchReadiness 未被执行）
+
+- 位置：`apps/backend/cli.mjs` `importCommand`（0abdee1 只做 non-empty/force 检查）；`verifySwitchReadiness` 仅在 health 字段与独立函数中暴露。
+- 复现：claimTask → Run RUNNING（runs=1、command=1、events=3）；`verifySwitchReadiness()` 返回 `ok:false, blockers:["active-run"]`；`import --mode replace --force` → exit 0，runs/commands/events 全部清空。测试 B3。
+- 规范依据：m6-contracts §0.3“存在活跃 Run/租约时 switchReadiness.ok=false，禁止切换”；ADR-006 阶段 3；ops 文档也写“切换只允许停机时进行”。
+- 归属：worker-backend / Lead。
+- 建议：`import --mode replace` 在写入前调用 `verifySwitchReadiness`；`ok=false` 时 exit 1 并输出 blockers（如要强制，必须显式危险开关 + 文档）；m6-smoke 增加“active-run → CLI 拒绝”的 check。
+
+### QA7-03（MAJOR）`GET /api/v1/events` 分页丢/跳事件
+
+- 位置：`apps/backend/src/server.mjs` events.list 832-866：`fetchLimit = limit+1` 调 `store.listEvents`，store 返回基于 fetchLimit 的 `hasMore/nextAfterSeq`；route 再 `slice(0,limit)`，但直接沿用 store 的 `hasMore/nextAfterSeq`。
+- 复现：4 条事件 `?limit=2` → items [1,2]、`nextAfterSeq:3`（客户端 afterSeq=3 从 4 开始，3 丢失）；3 条事件 `?limit=2` → items [1,2]、`hasMore:false`（3 永久丢失）；默认 100/105 同理跳 seq101。测试 C2。
+- 规范依据：m6-contracts §2（events 分页）、§3.1“分页 afterSeq 续页无重无漏”；Web `#/runs` 时间线唯一的 HTTP 事件源。
+- 归属：worker-backend / worker-web。
+- 建议：route 不要二次 slice；要么直接使用 store 返回的 `{items,hasMore,nextAfterSeq}`（一次分页完成），要么用 `limit+1` 的原始行自行判定 `hasMore = raw.length > limit`、`nextAfterSeq = items.at(-1).seq`；m6-smoke 加真实 HTTP 边界用例（3/4/100/1000）。
+
+### QA7-04（MINOR）export→replace 的状态有损：CLAIMED 变成 RUNNING
+
+- 位置：`import-export.mjs` `STATUS_TO_STAGE`（CLAIMED→`in-progress`）与 `PACKAGE_STAGE_TO_STATUS`（`in-progress`→RUNNING）。
+- 复现：任务 CLAIMED → export → replace import → 任务 RUNNING（测试 B1）。
+- 依据：m6-status ATK-604“export→import→export 语义等价”；m6-contracts §0.4 可读 JSON 用于跨版本/审计。归属：worker-database。
+- 建议：legacy stage 增加可逆映射（如 `claimed` 复用/新增 stage），或在文档明确“CLAIMED 与 RUNNING 在 legacy JSON 中不可区分”作为限制。
+
+### QA7-05（MINOR）store 层事件过滤参数校验与 HTTP 不一致
+
+- `listEventsPage({aggregateId:"bad id!"})` 不报 VALIDATION_ERROR，返回空；HTTP 层才用 ID_RE 拒绝。m6-contracts §1 要求非法参数 `VALIDATION_ERROR`。归属：worker-database。
+
+### QA7-06（MINOR）`store.verifySwitchReadiness()` 在 sqlite/memory store 上不存在（契约 §1 列了该方法）
+
+- 只有 `@atk/database` 导出的函数；backend `serve` 用 `Object.defineProperty` 临时挂到 store（cli.mjs 522-528），直接调用 store 的调用方（脚本/未来 CLI）会 `TypeError`。m6-smoke 直接 import 函数，因此门禁发现不了。归属：worker-database。
+- 建议：把 `verifySwitchReadiness` 真正挂到 store 接口（sqlite/memory），backend 去掉 shim。
+
+### QA7-07（MINOR）m6-smoke 覆盖缺口（7/7 与 3 MAJOR 并存）
+
+- check1 只 105 事件（契约要求 >1000）、不测 HTTP；check2 只测函数不测 CLI；check3 只比 3 个 counts；**check4 的坏 payload 在写前校验就被拒，不覆盖 clear 后回滚**；check5 只查版本/账本；check7 只查 schemaVersion/project，不查任务/事件行为与 v4→v5。
+- 归属：Lead / worker-runtime-spike。建议逐条对齐 m6-contracts §3 的语义，尤其 check4 用“独立注入写入中途异常”的指纹测试、check7 增加“旧事件按 aggregateId 查询”。
+
+### OBSERVATION
+
+| # | 内容 |
+|---|---|
+| QA7-08 | Phase C（HEAD `3f4183d`）的“backend 运行时拒绝 import replace”保护真实存在且有效：我在 HEAD 上用随机端口验证 `--port` 与 `ATK_PORT` 都被拒绝（exit 1，报 “database switch must run while the backend is stopped”）。但它不在 M6 冻结 `0abdee1` 内，且检测把“health 探测失败”视为“未运行”，属于 best-effort 而非锁。 |
+| QA7-09 | export/import 的 JSON 只含 legacy state/runtime，不包含 runs/events/leases；replace 会重置执行历史（import manifest `runs:0` 是真实声明）。m6-status 的“已知限制”未列出这一点。 |
+| QA7-10 | requirements 只从 `batch.id` 派生（export 不输出 requirements 数组），所以 A2 的 requirements 数据来自人工编辑/未来版本；但 fail-closed 的承诺应覆盖它。 |
+| QA7-11 | `listEvents` 数组带不可枚举 `items/hasMore/nextAfterSeq` 的向后兼容实现正确（`Array.isArray` 为 true），本轮未发现回归。 |
+
+---
+
+## 5. 变异测试（隔离树 `atk-qa-m6-mut`，0abdee1）
+
+基线：冻结树 19 条（14 绿 / 5 已知红）；逐个注入、跑 target、恢复。
+
+| 变异 | 目标测试 | 结果 |
+|---|---|---|
+| **M1 删掉 replace 的 fail-closed 校验块** | A1（batch.tasks/top-level tasks） | **CAUGHT**：1/1 红（原本 SKIPPED，变异后 PASS 清库） |
+| **M2 import 非 PASS 仍 exit 0** | F1（非 PASS 必须 exit1） | **CAUGHT**：1/1 红 |
+| **M3 backup 退化为直接复制 .db** | E4（live WAL 一致性） | **CAUGHT**：1/1 红（WAL 未 checkpoint 的事务丢失，counts 不等） |
+
+补充：M3 在“静止库”的 E1/E2 不会红（main 已 checkpoint），必须用 E4 这种 live-WAL 用例才能证明；这也说明 m6-smoke 的 backup check 是静止库备份，覆盖不到 WAL 一致性。
+
+---
+
+## 6. 文档与契约一致性
+
+| 契约项 | 验证 | 结论 |
+|---|---|---|
+| §0.1 replace 单事务、失败整体回滚 | 独立注入中段失败：全量 fingerprint 不变、reopen 正常 | 一致（A5） |
+| §0.2 不清 schema_migrations | 失败/成功 replace 后账本 1..5；reopen 不重跑 | 一致 |
+| §0.3 活跃 Run/租约禁止切换 | store readiness 正确，**CLI 不执行** | **不一致（QA7-02）** |
+| §0.4 两条恢复路径语义不同 | backup 二进制精确/export 可读 JSON；文档基本一致 | 一致（但 runs/events 不在 JSON，见 QA7-09） |
+| §0.5 listEvents 数组兼容 | `Array.isArray`、items/hasMore/nextAfterSeq 均验证 | 一致 |
+| §1 store API（filter/limit/import/readiness） | filter/limit/import 一致；**store.verifySwitchReadiness 缺失**；aggregateId 校验弱 | 部分不一致（QA7-05/06） |
+| §2 Backend events/export/import/health | export/import/健康字段一致；events 分页实现错误 | **分页不一致（QA7-03）** |
+| §3 m6-smoke 6 项 | 实际 7 条但覆盖语义不足 | 不一致（QA7-07） |
+| v1→v5 就地升级 | v1/v4 真实旧库数据+事件+行为 | 一致（门禁只查版本，我补了行为） |
+
+另外：m6-status 写“独立 QA（QA-007）待做”是诚实的；但它的“已知限制”没有列出 fail-closed 覆盖面、HTTP 分页、活跃 Run 切换、JSON 不含 runs/events，因此 v1.0 宣发前必须补文档或修代码。
+
+---
+
+## 7. 结论：M6 能否标记完成 / v1.0 边界
+
+- **冻结 `0abdee1`：不能标记完成。** 门禁 7/7、447/447、601/601、boundaries 9/6/0、m1..m5 全绿，但独立复核有 **3 个 MAJOR**：
+  1. fail-closed 漏 requirements/大小写/嵌套/agents → 清库 + PASS（数据丢失、假绿）；
+  2. 活跃 RUNNING Run 时 CLI 切换不拒绝（contract §0.3 被绕过，Run/命令/事件丢失）；
+  3. HTTP 事件分页丢/跳事件（Web 时间线核心路径）。
+  另有 4 个 MINOR（状态映射有损、store 校验/API 缺失、门禁覆盖不足）。**3 个 MAJOR 都足以阻止 v1.0 宣发**；建议按 BLOCKER 级别排期修复（尤其 1、3）。
+- 收口清单：
+  1. QA7-01：未知集合白名单 fail-closed（requirements/agents/runs/events/tasks 的大小写与嵌套），错误带 key 路径；补测试。
+  2. QA7-02：import replace 前调用 `verifySwitchReadiness`，blockers 非空 exit 1。
+  3. QA7-03：修 events route 的 hasMore/nextAfterSeq（不要二次 slice 混用 fetchLimit 元数据），加真实 HTTP 分页测试。
+  4. QA7-04/05/06：状态可逆映射/文档；store aggregateId 校验；store 挂 `verifySwitchReadiness`。
+  5. QA7-07：m6-smoke 加 HTTP 分页、active-run CLI、>1000 事件、mid-write 回滚指纹、v1/v4 行为断言。
+  6. 重新冻结后复跑全部门禁 + 本 QA 套件。
+- **v1.0 可用 ≠ 生产可用**：
+  1. 真实 DSH 不可用；所有多 Agent 演示是 MockRuntime。
+  2. 无安装包/签名/自动更新；Windows 单机。
+  3. 无浏览器 E2E（Web 时间线只到单测；而本轮 HTTP 分页 MAJOR 正说明“单测绿≠接口正确”）。
+  4. 旧 CLI 仍以 JSON 为事实源；Phase C 的只读切换在 HEAD 是独立提交，不在 M6 范围，且检测是 best-effort。
+  5. 无多用户/远程；日志无轮转；JSON export/import 不含 runs/events/leases，切换会重置执行历史。
+  6. Node < 22.5 时 QA 套件整体 SKIP；本轮未做跨平台验证。
+
+---
+
+## 附录 A：对抗套件（19 条）与冻结结果
+
+| 组 | 用例 | 冻结 |
+|---|---|---|
+| A（5） | batch.tasks/top tasks/非数组拒绝；空数组；mid-write 回滚；**requirements**；**大小写/嵌套/agents** | 3 绿 / **2 红**（A2/A3） |
+| B（3） | export→replace 精确内容；merge 幂等；**active RUNNING Run 拒绝切换** | 2 绿 / **1 红**（B3） |
+| C（3） | store 组合过滤/边界/memory 一致；**HTTP 分页完整性**；1000 cap/非法 400 | 2 绿 / **1 红**（C2） |
+| D（2） | v1/v4→v5 数据+行为；v5 账本自愈 | 2 绿 |
+| E（4） | tamper；restore 精确 counts+health；高版本拒绝；live WAL 一致性 | 4 绿 |
+| F（2） | CLI surface/非 PASS exit1；隐私 | 2 绿 |
+
+## 附录 B：复跑命令（冻结树 0abdee1）
+
+```bash
+# 隔离解包 0abdee1 后（包内 @atk/* 指向解包树；不要混入 HEAD Phase C）
+node scripts/test.mjs             # 447/447
+node scripts/test-workspace.mjs   # 601/601（59 文件）
+node scripts/check-boundaries.mjs # PASS 9/6/0
+node scripts/m1-smoke.mjs         # 16/16
+node scripts/m2-smoke.mjs         # 4/4
+node scripts/m3-smoke.mjs         # 6/6
+node scripts/m4-smoke.mjs         # 9/9
+node scripts/m5-smoke.mjs         # 4/4
+node scripts/m6-smoke.mjs         # 7/7
+node --test test/m6-qa-adversarial.test.mjs   # 19 tests：14 pass / 5 fail（本轮 5 个缺陷/缺口）
+
+# 变异（atk-qa-m6-mut）
+# M1 删 fail-closed          -> A1 红
+# M2 import 非 PASS exit 0   -> F1 红
+# M3 backup 直接复制 .db     -> E4 红（live WAL）
+```
