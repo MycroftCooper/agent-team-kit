@@ -580,7 +580,13 @@ export function createServer({
     },
     /** Diagnostics for tests: proves SSE timers/connections were cleaned up. */
     stats() {
-      return { listening, port: boundPort, url: baseUrl, sseClients: hub.size() };
+      return {
+        listening,
+        port: boundPort,
+        url: baseUrl,
+        sseClients: hub.size(),
+        schedulerHeartbeat: internalRouter.lastHeartbeat(),
+      };
     },
     tokenFile: tokenPersistence.tokenFile,
     tokenPersisted: tokenPersistence.persisted,

@@ -5,7 +5,7 @@
 // `x-atk-token`. The Backend is the single writer: handlers translate Host
 // reports into persisted events + Run transitions, then wake the SSE hub so the
 // browser sees real business events instead of just keep-alives.
-import { ID_RE, ApiError, createEvent } from "@atk/contracts";
+import { ID_RE, ApiError, createEvent, isEnumValue } from "@atk/contracts";
 
 import { normalizeLease } from "./internal.mjs";
 import { isPlainObject, parseIntegerParam, queryString, requireJsonBody, sendJson } from "./http.mjs";
@@ -37,6 +37,12 @@ const MAX_LOG_PAYLOAD_BYTES = 8 * 1024;
 /** M2 dedupe window for retried batches: (runId, sessionId, at, type). */
 const DEDUPE_LIMIT = 5000;
 
+/** A Run is "active" (occupies the Task, capacity and write scope) while non-terminal. */
+const ACTIVE_RUN_STATUSES = new Set(["QUEUED", "STARTING", "RUNNING"]);
+
+/** M3 claim idempotency cache: same key replays the original run/command. */
+const CLAIM_IDEMPOTENCY_LIMIT = 1000;
+
 const ROUTES = [
   { name: "dispatch.claim", method: "GET", regex: /^\/internal\/v1\/dispatch\/claim$/, keys: [] },
   { name: "dispatch.result", method: "POST", regex: /^\/internal\/v1\/dispatch\/([^/]+)\/result$/, keys: ["id"] },
@@ -44,6 +50,9 @@ const ROUTES = [
   { name: "runs.events", method: "POST", regex: /^\/internal\/v1\/runs\/([^/]+)\/events$/, keys: ["id"] },
   { name: "runtime.heartbeat", method: "POST", regex: /^\/internal\/v1\/runtime\/heartbeat$/, keys: [] },
   { name: "runs.reconcile", method: "GET", regex: /^\/internal\/v1\/runs\/([^/]+)\/reconcile$/, keys: ["id"] },
+  { name: "scheduling.snapshot", method: "GET", regex: /^\/internal\/v1\/scheduling\/snapshot$/, keys: [] },
+  { name: "tasks.claim", method: "POST", regex: /^\/internal\/v1\/tasks\/([^/]+)\/claim$/, keys: ["id"] },
+  { name: "scheduler.heartbeat", method: "POST", regex: /^\/internal\/v1\/scheduler\/heartbeat$/, keys: [] },
 ];
 
 function validationError(message, errors) {
@@ -270,6 +279,265 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
     throw error;
   }
 
+  // --- M3: scheduling snapshot + atomic claim -------------------------------
+
+  /** In-process idempotency cache: replaying a key returns the original run/command. */
+  const claimIdempotency = new Map();
+  let lastSchedulerHeartbeat = null;
+
+  function asArray(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
+  function isActiveRun(run) {
+    return ACTIVE_RUN_STATUSES.has(run?.status);
+  }
+
+  function filesOf(record) {
+    return asArray(record?.files).filter((file) => typeof file === "string" && file !== "");
+  }
+
+  function claimError(code, message, details) {
+    return new ApiError(code, message, { details });
+  }
+
+  /**
+   * Consistent snapshot for the Scheduler. Uses the store's atomic
+   * `schedulingSnapshot()` when available; otherwise composes the same shape
+   * from M1/M2 read methods and falls back to `latestSeq()` for the version
+   * (documented in the task receipt: still monotonic, because claims append
+   * events).
+   */
+  function buildSchedulingSnapshot() {
+    let raw = null;
+    if (typeof store.schedulingSnapshot === "function") {
+      try {
+        raw = store.schedulingSnapshot();
+      } catch (error) {
+        // Defensive: the Scheduler must keep working even if the store snapshot
+        // query is unavailable/buggy — compose the same contract shape from the
+        // M1/M2 read methods and record the degradation.
+        logger?.error?.(`[atk] store.schedulingSnapshot() failed; using composed snapshot: ${error?.message ?? error}`);
+        raw = null;
+      }
+    }
+    if (raw === null) {
+      const runs = asArray(store.listRuns({}));
+      const leases = [];
+      for (const run of runs) {
+        if (!isActiveRun(run) || typeof store.reconcileRun !== "function") continue;
+        try {
+          const lease = store.reconcileRun({ runId: run.id }).lease;
+          if (lease) leases.push(lease);
+        } catch {
+          // A run that vanished between list and reconcile is simply absent.
+        }
+      }
+      raw = {
+        version: typeof store.latestSeq === "function" ? store.latestSeq() : 0,
+        projects: asArray(store.listProjects()).map((project) => ({ id: project.id, policy: project.policy ?? null })),
+        tasks: asArray(store.listTasks({})),
+        agents: asArray(store.listAgents()),
+        runs,
+        leases,
+      };
+    }
+    const fallbackVersion = typeof store.latestSeq === "function" ? store.latestSeq() : 0;
+    return {
+      version: Number.isInteger(raw?.version) ? raw.version : fallbackVersion,
+      generatedAt: isIsoDate(raw?.generatedAt) ? raw.generatedAt : new Date(now()).toISOString(),
+      projects: asArray(raw?.projects).map((project) => ({ id: project.id, policy: project.policy ?? null })),
+      tasks: asArray(raw?.tasks),
+      agents: asArray(raw?.agents),
+      runs: asArray(raw?.runs),
+      leases: asArray(raw?.leases),
+    };
+  }
+
+  function parseClaimPolicies(body) {
+    const source = isPlainObject(body.policies)
+      ? body.policies
+      : isPlainObject(body.workspacePolicy?.policies)
+        ? body.workspacePolicy.policies
+        : null;
+    if (!source) return null;
+    const policies = {};
+    for (const key of ["maxConcurrentPerProject", "maxPerAgent"]) {
+      if (source[key] === undefined) continue;
+      if (!Number.isInteger(source[key]) || source[key] < 1) {
+        throw validationError("invalid claim policies", [`policies.${key} must be a positive integer`]);
+      }
+      policies[key] = source[key];
+    }
+    return Object.keys(policies).length > 0 ? policies : null;
+  }
+
+  function parseClaimRequest(body) {
+    const agentId = requireId(body.agentId, "agentId");
+    const expectedTaskVersion = requireInteger(body.expectedTaskVersion, "expectedTaskVersion", { min: 0 });
+    if (typeof body.idempotencyKey !== "string" || body.idempotencyKey.trim() === "" || body.idempotencyKey.length > 200) {
+      throw validationError("invalid task claim", ["idempotencyKey must be a non-empty string of at most 200 characters"]);
+    }
+    let requestedFunction;
+    if (body.function !== undefined) {
+      if (!isEnumValue("functions", body.function)) {
+        throw validationError("invalid task claim", ["function must be one of the functions enum values"]);
+      }
+      requestedFunction = body.function;
+    }
+    let requestedRole;
+    if (body.role !== undefined) {
+      if (typeof body.role !== "string" || !/^[A-Z][A-Z0-9_]*$/.test(body.role)) {
+        throw validationError("invalid task claim", ["role must be an upper-case role identifier"]);
+      }
+      requestedRole = body.role;
+    }
+    let workspacePolicy = null;
+    if (body.workspacePolicy !== undefined) {
+      if (!isPlainObject(body.workspacePolicy)) throw validationError("invalid task claim", ["workspacePolicy must be an object"]);
+      workspacePolicy = body.workspacePolicy;
+    }
+    return {
+      agentId,
+      expectedTaskVersion,
+      requestedFunction,
+      requestedRole,
+      workspacePolicy,
+      policies: parseClaimPolicies(body),
+      idempotencyKey: body.idempotencyKey,
+    };
+  }
+
+  /** §2 step 1: Task exists, READY and at the expected version. */
+  function assertTaskClaimable(task, expectedTaskVersion) {
+    if (task.status !== "READY" || task.version !== expectedTaskVersion) {
+      throw claimError("TASK_VERSION_CONFLICT", `task "${task.id}" is not claimable at version ${expectedTaskVersion}`, {
+        taskId: task.id,
+        currentVersion: task.version,
+        expectedVersion: expectedTaskVersion,
+        status: task.status,
+      });
+    }
+  }
+
+  /** §2 step 2: every dependency has to be DONE. */
+  function assertDependenciesDone(task) {
+    const blockingTaskIds = [];
+    for (const dependencyId of asArray(task.deps)) {
+      let dependency = null;
+      try {
+        dependency = store.getTask(dependencyId);
+      } catch {
+        dependency = null;
+      }
+      if (!dependency || dependency.status !== "DONE") blockingTaskIds.push(dependencyId);
+    }
+    if (blockingTaskIds.length > 0) {
+      throw claimError("TASK_DEPENDENCY_BLOCKED", `task "${task.id}" has unfinished dependencies`, {
+        taskId: task.id,
+        blockingTaskIds,
+      });
+    }
+  }
+
+  /** §2 step 3: Agent exists, IDLE and carries the required Role/Function. */
+  function resolveClaimAgent(agentId, task, requestedFunction, requestedRole) {
+    const requiredFunction = requestedFunction ?? task.functionRequired;
+    const requiredRole = requestedRole ?? task.roleRequired;
+    const agent = asArray(store.listAgents()).find((candidate) => candidate.id === agentId) ?? null;
+    const unavailable = (extra) => {
+      throw claimError("CAPABILITY_UNAVAILABLE", `agent "${agentId}" cannot take task "${task.id}"`, {
+        reason: "capability-mismatch",
+        agentId,
+        taskId: task.id,
+        requiredFunction,
+        requiredRole,
+        ...extra,
+      });
+    };
+    if (!agent) unavailable({ agentStatus: null, agentRole: null, agentCapabilities: [] });
+    if (agent.status !== "IDLE") {
+      unavailable({ agentStatus: agent.status, agentRole: agent.role ?? null, agentCapabilities: asArray(agent.capabilities) });
+    }
+    if (agent.role !== requiredRole) {
+      unavailable({ agentStatus: agent.status, agentRole: agent.role ?? null, agentCapabilities: asArray(agent.capabilities) });
+    }
+    if (!asArray(agent.capabilities).includes(requiredFunction)) {
+      unavailable({ agentStatus: agent.status, agentRole: agent.role ?? null, agentCapabilities: asArray(agent.capabilities) });
+    }
+    return { function: requiredFunction, role: requiredRole };
+  }
+
+  /** §2 step 4: at most one active Run per Task. */
+  function assertNoActiveRun(task) {
+    const active = asArray(store.listRuns({ taskId: task.id })).filter(isActiveRun);
+    if (active.length > 0) {
+      throw claimError("TASK_VERSION_CONFLICT", `task "${task.id}" already has an active Run`, {
+        taskId: task.id,
+        currentVersion: task.version,
+        activeRunId: active[0].id,
+      });
+    }
+  }
+
+  /** §2 step 5: per-project and per-agent capacity. Skipped when policies are absent. */
+  function assertCapacity({ task, agentId, policies, activeRuns, tasksById }) {
+    if (!policies) return;
+    if (Number.isInteger(policies.maxConcurrentPerProject)) {
+      const current = activeRuns.filter((run) => tasksById.get(run.taskId)?.projectId === task.projectId).length;
+      if (current >= policies.maxConcurrentPerProject) {
+        throw claimError("CAPABILITY_UNAVAILABLE", `project "${task.projectId}" is at capacity`, {
+          reason: "capacity",
+          scope: "project",
+          taskId: task.id,
+          projectId: task.projectId,
+          limit: policies.maxConcurrentPerProject,
+          current,
+        });
+      }
+    }
+    if (Number.isInteger(policies.maxPerAgent)) {
+      const current = activeRuns.filter((run) => run.agentId === agentId).length;
+      if (current >= policies.maxPerAgent) {
+        throw claimError("CAPABILITY_UNAVAILABLE", `agent "${agentId}" is at capacity`, {
+          reason: "capacity",
+          scope: "agent",
+          taskId: task.id,
+          agentId,
+          limit: policies.maxPerAgent,
+          current,
+        });
+      }
+    }
+  }
+
+  /** §2 step 6: declared write scope (`task.files` / `run.files`) must not overlap. */
+  function assertWriteScope({ task, activeRuns, tasksById }) {
+    const candidateFiles = filesOf(task);
+    if (candidateFiles.length === 0) return;
+    for (const run of activeRuns) {
+      const files = Array.isArray(run.files) ? filesOf(run) : filesOf(tasksById.get(run.taskId));
+      if (files.length === 0) continue;
+      const overlap = candidateFiles.filter((file) => files.includes(file));
+      if (overlap.length > 0) {
+        throw claimError("CAPABILITY_UNAVAILABLE", `task "${task.id}" conflicts with active Run "${run.id}" write scope`, {
+          reason: "write-scope-conflict",
+          taskId: task.id,
+          conflictingRunId: run.id,
+          files: overlap,
+        });
+      }
+    }
+  }
+
+  function rememberClaim(idempotencyKey, result) {
+    claimIdempotency.set(idempotencyKey, result);
+    while (claimIdempotency.size > CLAIM_IDEMPOTENCY_LIMIT) {
+      claimIdempotency.delete(claimIdempotency.keys().next().value);
+    }
+  }
+
+
   async function handle({ req, res, method, pathname, url }) {
     const route = matchRoute(pathname, method);
     if (!route) throw new ApiError("NOT_FOUND", `no internal route for ${method} ${pathname}`);
@@ -454,11 +722,106 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
         return;
       }
 
+      case "scheduling.snapshot": {
+        sendJson(res, 200, buildSchedulingSnapshot());
+        return;
+      }
+
+      case "tasks.claim": {
+        const taskId = params.id;
+        const body = requireObject(await requireJsonBody(req), "task claim");
+
+        // Idempotency is checked first: replaying a key must return the original
+        // {run, command} even though the Task version has advanced since.
+        if (typeof body.idempotencyKey !== "string" || body.idempotencyKey.trim() === "" || body.idempotencyKey.length > 200) {
+          throw validationError("invalid idempotencyKey", ["idempotencyKey must be a non-empty string of at most 200 characters"]);
+        }
+        const cached = claimIdempotency.get(body.idempotencyKey);
+        if (cached) {
+          if (cached.task?.id !== taskId) {
+            throw new ApiError("VALIDATION_ERROR", "idempotencyKey was already used for another task", {
+              details: { errors: ["idempotencyKey was already used for another task"], idempotencyKey: body.idempotencyKey, taskId, existingTaskId: cached.task?.id ?? null },
+            });
+          }
+          sendJson(res, 200, cached);
+          return;
+        }
+
+        const request = parseClaimRequest(body);
+
+        // --- the 7-step contract-layer validation (never rely on store errors) ---
+        const task = store.getTask(taskId); // 404 NOT_FOUND
+        assertTaskClaimable(task, request.expectedTaskVersion); // step 1
+        assertDependenciesDone(task); // step 2
+        const effective = resolveClaimAgent(request.agentId, task, request.requestedFunction, request.requestedRole); // step 3
+        assertNoActiveRun(task); // step 4
+
+        const allTasks = asArray(store.listTasks({}));
+        const tasksById = new Map(allTasks.map((candidate) => [candidate.id, candidate]));
+        const allRuns = asArray(store.listRuns({}));
+        const activeRuns = allRuns.filter(isActiveRun);
+        assertCapacity({ task, agentId: request.agentId, policies: request.policies, activeRuns, tasksById }); // step 5
+        assertWriteScope({ task, activeRuns, tasksById }); // step 6
+
+        // Step 7: one atomic store transaction (CAS + createRun + enqueue +
+        // task.updated/run.created events). Never compose this from M1 calls.
+        if (typeof store.claimTask !== "function") {
+          logger?.error?.("[atk] store.claimTask is unavailable; refusing a non-atomic claim");
+          throw new ApiError("INTERNAL_ERROR", "atomic claim store method is unavailable");
+        }
+        const result = store.claimTask({
+          taskId,
+          agentId: request.agentId,
+          expectedTaskVersion: request.expectedTaskVersion,
+          function: effective.function,
+          role: effective.role,
+          workspacePolicy: request.workspacePolicy,
+          policies: request.policies,
+          idempotencyKey: request.idempotencyKey,
+        });
+        if (!isPlainObject(result) || !result.run || !result.command || !result.task) {
+          logger?.error?.("[atk] store.claimTask returned an incomplete result");
+          throw new ApiError("INTERNAL_ERROR", "atomic claim returned an incomplete result");
+        }
+
+        rememberClaim(request.idempotencyKey, result);
+        try {
+          hub?.pump?.();
+        } catch (error) {
+          logger?.error?.(`[atk] SSE pump failed after claim: ${error?.message ?? error}`);
+        }
+        sendJson(res, 200, result);
+        return;
+      }
+
+      case "scheduler.heartbeat": {
+        const body = requireObject(await requireJsonBody(req), "scheduler heartbeat");
+        const ownerId = requireId(body.ownerId, "ownerId");
+        if (body.status !== undefined && (typeof body.status !== "string" || body.status.trim() === "")) {
+          throw validationError("invalid scheduler heartbeat", ["status must be a non-empty string when provided"]);
+        }
+        if (body.details !== undefined && !isPlainObject(body.details)) {
+          throw validationError("invalid scheduler heartbeat", ["details must be an object when provided"]);
+        }
+        lastSchedulerHeartbeat = {
+          ownerId,
+          status: body.status ?? null,
+          details: body.details ?? null,
+          receivedAt: new Date(now()).toISOString(),
+        };
+        sendJson(res, 200, { ok: true, ownerId, receivedAt: lastSchedulerHeartbeat.receivedAt });
+        return;
+      }
+
       default: {
         throw new ApiError("NOT_FOUND", `no internal route for ${method} ${pathname}`);
       }
     }
   }
 
-  return { handle };
+  function lastHeartbeat() {
+    return lastSchedulerHeartbeat === null ? null : structuredClone(lastSchedulerHeartbeat);
+  }
+
+  return { handle, lastHeartbeat };
 }

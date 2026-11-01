@@ -29,6 +29,7 @@ export function createFakeStore(seed = {}) {
   let events = [];
   let seq = 0;
   let counters = { task: 0, run: 0, requirement: 0, approval: 0, command: 0 };
+  let snapshotVersion = 1;
 
   for (const project of seed.projects ?? []) projects.set(project.id, { version: 0, createdAt: nowIso(), ...clone(project) });
   for (const requirement of seed.requirements ?? []) {
@@ -452,6 +453,205 @@ export function createFakeStore(seed = {}) {
       const run = requireRun(runId);
       // M2 contract: sessions are an empty array until M4 records them.
       return { run: clone(run), lease: clone(leases.get(runId) ?? null), sessions: [] };
+    },
+
+    // ---- M3: scheduling snapshot + atomic claim (m3-contracts §2) ----
+    schedulingSnapshot() {
+      return {
+        version: snapshotVersion,
+        projects: [...projects.values()].map((project) => ({ id: project.id, policy: project.policy ?? null })),
+        tasks: [...tasks.values()].map(clone),
+        agents: [...agents.values()].map(clone),
+        runs: [...runs.values()].map(clone),
+        leases: [...leases.values()].map(clone),
+      };
+    },
+    claimTask({
+      taskId,
+      agentId,
+      expectedTaskVersion,
+      function: requiredFunction,
+      role: requiredRole,
+      workspacePolicy = null,
+      policies = null,
+      idempotencyKey = null,
+    } = {}) {
+      // Idempotent replay first: the Task version has advanced, so validating
+      // before this check would turn a retry into a false conflict.
+      if (idempotencyKey) {
+        for (const existing of dispatchCommands.values()) {
+          if (existing.idempotencyKey === idempotencyKey) {
+            const run = runs.get(existing.runId);
+            return { run: clone(run), command: clone(existing), task: clone(tasks.get(run.taskId)) };
+          }
+        }
+      }
+
+      const task = requireTask(taskId);
+      if (task.status !== "READY" || task.version !== expectedTaskVersion) {
+        const error = new Error(`task ${taskId} version conflict`);
+        error.code = "TASK_VERSION_CONFLICT";
+        error.details = { taskId, currentVersion: task.version, expectedVersion: expectedTaskVersion, status: task.status };
+        throw error;
+      }
+
+      const blockingTaskIds = (task.deps ?? []).filter((depId) => tasks.get(depId)?.status !== "DONE");
+      if (blockingTaskIds.length > 0) {
+        const error = new Error(`task ${taskId} has unfinished dependencies`);
+        error.code = "TASK_DEPENDENCY_BLOCKED";
+        error.details = { taskId, blockingTaskIds };
+        throw error;
+      }
+
+      const requiredFunctionValue = requiredFunction ?? task.functionRequired;
+      const requiredRoleValue = requiredRole ?? task.roleRequired;
+      const agent = agents.get(agentId) ?? null;
+      const unavailable = (extra) => {
+        const error = new Error(`agent ${agentId} cannot take task ${taskId}`);
+        error.code = "CAPABILITY_UNAVAILABLE";
+        error.details = {
+          reason: "capability-mismatch",
+          agentId,
+          taskId,
+          requiredFunction: requiredFunctionValue,
+          requiredRole: requiredRoleValue,
+          ...extra,
+        };
+        throw error;
+      };
+      if (!agent) unavailable({ agentStatus: null, agentRole: null, agentCapabilities: [] });
+      if (agent.status !== "IDLE" || agent.role !== requiredRoleValue || !(agent.capabilities ?? []).includes(requiredFunctionValue)) {
+        unavailable({ agentStatus: agent.status, agentRole: agent.role, agentCapabilities: agent.capabilities ?? [] });
+      }
+
+      const active = [...runs.values()].filter((run) => ["QUEUED", "STARTING", "RUNNING"].includes(run.status));
+      const taskActive = active.filter((run) => run.taskId === taskId);
+      if (taskActive.length > 0) {
+        const error = new Error(`task ${taskId} already has an active run`);
+        error.code = "TASK_VERSION_CONFLICT";
+        error.details = { taskId, currentVersion: task.version, activeRunId: taskActive[0].id };
+        throw error;
+      }
+
+      if (policies) {
+        if (Number.isInteger(policies.maxConcurrentPerProject)) {
+          const current = active.filter((run) => tasks.get(run.taskId)?.projectId === task.projectId).length;
+          if (current >= policies.maxConcurrentPerProject) {
+            const error = new Error(`project ${task.projectId} is at capacity`);
+            error.code = "CAPABILITY_UNAVAILABLE";
+            error.details = {
+              reason: "capacity",
+              scope: "project",
+              taskId,
+              projectId: task.projectId,
+              limit: policies.maxConcurrentPerProject,
+              current,
+            };
+            throw error;
+          }
+        }
+        if (Number.isInteger(policies.maxPerAgent)) {
+          const current = active.filter((run) => run.agentId === agentId).length;
+          if (current >= policies.maxPerAgent) {
+            const error = new Error(`agent ${agentId} is at capacity`);
+            error.code = "CAPABILITY_UNAVAILABLE";
+            error.details = { reason: "capacity", scope: "agent", taskId, agentId, limit: policies.maxPerAgent, current };
+            throw error;
+          }
+        }
+      }
+
+      const candidateFiles = Array.isArray(task.files) ? task.files : [];
+      if (candidateFiles.length > 0) {
+        for (const run of active) {
+          const files = Array.isArray(run.files) ? run.files : tasks.get(run.taskId)?.files ?? [];
+          const overlap = candidateFiles.filter((file) => files.includes(file));
+          if (overlap.length > 0) {
+            const error = new Error(`task ${taskId} write scope conflicts with run ${run.id}`);
+            error.code = "CAPABILITY_UNAVAILABLE";
+            error.details = { reason: "write-scope-conflict", taskId, conflictingRunId: run.id, files: overlap };
+            throw error;
+          }
+        }
+      }
+
+      // Atomic commit (the fake is synchronous, so the whole block is "one transaction").
+      const previousStatus = task.status;
+      task.status = "CLAIMED";
+      task.version += 1;
+      task.updatedAt = nowIso();
+
+      counters.run += 1;
+      const runId = `RUN-${counters.run.toString(36).toUpperCase()}`;
+      const now = nowIso();
+      const run = {
+        id: runId,
+        taskId,
+        agentId,
+        function: requiredFunctionValue,
+        role: requiredRoleValue,
+        attempt: 1,
+        status: "STARTING",
+        version: 0,
+        exitCode: null,
+        createdAt: now,
+        updatedAt: now,
+        ...(workspacePolicy ? { workspacePolicy: clone(workspacePolicy) } : {}),
+        ...(candidateFiles.length > 0 ? { files: clone(candidateFiles) } : {}),
+      };
+      runs.set(runId, run);
+      seq += 1;
+      events.push(
+        createEvent({
+          seq,
+          projectId: task.projectId ?? null,
+          aggregateType: "run",
+          aggregateId: runId,
+          type: "run.created",
+          payload: {
+            runId,
+            taskId,
+            agentId,
+            function: requiredFunctionValue,
+            role: requiredRoleValue,
+            status: "STARTING",
+            attempt: 1,
+            version: 0,
+          },
+        }),
+      );
+
+      counters.command += 1;
+      const command = {
+        id: `CMD-${counters.command.toString(36).toUpperCase()}`,
+        runId,
+        taskId,
+        commandType: "RUN_TASK",
+        payload: { taskId, agentId, workspacePolicy: workspacePolicy ? clone(workspacePolicy) : null },
+        idempotencyKey,
+        status: "PENDING",
+        ownerId: null,
+        generation: 0,
+        claimedUntil: null,
+        attempts: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+      dispatchCommands.set(command.id, command);
+
+      seq += 1;
+      events.push(
+        createEvent({
+          seq,
+          projectId: task.projectId ?? null,
+          aggregateType: "task",
+          aggregateId: taskId,
+          type: "task.updated",
+          payload: { taskId, status: task.status, previousStatus, version: task.version, agentId, runId },
+        }),
+      );
+      snapshotVersion += 1;
+      return { run: clone(run), command: clone(command), task: clone(task) };
     },
 
     listAgents() {
