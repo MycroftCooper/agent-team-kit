@@ -8,6 +8,7 @@
 //   ATK_HOST_OWNER       default host-<pid>
 //   AGENT_RUNTIME        mock | dsh (default mock)
 import process from "node:process";
+import path from "node:path";
 import { createMockRuntime } from "@atk/runtime-sdk/mock";
 import { createDshRuntimeStub } from "@atk/runtime-sdk/dsh";
 import { createInternalClient } from "./client.mjs";
@@ -64,7 +65,8 @@ if (!token) {
 const logger = console;
 const runtime = buildRuntime(runtimeKind, logger);
 const client = createInternalClient({ baseUrl, token });
-const host = createHost({ client, runtime, ownerId, logger });
+const stateFile = process.env.ATK_HOST_STATE_FILE ?? path.join(process.env.LOCALAPPDATA ?? process.cwd(), "AgentTeamKit", "runtime", `host-${ownerId}.json`);
+const host = createHost({ client, runtime, ownerId, logger, stateFile });
 
 async function main() {
   const health = await runtime.probe();
@@ -73,9 +75,15 @@ async function main() {
     // real session exists.
     logger.warn?.(`[host] runtime ${runtime.kind} is not usable: ${health?.detail ?? "unknown reason"}`);
   }
+  // Reconcile before taking any new work: after a crash this host cannot know
+  // whether its previous incarnation started a session (ADR-010 decision 7).
+  const recovered = await host.recover();
+  if (recovered.total > 0) {
+    logger.warn?.(`[host] reconciled ${recovered.total} in-flight run(s) from ${stateFile}`);
+  }
   if (args.once) {
     await host.tick();
-    process.stdout.write(`${JSON.stringify(host.stats)}\n`);
+    process.stdout.write(`${JSON.stringify({ recovered, stats: host.stats })}\n`);
     await host.stop();
     return;
   }

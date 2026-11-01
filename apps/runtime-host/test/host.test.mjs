@@ -1,6 +1,9 @@
 // Runtime Host tests: a fake internal client (no HTTP) plus the real MockRuntime,
 // so the host's own logic is what is under test.
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { createMockRuntime } from "@atk/runtime-sdk/mock";
 import { createHost } from "../src/host.mjs";
@@ -54,6 +57,49 @@ function claimOf({ attempts = 1 } = {}) {
     lease: { ownerId: "host-a", generation: 1, claimedUntil: new Date(Date.now() + 30000).toISOString() },
   };
 }
+
+test("recover() reconciles persisted runs and never guesses (ADR-010 decision 7)", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "atk-host-recover-"));
+  const stateFile = path.join(dir, "host.json");
+  writeFileSync(
+    stateFile,
+    JSON.stringify([
+      { runId: "run-terminal", commandId: "CMD-1", ownerId: "host-a", generation: 1 },
+      { runId: "run-lost", commandId: "CMD-2", ownerId: "host-a", generation: 1 },
+    ]),
+  );
+  const seen = [];
+  const client = fakeClient({ claims: [] });
+  client.reconcile = (runId) => {
+    seen.push(runId);
+    const status = runId === "run-terminal" ? "COMPLETED" : "RUNNING";
+    return Promise.resolve({ run: { id: runId, status }, lease: null, sessions: [] });
+  };
+  const host = createHost({ client, runtime: createMockRuntime({ scenario: "complete" }), ownerId: "host-a", logger: quietLogger(), stateFile });
+  const summary = await host.recover();
+
+  assert.deepEqual(seen.sort(), ["run-lost", "run-terminal"], "every persisted run must be reconciled");
+  assert.equal(summary.terminal.length, 1);
+  assert.equal(summary.lost.length, 1);
+  assert.equal(summary.lost[0].runId, "run-lost");
+  const remaining = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert.deepEqual(remaining.map((record) => record.runId), ["run-lost"], "terminal runs are forgotten, lost ones are kept for the reclaim path");
+  await host.stop();
+});
+
+test("a started run is recorded on disk so a crash can be reconciled later", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "atk-host-state-"));
+  const stateFile = path.join(dir, "host.json");
+  const client = fakeClient({ claims: [claimOf()] });
+  const runtime = createMockRuntime({ scenario: "hang", ignoreStop: true });
+  const host = createHost({ client, runtime, ownerId: "host-a", pollMs: 1000, flushMs: 1000, heartbeatMs: 1000, logger: quietLogger(), stateFile });
+  await host.tick();
+  const records = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert.equal(records.length, 1);
+  assert.equal(records[0].runId, "run-1");
+  assert.equal(records[0].commandId, "CMD-1");
+  await host.stop();
+});
 
 function waitFor(predicate, timeoutMs = 3000) {
   const started = Date.now();

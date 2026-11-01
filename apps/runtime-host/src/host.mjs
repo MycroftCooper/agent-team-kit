@@ -12,6 +12,12 @@
 //   2. A STALE_GENERATION answer means another host owns the run now. We stop the
 //      session and send nothing else; the authoritative state lives in the
 //      backend.
+//
+// Restart path: the host persists an in-flight record per run (stateFile) and
+// calls `recover()` before taking new work, which reconciles every record with
+// the backend instead of guessing (ADR-010 decision 7).
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 /**
  * @param {object} options
@@ -19,7 +25,18 @@
  * @param {import("@atk/runtime-sdk").AgentRuntime} options.runtime
  * @param {string} options.ownerId
  */
-export function createHost({ client, runtime, ownerId, leaseMs = 30000, pollMs = 500, flushMs = 100, heartbeatMs = 10000, logger = console, now = () => Date.now() } = {}) {
+export function createHost({
+  client,
+  runtime,
+  ownerId,
+  leaseMs = 30000,
+  pollMs = 500,
+  flushMs = 100,
+  heartbeatMs = 10000,
+  logger = console,
+  now = () => Date.now(),
+  stateFile = null,
+} = {}) {
   if (!client) throw new Error("createHost: client is required");
   if (!runtime) throw new Error("createHost: runtime is required");
   if (!ownerId) throw new Error("createHost: ownerId is required");
@@ -37,6 +54,71 @@ export function createHost({ client, runtime, ownerId, leaseMs = 30000, pollMs =
     timer.unref?.();
     return timer;
   }
+
+  // --- crash-recovery bookkeeping (ADR-010 decision 7) ----------------------
+  // The host records the run it is driving before starting the session and
+  // clears the record when the command is closed. After a crash those records
+  // are the only way to know which runs this host may have left behind.
+  function readRecords() {
+    if (!stateFile) return [];
+    try {
+      return JSON.parse(readFileSync(stateFile, "utf8"));
+    } catch {
+      return [];
+    }
+  }
+
+  function writeRecords(records) {
+    if (!stateFile) return;
+    try {
+      mkdirSync(dirname(stateFile), { recursive: true });
+      writeFileSync(stateFile, JSON.stringify(records, null, 2));
+    } catch (error) {
+      logger.warn?.(`[host] could not write ${stateFile}: ${error?.message ?? error}`);
+    }
+  }
+
+  function recordRun(record) {
+    writeRecords([...readRecords().filter((entry) => entry.runId !== record.runId), record]);
+  }
+
+  function forgetRun(runId) {
+    writeRecords(readRecords().filter((entry) => entry.runId !== runId));
+  }
+
+  /**
+   * Called before taking new work. The spec is explicit: a restarted host must
+   * reconcile with the backend before it does anything else, because it cannot
+   * know whether its previous incarnation started a session.
+   */
+  async function recover() {
+    const records = readRecords();
+    const summary = { total: records.length, terminal: [], lost: [], unknown: [] };
+    for (const record of records) {
+      const state = await safe("reconcile", () => client.reconcile(record.runId));
+      if (state === undefined) {
+        summary.unknown.push(record.runId);
+        continue;
+      }
+      const status = state?.run?.status;
+      if (status === "COMPLETED" || status === "FAILED" || status === "CANCELLED" || status === "INTERRUPTED") {
+        summary.terminal.push({ runId: record.runId, status });
+        forgetRun(record.runId);
+      } else {
+        // Still running: the previous host may have started a session we cannot
+        // observe. Do NOT restart it; the revocable command will be reclaimed
+        // (attempts > 1) and reported INTERRUPTED.
+        summary.lost.push({ runId: record.runId, status });
+      }
+    }
+    if (summary.total > 0) {
+      logger.warn?.(
+        `[host] recovered ${summary.total} record(s): ${summary.terminal.length} terminal, ${summary.lost.length} lost, ${summary.unknown.length} unknown`,
+      );
+    }
+    return summary;
+  }
+
 
   async function safe(label, fn) {
     try {
@@ -91,6 +173,7 @@ export function createHost({ client, runtime, ownerId, leaseMs = 30000, pollMs =
       }),
     );
     if (status === "DONE") stats.completed += 1;
+    forgetRun(runId);
     clearSession(runId);
     return response;
   }
@@ -111,6 +194,9 @@ export function createHost({ client, runtime, ownerId, leaseMs = 30000, pollMs =
     stats.claimed += 1;
     const entry = { command, lease, session: null, unsubscribe: null, buffer: [], timers: [] };
     sessions.set(runId, entry);
+    // Persist BEFORE starting the session: if we die here, recover() must know
+    // that this run may have been touched.
+    recordRun({ runId, commandId: command.id, ownerId, generation: lease.generation, at: new Date(now()).toISOString() });
 
     const session = await safe("start", () =>
       runtime.start({
@@ -182,6 +268,7 @@ export function createHost({ client, runtime, ownerId, leaseMs = 30000, pollMs =
         error: "reclaimed-after-lost-lease",
       }),
     );
+    forgetRun(run.id);
   }
 
   async function tick() {
@@ -198,6 +285,7 @@ export function createHost({ client, runtime, ownerId, leaseMs = 30000, pollMs =
   return {
     stats,
     activeSessions: () => [...sessions.keys()],
+    recover,
 
     /** One claim attempt; exposed so tests do not need timers. */
     tick,
