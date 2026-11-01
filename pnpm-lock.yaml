@@ -17,6 +17,8 @@ importers:
         specifier: workspace:*
         version: link:../../packages/database
 
+  apps/launcher: {}
+
   apps/runtime-host:
     dependencies:
       '@atk/runtime-sdk':

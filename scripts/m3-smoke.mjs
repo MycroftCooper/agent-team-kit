@@ -323,6 +323,18 @@ try {
       await patchTask("M3-A", { status });
     }
     const targetHash = "a".repeat(64); // contracts: a target hash is a sha256 hex digest
+    // Since M4 an approval must bind to the task's real candidate hash, which a
+    // PASS review normally writes. This gate is about scheduling, so it seeds the
+    // hash directly in the throwaway database instead of replaying a whole review.
+    {
+      const { DatabaseSync } = await import("node:sqlite");
+      const raw = new DatabaseSync(dbFile);
+      try {
+        raw.prepare("UPDATE tasks SET target_hash = ? WHERE id = ?").run(targetHash, "M3-A");
+      } finally {
+        raw.close();
+      }
+    }
     const auth = { "x-atk-token": publicToken, "x-atk-csrf": csrf, "content-type": "application/json", origin: base };
     const created = await fetch(`${base}/api/v1/approvals`, {
       method: "POST",
