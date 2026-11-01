@@ -6,7 +6,7 @@
 - 执行者：Lead(ARCH) + `worker-runtime-spike`（runtime-sdk）+ `worker-database`（Run/租约/命令）+ `worker-backend`（内部 API）
 - 关联：[m2-contracts.md](../architecture/m2-contracts.md)、[ADR-010](../architecture/adr/ADR-010-runtime-host-boundary.md)、[ADR-003](../architecture/adr/ADR-003-dispatch-reliability.md)、[m1-status.md](m1-status.md)
 
-> **状态：M2 完成（MockRuntime 路径），M3 可以开始。真实 DSH 适配器仍不可用**——它只有"能力全 false"的占位，误用会以 `CAPABILITY_UNAVAILABLE` 明确拒绝，不会静默假装在跑。独立 QA 复核待下一轮补（本轮已有 `m2-smoke` 端到端门禁 + 各包测试）。
+> **状态：M2 完成（MockRuntime 路径），M3 已开始。真实 DSH 适配器仍不可用**——它只有"能力全 false"的占位，误用会以 `CAPABILITY_UNAVAILABLE` 明确拒绝，不会静默假装在跑。独立 QA（QA-003）已完成并签字，见 §8。
 
 ---
 
@@ -55,10 +55,14 @@ PASS  a dispatch command is claimed, the session runs and the run COMPLETES
       COMPLETED, 2 run.updated (RUNNING -> COMPLETED), 1 run.log
 PASS  a dead host's command is reclaimed as INTERRUPTED and never restarted
       INTERRUPTED, 0 sessions started by the recovery host
+PASS  a command whose run already finished is closed by the backend sweep
+      orphan command DONE (derivedFrom run-terminal)
 PASS  an outdated generation is refused and leaves the run untouched
       409 STALE_GENERATION, run unchanged (STARTING v0)
-3/3 checks passed
+4/4 checks passed
 ```
+
+> 冻结时门禁是 3/3；QA-003 的 MAJOR-2（"事件已落库、result 未发出"的崩溃窗口）暴露出遗漏后扩为 **4/4**，新增的正是该窗口。见 §7 裁决 9 与 §8。
 
 该脚本用**真实 SQLite + 真实 HTTP 内部 API + 真实 SQLite 事务**，只有 Agent 会话是 MockRuntime。三条断言分别对应规范 §14 M2 门禁的"一个任务全链路完成""重启不误报完成""无法恢复时安全阻断"。
 
@@ -80,7 +84,7 @@ PASS  an outdated generation is refused and leaves the run untouched
 2. **真实 DSH 不可用**：RT-P07（真实 Magpie 路由）、RT-P08（多 Agent 并行）、受限执行、会话级模型选择仍未验证。
 3. **单 Host 串行**：M2 的 Host 一次只驱动一个会话；并行执行是 M3 的事。
 4. **workspace 与 Run 尚未自动绑定**：`createWorktree` 已实现并有安全测试，但 Host 还没在 claim 后自动建 worktree（留给 M3，因为需要 Scheduler 决定 base ref）。
-5. **独立 QA 未做**：M2 目前只有 Lead 的端到端门禁与各包测试；独立复核留到下一轮，结论可能补充缺陷。
+5. **独立 QA 已完成（QA-003）**：1 BLOCKER + 2 MAJOR + 5 MINOR 全部关闭，见 §8；结论"M2 可以标记完成"，但 QA PASS ≠ 生产可用。
 6. **JSON 仍是旧 CLI 的事实源**：SQLite 是 Web/执行侧的事实源，ADR-006 的停机切换仍未执行。
 
 ---
@@ -109,3 +113,26 @@ PASS  an outdated generation is refused and leaves the run untouched
 | worktree 生命周期 | Scheduler 决定 base ref 与冲突域；Host 在 claim 后建、完成/中断后按策略清理 |
 
 M3 门禁（规范）：Mock 100 Task / 20 Agent 无双重有效租约；真实 2 Agent 不互相覆盖；Backend/Scheduler/Runtime 任一中断时状态可辨识并安全恢复。
+
+---
+
+## 8. 独立 QA（QA-003）结论与缺陷闭环
+
+审查对象：M2 冻结提交 `4158ea4`..`fed5ee8`（QA 用 `git archive` 隔离解包，包内 `@atk/*` 指向解包树）。报告：[qa-review-m2.md](../architecture/qa-review-m2.md)，对抗套件：`test/m2-qa-adversarial.test.mjs`（25 条）。
+
+**结论：M2 可以标记完成（MockRuntime 路径）。无未关闭的 BLOCKER/MAJOR/MINOR。**
+
+| 缺陷 | 严重度 | 状态 | 位置 |
+|---|---|---|---|
+| QA3-01 Host `result` 缺 `ownerId` → 每次 400 被吞 → 命令永不 DONE/FAILED，而门禁只断言 Run 所以 3/3 假绿 | BLOCKER | 已修（`b8fc426`）+ 门禁加固 | host client / m2-smoke |
+| QA3-02 租约过期后 `updateRunStatus` / `completeDispatchCommand` 仍能写终态 | MAJOR | 已修 | database（同事务校验 `claimed_until > now`，`reason:"lease-expired"`） |
+| QA3-05 Host 从不 reconcile；Run 已 COMPLETED 而命令永久 CLAIMED | MAJOR | 已修（sweep + claim 前 sweep + Host `recover()`） | database / backend / host |
+| QA3-03/04/06/07/08 空批次 fence 200、409 details 形状、0002 重跑不幂等、config test `.pathname`、§5 门禁覆盖说法 | MINOR | 全修 | 见契约 §7 裁决 8-14 |
+
+**变异测试（隔离冻结树，工作区未动）**：基线 35/35 绿，3 处变异 **3/3 被抓**——去掉 `updateRunStatus` 的 generation/租约 fence、把 claim 改成非事务、让 `run.updated` 双写，分别使 database/claim-atomicity/run-lifecycle 与 QA 对抗用例变红。
+
+**QA 主动指出的观察项（不判缺陷，M4 可考虑）**：backend 内部测试用 fake-store，sqlite 层的变异只能靠 database 包测试与 QA 套件抓；Host in-flight 状态文件在 `%LOCALAPPDATA%\AgentTeamKit\runtime\host-<ownerId>.json`（不含 token）；进程内 dedupe 重启后旧批次会 400（M2 契约只承诺同进程）。
+
+**QA 的诚实边界**：Host `recover()` 只做了代码审阅 + 包测试，没有独立构造"进程崩溃后重启"的 E2E（该场景由 `m2-smoke` 第 4 条与 `host.test` 覆盖）；"QA PASS ≠ 生产可用"的边界不变。
+
+**最终门禁（QA 复跑）**：legacy **375/375**、workspace **433/433**（42 文件）、boundaries **PASS**（8 packages / 6 edges）、m1-smoke **16/16**、m2-smoke **4/4**、QA 对抗套件 **25/25**、`pnpm --filter @atk/web build` exit 0。
