@@ -329,3 +329,74 @@ node --test test/m6-qa-adversarial.test.mjs   # 19 tests：14 pass / 5 fail（�
 **M6 当前仍不可标记完成。** 原 3 个 MAJOR 中，**QA7-02、QA7-03 已修并复验通过，QA7-01 只修了数组/集合路径**：未知**非空对象**（metadata、10 层嵌套、数字键、`__proto__`、`constructor`、batch/project/counts 下的对象）仍会 `PASS` 并清空旧库（§8.3 QA7-01r MAJOR），与修复提交自己的“unknown objects refused”说明矛盾。另有 QA7-05/06 两个 MINOR 未修。**修掉 QA7-01r（未知非空对象 fail-closed）并补上 §8.4 的 3 条门禁后，M6 才可以标记完成。**
 
 “v1.0 可用 ≠ 生产可用”的边界与 §7 相同：Mock DSH、无安装包/自动更新、无浏览器 E2E、旧 CLI 仍 JSON 事实源、JSON export/import 不含 runs/events/leases、单机 Windows、Node<22.5 时套件整体 SKIP。
+
+---
+
+## 9. 最终复验（HEAD `a0671ce`，QA-007 签字）
+
+- 日期：2026-11-02；对象 `a0671ce`（修复 `7a630b4`/`003066d`/`97605cd` + 本轮 `a0671ce`）。工作树干净；未改产品代码。
+- 本轮只读验证 + 一条隔离变异（证明门禁有效），未 commit 产品代码；报告的 §8 结论已被本轮取代。
+
+### 9.1 数字（HEAD a0671ce）
+
+| 检查 | 结果 |
+|---|---|
+| `node scripts/test.mjs` | **475/475**（0 fail / 0 skipped） |
+| `node scripts/test-workspace.mjs` | **604/604**（59 文件） |
+| `node scripts/check-boundaries.mjs` | **PASS：9 package / 6 edge / 0 cycle** |
+| `packages/database`（`test/*.test.mjs`） | **114/114** |
+| `apps/backend`（`test/*.test.mjs`） | **135/135** |
+| `m3 / m4 / m5 / m6-smoke` | **6/6、9/9、4/4、12/12** |
+| `test/m6-qa-adversarial.test.mjs` | **23/23**（含上轮追加的 A6/B4/B5/C4） |
+| `test/phase-c-readonly.test.mjs`（Phase C 回归） | **5/5**（写入口拒绝 + JSON 字节不变 + 只读命令 + stale lock + 非 ASCII） |
+
+### 9.2 未知对象 fail-closed 复验（QA7-01r）
+
+按 Lead 指定的 8 种变体 + 未见过的组合逐项实测（真实 SQLite，初始库 tasks/agents/events 各 1；`mode:"replace"`）：
+
+| 形状 | 结果 |
+|---|---|
+| `metadata` 对象 / 10 层纯对象 / 数字键对象 / `__proto__` 对象 / `constructor` 对象 / `batch.metadata` / `project.metadata` / `counts.metadata`（8 种） | **全部 SKIPPED `IMPORT_WRITE_FAILED`，`dbUnchanged`** |
+| `metadata: [{ a: { arr: [1] } }]`（数组→对象→数组，非受信容器） | SKIPPED，零写入 |
+| `metadata: { list: [{ deep: { arr: [1] } }] }` | SKIPPED，路径 `metadata.list` |
+| `counts.metadata.deep`（纯对象与数组叶子两种） | SKIPPED，路径 `counts.metadata...` |
+| 未知对象含空数组 `{arr:[]}` / 嵌套空对象 `{a:{}}` | SKIPPED（非空对象即拒绝；空对象 `{}` 本身放行） |
+| `Object.create(null)` 作为**根** state（合法 legacy 字段） | PASS（正常导入，无原型对象可工作） |
+| `Object.create(null)` 作为**未知 metadata** 值 | SKIPPED，零写入 |
+| **`batch.slices[i]` 内嵌未知非空对象**（`meta:{a:1,arr:[1,2]}`、`deep:{x:{y:1}}`、`__proto__`/`constructor` 对象） | **PASS（应放行）**；`legacy.item` 原样保留这些记录级扩展，不丢数据 |
+
+结论：QA7-01r 已关闭；“未知非空对象拒绝、受信记录内扩展保留”的边界现在符合预期。
+
+### 9.3 QA7-05 / 06 复验
+
+| 项 | 结果 |
+|---|---|
+| store 层 `aggregateId` 非法 | sqlite 与 memory 都抛 `VALIDATION_ERROR`，`details.field==="aggregateId"`（`"bad id!"` 已拒绝） |
+| `store.verifySwitchReadiness()` | sqlite 与 memory 上均为 function；空闲库返回 `{ok:true, schemaVersion:5, counts:{...}, blockers:[]}` |
+
+### 9.4 m6-smoke 12/12 自审（新增 3 条是否真抓缺陷）
+
+1. **>1000 事件**：check10 `seedOnlyEvents(1005)` → store `listEventsPage(limit=1000)` 断言 items=1000/hasMore=true/nextAfterSeq=1000，第二页 5 条、hasMore=false、无 next；HTTP 同一断言，并拼接两页校验 **seq 1..1005 恰好各一次**。真实、有效。
+2. **写入中途失败回滚**：check11 用 Proxy 包住 `createTask`，第 2 次调用抛错；断言 `status==="SKIPPED"`、`IMPORT_WRITE_FAILED`、`createTaskCalls>=2`、**15 张表 counts + schema_migrations 版本集合前后 deepEqual**、reopen schema5/warnings=[]。
+   - 是否证明“进了事务”：`createTaskCalls>=2` 证明已进入 `writeAll()`（replace 的 clear→writeAll 在 `INTERNAL.transaction` 内）；失败后全量 fingerprint 与失败前一致，证明 clear 与部分写入被回滚。
+   - **我做了隔离变异验证**：把 `INTERNAL.transaction` 改成 `(work) => work()`（去掉事务）后跑真实 `m6-smoke` → **check11 FAIL，11/12**；恢复后 12/12。说明该 check 确实能抓住“回滚被破坏”，不是自证。
+   - 非阻塞硬化建议：target 目前是空库，check11 没有**直接观测** `clearBusinessTables` 被调用；若要更强的实现无关性，可 seed 目标库旧行或 Proxy 计数 `clearBusinessTables`。当前证据（调用次数+代码顺序+变异）已足以签字。
+3. **v1/v4→v5 行为**：check12 对 v1、v4 两个真实旧库分别断言 schema5、旧任务 V-T 及其状态、旧事件按 aggregateId 可查、`idx_events_type_seq` 存在、账本 [1,2,3,4,5]、warnings=[]。真实、有效。
+- 原 check4（写前校验）保留；check11 已补上真正的事务中途回滚，两者互补。
+- 原先 QA7-07 的三条缺口已全部落进门禁；复验后无需再补门禁级项。
+
+### 9.5 Phase C 回归
+
+`test/phase-c-readonly.test.mjs` **5/5**：所有写入口仍以 `READ_ONLY_MODE` 拒绝、旧 JSON 字节不变、只读命令（board/status/doctor/verify/export）正常、stale lock 只诊断不强绕、非 ASCII/BOM 场景通过。M6 修复未改变 Phase C 的只读语义；HEAD `3f4183d` 的只读切换无回归。
+
+### 9.6 最终结论
+
+**M6 可以标记完成。** QA-007 原 3 个 MAJOR（换版失效/活跃 Run 切换/HTTP 分页）与残余 QA7-01r 均已关闭；QA7-04/05/06 已修并复验；m6-smoke 12/12，新增三道门禁经代码审查与一次“去掉事务”变异验证能抓住对应缺陷；root 475/475、workspace 604/604、database 114/114、backend 135/135、boundaries 9/6/0、m3..m6 全绿。无 BLOCKER，无 MAJOR，无必须再补的门禁级缺口。
+
+**v1.0 可用 ≠ 生产可用**（边界不变）：
+1. 真实 DSH 不可用，所有多 Agent 演示是 MockRuntime；
+2. 无安装包/签名/自动更新；仅 Windows 本机；
+3. 无 CI 级浏览器 E2E（Web 时间线只到单测 + 真实 HTTP 接口测试）；
+4. 旧 CLI 仍以 JSON 为事实源，Phase C 只是“只读视图”，不是完全切换；
+5. JSON export/import 不含 runs/events/leases，replace 切换会重置执行历史（已在 m6-status 文档化）；
+6. 无多用户/远程；日志无轮转；Node < 22.5 时 QA 套件整体 SKIP。
