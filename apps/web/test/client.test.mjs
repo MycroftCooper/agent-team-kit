@@ -18,7 +18,10 @@ import {
   streamHeaders,
   toFailure,
 } from "../src/api/client.ts";
-import { INVALID_RESPONSE_CODE, NETWORK_ERROR_CODE } from "../src/domain/errors.ts";
+import { INVALID_RESPONSE_CODE, NETWORK_ERROR_CODE, actionErrorView } from "../src/domain/errors.ts";
+import { buildDecideRequest, buildReworkRequest, buildSubmitRequest } from "../src/domain/workbench.ts";
+import { en } from "../src/i18n/en.ts";
+import { zhCN } from "../src/i18n/zh-CN.ts";
 
 test("normaliseErrorBody reads the contract envelope", () => {
   const failure = normaliseErrorBody(409, {
@@ -292,6 +295,174 @@ test("a rejected or unusable session is a readable state, not a crash", async ()
           return true;
         },
       );
+    },
+  );
+});
+
+// -------------------------------------------- M4 write flows (mock transport) ---
+
+const SESSION_RESPONSE = () => new Response(JSON.stringify({ token: "tok", csrf: "csrf" }), { status: 200 });
+
+test("a self-review submit sends CSRF + CAS and surfaces SELF_REVIEW_FORBIDDEN details", async () => {
+  const calls = [];
+  const review = { id: "RV-1", status: "PENDING", version: 3 };
+  const payload = buildSubmitRequest(review, {
+    verdict: "PASS",
+    manifestHash: "a".repeat(64),
+    commitSha: "",
+    testsPassed: "5",
+    testsTotal: "5",
+    findings: [],
+  });
+
+  await withFetch(
+    async (url, init) => {
+      calls.push({ url: String(url), init });
+      if (String(url).endsWith("/api/v1/session")) return SESSION_RESPONSE();
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: "SELF_REVIEW_FORBIDDEN",
+            message: "agent A-1 produced run R-1 and cannot review it",
+            requestId: "req-9",
+            details: { agentId: "A-1", runId: "R-1" },
+          },
+        }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      );
+    },
+    async () => {
+      let failure = null;
+      await assert.rejects(
+        () => apiPost(payload.path, payload.body),
+        (error) => {
+          failure = error;
+          assert.equal(error.code, "SELF_REVIEW_FORBIDDEN");
+          assert.equal(error.httpStatus, 403);
+          assert.equal(error.requestId, "req-9");
+          assert.deepEqual(error.details, { agentId: "A-1", runId: "R-1" }, "server details must survive");
+          return true;
+        },
+      );
+
+      const write = calls[1];
+      assert.equal(write.url, "/api/v1/reviews/RV-1/submit");
+      assert.equal(write.init.method, "POST");
+      assert.equal(write.init.headers["x-atk-token"], "tok");
+      assert.equal(write.init.headers["x-atk-csrf"], "csrf", "writes need the CSRF header");
+      assert.deepEqual(JSON.parse(write.init.body), {
+        expectedVersion: 3,
+        verdict: "PASS",
+        manifestHash: "a".repeat(64),
+        evidence: { tests: { passed: 5, total: 5 } },
+      });
+
+      const view = actionErrorView(failure);
+      assert.equal(view.titleKey, "error.title.selfReview");
+      assert.ok(zhCN[view.messageKey].includes("不能审查自己的工作"));
+      assert.match(en[view.messageKey].toLowerCase(), /cannot review your own work/);
+      assert.equal(view.serverMessage, "agent A-1 produced run R-1 and cannot review it");
+      assert.equal(view.hasDetails, true);
+    },
+  );
+});
+
+test("a stale approval decision surfaces APPROVAL_STALE with the full target hash sent", async () => {
+  const calls = [];
+  const targetHash = "b".repeat(64);
+  const payload = buildDecideRequest({ id: "AP-1", status: "PENDING", targetHash }, "APPROVED");
+
+  await withFetch(
+    async (url, init) => {
+      calls.push({ url: String(url), init });
+      if (String(url).endsWith("/api/v1/session")) return SESSION_RESPONSE();
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: "APPROVAL_STALE",
+            message: "target changed under the approval",
+            requestId: "req-stale",
+            details: { currentHash: "c".repeat(64), targetHash },
+          },
+        }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      );
+    },
+    async () => {
+      let failure = null;
+      await assert.rejects(
+        () => apiPost(payload.path, payload.body),
+        (error) => {
+          failure = error;
+          assert.equal(error.code, "APPROVAL_STALE");
+          assert.equal(error.retryable, true);
+          return true;
+        },
+      );
+      assert.deepEqual(JSON.parse(calls[1].init.body), { decision: "APPROVED", targetHash });
+      assert.equal(calls[1].init.headers["x-atk-csrf"], "csrf");
+
+      const view = actionErrorView(failure);
+      assert.equal(view.titleKey, "error.title.stale");
+      assert.ok(zhCN[view.messageKey].includes("目标已变更，需重新验收"), zhCN[view.messageKey]);
+      assert.deepEqual(view.details, { currentHash: "c".repeat(64), targetHash });
+    },
+  );
+});
+
+test("a rework request surfaces REWORK_LIMIT_REACHED with its readable title", async () => {
+  const payload = buildReworkRequest({ id: "RV-8", status: "CHANGES_REQUESTED" }, "  try again  ");
+  await withFetch(
+    async (url) => {
+      if (String(url).endsWith("/api/v1/session")) return SESSION_RESPONSE();
+      return new Response(
+        JSON.stringify({ error: { code: "REWORK_LIMIT_REACHED", message: "max attempts 3 reached", details: { maxAttempts: 3, attempts: 3 } } }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      );
+    },
+    async () => {
+      let failure = null;
+      await assert.rejects(
+        () => apiPost(payload.path, payload.body),
+        (error) => {
+          failure = error;
+          assert.equal(error.code, "REWORK_LIMIT_REACHED");
+          return true;
+        },
+      );
+      const view = actionErrorView(failure);
+      assert.equal(view.titleKey, "error.title.reworkLimit");
+      assert.ok(zhCN[view.messageKey].includes("返工上限"));
+      assert.equal(view.serverMessage, "max attempts 3 reached");
+    },
+  );
+});
+
+test("EVIDENCE_MISSING is reported as a 400 the UI can localize", async () => {
+  await withFetch(
+    async (url) => {
+      if (String(url).endsWith("/api/v1/session")) return SESSION_RESPONSE();
+      return new Response(
+        JSON.stringify({ error: { code: "EVIDENCE_MISSING", message: "evidence.tests.passed !== total", requestId: "req-ev" } }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+    },
+    async () => {
+      let failure = null;
+      await assert.rejects(
+        () => apiPost("/reviews/RV-2/submit", { expectedVersion: 1, verdict: "PASS" }),
+        (error) => {
+          failure = error;
+          assert.equal(error.code, "EVIDENCE_MISSING");
+          assert.equal(error.httpStatus, 400);
+          return true;
+        },
+      );
+      const view = actionErrorView(failure);
+      assert.equal(view.titleKey, "error.title.evidence");
+      assert.match(en[view.messageKey], /manifest hash/i);
+      assert.ok(zhCN[view.messageKey].includes("manifestHash"));
+      assert.equal(view.serverMessage, "evidence.tests.passed !== total");
     },
   );
 });

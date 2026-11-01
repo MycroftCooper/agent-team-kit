@@ -22,6 +22,16 @@ export const ERROR_CODES = Object.freeze({
   VERSION_CONFLICT: { http: 409, retryable: true },
   CAPABILITY_UNAVAILABLE: { http: 409, retryable: false },
   REVIEW_INVALIDATED: { http: 409, retryable: true },
+  // M4: an agent must never approve its own work (spec §6.3 / §9.4).
+  SELF_REVIEW_FORBIDDEN: { http: 403, retryable: false },
+  // M4: a PASS verdict without a manifest hash or with failing/missing test
+  // evidence is not a review, it is an assertion.
+  EVIDENCE_MISSING: { http: 400, retryable: false },
+  // M4: approvals are bound to a target hash; a changed target invalidates them.
+  APPROVAL_STALE: { http: 409, retryable: true },
+  // M4: the rework loop is bounded; exceeding it blocks the task instead of
+  // looping forever.
+  REWORK_LIMIT_REACHED: { http: 409, retryable: false },
   RUNTIME_UNAVAILABLE: { http: 503, retryable: true },
   GATE_NOT_PASSED: { http: 422, retryable: true },
   INTERNAL_ERROR: { http: 500, retryable: false },

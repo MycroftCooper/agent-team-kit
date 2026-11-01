@@ -23,7 +23,8 @@ declare module "@atk/contracts" {
     | "AWAITING_ACCEPTANCE"
     | "DONE"
     | "BLOCKED"
-    | "CANCELLED";
+    | "CANCELLED"
+    | "REJECTED";
   export const TASK_STATUSES: readonly TaskStatus[];
   export const TASK_BRANCH_STATUSES: readonly ("BLOCKED" | "CANCELLED")[];
 
@@ -33,7 +34,7 @@ declare module "@atk/contracts" {
   export type AgentStatus = "OFFLINE" | "STARTING" | "IDLE" | "BUSY" | "WAITING_APPROVAL" | "DISCONNECTED" | "ERROR";
   export const AGENT_STATUSES: readonly AgentStatus[];
 
-  export type ReviewStatus = "PENDING" | "RUNNING" | "PASS" | "FAIL" | "INVALIDATED";
+  export type ReviewStatus = "PENDING" | "RUNNING" | "PASS" | "FAIL" | "INVALIDATED" | "CHANGES_REQUESTED" | "BLOCKED";
   export const REVIEW_STATUSES: readonly ReviewStatus[];
 
   export type IntegrationStatus = "PENDING" | "VERIFYING" | "APPLIED" | "CONFLICT" | "FAILED";
@@ -46,7 +47,7 @@ declare module "@atk/contracts" {
   export const GATE_STATUSES: readonly GateStatus[];
   export const PASSING_GATE_STATUS: GateStatus;
 
-  export type ReviewVerdict = "PASS" | "FAIL";
+  export type ReviewVerdict = "PASS" | "FAIL" | "CHANGES_REQUESTED" | "BLOCKED";
   export const REVIEW_VERDICTS: readonly ReviewVerdict[];
 
   export type DispatchCommandStatus = "PENDING" | "CLAIMED" | "DONE" | "FAILED" | "EXPIRED";
@@ -69,6 +70,10 @@ declare module "@atk/contracts" {
     | "STALE_GENERATION"
     | "CAPABILITY_UNAVAILABLE"
     | "REVIEW_INVALIDATED"
+    | "SELF_REVIEW_FORBIDDEN"
+    | "EVIDENCE_MISSING"
+    | "APPROVAL_STALE"
+    | "REWORK_LIMIT_REACHED"
     | "RUNTIME_UNAVAILABLE"
     | "GATE_NOT_PASSED"
     | "INTERNAL_ERROR";

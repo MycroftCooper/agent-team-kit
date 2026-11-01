@@ -6,6 +6,48 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (M4 / v0.7)
+
+- `packages/contracts`: a `REJECTED` task state (the rework waiting room) and
+  `CHANGES_REQUESTED` / `BLOCKED` review states and verdicts, plus four error
+  codes — `SELF_REVIEW_FORBIDDEN`, `EVIDENCE_MISSING`, `APPROVAL_STALE`,
+  `REWORK_LIMIT_REACHED`.
+- `packages/database` (M4): migration `0004_reviews_approvals.sql` and the write
+  paths the M1 tables never had — `createReview`, `submitReview`, `reworkTask`,
+  `createApproval`, `decideApproval` (plus list/get), with one active review per
+  task, a rework budget, and approvals bound to a target hash.
+- `apps/backend` (M4): seven public review/approval endpoints and a `PATCH`
+  guard: `DONE` is reachable only through a human approval, a self-review is
+  refused at the contract layer, and a PASS verdict without a manifest hash and
+  fully passing test evidence is rejected.
+- `apps/web` (M4): the `#/reviews` workbench — review queue, verdict panel with
+  findings, evidence inputs, approval panel showing the target hash, rework
+  action, and localised messages for all sixteen error codes in en and zh-CN
+  (293 keys each). Write failures show the server code, request id, message and
+  details instead of being swallowed.
+- `scripts/m4-smoke.mjs`: the M4 gate over the real backend, SQLite, scheduler
+  and host — self-review refused, missing evidence refused, legal PASS advances,
+  approval hash binding, direct `DONE` refused, the rework loop with its limit,
+  approval rejection returning the task to `READY`, and SSE events. 8/8.
+
+### Fixed (M4 / v0.7)
+
+- QA-004 BLOCKER: neither CLI entry point could start — `apps/scheduler/cli.mjs`
+  and `apps/runtime-host/cli.mjs` imported `./client.mjs` instead of
+  `./src/client.mjs`, so every library test and gate stayed green while the
+  actual processes failed at import. Both are fixed, both gained process-level
+  tests, and `m3-smoke` now spawns the real scheduler CLI as a sixth check.
+- QA-004 findings in `scheduler-core`: `detectCycles` missed simple cycles that
+  share nodes (now enumerates every simple cycle per SCC, with explicit limits
+  and a `truncated` flag), and `readyCandidates.missingDeps` now has the
+  contract shape `{taskId, missing[]}`.
+- QA-004 minors: an `idempotencyKey` replay now survives a backend restart (the
+  route no longer pre-empts the store's durable idempotency), and write-scope
+  comparison is segment-aware (`src` overlaps `src/a.js`).
+- M4 gate finding: a legal PASS was rejected with 400 because the backend passed
+  an empty `findings: []` to the store, which required findings for every
+  verdict. Only `CHANGES_REQUESTED` requires findings now.
+
 ### Added (M3 / v0.6)
 
 - `packages/scheduler-core`: a zero-dependency, zero-import, zero-clock planner —

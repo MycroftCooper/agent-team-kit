@@ -1,4 +1,4 @@
-// Migration, schema and connection-level guarantees (contracts 搂1, ADR-006,
+// Migration, schema and connection-level guarantees (contracts 鎼?, ADR-006,
 // ADR-009): WAL + busy_timeout + foreign_keys are really on, migrations are
 // applied exactly once and re-opening a store neither re-creates tables nor
 // duplicates schema_migrations rows.
@@ -39,18 +39,20 @@ function rawOpen(file) {
 
 test("migrations are applied once and recorded in schema_migrations", (t) => {
   const { store, file } = useStore(t);
-  assert.equal(store.health().schemaVersion, 3);
+  assert.equal(store.health().schemaVersion, 4);
   assert.equal(store.health().ok, true);
   const raw = rawOpen(file);
   try {
     const rows = raw.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all();
-    assert.equal(rows.length, 3);
+    assert.equal(rows.length, 4);
     assert.equal(Number(rows[0].version), 1);
     assert.equal(rows[0].name, "0001_init.sql");
     assert.equal(Number(rows[1].version), 2);
     assert.equal(rows[1].name, "0002_runs_dispatch.sql");
     assert.equal(Number(rows[2].version), 3);
     assert.equal(rows[2].name, "0003_scheduling.sql");
+    assert.equal(Number(rows[3].version), 4);
+    assert.equal(rows[3].name, "0004_reviews_approvals.sql");
   } finally {
     raw.close();
   }
@@ -63,7 +65,7 @@ test("re-opening a store does not re-run migrations or lose data", (t) => {
   store.close();
 
   const second = open();
-  assert.equal(second.health().schemaVersion, 3);
+  assert.equal(second.health().schemaVersion, 4);
   assert.deepEqual(second.health().counts, { projects: 1, tasks: 1, runs: 0, events: 0, agents: 0 });
   assert.equal(second.listProjects().length, 1);
   assert.equal(second.listTasks({ projectId: "proj-1" }).length, 1);
@@ -71,7 +73,7 @@ test("re-opening a store does not re-run migrations or lose data", (t) => {
 
   const raw = rawOpen(file);
   try {
-    assert.equal(Number(raw.prepare("SELECT COUNT(*) AS c FROM schema_migrations").get().c), 3);
+    assert.equal(Number(raw.prepare("SELECT COUNT(*) AS c FROM schema_migrations").get().c), 4);
   } finally {
     raw.close();
   }
@@ -88,7 +90,7 @@ test("migrate:false opens without touching the schema; migrate:true repairs it",
   empty.close();
 
   const migrated = open({ migrate: true });
-  assert.equal(migrated.health().schemaVersion, 3);
+  assert.equal(migrated.health().schemaVersion, 4);
   assert.deepEqual(migrated.listProjects(), []);
 });
 
@@ -182,7 +184,7 @@ test("the database file may live in a non-ASCII path", (t) => {
   const { store } = useStore(t, { prefix: "atk-\u4e2d\u6587\u76ee\u5f55-", subdir: "\u6570\u636e" });
   store.createProject(projectDto());
   assert.equal(store.listProjects().length, 1);
-  assert.equal(store.health().schemaVersion, 3);
+  assert.equal(store.health().schemaVersion, 4);
 });
 
 test("schema v2 adds the M2 execution columns to the M1 tables", (t) => {
@@ -215,6 +217,13 @@ test("schema v2 adds the M2 execution columns to the M1 tables", (t) => {
     assert.ok(columnsOf("projects").includes("policy_json"));
     assert.ok(columnsOf("tasks").includes("files_json"));
     assert.ok(columnsOf("runs").includes("files_json"));
+    // v4 review/approval columns.
+    assert.ok(columnsOf("reviews").includes("reviewer"));
+    assert.ok(columnsOf("reviews").includes("evidence_json"));
+    assert.ok(columnsOf("review_attempts").includes("evidence_json"));
+    assert.ok(columnsOf("approvals").includes("decided_at"));
+    assert.ok(columnsOf("approvals").includes("version"));
+    assert.ok(columnsOf("tasks").includes("target_hash"));
   } finally {
     raw.close();
   }
@@ -254,7 +263,7 @@ test("an M1 (v1) database upgrades in place and keeps its rows", (t) => {
   }
 
   const upgraded = open({ migrate: true });
-  assert.equal(upgraded.health().schemaVersion, 3);
+  assert.equal(upgraded.health().schemaVersion, 4);
   assert.equal(upgraded.getProject("legacy-proj").name, "Legacy");
   assert.equal(upgraded.getTask("legacy-task").title, "Legacy task");
   const run = upgraded.getRun("legacy-run");
@@ -276,6 +285,7 @@ test("an M1 (v1) database upgrades in place and keeps its rows", (t) => {
         [1, "0001_init.sql"],
         [2, "0002_runs_dispatch.sql"],
         [3, "0003_scheduling.sql"],
+        [4, "0004_reviews_approvals.sql"],
       ],
     );
     const command = verify.prepare("SELECT * FROM dispatch_commands WHERE id = 'legacy-cmd'").get();
@@ -299,6 +309,19 @@ test("an M1 (v1) database upgrades in place and keeps its rows", (t) => {
       .all()
       .map((column) => column.name);
     assert.ok(runsColumns.includes("files_json"));
+    // v4 columns exist on the upgraded M1 rows too.
+    const reviewsColumns = verify
+      .prepare("PRAGMA table_info(reviews)")
+      .all()
+      .map((column) => column.name);
+    assert.ok(reviewsColumns.includes("reviewer"));
+    assert.ok(reviewsColumns.includes("evidence_json"));
+    const approvalsColumns = verify
+      .prepare("PRAGMA table_info(approvals)")
+      .all()
+      .map((column) => column.name);
+    assert.ok(approvalsColumns.includes("decided_at"));
+    assert.ok(approvalsColumns.includes("version"));
   } finally {
     verify.close();
   }
@@ -316,7 +339,7 @@ test("migration runner self-heals when bookkeeping rows are lost (QA-003)", (t) 
   raw.close();
 
   const reopened = open();
-  assert.equal(reopened.health().schemaVersion, 3);
+  assert.equal(reopened.health().schemaVersion, 4);
   assert.equal(reopened.getProject("proj-1").id, "proj-1");
   assert.equal(reopened.getTask("TASK-KEEP").title, "Task title");
   const warnings = reopened[INTERNAL].migrationWarnings();
@@ -335,7 +358,7 @@ test("migration runner self-heals when bookkeeping rows are lost (QA-003)", (t) 
   rawAgain.exec("DELETE FROM schema_migrations WHERE version = 3");
   rawAgain.close();
   const third = open();
-  assert.equal(third.health().schemaVersion, 3);
+  assert.equal(third.health().schemaVersion, 4);
   assert.equal(third.getTask("TASK-KEEP").title, "Task title");
   assert.ok(
     third[INTERNAL].migrationWarnings().some((warning) => warning.migration === "0003_scheduling.sql"),
@@ -346,7 +369,7 @@ test("migration runner self-heals when bookkeeping rows are lost (QA-003)", (t) 
   const verify = rawOpen(file);
   try {
     const rows = verify.prepare("SELECT version FROM schema_migrations ORDER BY version").all();
-    assert.deepEqual(rows.map((row) => Number(row.version)), [1, 2, 3]);
+    assert.deepEqual(rows.map((row) => Number(row.version)), [1, 2, 3, 4]);
     assert.equal(Number(verify.prepare("SELECT COUNT(*) AS c FROM tasks").get().c), 1);
     assert.equal(Number(verify.prepare("SELECT COUNT(*) AS c FROM projects").get().c), 1);
   } finally {
@@ -385,5 +408,6 @@ test("errors are contract-shaped objects with code/message/details", (t) => {
     });
   }
 });
+
 
 

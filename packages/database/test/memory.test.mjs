@@ -14,7 +14,7 @@ test("memory store exposes the same API shape with no file", (t) => {
   assert.deepEqual(store.health(), {
     ok: true,
     file: null,
-    schemaVersion: 3,
+    schemaVersion: 4,
     counts: { projects: 0, tasks: 0, runs: 0, events: 0, agents: 0 },
   });
   assert.deepEqual(store.listProjects(), []);
@@ -152,4 +152,5 @@ test("memory store runs the migration import/export path identically", (t) => {
   );
   assert.deepEqual(memory.health().counts, sqlite.health().counts);
 });
+
 

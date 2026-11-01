@@ -19,10 +19,11 @@ const EXPECTED_TRANSITIONS = {
   READY: ["CLAIMED", "BLOCKED", "CANCELLED"],
   CLAIMED: ["RUNNING", "BLOCKED", "CANCELLED"],
   RUNNING: ["REVIEWING", "BLOCKED", "CANCELLED"],
-  REVIEWING: ["INTEGRATING", "BLOCKED", "CANCELLED"],
+  REVIEWING: ["INTEGRATING", "BLOCKED", "CANCELLED", "REJECTED"],
   INTEGRATING: ["AWAITING_ACCEPTANCE", "BLOCKED", "CANCELLED"],
-  AWAITING_ACCEPTANCE: ["DONE", "BLOCKED", "CANCELLED"],
+  AWAITING_ACCEPTANCE: ["READY", "DONE", "BLOCKED", "CANCELLED", "REJECTED"],
   BLOCKED: ["READY", "CANCELLED"],
+  REJECTED: ["READY", "BLOCKED", "CANCELLED"],
   DONE: [],
   CANCELLED: [],
 };
@@ -84,6 +85,12 @@ test("canTransition is a pure total function matching the documented table", () 
   assert.equal(canTransition("NOPE", "READY"), false);
   assert.equal(canTransition("READY", "NOPE"), false);
   assert.deepEqual(allowedTransitionsFrom("NOPE"), []);
+  // M4 rework waiting room: no bypass straight into DONE (acceptance is the
+  // only entry), and it re-queues only through READY.
+  assert.equal(canTransition("REJECTED", "DONE"), false);
+  assert.equal(canTransition("REJECTED", "READY"), true);
+  assert.equal(canTransition("REVIEWING", "REJECTED"), true);
+  assert.equal(canTransition("AWAITING_ACCEPTANCE", "REJECTED"), true);
 });
 
 test("both stores walk the legal main chain step by step", (t) => {

@@ -1,8 +1,8 @@
-// Agents, approvals, reviews and runs: contract §1 read paths and the write
+// Agents, approvals, reviews and runs: contract 搂1 read paths and the write
 // paths M1 actually exposes (upsertAgent / createApproval).
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { projectDto, taskDto, useStore } from "./helpers.mjs";
+import { advanceTask, projectDto, taskDto, useStore } from "./helpers.mjs";
 
 const SHA = "a".repeat(64);
 
@@ -68,6 +68,7 @@ test("upsertAgent rejects invalid capability/role/id/status", (t) => {
 test("createApproval stores a HUMAN acceptance bound to a target hash", (t) => {
   const store = openProject(t);
   const task = store.createTask(taskDto("proj-1", { id: "TASK-1" }));
+  advanceTask(store, "TASK-1", "AWAITING_ACCEPTANCE");
   const approval = store.createApproval({
     projectId: "proj-1",
     taskId: task.id,
@@ -90,15 +91,36 @@ test("createApproval stores a HUMAN acceptance bound to a target hash", (t) => {
   assert.deepEqual(store.listApprovals({ status: "REJECTED" }), []);
 
   assert.throws(
-    () => store.createApproval({ scope: "x", targetHash: "not-a-sha", actor: "HUMAN", status: "APPROVED" }),
+    () =>
+      store.createApproval({
+        taskId: task.id,
+        scope: "x",
+        targetHash: "not-a-sha",
+        actor: "HUMAN",
+        status: "APPROVED",
+      }),
     (error) => error.code === "VALIDATION_ERROR",
   );
   assert.throws(
-    () => store.createApproval({ scope: "x", targetHash: SHA, actor: "AGENT", status: "APPROVED" }),
+    () =>
+      store.createApproval({
+        taskId: task.id,
+        scope: "x",
+        targetHash: SHA,
+        actor: "AGENT",
+        status: "APPROVED",
+      }),
     (error) => error.code === "VALIDATION_ERROR",
   );
   assert.throws(
-    () => store.createApproval({ scope: "", targetHash: SHA, actor: "HUMAN", status: "APPROVED" }),
+    () =>
+      store.createApproval({
+        taskId: task.id,
+        scope: "",
+        targetHash: SHA,
+        actor: "HUMAN",
+        status: "APPROVED",
+      }),
     (error) => error.code === "VALIDATION_ERROR",
   );
   assert.throws(
@@ -112,20 +134,21 @@ test("createApproval stores a HUMAN acceptance bound to a target hash", (t) => {
       }),
     (error) => error.code === "NOT_FOUND",
   );
+  // M4: an approval may only be opened once the Task is AWAITING_ACCEPTANCE.
+  store.createTask(taskDto("proj-1", { id: "TASK-READY" }));
   assert.throws(
     () =>
       store.createApproval({
-        projectId: "proj-missing",
+        taskId: "TASK-READY",
         scope: "x",
         targetHash: SHA,
         actor: "HUMAN",
-        status: "PENDING",
       }),
-    (error) => error.code === "NOT_FOUND",
+    (error) => error.code === "TASK_VERSION_CONFLICT" && error.details.reason === "not-awaiting-acceptance",
   );
 });
 
-test("runs and reviews are read-only in M1 and start empty", (t) => {
+test("runs and reviews start empty; review filters reject unknown enum values", (t) => {
   const store = openProject(t);
   assert.deepEqual(store.listRuns(), []);
   assert.deepEqual(store.listReviews(), []);
@@ -143,3 +166,4 @@ test("runs and reviews are read-only in M1 and start empty", (t) => {
   );
   assert.equal(store.health().counts.runs, 0);
 });
+

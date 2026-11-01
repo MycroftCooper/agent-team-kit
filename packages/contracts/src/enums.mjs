@@ -20,6 +20,10 @@ export const TASK_STATUSES = Object.freeze([
   "DONE",
   "BLOCKED",
   "CANCELLED",
+  // M4: a review that requests changes sends the task back for rework instead of
+  // silently failing it. REJECTED is the rework waiting room: REJECTED -> READY
+  // re-queues the task, and exhausting the rework budget blocks it.
+  "REJECTED",
 ]);
 
 export const TASK_BRANCH_STATUSES = Object.freeze(["BLOCKED", "CANCELLED"]);
@@ -39,7 +43,17 @@ export const AGENT_STATUSES = Object.freeze([
 ]);
 
 /** Review of a frozen candidate version. */
-export const REVIEW_STATUSES = Object.freeze(["PENDING", "RUNNING", "PASS", "FAIL", "INVALIDATED"]);
+export const REVIEW_STATUSES = Object.freeze([
+  "PENDING",
+  "RUNNING",
+  "PASS",
+  "FAIL",
+  "INVALIDATED",
+  // M4: "changes requested" and "blocked" are verdicts about the candidate, not
+  // failures of the review itself, so they get their own states.
+  "CHANGES_REQUESTED",
+  "BLOCKED",
+]);
 
 /** Integration of a reviewed candidate into the development branch. */
 export const INTEGRATION_STATUSES = Object.freeze(["PENDING", "VERIFYING", "APPLIED", "CONFLICT", "FAILED"]);
@@ -58,7 +72,14 @@ export const GATE_STATUSES = Object.freeze(["PASS", "FAIL", "SKIPPED", "UNCONFIG
 export const PASSING_GATE_STATUS = "PASS";
 
 /** Review verdict recorded on a QA approval receipt. */
-export const REVIEW_VERDICTS = Object.freeze(["PASS", "FAIL"]);
+export const REVIEW_VERDICTS = Object.freeze([
+  "PASS",
+  "FAIL",
+  // M4: the reviewer's three real outcomes. "FAIL" stays for QA receipts that
+  // describe a failed review run rather than a verdict on the candidate.
+  "CHANGES_REQUESTED",
+  "BLOCKED",
+]);
 
 /** Command lifecycle for durable dispatch commands (ADR-003). */
 export const DISPATCH_COMMAND_STATUSES = Object.freeze(["PENDING", "CLAIMED", "DONE", "FAILED", "EXPIRED"]);

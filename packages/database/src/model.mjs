@@ -11,6 +11,7 @@ import {
   FUNCTIONS,
   ID_RE,
   REVIEW_STATUSES,
+  REVIEW_VERDICTS,
   RUN_STATUSES,
   TASK_STATUSES,
   createEvent,
@@ -22,7 +23,7 @@ import {
 import { fail } from "./errors.mjs";
 
 /** Schema version written by the latest migration file. */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 export const DEFAULT_LIST_LIMIT = 100;
 export const MAX_LIST_LIMIT = 10000;
 export const MAX_EVENT_LIMIT = 10000;
@@ -192,6 +193,20 @@ const TASK_TRANSITIONS = Object.freeze(
       add(status, "CANCELLED");
     }
     add("BLOCKED", "READY");
+    // M4 rework loop (ADR-005, m4-contracts §1). REJECTED is the "changes were
+    // requested" waiting room, deliberately NOT on the main chain: it can only
+    // be entered from REVIEWING / AWAITING_ACCEPTANCE and can only leave toward
+    // READY (re-queue) or the generic BLOCKED/CANCELLED branches. There is no
+    // REJECTED -> DONE edge: acceptance is the only DONE entrance.
+    add("REVIEWING", "REJECTED");
+    add("AWAITING_ACCEPTANCE", "REJECTED");
+    add("REJECTED", "READY");
+    // A human acceptance rejection is not a review-requested-changes state: the
+    // Review is already PASS, so parking the Task in REJECTED would leave it
+    // with no legal exit (only reworkTask, which requires CHANGES_REQUESTED,
+    // could move it). The acceptance workflow therefore re-queues directly:
+    // AWAITING_ACCEPTANCE -> READY (Lead ruling, m4-contracts §1 line 50).
+    add("AWAITING_ACCEPTANCE", "READY");
     for (const status of TASK_STATUSES) {
       table[status].sort((a, b) => TASK_STATUS_ORDER.get(a) - TASK_STATUS_ORDER.get(b));
       Object.freeze(table[status]);
@@ -336,6 +351,10 @@ export function normalizeTask(dto, { now, status = "READY", version = 0 } = {}) 
   // M3 write scope (optional). An empty list is stored as "no files", not as [].
   const taskFiles = validateFiles(dto.files, "task.files");
   if (taskFiles.length > 0) task.files = taskFiles;
+  // M4: current candidate hash used by human acceptance (optional).
+  if (dto.targetHash !== undefined && dto.targetHash !== null) {
+    task.targetHash = validateTargetHash(dto.targetHash, "task.targetHash");
+  }
   return task;
 }
 
@@ -350,6 +369,7 @@ export const TASK_PATCH_KEYS = Object.freeze([
   "status",
   "deps",
   "files",
+  "targetHash",
 ]);
 
 export function mergeTask(current, changes, { now } = {}) {
@@ -380,6 +400,9 @@ export function mergeTask(current, changes, { now } = {}) {
     } else if (key === "acceptance" || key === "planId") {
       if (value === null || value === undefined) delete merged[key];
       else merged[key] = value;
+    } else if (key === "targetHash") {
+      if (value === null || value === undefined) delete merged.targetHash;
+      else merged.targetHash = validateTargetHash(value, "task.changes.targetHash");
     } else merged[key] = value;
   }
   validateTaskStatus(merged.status);
@@ -502,6 +525,218 @@ export function normalizeApproval(dto, { now, id } = {}) {
   if (dto.projectId !== undefined && dto.projectId !== null) approval.projectId = dto.projectId;
   if (dto.taskId !== undefined && dto.taskId !== null) approval.taskId = dto.taskId;
   return approval;
+}
+
+// ---------------------------------------------------------------------------
+// Review / rework / approval (M4, m4-contracts §1, ADR-005)
+// ---------------------------------------------------------------------------
+//
+// Review state is the verdict itself: PENDING -> PASS | CHANGES_REQUESTED |
+// BLOCKED. `FAIL` stays in contracts for QA receipts but is never written by
+// this store as a review status (a failed review run is a BLOCKED outcome).
+export const REVIEW_M4_STATUSES = Object.freeze(["PENDING", "PASS", "CHANGES_REQUESTED", "BLOCKED"]);
+export const REVIEW_M4_VERDICTS = Object.freeze(["PASS", "CHANGES_REQUESTED", "BLOCKED"]);
+export const DEFAULT_MAX_REVIEW_ATTEMPTS = 3;
+
+/** A non-empty, bounded token (hashes, actors, commit shas). */
+export function validateToken(value, label) {
+  if (
+    typeof value !== "string" ||
+    value.trim() === "" ||
+    value.length > 256 ||
+    /[\u0000-\u001f]/.test(value)
+  ) {
+    fail("VALIDATION_ERROR", `${label} must be a non-empty string`, { entity: label, value: value ?? null });
+  }
+  return value;
+}
+
+export function validateTargetHash(value, label = "targetHash") {
+  return validateToken(value, label);
+}
+
+export function validateActor(value, label = "actor") {
+  return validateToken(value, label);
+}
+
+export function validateReviewStatus(status) {
+  if (!REVIEW_M4_STATUSES.includes(status)) {
+    fail("VALIDATION_ERROR", "review.status must be a review status", {
+      status,
+      allowed: REVIEW_M4_STATUSES,
+    });
+  }
+  return status;
+}
+
+export function validateReviewVerdict(verdict) {
+  if (!REVIEW_M4_VERDICTS.includes(verdict)) {
+    fail("VALIDATION_ERROR", "review.verdict must be PASS, CHANGES_REQUESTED or BLOCKED", {
+      verdict,
+      allowed: REVIEW_M4_VERDICTS,
+    });
+  }
+  return verdict;
+}
+
+/** Validate the test evidence block a PASS must carry (m4-contracts §1). */
+export function validateReviewEvidence(evidence) {
+  if (!isPlainObject(evidence)) {
+    fail("VALIDATION_ERROR", "review.evidence must be an object", { evidence: evidence ?? null });
+  }
+  const tests = evidence.tests;
+  if (!isPlainObject(tests)) {
+    fail("VALIDATION_ERROR", "review.evidence.tests must be an object", { evidence });
+  }
+  if (
+    !Number.isInteger(tests.passed) ||
+    !Number.isInteger(tests.total) ||
+    tests.passed < 0 ||
+    tests.total <= 0 ||
+    tests.passed > tests.total
+  ) {
+    fail("VALIDATION_ERROR", "review.evidence.tests needs integer passed/total with 0 <= passed <= total", {
+      tests,
+    });
+  }
+  return evidence;
+}
+
+/**
+ * Hard invariant: a PASS without a manifest hash and full passing test evidence
+ * is not a review. Errors use EVIDENCE_MISSING so the public API can map to 400.
+ */
+export function assertPassEvidence({ manifestHash, evidence, taskId, reviewId } = {}) {
+  const missing = [];
+  if (typeof manifestHash !== "string" || manifestHash.trim() === "") missing.push("manifestHash");
+  if (!isPlainObject(evidence) || !isPlainObject(evidence.tests)) {
+    missing.push("evidence.tests");
+  } else {
+    const { passed, total } = evidence.tests;
+    if (!Number.isInteger(passed) || !Number.isInteger(total) || total <= 0) {
+      missing.push("evidence.tests");
+    } else if (passed !== total) {
+      missing.push("passed===total");
+    }
+  }
+  if (missing.length > 0) {
+    fail("EVIDENCE_MISSING", "a PASS review requires a manifest hash and passing test evidence", {
+      taskId: taskId ?? null,
+      reviewId: reviewId ?? null,
+      missing,
+    });
+  }
+  return { manifestHash, evidence };
+}
+
+function validateFindings(findings) {
+  if (!Array.isArray(findings) || findings.length === 0) {
+    fail("VALIDATION_ERROR", "review.findings must be a non-empty array", {
+      findings: findings ?? null,
+    });
+  }
+  findings.forEach((finding, index) => {
+    if (!isPlainObject(finding)) {
+      fail("VALIDATION_ERROR", `review.findings[${index}] must be an object`, { index });
+    }
+  });
+  return findings;
+}
+
+/** Build a new PENDING review; store checks Task/Run facts separately. */
+export function normalizeReview(dto, { now, attempt = 1, id } = {}) {
+  ensurePlainObject(dto, "review");
+  requireId(dto.taskId, "review.taskId");
+  if (dto.runId !== undefined && dto.runId !== null) requireId(dto.runId, "review.runId");
+  const actor = validateActor(dto.actor, "review.actor");
+  const at = nowIso(now);
+  const review = {
+    id: id ?? generateId("REV"),
+    taskId: dto.taskId,
+    status: "PENDING",
+    attempt: Number.isInteger(dto.attempt) && dto.attempt >= 1 ? dto.attempt : attempt,
+    version: 0,
+    createdAt: at,
+    updatedAt: at,
+  };
+  if (dto.runId !== undefined && dto.runId !== null) review.runId = dto.runId;
+  return { review, actor };
+}
+
+/**
+ * Apply a verdict to a PENDING review. Returns the next review object; the
+ * caller is responsible for the Task transition and the audit/event writes, so
+ * failures here happen before any mutation (zero-write guarantee).
+ */
+export function applyReviewVerdict(current, dto, { now } = {}) {
+  const verdict = validateReviewVerdict(dto.verdict);
+  const actor = validateActor(dto.actor, "review.actor");
+  const at = nowIso(now);
+  const next = {
+    ...current,
+    status: verdict,
+    verdict,
+    reviewer: actor,
+    submittedAt: at,
+    updatedAt: at,
+    version: current.version + 1,
+  };
+  if (dto.manifestHash !== undefined && dto.manifestHash !== null) {
+    next.manifestHash = validateTargetHash(dto.manifestHash, "review.manifestHash");
+  }
+  if (dto.commitSha !== undefined && dto.commitSha !== null) {
+    next.commitSha = validateToken(dto.commitSha, "review.commitSha");
+  }
+  if (dto.findings !== undefined && dto.findings !== null) {
+    if (verdict === "CHANGES_REQUESTED") {
+      next.findings = validateFindings(dto.findings);
+    } else {
+      // PASS/BLOCKED may carry findings, but they are optional: an empty array
+      // (the Backend default) is valid and must not reject a legal verdict.
+      if (!Array.isArray(dto.findings)) {
+        fail("VALIDATION_ERROR", "review.findings must be an array", { findings: dto.findings });
+      }
+      dto.findings.forEach((finding, index) => {
+        if (!isPlainObject(finding)) {
+          fail("VALIDATION_ERROR", `review.findings[${index}] must be an object`, { index });
+        }
+      });
+      next.findings = dto.findings;
+    }
+  }
+  if (verdict === "PASS") {
+    // PASS evidence is checked by the hard-invariant validator first so every
+    // missing piece is reported as EVIDENCE_MISSING (not a generic schema error).
+    assertPassEvidence({
+      manifestHash: dto.manifestHash,
+      evidence: dto.evidence,
+      taskId: current.taskId,
+      reviewId: current.id,
+    });
+    if (dto.evidence !== undefined && dto.evidence !== null) next.evidence = dto.evidence;
+  } else if (dto.evidence !== undefined && dto.evidence !== null) {
+    next.evidence = validateReviewEvidence(dto.evidence);
+  }
+  if (verdict === "CHANGES_REQUESTED") {
+    if (dto.findings === undefined || dto.findings === null) {
+      fail("VALIDATION_ERROR", "CHANGES_REQUESTED requires findings", {
+        taskId: current.taskId,
+        reviewId: current.id,
+      });
+    }
+    validateFindings(dto.findings);
+  }
+  return next;
+}
+
+export function validateApprovalDecision(decision) {
+  if (decision !== "APPROVED" && decision !== "REJECTED") {
+    fail("VALIDATION_ERROR", "approval.decision must be APPROVED or REJECTED", {
+      decision: decision ?? null,
+      allowed: ["APPROVED", "REJECTED"],
+    });
+  }
+  return decision;
 }
 
 // ---------------------------------------------------------------------------
@@ -687,22 +922,54 @@ export function validateFiles(value, label = "files") {
     if (file.length > 512) {
       fail("VALIDATION_ERROR", `${label}[${index}] must be at most 512 characters`, { entity: label, index });
     }
-    const normalised = file.replace(/\\/g, "/");
-    if (normalised.includes("\0")) {
-      fail("VALIDATION_ERROR", `${label}[${index}] must not contain NUL bytes`, { entity: label, index });
-    }
-    if (/^[A-Za-z]:/.test(normalised) || normalised.startsWith("/") || normalised.split("/").includes("..")) {
-      fail("VALIDATION_ERROR", `${label}[${index}] must be a repo-relative path`, {
-        entity: label,
-        index,
-        path: file,
-      });
-    }
-    if (seen.has(file)) continue;
-    seen.add(file);
-    files.push(file);
+    // Canonicalise once at the boundary (same semantics as scheduler-core:
+    // backslashes -> '/', remove './', resolve '..' lexically, reject escapes)
+    // so stored scopes can never alias each other.
+    const normalised = normalizeRepoPath(file, `${label}[${index}]`);
+    if (seen.has(normalised)) continue;
+    seen.add(normalised);
+    files.push(normalised);
   }
   return files;
+}
+
+/**
+ * Repo-relative path canonicalisation shared by validation and write-scope
+ * comparison. Rejects absolute paths, NUL bytes and `..` escapes; resolves
+ * harmless `.`/`..` segments lexically ("a/../b" -> "b", "./src/a.js" ->
+ * "src/a.js", "src\\a.js" -> "src/a.js").
+ */
+export function normalizeRepoPath(value, label = "path") {
+  if (typeof value !== "string" || value.trim() === "") {
+    fail("VALIDATION_ERROR", `${label} must be a non-empty string`, { entity: label, value: value ?? null });
+  }
+  const slashed = value.replace(/\\/g, "/");
+  if (slashed.includes("\0")) {
+    fail("VALIDATION_ERROR", `${label} must not contain NUL bytes`, { entity: label });
+  }
+  if (/^[A-Za-z]:/.test(slashed) || slashed.startsWith("/")) {
+    fail("VALIDATION_ERROR", `${label} must be a repo-relative path`, { entity: label, path: value });
+  }
+  const segments = [];
+  for (const segment of slashed.split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      if (segments.length === 0) {
+        fail("VALIDATION_ERROR", `${label} must stay inside the repository`, { entity: label, path: value });
+      }
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  const normalised = segments.join("/");
+  if (normalised === "") {
+    fail("VALIDATION_ERROR", `${label} must point at a file inside the repository`, {
+      entity: label,
+      path: value,
+    });
+  }
+  return normalised;
 }
 
 /** `projects.policy_json` payload; NULL/missing → {}. */
@@ -739,9 +1006,40 @@ export function validateSchedulingPolicies(policies) {
 }
 
 /** Sorted intersection of two write scopes (used by the claim conflict check). */
+/**
+ * Write-scope overlap, segment-aware (QA4-03): two canonical repo-relative paths
+ * conflict when they are equal OR one is a path-segment prefix of the other
+ * ("src" ⊂ "src/a.js"). A plain string prefix is NOT enough: "src2/a.js" must
+ * not conflict with "src/a.js". Comparison is case-sensitive on every platform
+ * (the repository paths are canonical POSIX-style strings, and Windows checkouts
+ * keep the declared case), so "Src/a.js" and "src/a.js" are different files.
+ *
+ * Returns the sorted union of the conflicting canonical paths from both sides.
+ */
 export function filesIntersection(left, right) {
-  const rightSet = new Set(right);
-  return [...new Set(left.filter((file) => rightSet.has(file)))].sort((a, b) => a.localeCompare(b));
+  const normalize = (file) => {
+    try {
+      return normalizeRepoPath(file);
+    } catch {
+      return file;
+    }
+  };
+  const leftFiles = [...new Set(left.map(normalize))];
+  const rightFiles = [...new Set(right.map(normalize))];
+  const conflicts = new Set();
+  for (const leftFile of leftFiles) {
+    for (const rightFile of rightFiles) {
+      if (
+        leftFile === rightFile ||
+        leftFile.startsWith(`${rightFile}/`) ||
+        rightFile.startsWith(`${leftFile}/`)
+      ) {
+        conflicts.add(leftFile);
+        conflicts.add(rightFile);
+      }
+    }
+  }
+  return [...conflicts].sort((a, b) => a.localeCompare(b));
 }
 
 export function leaseExpiryAfter(now, leaseMs) {

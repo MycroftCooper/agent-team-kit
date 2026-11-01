@@ -14,12 +14,15 @@ import { fail, notFound } from "./errors.mjs";
 import { INTERNAL } from "./internal.mjs";
 import {
   DEFAULT_LEASE_MS,
+  DEFAULT_MAX_REVIEW_ATTEMPTS,
   MAX_EVENT_LIMIT,
   MAX_OVERVIEW_EVENTS,
   ACTIVE_RUN_STATUSES,
   RUN_TERMINAL_STATUSES,
   SCHEMA_VERSION,
+  applyReviewVerdict,
   assertEnumFilter,
+  assertTaskTransition,
   buildOverview,
   canTransition,
   compareTasks,
@@ -39,11 +42,15 @@ import {
   normalizeProject,
   normalizeProjectPolicy,
   normalizeRequirement,
+  normalizeReview,
   normalizeRun,
   normalizeTask,
   nowIso,
   requireId,
   safeJson,
+  validateActor,
+  validateApprovalDecision,
+  validateTargetHash,
   validateCommandPayload,
   validateCommandType,
   validateIdempotencyKey,
@@ -68,6 +75,8 @@ export function createMemoryStore() {
   const requirements = new Map();
   const tasks = new Map();
   const agents = new Map();
+  const reviews = new Map();
+  const reviewAttempts = new Map();
   const approvals = new Map();
   const events = [];
   const projectMeta = new Map();
@@ -121,6 +130,45 @@ export function createMemoryStore() {
 
   function leaseOf(runId) {
     return runLeases.get(runId) ?? null;
+  }
+
+  function getReviewEntry(id) {
+    requireId(id, "review.id");
+    return reviews.get(id) ?? null;
+  }
+
+  function requireReviewEntry(id) {
+    const review = getReviewEntry(id);
+    if (!review) notFound("review", id);
+    return review;
+  }
+
+  /**
+   * Self-review proxy (Lead ruling, no assignee column): producer = reviewed
+   * Run's agent, else the Task's latest/active Run agent.
+   */
+  function latestProducerAgentId(taskId) {
+    const taskRuns = [...runs.values()].filter((run) => run.taskId === taskId);
+    const active = taskRuns
+      .filter((run) => ACTIVE_RUN_STATUSES.includes(run.status))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    if (active.length > 0) return active[0].agentId;
+    const all = taskRuns.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    return all.length > 0 ? all[0].agentId : null;
+  }
+
+  /** Validate + apply a Task transition inside the caller's write path. */
+  function transitionTaskEntry(taskId, to) {
+    const current = requireTaskEntry(taskId);
+    assertTaskTransition(current.status, to);
+    const next = {
+      ...current,
+      status: to,
+      version: current.version + 1,
+      updatedAt: nowIso(),
+    };
+    tasks.set(taskId, next);
+    return clone(next);
   }
 
   function commandEntry(id) {
@@ -1093,12 +1141,308 @@ export function createMemoryStore() {
       return clone(agent);
     },
 
-    listReviews({ status } = {}) {
-      if (status !== undefined && status !== null) assertEnumFilter("review", status);
-      return [];
+    getReview(id) {
+      return clone(requireReviewEntry(id));
     },
 
-    listApprovals({ taskId, status } = {}) {
+    listReviews({ taskId, status, limit } = {}) {
+      let list = [...reviews.values()];
+      if (taskId !== undefined && taskId !== null) {
+        requireId(taskId, "review.taskId");
+        list = list.filter((review) => review.taskId === taskId);
+      }
+      if (status !== undefined && status !== null) {
+        assertEnumFilter("review", status);
+        list = list.filter((review) => review.status === status);
+      }
+      const capped = normalizeLimit(limit, { fallback: 50, max: 100 });
+      return list
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
+        .slice(0, capped)
+        .map(clone);
+    },
+
+    createReview(dto = {}) {
+      ensurePlainObject(dto, "review");
+      validateActor(dto.actor, "review.actor");
+      requireId(dto.taskId, "review.taskId");
+      const task = getTaskEntry(dto.taskId);
+      if (!task) {
+        fail("TASK_VERSION_CONFLICT", `task "${dto.taskId}" is not reviewable`, {
+          taskId: dto.taskId,
+          currentVersion: null,
+          reason: "task-not-found",
+        });
+      }
+      if (task.status !== "REVIEWING") {
+        fail("TASK_VERSION_CONFLICT", `task "${dto.taskId}" is not REVIEWING`, {
+          taskId: dto.taskId,
+          status: task.status,
+          currentVersion: task.version,
+          reason: "not-reviewing",
+        });
+      }
+      if (dto.runId !== undefined && dto.runId !== null) {
+        requireId(dto.runId, "review.runId");
+        const run = getRunEntry(dto.runId);
+        if (!run) {
+          fail("VALIDATION_ERROR", `run "${dto.runId}" does not exist`, { entity: "run", id: dto.runId });
+        }
+        if (run.taskId !== task.id) {
+          fail("VALIDATION_ERROR", `run "${dto.runId}" does not belong to task "${task.id}"`, {
+            runId: dto.runId,
+            taskId: task.id,
+            runTaskId: run.taskId,
+          });
+        }
+      }
+      const active = [...reviews.values()].find(
+        (review) => review.taskId === task.id && review.status === "PENDING",
+      );
+      if (active) {
+        fail("TASK_VERSION_CONFLICT", `task "${task.id}" already has an active review`, {
+          taskId: task.id,
+          reviewId: active.id,
+          status: active.status,
+          reason: "review-exists",
+        });
+      }
+      const nextAttempt =
+        Math.max(0, ...[...reviews.values()].filter((review) => review.taskId === task.id).map((review) => review.attempt)) + 1;
+      const at = nowIso();
+      const { review } = normalizeReview(dto, { now: at, attempt: nextAttempt });
+      reviews.set(review.id, clone(review));
+      const attemptId = generateId("RVA");
+      reviewAttempts.set(attemptId, {
+        id: attemptId,
+        reviewId: review.id,
+        runId: review.runId ?? null,
+        attempt: review.attempt,
+        status: "PENDING",
+        verdict: null,
+        manifestHash: null,
+        findings: null,
+        evidence: null,
+        createdAt: at,
+      });
+      appendEventEntry(
+        makeEvent({
+          projectId: task.projectId,
+          aggregateType: "review",
+          aggregateId: review.id,
+          type: "review.requested",
+          payload: { taskId: review.taskId, reviewId: review.id, attempt: review.attempt },
+          now: at,
+        }),
+      );
+      return clone(requireReviewEntry(review.id));
+    },
+
+    submitReview({ id, expectedVersion, verdict, manifestHash, commitSha, findings, evidence, actor } = {}) {
+      requireId(id, "review.id");
+      if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+        fail("VALIDATION_ERROR", "expectedVersion must be a non-negative integer", { expectedVersion });
+      }
+      const row = requireReviewEntry(id);
+      if (row.version !== expectedVersion) {
+        fail("VERSION_CONFLICT", `review "${id}" version conflict`, {
+          entity: "review",
+          id,
+          expectedVersion,
+          currentVersion: row.version,
+        });
+      }
+      if (row.status !== "PENDING") {
+        fail("REVIEW_INVALIDATED", `review "${id}" is not pending`, {
+          reviewId: id,
+          taskId: row.taskId,
+          status: row.status,
+        });
+      }
+      const next = applyReviewVerdict(row, { verdict, manifestHash, commitSha, findings, evidence, actor }, { now: nowIso() });
+      const task = requireTaskEntry(row.taskId);
+      const authorAgentIds = new Set();
+      if (row.runId !== undefined && row.runId !== null) {
+        const producer = getRunEntry(row.runId);
+        if (producer) authorAgentIds.add(producer.agentId);
+      }
+      const latestProducer = latestProducerAgentId(row.taskId);
+      if (latestProducer) authorAgentIds.add(latestProducer);
+      if (authorAgentIds.has(next.reviewer)) {
+        fail("SELF_REVIEW_FORBIDDEN", "an actor cannot review their own work", {
+          actor: next.reviewer,
+          authorAgentId: next.reviewer,
+          taskId: row.taskId,
+          reviewId: id,
+        });
+      }
+      const taskTo = verdict === "PASS" ? "INTEGRATING" : verdict === "CHANGES_REQUESTED" ? "REJECTED" : "BLOCKED";
+      const updatedTask = transitionTaskEntry(row.taskId, taskTo);
+      const persisted = { ...next, actor: next.reviewer };
+      reviews.set(id, clone(persisted));
+      for (const [attemptId, attempt] of reviewAttempts) {
+        if (attempt.reviewId === id && attempt.attempt === row.attempt) {
+          reviewAttempts.set(attemptId, {
+            ...attempt,
+            status: next.status,
+            verdict: next.verdict,
+            manifestHash: next.manifestHash ?? null,
+            findings: next.findings === undefined ? null : clone(next.findings),
+            evidence: next.evidence === undefined ? null : clone(next.evidence),
+          });
+        }
+      }
+      appendEventEntry(
+        makeEvent({
+          projectId: task.projectId,
+          aggregateType: "review",
+          aggregateId: id,
+          type: "review.updated",
+          payload: {
+            taskId: row.taskId,
+            reviewId: id,
+            status: next.status,
+            verdict: next.verdict,
+            actor: next.reviewer,
+            attempt: row.attempt,
+          },
+          now: next.updatedAt,
+        }),
+      );
+      return { review: clone(requireReviewEntry(id)), task: updatedTask };
+    },
+
+    reworkTask({ taskId, reviewId, reason, actor, maxAttempts } = {}) {
+      requireId(taskId, "task.id");
+      requireId(reviewId, "review.id");
+      if (maxAttempts !== undefined && (!Number.isInteger(maxAttempts) || maxAttempts < 1)) {
+        fail("VALIDATION_ERROR", "maxAttempts must be a positive integer", { maxAttempts });
+      }
+      const limit = maxAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS;
+      const reviewer = validateActor(actor, "review.actor");
+      const task = requireTaskEntry(taskId);
+      const reviewRow = requireReviewEntry(reviewId);
+      if (reviewRow.taskId !== taskId) {
+        fail("VALIDATION_ERROR", "review does not belong to the task", { taskId, reviewId });
+      }
+      if (reviewRow.status !== "CHANGES_REQUESTED") {
+        fail("REVIEW_INVALIDATED", `review "${reviewId}" is not CHANGES_REQUESTED`, {
+          reviewId,
+          taskId,
+          status: reviewRow.status,
+        });
+      }
+      if (task.status !== "REJECTED") {
+        fail("TASK_VERSION_CONFLICT", `task "${taskId}" is not REJECTED`, {
+          taskId,
+          status: task.status,
+          currentVersion: task.version,
+          reason: "not-rejected",
+        });
+      }
+      const at = nowIso();
+      const nextAttempt = reviewRow.attempt + 1;
+      if (nextAttempt > limit) {
+        const blocked = transitionTaskEntry(taskId, "BLOCKED");
+        const blockedReview = {
+          ...requireReviewEntry(reviewId),
+          status: "BLOCKED",
+          version: requireReviewEntry(reviewId).version + 1,
+          updatedAt: at,
+        };
+        reviews.set(reviewId, blockedReview);
+        appendEventEntry(
+          makeEvent({
+            projectId: task.projectId,
+            aggregateType: "review",
+            aggregateId: reviewId,
+            type: "review.updated",
+            payload: {
+              taskId,
+              reviewId,
+              status: "BLOCKED",
+              verdict: "CHANGES_REQUESTED",
+              actor: reviewer,
+              attempt: nextAttempt,
+              reason: reason ?? null,
+            },
+            now: at,
+          }),
+        );
+        appendEventEntry(
+          makeEvent({
+            projectId: task.projectId,
+            aggregateType: "task",
+            aggregateId: taskId,
+            type: "task.updated",
+            payload: {
+              taskId,
+              status: "BLOCKED",
+              previousStatus: "REJECTED",
+              reason: "rework-limit",
+              attempt: nextAttempt,
+            },
+            now: at,
+          }),
+        );
+        fail("REWORK_LIMIT_REACHED", `task "${taskId}" exhausted its rework budget`, {
+          taskId,
+          attempt: nextAttempt,
+          maxAttempts: limit,
+        });
+      }
+      const revived = transitionTaskEntry(taskId, "READY");
+      const advancedReview = {
+        ...requireReviewEntry(reviewId),
+        version: requireReviewEntry(reviewId).version + 1,
+        updatedAt: at,
+      };
+      reviews.set(reviewId, advancedReview);
+      const nextAttemptId = generateId("RVA");
+      reviewAttempts.set(nextAttemptId, {
+        id: nextAttemptId,
+        reviewId,
+        runId: reviewRow.runId ?? null,
+        attempt: nextAttempt,
+        status: "PENDING",
+        verdict: null,
+        manifestHash: null,
+        findings: null,
+        evidence: null,
+        createdAt: at,
+      });
+      appendEventEntry(
+        makeEvent({
+          projectId: task.projectId,
+          aggregateType: "review",
+          aggregateId: reviewId,
+          type: "review.updated",
+          payload: {
+            taskId,
+            reviewId,
+            status: "CHANGES_REQUESTED",
+            verdict: "CHANGES_REQUESTED",
+            actor: reviewer,
+            attempt: nextAttempt,
+            reason: reason ?? null,
+          },
+          now: at,
+        }),
+      );
+      appendEventEntry(
+        makeEvent({
+          projectId: task.projectId,
+          aggregateType: "task",
+          aggregateId: taskId,
+          type: "task.updated",
+          payload: { taskId, status: "READY", previousStatus: "REJECTED", reason: "rework", attempt: nextAttempt },
+          now: at,
+        }),
+      );
+      return { review: clone(requireReviewEntry(reviewId)), task: revived, attempt: nextAttempt };
+    },
+
+    listApprovals({ taskId, status, limit } = {}) {
       let list = [...approvals.values()];
       if (taskId !== undefined && taskId !== null) {
         requireId(taskId, "approval.taskId");
@@ -1108,18 +1452,142 @@ export function createMemoryStore() {
         assertEnumFilter("acceptance", status);
         list = list.filter((approval) => approval.status === status);
       }
+      const capped = normalizeLimit(limit, { fallback: 50, max: 100 });
       return list
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
+        .slice(0, capped)
         .map(clone);
     },
 
-    createApproval(dto) {
+    createApproval(dto = {}) {
       ensurePlainObject(dto, "approval");
-      const approval = normalizeApproval(dto, { now: nowIso() });
-      if (approval.projectId !== undefined) requireProject(approval.projectId);
-      if (approval.taskId !== undefined) requireTaskEntry(approval.taskId);
-      approvals.set(approval.id, approval);
-      return clone(approval);
+      requireId(dto.taskId, "approval.taskId");
+      const task = getTaskEntry(dto.taskId);
+      if (!task) notFound("task", dto.taskId);
+      if (task.status !== "AWAITING_ACCEPTANCE") {
+        fail("TASK_VERSION_CONFLICT", `task "${dto.taskId}" is not AWAITING_ACCEPTANCE`, {
+          taskId: dto.taskId,
+          status: task.status,
+          currentVersion: task.version,
+          reason: "not-awaiting-acceptance",
+        });
+      }
+      const approval = normalizeApproval(
+        { ...dto, projectId: task.projectId, taskId: task.id, status: dto.status ?? "PENDING" },
+        { now: nowIso() },
+      );
+      approval.version = 0;
+      approvals.set(approval.id, clone(approval));
+      appendEventEntry(
+        makeEvent({
+          projectId: task.projectId,
+          aggregateType: "approval",
+          aggregateId: approval.id,
+          type: "approval.recorded",
+          payload: {
+            taskId: task.id,
+            approvalId: approval.id,
+            status: approval.status,
+            targetHash: approval.targetHash,
+            actor: approval.actor,
+          },
+          now: approval.createdAt,
+        }),
+      );
+      return clone(approvals.get(approval.id));
+    },
+
+    decideApproval({ id, decision: rawDecision, actor, targetHash } = {}) {
+      requireId(id, "approval.id");
+      const decision = validateApprovalDecision(rawDecision);
+      const reviewer = validateActor(actor, "approval.actor");
+      const receivedTargetHash = validateTargetHash(targetHash, "approval.targetHash");
+      const row = approvals.get(id);
+      if (!row) notFound("approval", id);
+      if (row.status !== "PENDING") {
+        fail("REVIEW_INVALIDATED", `approval "${id}" is not pending`, {
+          approvalId: id,
+          taskId: row.taskId,
+          status: row.status,
+        });
+      }
+      const task = requireTaskEntry(row.taskId);
+      if (task.status !== "AWAITING_ACCEPTANCE") {
+        fail("TASK_VERSION_CONFLICT", `task "${row.taskId}" is not AWAITING_ACCEPTANCE`, {
+          taskId: row.taskId,
+          status: task.status,
+          currentVersion: task.version,
+          reason: "not-awaiting-acceptance",
+        });
+      }
+      if (receivedTargetHash !== row.targetHash) {
+        fail("APPROVAL_STALE", `approval "${id}" is bound to a different target`, {
+          approvalId: id,
+          taskId: row.taskId,
+          expectedTargetHash: row.targetHash,
+          receivedTargetHash,
+        });
+      }
+      if (task.targetHash !== undefined && task.targetHash !== null && task.targetHash !== receivedTargetHash) {
+        fail("APPROVAL_STALE", `task "${row.taskId}" moved to a different target`, {
+          approvalId: id,
+          taskId: row.taskId,
+          expectedTargetHash: task.targetHash,
+          receivedTargetHash,
+        });
+      }
+      const at = nowIso();
+      // Rejected acceptance re-queues directly (m4-contracts §1 / Lead ruling):
+      // Task.REJECTED is reserved for "review requested changes" and is only
+      // escapable via reworkTask (CHANGES_REQUESTED Review); an acceptance
+      // rejection has a PASS Review, so REJECTED would be a dead end.
+      const taskTo = decision === "APPROVED" ? "DONE" : "READY";
+      const updatedTask = transitionTaskEntry(row.taskId, taskTo);
+      if (decision === "REJECTED") {
+        appendEventEntry(
+          makeEvent({
+            projectId: task.projectId,
+            aggregateType: "task",
+            aggregateId: row.taskId,
+            type: "task.updated",
+            payload: {
+              taskId: row.taskId,
+              status: "READY",
+              previousStatus: "AWAITING_ACCEPTANCE",
+              reason: "rework",
+            },
+            now: at,
+          }),
+        );
+      }
+      const updatedApproval = {
+        ...row,
+        status: decision,
+        decision,
+        actor: reviewer,
+        at,
+        decidedAt: at,
+        version: (row.version ?? 0) + 1,
+      };
+      approvals.set(id, updatedApproval);
+      appendEventEntry(
+        makeEvent({
+          projectId: task.projectId,
+          aggregateType: "approval",
+          aggregateId: id,
+          type: "approval.recorded",
+          payload: {
+            taskId: row.taskId,
+            approvalId: id,
+            decision,
+            status: decision,
+            targetHash: receivedTargetHash,
+            actor: reviewer,
+          },
+          now: at,
+        }),
+      );
+      return { approval: clone(updatedApproval), task: updatedTask };
     },
 
     // --- Overview ---------------------------------------------------------

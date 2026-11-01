@@ -81,6 +81,20 @@ function allowedActionsFor(task) {
   return Array.isArray(actions) ? [...actions] : [];
 }
 
+// --- M4 review / rework / human acceptance ---------------------------------
+
+/** Review verdicts accepted by the M4 submit endpoint. */
+const M4_VERDICTS = new Set(["PASS", "CHANGES_REQUESTED", "BLOCKED"]);
+
+/** Review statuses (M4 adds CHANGES_REQUESTED/BLOCKED to the M1 enum). */
+const M4_REVIEW_STATUSES = new Set(["PENDING", "PASS", "CHANGES_REQUESTED", "BLOCKED", "RUNNING", "FAIL", "INVALIDATED"]);
+
+/** m4-contracts §0.4: same Task may be reworked at most this many times. */
+const MAX_REVIEW_ATTEMPTS = 3;
+
+/** Human acceptance decisions. */
+const APPROVAL_DECISIONS = new Set(["APPROVED", "REJECTED"]);
+
 const ROUTES = [
   { name: "projects.list", method: "GET", regex: /^\/api\/v1\/projects$/, keys: [] },
   { name: "projects.create", method: "POST", regex: /^\/api\/v1\/projects$/, keys: [] },
@@ -93,7 +107,12 @@ const ROUTES = [
   { name: "runs.get", method: "GET", regex: /^\/api\/v1\/runs\/([^/]+)$/, keys: ["id"] },
   { name: "agents.list", method: "GET", regex: /^\/api\/v1\/agents$/, keys: [] },
   { name: "reviews.list", method: "GET", regex: /^\/api\/v1\/reviews$/, keys: [] },
+  { name: "reviews.create", method: "POST", regex: /^\/api\/v1\/reviews$/, keys: [] },
+  { name: "reviews.submit", method: "POST", regex: /^\/api\/v1\/reviews\/([^/]+)\/submit$/, keys: ["id"] },
+  { name: "reviews.rework", method: "POST", regex: /^\/api\/v1\/reviews\/([^/]+)\/rework$/, keys: ["id"] },
   { name: "approvals.list", method: "GET", regex: /^\/api\/v1\/approvals$/, keys: [] },
+  { name: "approvals.create", method: "POST", regex: /^\/api\/v1\/approvals$/, keys: [] },
+  { name: "approvals.decide", method: "POST", regex: /^\/api\/v1\/approvals\/([^/]+)\/decide$/, keys: ["id"] },
   { name: "events.list", method: "GET", regex: /^\/api\/v1\/events$/, keys: [] },
   { name: "events.stream", method: "GET", regex: /^\/api\/v1\/events\/stream$/, keys: [] },
 ];
@@ -197,6 +216,134 @@ export function createServer({
 
   function listPayload(items) {
     return { items: Array.isArray(items) ? items : [] };
+  }
+
+  // --- M4 contract-layer helpers (never delegated to the store for codes) ---
+
+  function requireNonEmptyString(value, label) {
+    if (typeof value !== "string" || value.trim() === "") {
+      throw validationError(`invalid ${label}`, [`${label} must be a non-empty string`]);
+    }
+    return value;
+  }
+
+  /** `actor` defaults to HUMAN for browser sessions; agents must be explicit. */
+  function actorFrom(body, { required = false } = {}) {
+    if (body.actor === undefined) {
+      if (required) throw validationError("invalid actor", ["actor is required"]);
+      return "HUMAN";
+    }
+    return requireNonEmptyString(body.actor, "actor");
+  }
+
+  function pumpSse() {
+    try {
+      hub.pump();
+    } catch (error) {
+      logger?.error?.(`[atk] SSE pump failed: ${error?.message ?? error}`);
+    }
+  }
+
+  function taskStateConflict(task, reason) {
+    return new ApiError("TASK_VERSION_CONFLICT", `task "${task.id}" is in state ${task.status}`, {
+      details: { taskId: task.id, status: task.status, currentVersion: task.version, reason },
+    });
+  }
+
+  function reviewCasConflict(review, expectedVersion) {
+    return new ApiError("VERSION_CONFLICT", `review "${review.id}" version conflict`, {
+      details: { entity: "review", id: review.id, currentVersion: review.version, expectedVersion },
+    });
+  }
+
+  function reviewStateConflict(review, reason) {
+    return new ApiError("VERSION_CONFLICT", `review "${review.id}" cannot accept this action`, {
+      details: { entity: "review", id: review.id, status: review.status, reason },
+    });
+  }
+
+  function approvalStale({ approvalId, taskId, expectedTargetHash, receivedTargetHash }) {
+    return new ApiError("APPROVAL_STALE", "target hash does not match the current target", {
+      details: { approvalId, taskId, expectedTargetHash: expectedTargetHash ?? null, receivedTargetHash: receivedTargetHash ?? null },
+    });
+  }
+
+  function reworkLimitReached({ taskId, attempt, maxAttempts }) {
+    return new ApiError("REWORK_LIMIT_REACHED", `task "${taskId}" reached the rework limit`, {
+      details: { taskId, attempt, maxAttempts },
+    });
+  }
+
+  function getReviewOrThrow(id) {
+    if (typeof store.getReview !== "function") {
+      throw new ApiError("INTERNAL_ERROR", "store.getReview is unavailable");
+    }
+    return store.getReview(id);
+  }
+
+  /** Hard invariant §0.1: the author (Run agent or current assignee) cannot review. */
+  function assertNotSelfReview(review, task, actor) {
+    const authorIds = new Set();
+    if (review.runId) {
+      try {
+        const run = store.getRun(review.runId);
+        if (typeof run?.agentId === "string" && run.agentId !== "") authorIds.add(run.agentId);
+      } catch {
+        // A missing Run is reported by the store on submit; self-review just has
+        // nothing to compare against here.
+      }
+    }
+    if (typeof task?.assignee === "string" && task.assignee !== "") authorIds.add(task.assignee);
+    if (authorIds.has(actor)) {
+      throw new ApiError("SELF_REVIEW_FORBIDDEN", "the author cannot review their own work", {
+        details: { actor, authorAgentId: [...authorIds].find((id) => id === actor) ?? null },
+      });
+    }
+  }
+
+  /** Hard invariant §0.2: a PASS must carry a manifest hash and a full green test run. */
+  function assertPassEvidence(manifestHash, evidence) {
+    const missing = [];
+    if (typeof manifestHash !== "string" || manifestHash.trim() === "") missing.push("manifestHash");
+    const tests = isPlainObject(evidence?.tests) ? evidence.tests : null;
+    if (!tests) {
+      missing.push("evidence.tests");
+    } else {
+      if (!Number.isInteger(tests.passed) || tests.passed < 0) missing.push("evidence.tests.passed");
+      if (!Number.isInteger(tests.total) || tests.total < 1) missing.push("evidence.tests.total");
+      if (!missing.includes("evidence.tests.passed") && !missing.includes("evidence.tests.total") && tests.passed !== tests.total) {
+        missing.push("evidence.tests.passed===total");
+      }
+    }
+    if (missing.length > 0) {
+      throw new ApiError("EVIDENCE_MISSING", "PASS requires manifestHash and evidence.tests.passed === evidence.tests.total > 0", {
+        details: {
+          missing,
+          verdict: "PASS",
+          manifestHashProvided: typeof manifestHash === "string" && manifestHash.trim() !== "",
+          testsPresent: Boolean(tests),
+        },
+      });
+    }
+  }
+
+  function reviewFilterFrom(searchParams) {
+    const filter = {};
+    const taskId = queryString(searchParams, "taskId");
+    if (taskId !== undefined) {
+      if (taskId.trim() === "" || !ID_RE.test(taskId)) throw validationError("invalid review filter", ["taskId must be an id string"]);
+      filter.taskId = taskId;
+    }
+    const status = queryString(searchParams, "status");
+    if (status !== undefined) {
+      if (!M4_REVIEW_STATUSES.has(status)) {
+        throw validationError("invalid review filter", ["status must be a known review status"]);
+      }
+      filter.status = status;
+    }
+    const limit = parseIntegerParam(searchParams, "limit", { min: 1, max: 100 });
+    if (limit !== undefined) filter.limit = limit;
+    return filter;
   }
 
   function matchRoute(pathname, method) {
@@ -328,6 +475,12 @@ export function createServer({
           : Object.fromEntries(Object.entries(body).filter(([key]) => key !== "expectedVersion"));
         const errors = validateTaskChanges(changes);
         if (errors.length > 0) throw validationError("invalid task changes", errors);
+        // §0.5: DONE has exactly one entrance — an APPROVED human acceptance.
+        if (changes.status === "DONE") {
+          throw new ApiError("TASK_VERSION_CONFLICT", "DONE can only be reached through human approval", {
+            details: { taskId: params.id, reason: "human-approval-required", requestedStatus: "DONE" },
+          });
+        }
         sendJson(res, 200, store.patchTask(params.id, { expectedVersion: body.expectedVersion, changes }));
         return;
       }
@@ -354,7 +507,150 @@ export function createServer({
         return;
       }
       case "reviews.list": {
-        sendJson(res, 200, listPayload(store.listReviews({})));
+        const filter = reviewFilterFrom(url.searchParams);
+        // Filter statuses in the Backend: M4 adds CHANGES_REQUESTED/BLOCKED while
+        // the store's enum filter only knows the M1 set.
+        const { status, limit, ...storeFilter } = filter;
+        storeFilter.limit = limit ?? 100;
+        let items = store.listReviews(storeFilter);
+        items = Array.isArray(items) ? items : [];
+        if (status !== undefined) items = items.filter((review) => review.status === status);
+        if (limit !== undefined) items = items.slice(0, limit);
+        sendJson(res, 200, { items, total: items.length });
+        return;
+      }
+      case "reviews.create": {
+        const body = requireBodyObject(await requireJsonBody(req), "review");
+        if (typeof body.taskId !== "string" || !ID_RE.test(body.taskId)) {
+          throw validationError("invalid review", ["taskId must be an id string"]);
+        }
+        const actor = actorFrom(body, { required: true });
+        let runId = null;
+        if (body.runId !== undefined) {
+          if (typeof body.runId !== "string" || !ID_RE.test(body.runId)) {
+            throw validationError("invalid review", ["runId must be an id string when provided"]);
+          }
+          runId = body.runId;
+        }
+        const task = store.getTask(body.taskId); // 404 NOT_FOUND
+        if (task.status !== "REVIEWING") throw taskStateConflict(task, "not-reviewing");
+        if (runId !== null) {
+          const run = store.getRun(runId); // 404 NOT_FOUND
+          if (run.taskId !== task.id) throw validationError("invalid review", ["runId does not belong to the task"]);
+        }
+        // §1: one active Review per Task (contract-layer, not store-dependent).
+        const active = (store.listReviews({ taskId: task.id }) ?? []).find(
+          (review) => review.status === "PENDING" && (review.verdict === null || review.verdict === undefined),
+        );
+        if (active) {
+          throw new ApiError("VERSION_CONFLICT", `task "${task.id}" already has an active review`, {
+            details: { entity: "review", taskId: task.id, activeReviewId: active.id, currentVersion: active.version ?? 0 },
+          });
+        }
+        const review = store.createReview({ taskId: task.id, runId, actor });
+        pumpSse();
+        sendJson(res, 201, review);
+        return;
+      }
+      case "reviews.submit": {
+        const body = requireBodyObject(await requireJsonBody(req), "review submission");
+        const expectedVersion = body.expectedVersion;
+        if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+          throw validationError("invalid review submission", ["expectedVersion must be a non-negative integer"]);
+        }
+        if (!M4_VERDICTS.has(body.verdict)) {
+          throw validationError("invalid review submission", ["verdict must be PASS, CHANGES_REQUESTED or BLOCKED"]);
+        }
+        const actor = actorFrom(body);
+        const review = getReviewOrThrow(params.id); // 404 NOT_FOUND
+        if (review.status !== "PENDING") throw reviewStateConflict(review, "not-pending");
+        if (review.version !== expectedVersion) throw reviewCasConflict(review, expectedVersion);
+        const task = store.getTask(review.taskId); // 404 NOT_FOUND
+        if (task.status !== "REVIEWING") throw taskStateConflict(task, "not-reviewing");
+        assertNotSelfReview(review, task, actor);
+
+        let findings;
+        if (body.findings !== undefined) {
+          if (!Array.isArray(body.findings) || body.findings.some((finding) => !isPlainObject(finding) || typeof finding.code !== "string" || finding.code === "")) {
+            throw validationError("invalid review submission", ["findings must be an array of objects with a non-empty code"]);
+          }
+          findings = body.findings;
+        }
+        if (body.commitSha !== undefined) {
+          if (typeof body.commitSha !== "string" || !/^[0-9a-f]{7,64}$/i.test(body.commitSha)) {
+            throw validationError("invalid review submission", ["commitSha must be a git sha"]);
+          }
+        }
+        if (body.evidence !== undefined && body.evidence !== null && !isPlainObject(body.evidence)) {
+          throw validationError("invalid review submission", ["evidence must be an object"]);
+        }
+        if (body.verdict === "PASS") assertPassEvidence(body.manifestHash, body.evidence);
+        if (body.verdict === "CHANGES_REQUESTED" && (!Array.isArray(findings) || findings.length === 0)) {
+          throw validationError("invalid review submission", ["CHANGES_REQUESTED requires at least one finding"]);
+        }
+
+        // findings is only required for CHANGES_REQUESTED. PASS/BLOCKED must not
+        // send an empty array: the store rejects any explicitly empty findings
+        // list, so normalise "empty" to "absent".
+        const storeFindings = Array.isArray(findings) && findings.length > 0 ? findings : undefined;
+
+        const result = store.submitReview({
+          id: review.id,
+          expectedVersion,
+          verdict: body.verdict,
+          manifestHash: body.manifestHash ?? null,
+          commitSha: body.commitSha ?? null,
+          findings: storeFindings,
+          evidence: body.evidence ?? null,
+          actor,
+        });
+        if (!isPlainObject(result) || !result.review || !result.task) {
+          throw new ApiError("INTERNAL_ERROR", "review submission returned an incomplete result");
+        }
+        // "Looks successful but did nothing" guard: the returned facts must match.
+        const expectedTaskStatus = body.verdict === "PASS" ? "INTEGRATING" : body.verdict === "CHANGES_REQUESTED" ? "REJECTED" : "BLOCKED";
+        if (result.review.verdict !== body.verdict || result.review.status === "PENDING" || result.task.status !== expectedTaskStatus) {
+          logger?.error?.(
+            `[atk] review submit did not persist expected facts: verdict=${result.review.verdict} reviewStatus=${result.review.status} taskStatus=${result.task.status}`,
+          );
+          throw new ApiError("INTERNAL_ERROR", "review submission did not persist the expected state");
+        }
+        pumpSse();
+        sendJson(res, 200, result);
+        return;
+      }
+      case "reviews.rework": {
+        const body = requireBodyObject(await requireJsonBody(req), "review rework");
+        const reason = requireNonEmptyString(body.reason, "reason");
+        const actor = actorFrom(body);
+        const review = getReviewOrThrow(params.id); // 404 NOT_FOUND
+        if (review.status !== "CHANGES_REQUESTED") throw reviewStateConflict(review, "not-changes-requested");
+        const task = store.getTask(review.taskId); // 404 NOT_FOUND
+        // §0.4: reaching maxAttempts must BLOCK the Task and raise
+        // REWORK_LIMIT_REACHED atomically — the store owns that transition, the
+        // Backend normalises the error so the code/details are contract-stable.
+        let result;
+        try {
+          result = store.reworkTask({ taskId: task.id, reviewId: review.id, reason, actor });
+        } catch (error) {
+          if (error?.code === "REWORK_LIMIT_REACHED") {
+            throw reworkLimitReached({
+              taskId: task.id,
+              attempt: error.details?.attempt ?? review.attempt,
+              maxAttempts: error.details?.maxAttempts ?? MAX_REVIEW_ATTEMPTS,
+            });
+          }
+          throw error;
+        }
+        if (!isPlainObject(result) || !result.review || !result.task) {
+          throw new ApiError("INTERNAL_ERROR", "review rework returned an incomplete result");
+        }
+        if (result.task.status !== "READY") {
+          logger?.error?.(`[atk] rework did not move the task to READY (status=${result.task.status})`);
+          throw new ApiError("INTERNAL_ERROR", "review rework did not persist the expected state");
+        }
+        pumpSse();
+        sendJson(res, 200, result);
         return;
       }
       case "approvals.list": {
@@ -366,7 +662,83 @@ export function createServer({
           }
           filter.taskId = taskId;
         }
+        const status = queryString(url.searchParams, "status");
+        if (status !== undefined) {
+          if (!isEnumValue("acceptance", status)) {
+            throw validationError("invalid approval filter", ["status must be one of the acceptance enum values"]);
+          }
+          filter.status = status;
+        }
+        const limit = parseIntegerParam(url.searchParams, "limit", { min: 1, max: 100 });
+        if (limit !== undefined) filter.limit = limit;
         sendJson(res, 200, listPayload(store.listApprovals(filter)));
+        return;
+      }
+      case "approvals.create": {
+        const body = requireBodyObject(await requireJsonBody(req), "approval");
+        if (typeof body.taskId !== "string" || !ID_RE.test(body.taskId)) {
+          throw validationError("invalid approval", ["taskId must be an id string"]);
+        }
+        requireNonEmptyString(body.scope, "scope");
+        requireNonEmptyString(body.targetHash, "targetHash");
+        const task = store.getTask(body.taskId); // 404 NOT_FOUND
+        if (task.status !== "AWAITING_ACCEPTANCE") throw taskStateConflict(task, "not-awaiting-acceptance");
+        const approval = store.createApproval({
+          taskId: task.id,
+          scope: body.scope,
+          targetHash: body.targetHash,
+          actor: "HUMAN",
+          status: "PENDING",
+        });
+        pumpSse();
+        sendJson(res, 201, approval);
+        return;
+      }
+      case "approvals.decide": {
+        const body = requireBodyObject(await requireJsonBody(req), "approval decision");
+        if (!APPROVAL_DECISIONS.has(body.decision)) {
+          throw validationError("invalid approval decision", ['decision must be "APPROVED" or "REJECTED"']);
+        }
+        const targetHash = requireNonEmptyString(body.targetHash, "targetHash");
+        const approvals = Array.isArray(store.listApprovals({})) ? store.listApprovals({}) : [];
+        const approval = approvals.find((candidate) => candidate.id === params.id);
+        if (!approval) throw new ApiError("NOT_FOUND", `approval "${params.id}" not found`, { details: { entity: "approval", id: params.id } });
+        if (approval.status !== "PENDING") {
+          throw new ApiError("VERSION_CONFLICT", `approval "${approval.id}" is not pending`, {
+            details: { entity: "approval", id: approval.id, status: approval.status, reason: "not-pending" },
+          });
+        }
+        const task = store.getTask(approval.taskId); // 404 NOT_FOUND
+        // §0.3: the acceptance is bound to the hash it was created for AND to the
+        // Task's current target hash (if the Task carries one).
+        if (approval.targetHash !== targetHash) {
+          throw approvalStale({
+            approvalId: approval.id,
+            taskId: task.id,
+            expectedTargetHash: approval.targetHash,
+            receivedTargetHash: targetHash,
+          });
+        }
+        if (typeof task.targetHash === "string" && task.targetHash !== "" && task.targetHash !== targetHash) {
+          throw approvalStale({
+            approvalId: approval.id,
+            taskId: task.id,
+            expectedTargetHash: task.targetHash,
+            receivedTargetHash: targetHash,
+          });
+        }
+        if (task.status !== "AWAITING_ACCEPTANCE") throw taskStateConflict(task, "not-awaiting-acceptance");
+        const result = store.decideApproval({ id: approval.id, decision: body.decision, actor: "HUMAN", targetHash });
+        if (!isPlainObject(result) || !result.approval || !result.task) {
+          throw new ApiError("INTERNAL_ERROR", "approval decision returned an incomplete result");
+        }
+        const expectedTaskStatus = body.decision === "APPROVED" ? "DONE" : "READY";
+        if (result.approval.status !== body.decision || result.task.status !== expectedTaskStatus) {
+          logger?.error?.(`[atk] approval decide did not persist expected facts: approval=${result.approval.status} task=${result.task.status}`);
+          throw new ApiError("INTERNAL_ERROR", "approval decision did not persist the expected state");
+        }
+        pumpSse();
+        sendJson(res, 200, result);
         return;
       }
       case "events.list": {

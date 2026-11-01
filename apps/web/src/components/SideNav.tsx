@@ -10,7 +10,12 @@ export function SideNav({ active }: { active: NavName }) {
       <ul className="sidenav__list">
         {NAV_ITEMS.map((item) => (
           <li key={item.name} className="sidenav__item">
-            <a className="sidenav__link" href={item.href} aria-current={item.name === active ? "page" : undefined}>
+            <a
+              className="sidenav__link"
+              href={item.href}
+              data-testid={`nav-${item.name}`}
+              aria-current={item.name === active ? "page" : undefined}
+            >
               {t(item.labelKey)}
             </a>
           </li>

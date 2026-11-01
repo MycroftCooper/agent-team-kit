@@ -13,11 +13,14 @@ import { StoreError, fail, notFound } from "./errors.mjs";
 import { INTERNAL } from "./internal.mjs";
 import {
   DEFAULT_LEASE_MS,
+  DEFAULT_MAX_REVIEW_ATTEMPTS,
   MAX_EVENT_LIMIT,
   MAX_LIST_LIMIT,
   MAX_OVERVIEW_EVENTS,
   SCHEMA_VERSION,
+  applyReviewVerdict,
   assertEnumFilter,
+  assertTaskTransition,
   buildOverview,
   canTransition,
   compareTasks,
@@ -37,12 +40,16 @@ import {
   normalizeProject,
   normalizeProjectPolicy,
   normalizeRequirement,
+  normalizeReview,
   normalizeRun,
   normalizeTask,
   nowIso,
   parseJsonColumn,
   requireId,
   safeJson,
+  validateActor,
+  validateApprovalDecision,
+  validateTargetHash,
   validateCommandPayload,
   validateCommandType,
   validateIdempotencyKey,
@@ -467,6 +474,7 @@ export function openStore(options = {}) {
     if (row.plan_id !== null && row.plan_id !== undefined) task.planId = row.plan_id;
     const files = parseJsonColumn(row.files_json);
     if (Array.isArray(files) && files.length > 0) task.files = files;
+    if (row.target_hash !== null && row.target_hash !== undefined) task.targetHash = row.target_hash;
     return task;
   }
 
@@ -563,6 +571,10 @@ export function openStore(options = {}) {
     if (row.commit_sha !== null && row.commit_sha !== undefined) review.commitSha = row.commit_sha;
     const findings = parseJsonColumn(row.findings_json);
     if (findings !== null) review.findings = findings;
+    if (row.reviewer !== null && row.reviewer !== undefined) review.actor = row.reviewer;
+    const evidence = parseJsonColumn(row.evidence_json);
+    if (evidence !== null) review.evidence = evidence;
+    if (row.submitted_at !== null && row.submitted_at !== undefined) review.submittedAt = row.submitted_at;
     return review;
   }
 
@@ -578,6 +590,9 @@ export function openStore(options = {}) {
     };
     if (row.project_id !== null && row.project_id !== undefined) approval.projectId = row.project_id;
     if (row.task_id !== null && row.task_id !== undefined) approval.taskId = row.task_id;
+    if (row.decided_at !== null && row.decided_at !== undefined) approval.decidedAt = row.decided_at;
+    if (row.decision !== null && row.decision !== undefined) approval.decision = row.decision;
+    approval.version = Number(row.version ?? 0);
     return approval;
   }
 
@@ -655,6 +670,69 @@ export function openStore(options = {}) {
 
   function currentTaskJson(id) {
     return taskJson(requireTaskRow(id));
+  }
+
+  function getReviewRow(id) {
+    requireId(id, "review.id");
+    return stmt("SELECT * FROM reviews WHERE id = ?").get(id) ?? null;
+  }
+
+  function requireReviewRow(id) {
+    const row = getReviewRow(id);
+    if (!row) notFound("review", id);
+    return row;
+  }
+
+  function getApprovalRow(id) {
+    requireId(id, "approval.id");
+    return stmt("SELECT * FROM approvals WHERE id = ?").get(id) ?? null;
+  }
+
+  function requireApprovalRow(id) {
+    const row = getApprovalRow(id);
+    if (!row) notFound("approval", id);
+    return row;
+  }
+
+  /**
+   * Self-review proxy (Lead ruling, no `tasks.assignee` column): the producer of
+   * the reviewed work is the agent of the Run. Prefer an active Run, fall back to
+   * the latest Run of the Task. This is only used to forbid self-review; it is
+   * never persisted.
+   */
+  function latestProducerAgentId(taskId) {
+    const active = stmt(
+      `SELECT agent_id FROM runs
+        WHERE task_id = ? AND status IN ('QUEUED', 'STARTING', 'RUNNING')
+        ORDER BY created_at DESC, id DESC LIMIT 1`,
+    ).get(taskId);
+    if (active) return active.agent_id;
+    const latest = stmt(
+      "SELECT agent_id FROM runs WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+    ).get(taskId);
+    return latest ? latest.agent_id : null;
+  }
+
+  /**
+   * Task transition inside the caller's transaction: validates via the shared
+   * state machine and bumps the version with a CAS so a concurrent writer cannot
+   * be silently overwritten.
+   */
+  function transitionTaskInTx(taskId, to) {
+    const row = requireTaskRow(taskId);
+    assertTaskTransition(row.status, to);
+    const at = nowIso();
+    const result = stmt(
+      "UPDATE tasks SET status = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?",
+    ).run(to, at, taskId, Number(row.version));
+    if (Number(result.changes) === 0) {
+      const fresh = requireTaskRow(taskId);
+      fail("TASK_VERSION_CONFLICT", `task "${taskId}" version conflict`, {
+        taskId,
+        currentVersion: Number(fresh.version),
+      });
+    }
+    return taskJson(requireTaskRow(taskId));
   }
 
   function assertDepsExist(deps, selfId) {
@@ -897,8 +975,9 @@ export function openStore(options = {}) {
         stmt(
           `INSERT INTO tasks
              (id, project_id, title, description, function_required, role_required, priority, status,
-              acceptance, plan_id, parent_id, version, legacy_json, files_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              acceptance, plan_id, parent_id, version, legacy_json, files_json, target_hash,
+              created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           task.id,
           task.projectId,
@@ -914,6 +993,7 @@ export function openStore(options = {}) {
           task.version,
           safeJson(dto.legacy, "task.legacy"),
           task.files === undefined ? null : JSON.stringify(task.files),
+          task.targetHash ?? null,
           task.createdAt,
           task.updatedAt,
         );
@@ -935,7 +1015,8 @@ export function openStore(options = {}) {
         const result = stmt(
           `UPDATE tasks
               SET title = ?, description = ?, function_required = ?, role_required = ?, priority = ?,
-                  acceptance = ?, plan_id = ?, status = ?, files_json = ?, version = ?, updated_at = ?
+                  acceptance = ?, plan_id = ?, status = ?, files_json = ?, target_hash = ?, version = ?,
+                  updated_at = ?
             WHERE id = ? AND version = ?`,
         ).run(
           merged.title,
@@ -947,6 +1028,7 @@ export function openStore(options = {}) {
           merged.planId ?? null,
           merged.status,
           merged.files === undefined ? null : JSON.stringify(merged.files),
+          merged.targetHash ?? null,
           merged.version,
           merged.updatedAt,
           id,
@@ -1879,17 +1961,350 @@ export function openStore(options = {}) {
       });
     },
 
-    listReviews({ status } = {}) {
-      if (status !== undefined && status !== null) {
-        assertEnumFilter("review", status);
-        return stmt("SELECT * FROM reviews WHERE status = ? ORDER BY created_at DESC, id DESC")
-          .all(status)
-          .map(reviewJson);
-      }
-      return stmt("SELECT * FROM reviews ORDER BY created_at DESC, id DESC").all().map(reviewJson);
+    getReview(id) {
+      return reviewJson(requireReviewRow(id));
     },
 
-    listApprovals({ taskId, status } = {}) {
+    listReviews({ taskId, status, limit } = {}) {
+      const where = [];
+      const params = [];
+      if (taskId !== undefined && taskId !== null) {
+        requireId(taskId, "review.taskId");
+        where.push("task_id = ?");
+        params.push(taskId);
+      }
+      if (status !== undefined && status !== null) {
+        assertEnumFilter("review", status);
+        where.push("status = ?");
+        params.push(status);
+      }
+      const capped = normalizeLimit(limit, { fallback: 50, max: 100 });
+      const sql = `SELECT * FROM reviews${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""}
+        ORDER BY created_at DESC, id DESC LIMIT ?`;
+      return stmt(sql).all(...params, capped).map(reviewJson);
+    },
+
+    createReview(dto = {}) {
+      ensurePlainObject(dto, "review");
+      // Validate the actor before the state checks so a bad request is a
+      // VALIDATION_ERROR, not a confusing "already has an active review".
+      validateActor(dto.actor, "review.actor");
+      return transaction(() => {
+        requireId(dto.taskId, "review.taskId");
+        const taskRow = getTaskRow(dto.taskId);
+        if (!taskRow) {
+          fail("TASK_VERSION_CONFLICT", `task "${dto.taskId}" is not reviewable`, {
+            taskId: dto.taskId,
+            currentVersion: null,
+            reason: "task-not-found",
+          });
+        }
+        if (taskRow.status !== "REVIEWING") {
+          fail("TASK_VERSION_CONFLICT", `task "${dto.taskId}" is not REVIEWING`, {
+            taskId: dto.taskId,
+            status: taskRow.status,
+            currentVersion: Number(taskRow.version),
+            reason: "not-reviewing",
+          });
+        }
+        if (dto.runId !== undefined && dto.runId !== null) {
+          requireId(dto.runId, "review.runId");
+          const runRow = getRunRow(dto.runId);
+          if (!runRow) {
+            fail("VALIDATION_ERROR", `run "${dto.runId}" does not exist`, { entity: "run", id: dto.runId });
+          }
+          if (runRow.task_id !== taskRow.id) {
+            fail("VALIDATION_ERROR", `run "${dto.runId}" does not belong to task "${taskRow.id}"`, {
+              runId: dto.runId,
+              taskId: taskRow.id,
+              runTaskId: runRow.task_id,
+            });
+          }
+        }
+        const active = stmt(
+          "SELECT * FROM reviews WHERE task_id = ? AND status = 'PENDING' ORDER BY created_at DESC, id DESC LIMIT 1",
+        ).get(taskRow.id);
+        if (active) {
+          fail("TASK_VERSION_CONFLICT", `task "${taskRow.id}" already has an active review`, {
+            taskId: taskRow.id,
+            reviewId: active.id,
+            status: active.status,
+            reason: "review-exists",
+          });
+        }
+        const nextAttempt =
+          Number(
+            stmt("SELECT COALESCE(MAX(attempt), 0) AS attempt FROM reviews WHERE task_id = ?").get(
+              taskRow.id,
+            ).attempt,
+          ) + 1;
+        const at = nowIso();
+        const { review, actor } = normalizeReview(dto, { now: at, attempt: nextAttempt });
+        stmt(
+          `INSERT INTO reviews
+             (id, task_id, run_id, status, verdict, manifest_hash, commit_sha, findings_json, attempt,
+              version, reviewer, evidence_json, submitted_at, created_at, updated_at)
+           VALUES (?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, ?, 0, NULL, NULL, NULL, ?, ?)`,
+        ).run(review.id, review.taskId, review.runId ?? null, review.attempt, at, at);
+        stmt(
+          `INSERT INTO review_attempts
+             (id, review_id, run_id, attempt, status, verdict, manifest_hash, findings_json,
+              evidence_json, created_at)
+           VALUES (?, ?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, ?)`,
+        ).run(generateId("RVA"), review.id, review.runId ?? null, review.attempt, at);
+        insertEvent(
+          makeEvent({
+            projectId: taskRow.project_id,
+            aggregateType: "review",
+            aggregateId: review.id,
+            type: "review.requested",
+            payload: { taskId: review.taskId, reviewId: review.id, attempt: review.attempt },
+            now: at,
+          }),
+        );
+        // `actor` is the human/agent opening the review; it is not persisted on
+        // the review (the reviewer is the actor who submits the verdict).
+        void actor;
+        return reviewJson(requireReviewRow(review.id));
+      });
+    },
+
+    submitReview({ id, expectedVersion, verdict, manifestHash, commitSha, findings, evidence, actor } = {}) {
+      requireId(id, "review.id");
+      if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+        fail("VALIDATION_ERROR", "expectedVersion must be a non-negative integer", { expectedVersion });
+      }
+      return transaction(() => {
+        const row = requireReviewRow(id);
+        if (Number(row.version) !== expectedVersion) {
+          fail("VERSION_CONFLICT", `review "${id}" version conflict`, {
+            entity: "review",
+            id,
+            expectedVersion,
+            currentVersion: Number(row.version),
+          });
+        }
+        if (row.status !== "PENDING") {
+          fail("REVIEW_INVALIDATED", `review "${id}" is not pending`, {
+            reviewId: id,
+            taskId: row.task_id,
+            status: row.status,
+          });
+        }
+        const taskRow = requireTaskRow(row.task_id);
+        const current = reviewJson(row);
+        const next = applyReviewVerdict(
+          current,
+          { verdict, manifestHash, commitSha, findings, evidence, actor },
+          { now: nowIso() },
+        );
+        // Self-review proxy (Lead ruling): the producer is the reviewed Run's
+        // agent, or (no assignee column) the Task's latest/active Run agent.
+        const authorAgentIds = new Set();
+        if (row.run_id !== null && row.run_id !== undefined) {
+          const producerRow = getRunRow(row.run_id);
+          if (producerRow) authorAgentIds.add(producerRow.agent_id);
+        }
+        const latestProducer = latestProducerAgentId(row.task_id);
+        if (latestProducer) authorAgentIds.add(latestProducer);
+        if (authorAgentIds.has(next.reviewer)) {
+          fail("SELF_REVIEW_FORBIDDEN", "an actor cannot review their own work", {
+            actor: next.reviewer,
+            authorAgentId: next.reviewer,
+            taskId: row.task_id,
+            reviewId: id,
+          });
+        }
+        const taskTo = verdict === "PASS" ? "INTEGRATING" : verdict === "CHANGES_REQUESTED" ? "REJECTED" : "BLOCKED";
+        const task = transitionTaskInTx(row.task_id, taskTo);
+        stmt(
+          `UPDATE reviews
+              SET status = ?, verdict = ?, manifest_hash = ?, commit_sha = ?, findings_json = ?,
+                  evidence_json = ?, reviewer = ?, submitted_at = ?, version = ?, updated_at = ?
+            WHERE id = ?`,
+        ).run(
+          next.status,
+          next.verdict,
+          next.manifestHash ?? null,
+          next.commitSha ?? null,
+          next.findings === undefined ? null : JSON.stringify(next.findings),
+          next.evidence === undefined ? null : JSON.stringify(next.evidence),
+          next.reviewer,
+          next.submittedAt,
+          next.version,
+          next.updatedAt,
+          id,
+        );
+        stmt(
+          `UPDATE review_attempts
+              SET status = ?, verdict = ?, manifest_hash = ?, findings_json = ?, evidence_json = ?
+            WHERE review_id = ? AND attempt = ?`,
+        ).run(
+          next.status,
+          next.verdict,
+          next.manifestHash ?? null,
+          next.findings === undefined ? null : JSON.stringify(next.findings),
+          next.evidence === undefined ? null : JSON.stringify(next.evidence),
+          id,
+          Number(row.attempt),
+        );
+        insertEvent(
+          makeEvent({
+            projectId: taskRow.project_id,
+            aggregateType: "review",
+            aggregateId: id,
+            type: "review.updated",
+            payload: {
+              taskId: row.task_id,
+              reviewId: id,
+              status: next.status,
+              verdict: next.verdict,
+              actor: next.reviewer,
+              attempt: Number(row.attempt),
+            },
+            now: next.updatedAt,
+          }),
+        );
+        return { review: reviewJson(requireReviewRow(id)), task };
+      });
+    },
+
+    reworkTask({ taskId, reviewId, reason, actor, maxAttempts } = {}) {
+      requireId(taskId, "task.id");
+      requireId(reviewId, "review.id");
+      if (maxAttempts !== undefined && (!Number.isInteger(maxAttempts) || maxAttempts < 1)) {
+        fail("VALIDATION_ERROR", "maxAttempts must be a positive integer", { maxAttempts });
+      }
+      const limit = maxAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS;
+      const reviewer = validateActor(actor, "review.actor");
+      const outcome = transaction(() => {
+        const taskRow = requireTaskRow(taskId);
+        const reviewRow = getReviewRow(reviewId);
+        if (!reviewRow) notFound("review", reviewId);
+        if (reviewRow.task_id !== taskId) {
+          fail("VALIDATION_ERROR", "review does not belong to the task", { taskId, reviewId });
+        }
+        if (reviewRow.status !== "CHANGES_REQUESTED") {
+          fail("REVIEW_INVALIDATED", `review "${reviewId}" is not CHANGES_REQUESTED`, {
+            reviewId,
+            taskId,
+            status: reviewRow.status,
+          });
+        }
+        if (taskRow.status !== "REJECTED") {
+          fail("TASK_VERSION_CONFLICT", `task "${taskId}" is not REJECTED`, {
+            taskId,
+            status: taskRow.status,
+            currentVersion: Number(taskRow.version),
+            reason: "not-rejected",
+          });
+        }
+        const at = nowIso();
+        const nextAttempt = Number(reviewRow.attempt) + 1;
+        if (nextAttempt > limit) {
+          const task = transitionTaskInTx(taskId, "BLOCKED");
+          stmt("UPDATE reviews SET status = 'BLOCKED', version = version + 1, updated_at = ? WHERE id = ?").run(
+            at,
+            reviewId,
+          );
+          insertEvent(
+            makeEvent({
+              projectId: taskRow.project_id,
+              aggregateType: "review",
+              aggregateId: reviewId,
+              type: "review.updated",
+              payload: {
+                taskId,
+                reviewId,
+                status: "BLOCKED",
+                verdict: "CHANGES_REQUESTED",
+                actor: reviewer,
+                attempt: nextAttempt,
+                reason: reason ?? null,
+              },
+              now: at,
+            }),
+          );
+          insertEvent(
+            makeEvent({
+              projectId: taskRow.project_id,
+              aggregateType: "task",
+              aggregateId: taskId,
+              type: "task.updated",
+              payload: {
+                taskId,
+                status: "BLOCKED",
+                previousStatus: "REJECTED",
+                reason: "rework-limit",
+                attempt: nextAttempt,
+              },
+              now: at,
+            }),
+          );
+          return {
+            limitReached: true,
+            review: reviewJson(requireReviewRow(reviewId)),
+            task,
+            attempt: nextAttempt,
+          };
+        }
+        const task = transitionTaskInTx(taskId, "READY");
+        // The finished review keeps its own attempt number (1 = first verdict);
+        // `nextAttempt` is the round the next review will use.
+        stmt("UPDATE reviews SET version = version + 1, updated_at = ? WHERE id = ?").run(at, reviewId);
+        stmt(
+          `INSERT INTO review_attempts
+             (id, review_id, run_id, attempt, status, verdict, manifest_hash, findings_json,
+              evidence_json, created_at)
+           VALUES (?, ?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, ?)`,
+        ).run(generateId("RVA"), reviewId, reviewRow.run_id ?? null, nextAttempt, at);
+        insertEvent(
+          makeEvent({
+            projectId: taskRow.project_id,
+            aggregateType: "review",
+            aggregateId: reviewId,
+            type: "review.updated",
+            payload: {
+              taskId,
+              reviewId,
+              status: "CHANGES_REQUESTED",
+              verdict: "CHANGES_REQUESTED",
+              actor: reviewer,
+              attempt: nextAttempt,
+              reason: reason ?? null,
+            },
+            now: at,
+          }),
+        );
+        insertEvent(
+          makeEvent({
+            projectId: taskRow.project_id,
+            aggregateType: "task",
+            aggregateId: taskId,
+            type: "task.updated",
+            payload: {
+              taskId,
+              status: "READY",
+              previousStatus: "REJECTED",
+              reason: "rework",
+              attempt: nextAttempt,
+            },
+            now: at,
+          }),
+        );
+        return { review: reviewJson(requireReviewRow(reviewId)), task, attempt: nextAttempt };
+      });
+      if (outcome.limitReached) {
+        fail("REWORK_LIMIT_REACHED", `task "${taskId}" exhausted its rework budget`, {
+          taskId,
+          attempt: outcome.attempt,
+          maxAttempts: limit,
+        });
+      }
+      return outcome;
+    },
+
+    listApprovals({ taskId, status, limit } = {}) {
       const where = [];
       const params = [];
       if (taskId !== undefined && taskId !== null) {
@@ -1902,20 +2317,35 @@ export function openStore(options = {}) {
         where.push("status = ?");
         params.push(status);
       }
+      const capped = normalizeLimit(limit, { fallback: 50, max: 100 });
       const sql = `SELECT * FROM approvals${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""}
-        ORDER BY created_at DESC, id DESC`;
-      return stmt(sql).all(...params).map(approvalJson);
+        ORDER BY created_at DESC, id DESC LIMIT ?`;
+      return stmt(sql).all(...params, capped).map(approvalJson);
     },
 
-    createApproval(dto) {
+    createApproval(dto = {}) {
       ensurePlainObject(dto, "approval");
       return transaction(() => {
-        const approval = normalizeApproval(dto, { now: nowIso() });
-        if (approval.projectId !== undefined) requireProject(approval.projectId);
-        if (approval.taskId !== undefined) requireTaskRow(approval.taskId);
+        requireId(dto.taskId, "approval.taskId");
+        const taskRow = getTaskRow(dto.taskId);
+        if (!taskRow) notFound("task", dto.taskId);
+        if (taskRow.status !== "AWAITING_ACCEPTANCE") {
+          fail("TASK_VERSION_CONFLICT", `task "${dto.taskId}" is not AWAITING_ACCEPTANCE`, {
+            taskId: dto.taskId,
+            status: taskRow.status,
+            currentVersion: Number(taskRow.version),
+            reason: "not-awaiting-acceptance",
+          });
+        }
+        const approval = normalizeApproval(
+          { ...dto, projectId: taskRow.project_id, taskId: taskRow.id, status: dto.status ?? "PENDING" },
+          { now: nowIso() },
+        );
         stmt(
-          `INSERT INTO approvals (id, project_id, task_id, scope, target_hash, actor, status, at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO approvals
+             (id, project_id, task_id, scope, target_hash, actor, status, decision, decided_at, version,
+              at, legacy_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?, ?)`,
         ).run(
           approval.id,
           approval.projectId ?? null,
@@ -1925,9 +2355,116 @@ export function openStore(options = {}) {
           approval.actor,
           approval.status,
           approval.at,
+          safeJson(dto.legacy, "approval.legacy"),
           approval.createdAt,
         );
-        return approvalJson(stmt("SELECT * FROM approvals WHERE id = ?").get(approval.id));
+        insertEvent(
+          makeEvent({
+            projectId: taskRow.project_id,
+            aggregateType: "approval",
+            aggregateId: approval.id,
+            type: "approval.recorded",
+            payload: {
+              taskId: taskRow.id,
+              approvalId: approval.id,
+              status: approval.status,
+              targetHash: approval.targetHash,
+              actor: approval.actor,
+            },
+            now: approval.createdAt,
+          }),
+        );
+        return approvalJson(requireApprovalRow(approval.id));
+      });
+    },
+
+    decideApproval({ id, decision: rawDecision, actor, targetHash } = {}) {
+      requireId(id, "approval.id");
+      const decision = validateApprovalDecision(rawDecision);
+      const reviewer = validateActor(actor, "approval.actor");
+      const receivedTargetHash = validateTargetHash(targetHash, "approval.targetHash");
+      return transaction(() => {
+        const row = requireApprovalRow(id);
+        if (row.status !== "PENDING") {
+          fail("REVIEW_INVALIDATED", `approval "${id}" is not pending`, {
+            approvalId: id,
+            taskId: row.task_id,
+            status: row.status,
+          });
+        }
+        const taskRow = requireTaskRow(row.task_id);
+        if (taskRow.status !== "AWAITING_ACCEPTANCE") {
+          fail("TASK_VERSION_CONFLICT", `task "${row.task_id}" is not AWAITING_ACCEPTANCE`, {
+            taskId: row.task_id,
+            status: taskRow.status,
+            currentVersion: Number(taskRow.version),
+            reason: "not-awaiting-acceptance",
+          });
+        }
+        if (receivedTargetHash !== row.target_hash) {
+          fail("APPROVAL_STALE", `approval "${id}" is bound to a different target`, {
+            approvalId: id,
+            taskId: row.task_id,
+            expectedTargetHash: row.target_hash,
+            receivedTargetHash,
+          });
+        }
+        if (taskRow.target_hash !== null && taskRow.target_hash !== undefined && taskRow.target_hash !== receivedTargetHash) {
+          fail("APPROVAL_STALE", `task "${row.task_id}" moved to a different target`, {
+            approvalId: id,
+            taskId: row.task_id,
+            expectedTargetHash: taskRow.target_hash,
+            receivedTargetHash,
+          });
+        }
+        const at = nowIso();
+        // m4-contracts §1 line 50 + Lead ruling: a rejected acceptance re-queues
+        // the Task directly (AWAITING_ACCEPTANCE -> READY). It must NOT go
+        // through Task.REJECTED: that state means "review requested changes" and
+        // can only be left by reworkTask (which requires a CHANGES_REQUESTED
+        // Review), while an acceptance rejection happens with a PASS Review.
+        const taskTo = decision === "APPROVED" ? "DONE" : "READY";
+        const task = transitionTaskInTx(row.task_id, taskTo);
+        if (decision === "REJECTED") {
+          insertEvent(
+            makeEvent({
+              projectId: taskRow.project_id,
+              aggregateType: "task",
+              aggregateId: row.task_id,
+              type: "task.updated",
+              payload: {
+                taskId: row.task_id,
+                status: "READY",
+                previousStatus: "AWAITING_ACCEPTANCE",
+                reason: "rework",
+              },
+              now: at,
+            }),
+          );
+        }
+        stmt(
+          `UPDATE approvals
+              SET status = ?, decision = ?, actor = ?, at = ?, decided_at = ?, version = version + 1
+            WHERE id = ?`,
+        ).run(decision, decision, reviewer, at, at, id);
+        insertEvent(
+          makeEvent({
+            projectId: taskRow.project_id,
+            aggregateType: "approval",
+            aggregateId: id,
+            type: "approval.recorded",
+            payload: {
+              taskId: row.task_id,
+              approvalId: id,
+              decision,
+              status: decision,
+              targetHash: receivedTargetHash,
+              actor: reviewer,
+            },
+            now: at,
+          }),
+        );
+        return { approval: approvalJson(requireApprovalRow(id)), task };
       });
     },
 

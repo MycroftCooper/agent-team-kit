@@ -46,10 +46,33 @@ export const ERROR_MESSAGE_KEYS: Record<ErrorCode, MessageKey> = {
   STALE_GENERATION: "error.code.STALE_GENERATION",
   CAPABILITY_UNAVAILABLE: "error.code.CAPABILITY_UNAVAILABLE",
   REVIEW_INVALIDATED: "error.code.REVIEW_INVALIDATED",
+  SELF_REVIEW_FORBIDDEN: "error.code.SELF_REVIEW_FORBIDDEN",
+  EVIDENCE_MISSING: "error.code.EVIDENCE_MISSING",
+  APPROVAL_STALE: "error.code.APPROVAL_STALE",
+  REWORK_LIMIT_REACHED: "error.code.REWORK_LIMIT_REACHED",
   RUNTIME_UNAVAILABLE: "error.code.RUNTIME_UNAVAILABLE",
   GATE_NOT_PASSED: "error.code.GATE_NOT_PASSED",
   INTERNAL_ERROR: "error.code.INTERNAL_ERROR",
 };
+
+/**
+ * M4 review/acception error codes get their own titles so the workbench can tell
+ * "you may not review this" apart from "your evidence is incomplete" and
+ * "the target changed under you" at a glance.
+ */
+const ERROR_TITLE_KEYS: Record<string, MessageKey> = {
+  NOT_AUTHORIZED: "error.title.unauthorized",
+  TASK_VERSION_CONFLICT: "error.title.conflict",
+  VERSION_CONFLICT: "error.title.conflict",
+  SELF_REVIEW_FORBIDDEN: "error.title.selfReview",
+  EVIDENCE_MISSING: "error.title.evidence",
+  APPROVAL_STALE: "error.title.stale",
+  REWORK_LIMIT_REACHED: "error.title.reworkLimit",
+};
+
+export function errorTitleKey(code: string): MessageKey {
+  return ERROR_TITLE_KEYS[code] ?? "error.title";
+}
 
 export function isKnownErrorCode(code: unknown): boolean {
   return isErrorCode(code);
@@ -92,9 +115,7 @@ export function describeError(failure: Partial<ApiFailure> | null | undefined): 
 
   const known = isErrorCode(code);
   const version = versionFromDetails(failure?.details);
-  const isConflict = code === "TASK_VERSION_CONFLICT" || code === "VERSION_CONFLICT";
-  const titleKey: MessageKey =
-    code === "NOT_AUTHORIZED" ? "error.title.unauthorized" : isConflict ? "error.title.conflict" : "error.title";
+  const titleKey = errorTitleKey(code);
 
   return {
     code,
@@ -104,5 +125,29 @@ export function describeError(failure: Partial<ApiFailure> | null | undefined): 
     params: known ? (version === null ? {} : { version }) : { code },
     retryable: known ? ERROR_CODES[code].retryable : false,
     requestId,
+  };
+}
+
+/**
+ * Everything a write-failure panel must show: the localized title/message, the
+ * *verbatim* server `message`, the raw `details` and the code. The UI never
+ * replaces the server's words with a local guess — it translates the code and
+ * keeps the server payload visible underneath.
+ */
+export type ActionErrorView = ErrorDescriptor & {
+  serverMessage: string | null;
+  details: unknown;
+  hasDetails: boolean;
+};
+
+export function actionErrorView(failure: Partial<ApiFailure> | null | undefined): ActionErrorView {
+  const descriptor = describeError(failure);
+  const serverMessage = typeof failure?.message === "string" && failure.message.trim() !== "" ? failure.message : null;
+  const details = failure?.details;
+  return {
+    ...descriptor,
+    serverMessage,
+    details,
+    hasDetails: details !== undefined && details !== null,
   };
 }

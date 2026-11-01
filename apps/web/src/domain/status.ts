@@ -8,7 +8,7 @@
 //
 // Tones express *semantics only* (success / warning / danger / info); plain
 // metadata stays neutral. CSS lives in src/styles/tokens.css.
-import { PRIORITY, type AcceptanceStatus, type AgentStatus, type FunctionKind, type GateStatus, type IntegrationStatus, type ReviewStatus, type RunStatus, type TaskStatus } from "@atk/contracts";
+import { PRIORITY, type AcceptanceStatus, type AgentStatus, type FunctionKind, type GateStatus, type IntegrationStatus, type ReviewStatus, type ReviewVerdict, type RunStatus, type TaskStatus } from "@atk/contracts";
 import type { MessageKey } from "../i18n/en.ts";
 
 export type Tone = "neutral" | "info" | "success" | "warning" | "danger";
@@ -28,6 +28,8 @@ const TASK_STATUS_META: Record<TaskStatus, StatusMeta> = {
   DONE: { key: "status.task.DONE", tone: "success" },
   BLOCKED: { key: "status.task.BLOCKED", tone: "danger" },
   CANCELLED: { key: "status.task.CANCELLED", tone: "neutral" },
+  // M4: rework waiting room (REJECTED -> READY re-queues the task).
+  REJECTED: { key: "status.task.REJECTED", tone: "warning" },
 };
 
 const RUN_STATUS_META: Record<RunStatus, StatusMeta> = {
@@ -56,6 +58,9 @@ const REVIEW_STATUS_META: Record<ReviewStatus, StatusMeta> = {
   PASS: { key: "status.review.PASS", tone: "success" },
   FAIL: { key: "status.review.FAIL", tone: "danger" },
   INVALIDATED: { key: "status.review.INVALIDATED", tone: "warning" },
+  // M4: the candidate needs rework / the task is parked for a human decision.
+  CHANGES_REQUESTED: { key: "status.review.CHANGES_REQUESTED", tone: "warning" },
+  BLOCKED: { key: "status.review.BLOCKED", tone: "danger" },
 };
 
 const INTEGRATION_STATUS_META: Record<IntegrationStatus, StatusMeta> = {
@@ -87,6 +92,17 @@ const FUNCTION_META: Record<FunctionKind, StatusMeta> = {
   REVIEWER: { key: "status.function.REVIEWER", tone: "neutral" },
 };
 
+/**
+ * Verdict labels are badges, not form options: `FAIL` stays for historical QA
+ * receipts while the M4 verdict pair is CHANGES_REQUESTED / BLOCKED.
+ */
+const REVIEW_VERDICT_META: Record<ReviewVerdict, StatusMeta> = {
+  PASS: { key: "status.verdict.PASS", tone: "success" },
+  FAIL: { key: "status.verdict.FAIL", tone: "danger" },
+  CHANGES_REQUESTED: { key: "status.verdict.CHANGES_REQUESTED", tone: "warning" },
+  BLOCKED: { key: "status.verdict.BLOCKED", tone: "danger" },
+};
+
 export const STATUS_GROUP_META: Record<StatusGroup, { labelKey: MessageKey; byValue: Record<string, StatusMeta> }> = {
   task: { labelKey: "statusGroup.task", byValue: TASK_STATUS_META },
   run: { labelKey: "statusGroup.run", byValue: RUN_STATUS_META },
@@ -112,6 +128,15 @@ export function statusMeta(group: StatusGroup, value: string | null | undefined)
     return { key: "status.unknown", tone: "neutral" };
   }
   return table[key];
+}
+
+/** Total: verdict badges fall back to `status.unknown` for unknown values. */
+export function verdictMeta(value: string | null | undefined): StatusMeta {
+  const key = String(value ?? "");
+  if (!Object.prototype.hasOwnProperty.call(REVIEW_VERDICT_META, key)) {
+    return { key: "status.unknown", tone: "neutral" };
+  }
+  return REVIEW_VERDICT_META[key as ReviewVerdict];
 }
 
 export type PriorityMeta = { key: MessageKey; params?: { value: string | number }; tone: Tone };

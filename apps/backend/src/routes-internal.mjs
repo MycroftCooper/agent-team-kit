@@ -818,9 +818,44 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
         }
 
         const request = parseClaimRequest(body);
+        // 404 first: a missing Task is NOT_FOUND, not a claim conflict.
+        const task = store.getTask(taskId);
+
+        // B6: durable idempotency before the contract-layer "claimable" checks.
+        // After a Backend restart the in-process map is empty and the Task is
+        // already CLAIMED, so those checks would answer 409 before the store can
+        // replay the original result from its persisted idempotency_key.
+        // store.claimTask is atomic: a replay returns the original
+        // {run, command, task}; a truly invalid claim rolls back with no writes
+        // and falls through to the friendly contract-layer validation below.
+        if (typeof store.claimTask === "function") {
+          try {
+            const replayed = store.claimTask({
+              taskId,
+              agentId: request.agentId,
+              expectedTaskVersion: request.expectedTaskVersion,
+              function: request.requestedFunction,
+              role: request.requestedRole,
+              workspacePolicy: request.workspacePolicy,
+              policies: request.policies,
+              idempotencyKey: request.idempotencyKey,
+            });
+            if (isPlainObject(replayed) && replayed.run && replayed.command && replayed.task) {
+              rememberClaim(request.idempotencyKey, replayed);
+              try {
+                hub?.pump?.();
+              } catch (error) {
+                logger?.error?.(`[atk] SSE pump failed after replayed claim: ${error?.message ?? error}`);
+              }
+              sendJson(res, 200, replayed);
+              return;
+            }
+          } catch {
+            // Not a replay: report the friendly contract-layer error below.
+          }
+        }
 
         // --- the 7-step contract-layer validation (never rely on store errors) ---
-        const task = store.getTask(taskId); // 404 NOT_FOUND
         assertTaskClaimable(task, request.expectedTaskVersion); // step 1
         assertDependenciesDone(task); // step 2
         const effective = resolveClaimAgent(request.agentId, task, request.requestedFunction, request.requestedRole); // step 3

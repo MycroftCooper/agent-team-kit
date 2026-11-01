@@ -8,6 +8,10 @@
 // - `_dropEventsBefore(seq)` simulates a pruned event log for the resync test
 import { createEvent } from "@atk/contracts";
 
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
 }
@@ -28,7 +32,7 @@ export function createFakeStore(seed = {}) {
   const leases = new Map();
   let events = [];
   let seq = 0;
-  let counters = { task: 0, run: 0, requirement: 0, approval: 0, command: 0 };
+  let counters = { task: 0, run: 0, requirement: 0, approval: 0, command: 0, review: 0 };
   let snapshotVersion = 1;
 
   for (const project of seed.projects ?? []) projects.set(project.id, { version: 0, createdAt: nowIso(), ...clone(project) });
@@ -73,6 +77,20 @@ export function createFakeStore(seed = {}) {
     error.code = "STALE_GENERATION";
     error.details = details;
     throw error;
+  }
+
+  function fail(code, message, details) {
+    const error = new Error(message);
+    error.code = code;
+    error.details = details;
+    throw error;
+  }
+
+  function recordEvent({ projectId = null, aggregateType, aggregateId, type, payload = {} }) {
+    seq += 1;
+    const event = createEvent({ seq, projectId, aggregateType, aggregateId, type, payload });
+    events.push(event);
+    return clone(event);
   }
 
   return {
@@ -693,18 +711,272 @@ export function createFakeStore(seed = {}) {
       return clone(agent);
     },
 
-    listReviews({ status } = {}) {
-      return [...reviews.values()].filter((review) => !status || review.status === status).map(clone);
+    // ---- M4: reviews / rework / human approval (m4-contracts §1) ----
+    listReviews({ taskId, status, limit } = {}) {
+      let items = [...reviews.values()];
+      if (taskId) items = items.filter((review) => review.taskId === taskId);
+      if (status) items = items.filter((review) => review.status === status);
+      if (Number.isInteger(limit)) items = items.slice(0, limit);
+      return items.map(clone);
     },
-    listApprovals({ taskId, status } = {}) {
-      return [...approvals.values()]
-        .filter((approval) => (!taskId || approval.taskId === taskId) && (!status || approval.status === status))
-        .map(clone);
+    getReview(id) {
+      const review = reviews.get(id);
+      if (!review) fail("NOT_FOUND", `review ${id} not found`, { entity: "review", id });
+      return clone(review);
     },
-    createApproval(dto) {
-      const approval = { ...clone(dto), id: dto.id ?? nextId("APR", "approval"), createdAt: nowIso() };
+    createReview({ taskId, runId = null, actor = "HUMAN", attempt } = {}) {
+      const task = requireTask(taskId);
+      if (task.status !== "REVIEWING") {
+        fail("TASK_VERSION_CONFLICT", `task ${taskId} is not REVIEWING`, {
+          taskId,
+          status: task.status,
+          currentVersion: task.version,
+          reason: "not-reviewing",
+        });
+      }
+      if (runId) {
+        const run = requireRun(runId);
+        if (run.taskId !== taskId) fail("VALIDATION_ERROR", `run ${runId} does not belong to task ${taskId}`, { errors: ["runId does not belong to task"] });
+      }
+      const active = [...reviews.values()].find((review) => review.taskId === taskId && review.status === "PENDING" && review.verdict === null);
+      if (active) {
+        fail("VERSION_CONFLICT", `task ${taskId} already has an active review`, {
+          entity: "review",
+          taskId,
+          activeReviewId: active.id,
+          currentVersion: active.version ?? 0,
+        });
+      }
+      counters.review += 1;
+      const review = {
+        id: `REV-${counters.review.toString(36).toUpperCase()}`,
+        taskId,
+        runId,
+        actor,
+        status: "PENDING",
+        verdict: null,
+        attempt: Number.isInteger(attempt) && attempt > 0 ? attempt : 1,
+        version: 0,
+        findings: [],
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      };
+      reviews.set(review.id, review);
+      recordEvent({
+        projectId: task.projectId ?? null,
+        aggregateType: "review",
+        aggregateId: review.id,
+        type: "review.requested",
+        payload: { reviewId: review.id, taskId, runId, actor, attempt: review.attempt },
+      });
+      return clone(review);
+    },
+    submitReview({ id, expectedVersion, verdict, manifestHash = null, commitSha = null, findings = [], evidence = null, actor = "HUMAN" } = {}) {
+      const review = reviews.get(id);
+      if (!review) fail("NOT_FOUND", `review ${id} not found`, { entity: "review", id });
+      if (review.version !== expectedVersion) {
+        fail("VERSION_CONFLICT", `review ${id} version conflict`, {
+          entity: "review",
+          id,
+          currentVersion: review.version,
+          expectedVersion,
+        });
+      }
+      if (review.status !== "PENDING") {
+        fail("VERSION_CONFLICT", `review ${id} is not pending`, { entity: "review", id, status: review.status, reason: "not-pending", currentVersion: review.version });
+      }
+      const task = requireTask(review.taskId);
+      const run = review.runId ? runs.get(review.runId) ?? null : null;
+      const authorAgentId = run?.agentId ?? task.assignee ?? null;
+      if (authorAgentId && authorAgentId === actor) {
+        fail("SELF_REVIEW_FORBIDDEN", "the author cannot review their own work", { actor, authorAgentId });
+      }
+      if (verdict !== "PASS" && verdict !== "CHANGES_REQUESTED" && verdict !== "BLOCKED") {
+        fail("VALIDATION_ERROR", "unsupported verdict", { errors: ["verdict must be PASS, CHANGES_REQUESTED or BLOCKED"] });
+      }
+      if (verdict === "PASS") {
+        const tests = isPlainObject(evidence?.tests) ? evidence.tests : null;
+        if (typeof manifestHash !== "string" || manifestHash.trim() === "" || !tests || !Number.isInteger(tests.passed) || !Number.isInteger(tests.total) || tests.total <= 0 || tests.passed !== tests.total) {
+          fail("EVIDENCE_MISSING", "PASS requires manifestHash and passing tests", { errors: ["manifestHash and evidence.tests.passed===total>0 are required"] });
+        }
+      }
+      if (verdict === "CHANGES_REQUESTED" && (!Array.isArray(findings) || findings.length === 0)) {
+        fail("VALIDATION_ERROR", "CHANGES_REQUESTED requires findings", { errors: ["findings must be a non-empty array"] });
+      }
+      const previousTaskStatus = task.status;
+      review.verdict = verdict;
+      review.status = verdict === "PASS" ? "PASS" : verdict === "CHANGES_REQUESTED" ? "CHANGES_REQUESTED" : "BLOCKED";
+      review.version += 1;
+      review.manifestHash = manifestHash;
+      review.commitSha = commitSha;
+      review.findings = clone(findings ?? []);
+      review.evidence = clone(evidence);
+      review.submittedAt = nowIso();
+      review.updatedAt = review.submittedAt;
+      task.status = verdict === "PASS" ? "INTEGRATING" : verdict === "CHANGES_REQUESTED" ? "REJECTED" : "BLOCKED";
+      task.version += 1;
+      task.updatedAt = nowIso();
+      recordEvent({
+        projectId: task.projectId ?? null,
+        aggregateType: "review",
+        aggregateId: review.id,
+        type: "review.updated",
+        payload: { reviewId: review.id, taskId: task.id, verdict, status: review.status, attempt: review.attempt, version: review.version },
+      });
+      recordEvent({
+        projectId: task.projectId ?? null,
+        aggregateType: "task",
+        aggregateId: task.id,
+        type: "task.updated",
+        payload: { taskId: task.id, status: task.status, previousStatus: previousTaskStatus, version: task.version, reason: `review-${verdict.toLowerCase()}` },
+      });
+      return { review: clone(review), task: clone(task) };
+    },
+    reworkTask({ taskId, reviewId, reason, actor = "HUMAN" } = {}) {
+      const review = reviews.get(reviewId);
+      if (!review) fail("NOT_FOUND", `review ${reviewId} not found`, { entity: "review", id: reviewId });
+      const task = requireTask(taskId);
+      if (review.status !== "CHANGES_REQUESTED") {
+        fail("VERSION_CONFLICT", `review ${reviewId} is not CHANGES_REQUESTED`, {
+          entity: "review",
+          id: reviewId,
+          status: review.status,
+          reason: "not-changes-requested",
+        });
+      }
+      const MAX_ATTEMPTS = 3;
+      const previousTaskStatus = task.status;
+      if (review.attempt >= MAX_ATTEMPTS) {
+        review.status = "BLOCKED";
+        review.version += 1;
+        review.updatedAt = nowIso();
+        task.status = "BLOCKED";
+        task.version += 1;
+        task.blockReason = "rework-limit";
+        task.updatedAt = nowIso();
+        recordEvent({
+          projectId: task.projectId ?? null,
+          aggregateType: "review",
+          aggregateId: review.id,
+          type: "review.updated",
+          payload: { reviewId: review.id, taskId, status: "BLOCKED", reason: "rework-limit", attempt: review.attempt },
+        });
+        recordEvent({
+          projectId: task.projectId ?? null,
+          aggregateType: "task",
+          aggregateId: taskId,
+          type: "task.updated",
+          payload: { taskId, status: "BLOCKED", previousStatus: previousTaskStatus, version: task.version, reason: "rework-limit" },
+        });
+        fail("REWORK_LIMIT_REACHED", `task ${taskId} reached the rework limit`, {
+          taskId,
+          attempt: review.attempt,
+          maxAttempts: MAX_ATTEMPTS,
+        });
+      }
+      review.attempt += 1;
+      review.version += 1;
+      review.updatedAt = nowIso();
+      task.status = "READY";
+      task.version += 1;
+      task.updatedAt = nowIso();
+      recordEvent({
+        projectId: task.projectId ?? null,
+        aggregateType: "review",
+        aggregateId: review.id,
+        type: "review.updated",
+        payload: { reviewId: review.id, taskId, status: review.status, reason: "rework", attempt: review.attempt, version: review.version },
+      });
+      recordEvent({
+        projectId: task.projectId ?? null,
+        aggregateType: "task",
+        aggregateId: taskId,
+        type: "task.updated",
+        payload: { taskId, status: task.status, previousStatus: previousTaskStatus, version: task.version, reason: "rework" },
+      });
+      return { review: clone(review), task: clone(task), attempt: review.attempt };
+    },
+    listApprovals({ taskId, status, limit } = {}) {
+      let items = [...approvals.values()];
+      if (taskId) items = items.filter((approval) => approval.taskId === taskId);
+      if (status) items = items.filter((approval) => approval.status === status);
+      if (Number.isInteger(limit)) items = items.slice(0, limit);
+      return items.map(clone);
+    },
+    createApproval(dto = {}) {
+      const task = requireTask(dto.taskId);
+      counters.approval += 1;
+      const now = nowIso();
+      const approval = {
+        id: dto.id ?? `APR-${counters.approval.toString(36).toUpperCase()}`,
+        taskId: dto.taskId,
+        projectId: task.projectId ?? null,
+        scope: dto.scope,
+        targetHash: dto.targetHash,
+        actor: dto.actor ?? "HUMAN",
+        status: dto.status ?? "PENDING",
+        at: dto.at ?? now,
+        version: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
       approvals.set(approval.id, approval);
+      recordEvent({
+        projectId: approval.projectId,
+        aggregateType: "approval",
+        aggregateId: approval.id,
+        type: "approval.recorded",
+        payload: { approvalId: approval.id, taskId: approval.taskId, scope: approval.scope, targetHash: approval.targetHash, status: approval.status, actor: approval.actor },
+      });
       return clone(approval);
+    },
+    decideApproval({ id, decision, actor = "HUMAN", targetHash } = {}) {
+      const approval = approvals.get(id);
+      if (!approval) fail("NOT_FOUND", `approval ${id} not found`, { entity: "approval", id });
+      const task = requireTask(approval.taskId);
+      if (approval.status !== "PENDING") {
+        fail("VERSION_CONFLICT", `approval ${id} is not pending`, { entity: "approval", id, status: approval.status, reason: "not-pending" });
+      }
+      if (approval.targetHash !== targetHash) {
+        fail("APPROVAL_STALE", `approval ${id} target hash is stale`, {
+          approvalId: id,
+          taskId: task.id,
+          expectedTargetHash: approval.targetHash,
+          receivedTargetHash: targetHash ?? null,
+        });
+      }
+      if (typeof task.targetHash === "string" && task.targetHash !== "" && task.targetHash !== targetHash) {
+        fail("APPROVAL_STALE", `task ${task.id} target hash changed`, {
+          approvalId: id,
+          taskId: task.id,
+          expectedTargetHash: task.targetHash,
+          receivedTargetHash: targetHash ?? null,
+        });
+      }
+      const previousTaskStatus = task.status;
+      approval.status = decision;
+      approval.decision = decision;
+      approval.decidedAt = nowIso();
+      approval.updatedAt = approval.decidedAt;
+      approval.version += 1;
+      task.status = decision === "APPROVED" ? "DONE" : "READY";
+      task.version += 1;
+      task.updatedAt = nowIso();
+      recordEvent({
+        projectId: approval.projectId ?? null,
+        aggregateType: "approval",
+        aggregateId: id,
+        type: "approval.recorded",
+        payload: { approvalId: id, taskId: task.id, decision, status: approval.status, targetHash, actor },
+      });
+      recordEvent({
+        projectId: approval.projectId ?? null,
+        aggregateType: "task",
+        aggregateId: task.id,
+        type: "task.updated",
+        payload: { taskId: task.id, status: task.status, previousStatus: previousTaskStatus, version: task.version, reason: `approval-${decision.toLowerCase()}` },
+      });
+      return { approval: clone(approval), task: clone(task) };
     },
 
     overview(projectId) {
