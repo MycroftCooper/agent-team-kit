@@ -552,4 +552,111 @@ if (!hasSqlite) {
       assert.ok(!text.includes("C:\\Users\\"), `${relative}: absolute user path`);
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Recheck (HEAD 97605cd): residual shape holes, --force-switch, pagination
+  // -------------------------------------------------------------------------
+  test("A6 unseen unknown-object shapes are still silently dropped (recheck)", async (t) => {
+    const cases = [
+      ["metadata object", { metadata: { a: 1, b: "x" } }],
+      ["10-level object", { metadata: (() => { let value = "leaf"; for (let i = 0; i < 10; i += 1) value = { ["level" + i]: value }; return value; })() }],
+      ["numeric-key object", JSON.parse('{"0":{"a":1}}')],
+      ["__proto__ object", JSON.parse('{"__proto__":{"a":1}}')],
+      ["constructor object", JSON.parse('{"constructor":{"a":1}}')],
+      ["batch metadata", { batch: { id: "B1", goal: "g", metadata: { a: 1 } } }],
+      ["project metadata", { project: { id: "P1", name: "p1", repoPath: ".", defaultBranch: "main", metadata: { a: 1 } } }],
+    ];
+    for (const [label, extra] of cases) {
+      assertRefusedWithoutWrites(t, label, legacyState(extra), "metadata");
+    }
+  });
+
+  test("B4 --force-switch: blocked without it, explicit+warned with it", async (t) => {
+    const dir = tempDir(t);
+    const file = path.join(dir, "data", "atk.db");
+    const exportFile = path.join(dir, "export.json");
+    const store = openStore({ file, migrate: true });
+    seedBase(store);
+    const task = store.getTask("T-KEEP");
+    const claim = store.claimTask({ taskId: task.id, agentId: "A-KEEP", expectedTaskVersion: task.version, idempotencyKey: "qa-recheck-b4" });
+    store.updateRunStatus(claim.run.id, { status: "RUNNING" });
+    store.close();
+    assert.equal(cli(["export", "--data", file, "--to", exportFile, "--json"]).status, 0);
+    const before = fingerprint(file);
+    const blocked = cli(["import", "--from", exportFile, "--data", file, "--mode", "replace", "--force", "--json"]);
+    assert.equal(blocked.status, 1);
+    assert.match(`${blocked.stdout}${blocked.stderr}`, /active-run|not ready|cannot switch/i);
+    assert.deepEqual(fingerprint(file), before, "blocked switch must not touch the target");
+    const forced = cli(["import", "--from", exportFile, "--data", file, "--mode", "replace", "--force", "--force-switch", "--json"]);
+    assert.equal(forced.status, 0, forced.stderr);
+    assert.match(forced.stdout, /"forced": true/);
+    assert.match(forced.stdout, /"switchForced": true/);
+    assert.match(forced.stderr, /warning: --force-switch discards in-flight Runs\/leases/);
+    assert.equal(fingerprint(file).runs, 0);
+  });
+
+  test("B5 --force-switch cannot bypass the online-backend refusal (order check)", async (t) => {
+    const dir = tempDir(t);
+    const file = path.join(dir, "data", "atk.db");
+    const exportFile = path.join(dir, "export.json");
+    const store = openStore({ file, migrate: true });
+    seedBase(store);
+    const task = store.getTask("T-KEEP");
+    const claim = store.claimTask({ taskId: task.id, agentId: "A-KEEP", expectedTaskVersion: task.version, idempotencyKey: "qa-recheck-b5" });
+    store.updateRunStatus(claim.run.id, { status: "RUNNING" });
+    store.close();
+    assert.equal(cli(["export", "--data", file, "--to", exportFile, "--json"]).status, 0);
+    const port = await freePort();
+    const child = spawn(process.execPath, [BACKEND, "serve", "--port", String(port), "--data", file], { cwd: REPO, windowsHide: true, env: { ...process.env, LOCALAPPDATA: dir } });
+    t.after(() => { try { child.kill(); } catch { /* gone */ } });
+    let ready = false;
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      try { if ((await fetch(`http://127.0.0.1:${port}/api/v1/system/health`)).ok) { ready = true; break; } } catch { /* not up */ }
+      await sleep(50);
+    }
+    assert.ok(ready);
+    const online = cli(["import", "--from", exportFile, "--data", file, "--mode", "replace", "--force", "--force-switch", "--port", String(port), "--json"]);
+    assert.equal(online.status, 1, "online-backend refusal must win over --force-switch");
+    assert.match(online.stderr, /backend is stopped|must run while the backend is stopped/i);
+    assert.doesNotMatch(online.stderr, /discards in-flight Runs/);
+  });
+
+  test("C4 HTTP pagination boundaries on 1001 events and exact pages (recheck)", async (t) => {
+    const dir = tempDir(t);
+    const file = path.join(dir, "data", "atk.db");
+    const store = openStore({ file, migrate: true });
+    store.createProject({ id: "P1", name: "p1", repoPath: ".", defaultBranch: "main" });
+    for (let index = 0; index < 1001; index += 1) store.appendEvent({ projectId: "P1", aggregateType: "task", aggregateId: "T1", type: "task.updated", payload: { index } });
+    store.close();
+    const port = await freePort();
+    const child = spawn(process.execPath, [BACKEND, "serve", "--port", String(port), "--data", file], { cwd: REPO, windowsHide: true, env: { ...process.env, LOCALAPPDATA: dir } });
+    t.after(() => { try { child.kill(); } catch { /* gone */ } });
+    let ready = false;
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      try { if ((await fetch(`http://127.0.0.1:${port}/api/v1/system/health`)).ok) { ready = true; break; } } catch { /* not up */ }
+      await sleep(50);
+    }
+    assert.ok(ready);
+    const session = await (await fetch(`http://127.0.0.1:${port}/api/v1/session`)).json();
+    const get = async (query) => {
+      const response = await fetch(`http://127.0.0.1:${port}/api/v1/events${query}`, { headers: { "x-atk-token": session.token } });
+      return { status: response.status, body: await response.json() };
+    };
+    const first = await get("?aggregateId=T1&limit=1000");
+    assert.equal(first.body.items.length, 1000);
+    assert.equal(first.body.hasMore, true);
+    assert.equal(first.body.nextAfterSeq, 1000);
+    const second = await get("?aggregateId=T1&limit=1000&afterSeq=1000");
+    assert.deepEqual(second.body.items.map((event) => event.seq), [1001]);
+    assert.equal(second.body.hasMore, false);
+    assert.equal("nextAfterSeq" in second.body, false);
+    const tail = await get("?aggregateId=T1&afterSeq=1001");
+    assert.deepEqual(tail.body.items, []);
+    assert.equal(tail.body.hasMore, false);
+    assert.equal("nextAfterSeq" in tail.body, false);
+    const small = await get("?aggregateId=T1&limit=2");
+    assert.deepEqual(small.body.items.map((event) => event.seq), [1, 2]);
+    assert.equal(small.body.nextAfterSeq, 2);
+    assert.equal(small.body.hasMore, true);
+  });
 }

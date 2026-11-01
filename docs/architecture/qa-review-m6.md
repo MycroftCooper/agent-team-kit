@@ -251,3 +251,81 @@ node --test test/m6-qa-adversarial.test.mjs   # 19 tests：14 pass / 5 fail（�
 # M2 import 非 PASS exit 0   -> F1 红
 # M3 backup 直接复制 .db     -> E4 红（live WAL）
 ```
+
+---
+
+## 8. 复验（HEAD `97605cd`，QA-007 修复后）
+
+- 复验日期：2026-11-02；对象 `97605cd`（修复提交 `7a630b4` / `003066d` / `97605cd`），工作区干净。
+- 复验未改产品代码；`test/m6-qa-adversarial.test.mjs` 追加了 4 条复验用例（A6/B4/B5/C4），报告追加本节。
+
+### 8.1 数字（HEAD 97605cd）
+
+| 检查 | 结果 |
+|---|---|
+| `node scripts/test.mjs` | 追加复验用例前 **471/471**（0 fail / 0 skipped）；追加 A6/B4/B5/C4 后 **475 tests / 474 pass / 1 fail**（A6 残余形状缺口） |
+| `node scripts/test-workspace.mjs` | **604/604**（59 文件） |
+| `node scripts/check-boundaries.mjs` | **PASS：9 package / 6 edge / 0 cycle** |
+| `m3 / m4 / m5 / m6-smoke` | **6/6、9/9、4/4、9/9**（m6-smoke 新增 2 条真实 HTTP 分页） |
+| 本 QA 套件（23 条：原 19 + A6/B4/B5/C4） | **22 pass / 1 fail**（A6 残余形状缺口） |
+
+### 8.2 三个原 MAJOR 的复验
+
+| 原缺陷 | 复验结论 | 证据 |
+|---|---|---|
+| QA7-01 未知集合 fail-closed | **数组路径已修；对象路径仍有残余 MAJOR（QA7-01r，见 §8.3）** | 未知**数组**（含 10 层深、数字键、`__proto__`、`constructor`、`batch.nested`）→ SKIPPED `IMPORT_WRITE_FAILED`，零写入；但未知**非空对象（无数组）**仍 PASS 并清库 |
+| QA7-02 活跃 Run 切换 | **已修** | 有 RUNNING Run/命令时 import replace → exit1，**数据库 main/wal/journal sha256 与 counts 完全不变**；`--force-switch` → exit0、stderr 有 `warning: --force-switch discards in-flight Runs/leases`、stdout `"forced": true` + `"switchForced": true`；backend 在线 + `--force-switch` → exit1 且是 online 拒绝（“backend is stopped”），**在线检查先于 readiness/force** |
+| QA7-03 HTTP 事件分页 | **已修** | 1001 条/limit=1000：items=1000、hasMore=true、nextAfterSeq=1000，第二页 seq1001 且 hasMore=false 无 next；正好 1000 条：hasMore=false 无 next；3 条/limit=2 第二页 seq3；4 条/limit=2 两页 [1,2]/[3,4]；`afterSeq` 指向最后一条/空结果：`{items:[],hasMore:false}` 且**无 nextAfterSeq 键** |
+| QA7-04 CLAIMED→RUNNING | **已修** | B1 用例转绿，export→replace 保持 CLAIMED |
+| QA7-05 store `aggregateId` 校验 | **未修（MINOR）** | `store.listEventsPage({aggregateId:"bad id!"})` 仍不抛错（`code:null`）；仅 HTTP 层 400 |
+| QA7-06 `store.verifySwitchReadiness` | **未修（MINOR）** | sqlite store 上 `typeof store.verifySwitchReadiness === "undefined"`；仍只有 `@atk/database` 导出函数 + backend serve 的临时 shim |
+
+### 8.3 残余 MAJOR（QA7-01r）：未知**非空对象**仍被静默丢弃
+
+- 提交 `97605cd` 的说明与 Lead 口径是“Unknown non-empty arrays **and objects** are now both refused at any depth”；实际 `scanUnsupportedCollections` 对未知键只做 `firstNestedArray()`：对象里没有**非空数组**就直接放行（`import-export.mjs` 498-547）。
+- 复现（真实 SQLite，初始 tasks/agents/events 各 1；`mode:"replace", force:true`）以下全部 **`status:"PASS"`、零错误、旧库被清空（tasks/agents/events=0）**：
+  - `{ metadata: { a: 1, b: "x" } }`
+  - `{ metadata: {10 层嵌套，叶子是字符串} }`
+  - `{ "0": { a: 1 } }`（数字键对象）
+  - `JSON.parse('{"__proto__":{"a":1}}')`、`JSON.parse('{"constructor":{"a":1}}')`
+  - `batch.metadata` / `project.metadata` / `counts.metadata` 对象
+  - 空对象 `{metadata:{}}` 放行是合理的（无数据）；以上是**非空**对象。
+- 已拒绝的对照：同样结构只要叶子是**非空数组**（如 `metadata.level…arr:[1]`、`"0":[1]`、`__proto__.arr:[1]`、`constructor.arr:[1]`）→ SKIPPED + 零写入。
+- 影响：与 QA7-01 同类——调用方把新集合/扩展数据以对象形式放进 state，replace 清空旧库后 PASS，数据被丢弃；也与提交说明/Lead 的“unknown objects refused”直接矛盾。
+- 定级：**MAJOR（残余）**。归属：worker-database / Lead。
+- 建议：对未知键的对象值也 fail-closed（至少“非空对象”拒绝，空对象可放行）；或把 `firstNestedArray` 替换为“未知子树中任何非空数组或非空对象 → 拒绝”，并在错误里保留 dotted path。`batch.slices` 记录内部的未知字段目前会被 `legacy.item` 原样保存（已验证 `meta:{a:1,arr:[1,2]}` 保留），若白名单设计要允许这种“记录内扩展”，需在文档中显式区分“记录内部扩展”与“集合/顶层扩展”。
+
+### 8.4 `m6-smoke` 9/9 自审与 QA7-07 剩余项
+
+新增的两条 HTTP 分页 check（3/4/105 条 + 非法参数 400）是真实且有效的，复验通过。仍然缺：
+
+| # | 缺口 | 现状 |
+|---|---|---|
+| 1 | **>1000 事件** | check1 仍只 seed 105；契约 §3.1 要求 >1000；limit=1000 的 `hasMore/nextAfterSeq` 边界未被门禁覆盖 |
+| 2 | **写入中途失败回滚指纹** | check4 的坏 payload 仍是 `batch.tasks`（写前校验阶段），**不进 clear/写入事务**；因此门禁无法发现“事务回滚被破坏” |
+| 3 | **v1/v4→v5 行为** | check7 仍只断言 `schemaVersion===5` + project 行；没有 tasks/events 保留、旧事件按 aggregateId 查询、v4→v5 |
+| 4 | 未知**对象**形状 | §8.3 的残余缺口没有任何门禁用例 |
+
+**最小可执行清单（每行一句话 + 期望断言，可直接进 m6-smoke）：**
+
+1. **>1000 事件**：`seedOnlyEvents(file, 1005, "M6-MANY")` 后
+   - `store.listEventsPage({aggregateId:"M6-MANY", limit:1000})` → `items.length===1000 && hasMore===true && nextAfterSeq===1000`；用 `afterSeq:1000` 再查 → `items.length===5 && hasMore===false`；
+   - HTTP `GET /api/v1/events?aggregateId=M6-MANY&limit=1000` → 同样 1000/true/1000，第二页 5 条，全量 seq 无重无漏。
+2. **写入中途失败回滚**：用 in-process `importStateJson`（临时 DB，`openStore` 后把 `store.createTask` 包成“第 2 次调用抛错”，`mode:"replace"`）→
+   - `report.status==="SKIPPED"` 且 problems 含 `IMPORT_WRITE_FAILED`；
+   - 13 张业务表 counts + `schema_migrations` 版本集合在调用前后 **deepEqual**；
+   - reopen `migrate:true` → `schemaVersion===5`、`migrationWarnings()===[]`。
+3. **v1/v4→v5 行为**：用 raw SQL 建 v1 与 v4 两个库（0001/0001-0004 + 账本行 + project/task/event），`openStore({migrate:true})` 后分别断言
+   - `health().schemaVersion===5`；`listTasks()` 含旧任务；`listEvents({aggregateId:"V-T"})` 返回旧事件；`idx_events_type_seq` 存在；账本 1..5。
+4. **（修 §8.3 后）未知对象形状**：`importStateJson(mode:"replace", stateJson:{metadata:{a:1}})` → `status==="SKIPPED"` + 全量 fingerprint 不变。
+
+**哪些已由对抗套件覆盖、哪些必须进门禁**：
+- 已由 QA 套件覆盖：A1/A2/A3/A6（形状）、A5（写入中途回滚指纹）、B1-B5（内容/幂等/活跃 Run/force-switch/在线顺序）、C1-C4（过滤/分页/HTTP 边界）、D1-D2（v1/v4 行为、账本自愈）、E1-E4（backup/tamper/live WAL）、F1-F2。
+- **必须单独进 m6-smoke**：上表 1、2、3（门禁要能独立防回归，不能依赖 QA 套件）；4 在 §8.3 修复后加入。
+- QA7-05/06（store 参数校验/store 方法）建议作为 MINOR 顺带修，不阻塞门禁清单。
+
+### 8.5 复验结论（直接回答）
+
+**M6 当前仍不可标记完成。** 原 3 个 MAJOR 中，**QA7-02、QA7-03 已修并复验通过，QA7-01 只修了数组/集合路径**：未知**非空对象**（metadata、10 层嵌套、数字键、`__proto__`、`constructor`、batch/project/counts 下的对象）仍会 `PASS` 并清空旧库（§8.3 QA7-01r MAJOR），与修复提交自己的“unknown objects refused”说明矛盾。另有 QA7-05/06 两个 MINOR 未修。**修掉 QA7-01r（未知非空对象 fail-closed）并补上 §8.4 的 3 条门禁后，M6 才可以标记完成。**
+
+“v1.0 可用 ≠ 生产可用”的边界与 §7 相同：Mock DSH、无安装包/自动更新、无浏览器 E2E、旧 CLI 仍 JSON 事实源、JSON export/import 不含 runs/events/leases、单机 Windows、Node<22.5 时套件整体 SKIP。
