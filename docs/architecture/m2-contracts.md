@@ -135,3 +135,32 @@ node scripts/m2-smoke.mjs                        # Lead 写的端到端门禁
 4. **重启对账**：Host 跑到一半被杀 → 新 Host 启动先 `reconcile` → Run 标 `INTERRUPTED`（**不得** `COMPLETED`），且不会二次启动同一 Run；
 5. **generation fencing**：旧 Host 用过期 generation 上报 → 409，Backend 状态不被覆盖；
 6. 失败路径：`startFails` → Run `FAILED` + 可读错误；`neverEnds` → 超时后 `INTERRUPTED`。
+
+---
+
+## 6. 已实现状态与最终裁决（M2 收尾）
+
+实现与本文档的差异已收敛为下面 7 条裁决，代码、测试与 [m2-status.md](../roadmap/m2-status.md) 以此为准：
+
+| # | 裁决 |
+|---|---|
+| 1 | `run.created` 只由 `createRun` 写；**`run.updated` 只由 `updateRunStatus` 写**（同事务）；`appendRunEvent` 只承载 `run.log`（收到 `run.updated` 按普通事件写入，不做特殊处理）。早期两边都写会产生**两条** `run.updated` |
+| 2 | `updateRunStatus(id, { status, exitCode?, endedAt?, generation? })`：给了 `generation` 就在同一事务校验租约，不符 → `STALE_GENERATION`（409，`details {runId, generation, currentGeneration, reason}`）且零写入；不给则 M1 行为 |
+| 3 | `appendRunEvent({ runId, generation, events })`：只校验 generation 与租约存在/未过期；**`events: []` 是合法的纯 fence**；不推进 Run 状态 |
+| 4 | **释放租约 = 置为过期，不删行**；`reconcileRun` 对已完成的 Run 返回**已过期 lease（generation 保留）** 而不是 null。删行会让 generation 从 1 重来，旧 Host 可能重新匹配 → fencing 失效 |
+| 5 | Host 领到 `attempts > 1` 的命令**绝不重启会话**：上报 `session.ended(interrupted)` 并把命令置 `FAILED`（`result.reason = "reclaimed-after-lost-lease"`） |
+| 6 | 同一 Run 同时只允许一个 live lease；claim 先重试过期命令、再取新命令 |
+| 7 | Runtime SDK 零运行时依赖（只声明 `@atk/contracts` 为允许依赖，src 不 import）；`createDshRuntimeStub()` 七项能力全 false、`probe()` false、所有操作 reject `CAPABILITY_UNAVAILABLE` |
+
+**内部 API 最终响应形状**
+
+| Endpoint | 响应 |
+|---|---|
+| `GET /internal/v1/dispatch/claim` | 200 `{ command, run, task, lease: { ownerId, generation, claimedUntil } }` / 204 无活 |
+| `POST /internal/v1/dispatch/:id/result` | 200 `{ command, run }`（同 generation 幂等） / 409 `STALE_GENERATION` |
+| `POST /internal/v1/runs/:id/renew` | 200 `{ lease }`（generation+1） / 409 |
+| `POST /internal/v1/runs/:id/events` | 200 `{ run, appended, skipped }`（`appended` 只含 `run.log`；纯状态批次为 `[]`） / 409 |
+| `POST /internal/v1/runtime/heartbeat` | 200 `{ ok, ownerId, status, receivedAt }` |
+| `GET /internal/v1/runs/:id/reconcile` | 200 `{ run, lease\|null, sessions: [] }`（M2 `sessions` 恒为空数组） |
+
+**门禁实测（`node scripts/m2-smoke.mjs`）**：3/3 通过——COMPLETED 且 `run.updated` 恰好 2 条（RUNNING→COMPLETED）无重复；死 Host 的命令被回收后 `INTERRUPTED` 且恢复 Host **0 次启动**；过期 generation → `409 STALE_GENERATION` 且 Run 保持 `STARTING v0`。

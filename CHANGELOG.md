@@ -6,6 +6,48 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (M2 / v0.5)
+
+- `packages/runtime-sdk`: the `AgentRuntime` interface (probe/capabilities/start/
+  send/stop/reconnect/subscribe), runtime event types with validators, a
+  deterministic scriptable **MockRuntime** (scenario DSL plus start-failure,
+  slow-start, crash, ignore-stop and never-end injections, timer cleanup) and a
+  `createDshRuntimeStub()` whose seven capabilities are **all false** and whose
+  `start()` rejects with `CAPABILITY_UNAVAILABLE` — the real adapter cannot be
+  enabled by accident while RT-P07/P08 are unverified.
+- `packages/database` (M2): ordered migration `0002_runs_dispatch.sql`, a Run
+  status machine, atomic `claimDispatchCommand` (verified with two real SQLite
+  connections racing on a barrier: exactly one winner), lease renewal with
+  monotonic generation, `updateRunStatus(..., { generation })` for in-transaction
+  fencing, and `reconcileRun`. Releasing a lease expires it instead of deleting
+  the row, so a generation can never restart at 1.
+- `apps/backend` (M2): `/internal/v1/*` (claim, result, renew, events,
+  heartbeat, reconcile) behind a **separate** internal credential that is printed
+  once by `serve`, never persisted and never accepted from a browser; runtime
+  events are mapped to Run state and pushed to SSE clients immediately, so the UI
+  finally receives real `run.updated` / `run.log` events. Exactly one
+  `run.updated` per transition (no duplicates).
+- `apps/runtime-host`: a process that claims durable commands, drives one
+  `AgentRuntime` session, forwards facts, renews leases and completes commands —
+  and never writes the database. A reclaimed command (`attempts > 1`) is never
+  restarted: it is reported `INTERRUPTED` and closed as `FAILED`.
+- `packages/workspace`: one git worktree per Run outside the repository, with
+  path/branch validation and a removal that refuses uncommitted work unless the
+  caller passes both `force` and `confirmClean`.
+- `scripts/m2-smoke.mjs`: end-to-end gate (real backend + SQLite + internal HTTP,
+  MockRuntime only) asserting completion, crash/reclaim with **zero** restarts,
+  and generation fencing leaving the row untouched. 3/3.
+- ADR-010 (the Host talks only to the internal API; MockRuntime first; the real
+  DSH adapter stays experimental) and `docs/architecture/m2-contracts.md`.
+
+### Changed (M2 / v0.5)
+
+- `packages/contracts`: `STALE_GENERATION` (409) for lease/generation fencing and
+  the `run.log` event type. The web app's completeness guards caught both, and
+  the en/zh-CN dictionaries plus the TS type mirror now cover them.
+- The M1 smoke gate and QA's migration test assert "a migration ran" rather than
+  pinning generation 1, so additive migrations are not reported as regressions.
+
 ### Added (M1 / v0.4)
 
 - pnpm workspace: `apps/backend`, `apps/web`, `packages/database`, `packages/contracts`.
