@@ -7,11 +7,12 @@
 // Usage: node scripts/m6-smoke.mjs
 // Exit: 0 = all checks pass, 1 = a check failed, 2 = prerequisites missing.
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -23,8 +24,7 @@ if (!existsSync(BACKEND)) {
   process.exit(2);
 }
 
-const { openStore } = await load("packages/database/src/index.mjs");
-const { verifySwitchReadiness } = await load("packages/database/src/index.mjs");
+const { openStore, verifySwitchReadiness, exportStateJson, importStateJson } = await load("packages/database/src/index.mjs");
 
 const checks = [];
 const results = [];
@@ -152,6 +152,75 @@ async function collectEventSeqs({ base, token, aggregateId, limit, expected, pag
   expect(new Set(seqs).size === seqs.length, `pagination returned duplicate seq: ${JSON.stringify(seqs)}`);
   expect(JSON.stringify(seqs) === JSON.stringify(expected), `paged seq mismatch: got ${JSON.stringify(seqs)} expected ${JSON.stringify(expected)}`);
   return `${pageSizes.join("/")} -> seq ${expected[0]}..${expected[expected.length - 1]} exactly once`;
+}
+
+const MIGRATIONS_DIR = path.join(ROOT, "packages", "database", "migrations");
+
+function migrationFiles() {
+  return readdirSync(MIGRATIONS_DIR)
+    .filter((file) => file.endsWith(".sql"))
+    .sort();
+}
+
+/** Execute raw DDL/DML against a fresh SQLite file (used to forge old schemas). */
+function rawExec(file, statements) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  const db = new DatabaseSync(file);
+  try {
+    for (const statement of statements) db.exec(statement);
+  } finally {
+    db.close();
+  }
+}
+
+/** A fingerprint strong enough to prove a failed replace wrote nothing. */
+function schemaFingerprint(file) {
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    const names = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_migrations' ORDER BY name")
+      .all()
+      .map((row) => row.name);
+    const tables = names.map((name) => ({ name, rows: Number(db.prepare(`SELECT COUNT(*) AS c FROM "${name}"`).get().c) }));
+    const versions = db
+      .prepare("SELECT version FROM schema_migrations ORDER BY version")
+      .all()
+      .map((row) => Number(row.version));
+    return { tables, versions };
+  } finally {
+    db.close();
+  }
+}
+
+function hasSqliteIndex(file, indexName) {
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    return Boolean(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?").get(indexName));
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Forge a database at schema v1..v4 (real migration SQL + ledger rows), with one
+ * old project/task/event row, so openStore(migrate:true) can be tested for actual
+ * data survival rather than just a schemaVersion number.
+ */
+function buildVersionedDb(file, maxVersion, { taskId = "V-T" } = {}) {
+  const files = migrationFiles().filter((name) => Number(name.slice(0, 4)) <= maxVersion);
+  const statements = files.map((name) => readFileSync(path.join(MIGRATIONS_DIR, name), "utf8"));
+  statements.push("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)");
+  for (const name of files) {
+    statements.push(
+      `INSERT INTO schema_migrations (version, name, applied_at) VALUES (${Number(name.slice(0, 4))}, '${name}', '2026-01-01T00:00:00.000Z')`,
+    );
+  }
+  statements.push(
+    "INSERT INTO projects (id, name, repo_path, default_branch, version, created_at, updated_at) VALUES ('V-P', 'legacy project', '.', 'main', 0, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+    `INSERT INTO tasks (id, project_id, title, description, function_required, role_required, priority, status, acceptance, version, created_at, updated_at) VALUES ('${taskId}', 'V-P', 'legacy task', 'legacy', 'WORKER', 'DEV', 2, 'READY', 'legacy acceptance', 0, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`,
+    `INSERT INTO events (schema_version, project_id, aggregate_type, aggregate_id, type, payload_json, happened_at) VALUES (1, 'V-P', 'task', '${taskId}', 'task.updated', '{"index":7}', '2026-01-01T00:00:00.000Z')`,
+  );
+  rawExec(file, statements);
 }
 function countsOf(dbFile) {
   const store = openStore({ file: dbFile, migrate: false });
@@ -418,6 +487,154 @@ try {
     } finally {
       store.close();
     }
+  });
+
+  check("events beyond 1000 page correctly through both store and real HTTP", async () => {
+    const file = path.join(tmp, "http-events", "many.db");
+    seedOnlyEvents(file, 1005, "M6-MANY");
+    const expected = Array.from({ length: 1005 }, (_, index) => index + 1);
+
+    const store = openStore({ file, migrate: false });
+    let storeSeqs;
+    try {
+      const page1 = store.listEventsPage({ aggregateId: "M6-MANY", limit: 1000 });
+      expect(page1.items.length === 1000, `store page1 expected 1000 items, got ${page1.items.length}`);
+      expect(page1.hasMore === true, `store page1 expected hasMore:true, got ${page1.hasMore}`);
+      expect(page1.nextAfterSeq === 1000, `store page1 expected nextAfterSeq 1000, got ${page1.nextAfterSeq}`);
+      const page2 = store.listEventsPage({ aggregateId: "M6-MANY", limit: 1000, afterSeq: 1000 });
+      expect(page2.items.length === 5, `store page2 expected 5 items, got ${page2.items.length}`);
+      expect(page2.hasMore === false, `store page2 expected hasMore:false, got ${page2.hasMore}`);
+      expect(page2.nextAfterSeq === undefined, `store page2 must not return nextAfterSeq, got ${page2.nextAfterSeq}`);
+      storeSeqs = [...page1.items, ...page2.items].map((event) => Number(event.seq));
+      expect(JSON.stringify(storeSeqs) === JSON.stringify(expected), `store paging lost seqs: got ${storeSeqs.length}, expected 1005`);
+    } finally {
+      store.close();
+    }
+
+    const httpDetail = await withBackend(file, async ({ base, token }) => {
+      const first = await httpEvents(base, token, "aggregateId=M6-MANY&limit=1000");
+      expect(first.status === 200, `HTTP page1 expected 200, got ${first.status}: ${first.text.slice(0, 200)}`);
+      expect(first.body.items.length === 1000, `HTTP page1 expected 1000 items, got ${first.body.items.length}`);
+      expect(first.body.items.length <= 1000, "HTTP page1 exceeded limit 1000");
+      expect(first.body.hasMore === true, `HTTP page1 expected hasMore:true, got ${first.body.hasMore}`);
+      expect(first.body.nextAfterSeq === 1000, `HTTP page1 expected nextAfterSeq 1000, got ${first.body.nextAfterSeq}`);
+      const second = await httpEvents(base, token, "aggregateId=M6-MANY&limit=1000&afterSeq=1000");
+      expect(second.status === 200, `HTTP page2 expected 200, got ${second.status}: ${second.text.slice(0, 200)}`);
+      expect(second.body.items.length === 5, `HTTP page2 expected 5 items, got ${second.body.items.length}`);
+      expect(second.body.hasMore === false, `HTTP page2 expected hasMore:false, got ${second.body.hasMore}`);
+      expect(second.body.nextAfterSeq === undefined, `HTTP page2 must not return nextAfterSeq, got ${second.body.nextAfterSeq}`);
+      const httpSeqs = [...first.body.items, ...second.body.items].map((event) => Number(event.seq));
+      expect(JSON.stringify(httpSeqs) === JSON.stringify(expected), `HTTP paging lost seqs: got ${httpSeqs.length}, expected 1005`);
+      return `HTTP 1000/5 -> seq 1..1005 exactly once`;
+    });
+    return `store 1000/5 and ${httpDetail}`;
+  });
+
+  check("a replace that fails mid-write rolls back to the same database fingerprint", async () => {
+    const rollbackDir = path.join(tmp, "rollback");
+    const sourceFile = path.join(rollbackDir, "source.db");
+    const targetFile = path.join(rollbackDir, "target.db");
+    const source = openStore({ file: sourceFile, migrate: true });
+    let exported;
+    try {
+      const project = source.createProject({ id: "M6-RB-P", name: "rollback source", repoPath: ROOT, defaultBranch: "m0/baseline-and-p0" });
+      for (const id of ["M6-RB-T1", "M6-RB-T2"]) {
+        source.createTask({
+          id,
+          projectId: project.id,
+          title: id,
+          description: "rollback fixture",
+          functionRequired: "WORKER",
+          roleRequired: "DEV",
+          priority: 2,
+          deps: [],
+          acceptance: "fixture",
+        });
+      }
+      exported = exportStateJson(source);
+    } finally {
+      source.close();
+    }
+
+    const probe = openStore({ file: targetFile, migrate: true });
+    probe.close();
+    const before = schemaFingerprint(targetFile);
+
+    const target = openStore({ file: targetFile, migrate: false });
+    let createTaskCalls = 0;
+    const failingStore = new Proxy(target, {
+      get(object, property) {
+        if (property === "createTask") {
+          return (...args) => {
+            createTaskCalls += 1;
+            if (createTaskCalls === 2) throw new Error("injected createTask failure");
+            return object.createTask(...args);
+          };
+        }
+        const value = Reflect.get(object, property);
+        return typeof value === "function" ? value.bind(object) : value;
+      },
+    });
+    let result;
+    try {
+      result = importStateJson(failingStore, {
+        stateJson: exported.state,
+        mode: "replace",
+        force: true,
+        repoPath: ROOT,
+        defaultBranch: "m0/baseline-and-p0",
+      });
+    } finally {
+      target.close();
+    }
+    expect(result.status === "SKIPPED", `a mid-write failure must be SKIPPED, got ${result.status}`);
+    expect(createTaskCalls >= 2, `the injected failure was never reached (createTask calls: ${createTaskCalls})`);
+    const failedProblem = result.problems.find((problem) => problem.code === "IMPORT_WRITE_FAILED" && problem.level === "error");
+    expect(failedProblem, `expected an IMPORT_WRITE_FAILED problem, got ${JSON.stringify(result.problems)}`);
+
+    const after = schemaFingerprint(targetFile);
+    expect(
+      JSON.stringify(after) === JSON.stringify(before),
+      `rollback changed the database fingerprint:\nbefore=${JSON.stringify(before)}\nafter=${JSON.stringify(after)}`,
+    );
+    const reopened = openStore({ file: targetFile, migrate: false });
+    try {
+      expect(reopened.health().schemaVersion === 5, `reopened schemaVersion expected 5, got ${reopened.health().schemaVersion}`);
+      const warnings = typeof reopened.migrationWarnings === "function" ? reopened.migrationWarnings() : [];
+      expect(Array.isArray(warnings) && warnings.length === 0, `reopened migrationWarnings expected [], got ${JSON.stringify(warnings)}`);
+    } finally {
+      reopened.close();
+    }
+    return `SKIPPED after ${createTaskCalls} createTask calls (IMPORT_WRITE_FAILED); ${before.tables.length} table counts + ledger ${JSON.stringify(before.versions)} deep-equal; reopen v5, migrationWarnings []`;
+  });
+
+  check("v1 and v4 databases upgrade to v5 with old tasks, events and indexes intact", async () => {
+    const evidence = [];
+    for (const version of [1, 4]) {
+      const file = path.join(tmp, `upgrade-v${version}`, "atk.db");
+      buildVersionedDb(file, version);
+      const store = openStore({ file, migrate: true });
+      try {
+        const health = store.health();
+        expect(health.schemaVersion === 5, `v${version} -> expected v5, got ${health.schemaVersion}`);
+        const tasks = store.listTasks({ limit: 100 });
+        const task = tasks.find((entry) => entry.id === "V-T");
+        expect(task, `v${version} upgrade lost task V-T (tasks: ${tasks.map((entry) => entry.id).join(",")})`);
+        expect(task.status === "READY", `v${version} task status changed: ${task.status}`);
+        const events = store.listEvents({ aggregateId: "V-T", limit: 10 });
+        expect(events.length === 1, `v${version} expected the old event, got ${events.length}`);
+        expect(events[0].type === "task.updated", `v${version} event type changed: ${events[0].type}`);
+        const warnings = typeof store.migrationWarnings === "function" ? store.migrationWarnings() : [];
+        expect(Array.isArray(warnings) && warnings.length === 0, `v${version} migrationWarnings expected [], got ${JSON.stringify(warnings)}`);
+      } finally {
+        store.close();
+      }
+      expect(hasSqliteIndex(file, "idx_events_type_seq"), `v${version} upgrade did not create idx_events_type_seq`);
+      const fingerprint = schemaFingerprint(file);
+      expect(JSON.stringify(fingerprint.versions) === JSON.stringify([1, 2, 3, 4, 5]), `v${version} ledger versions expected [1,2,3,4,5], got ${JSON.stringify(fingerprint.versions)}`);
+      evidence.push(`v${version}: v5, task V-T + its event kept, idx_events_type_seq present, ledger [1,2,3,4,5]`);
+    }
+    return evidence.join("; ");
   });
 
   for (const runCheck of checks) results.push(await runCheck());

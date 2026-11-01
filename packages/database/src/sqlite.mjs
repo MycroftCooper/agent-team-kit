@@ -61,6 +61,7 @@ import {
   validateSchedulingPolicies,
   validateTaskStatus,
 } from "./model.mjs";
+import { verifySwitchReadiness } from "./import-export.mjs";
 
 const MIGRATIONS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "migrations");
 const MIGRATION_FILE_RE = /^(\d+)_.*\.sql$/;
@@ -882,6 +883,9 @@ export function openStore(options = {}) {
         },
       };
     },
+
+    /** JSON -> SQLite switch pre-flight (m6-contracts §1); shared with CLI. */
+    verifySwitchReadiness: () => verifySwitchReadiness(guarded),
 
     // --- Projects ---------------------------------------------------------
     listProjects() {

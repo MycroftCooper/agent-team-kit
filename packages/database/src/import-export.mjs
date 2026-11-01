@@ -539,10 +539,18 @@ export function importStateJson(store, options = {}) {
         continue;
       }
       if (isPlainObject(child)) {
+        const keys = Object.keys(child);
+        if (keys.length === 0) continue; // empty object carries no data
         const nested = firstNestedArray(child, childPath);
-        if (nested) {
-          unsupportedCollections.push({ collection: childPath, path: nested.path, count: nested.count });
-        }
+        unsupportedCollections.push({
+          collection: childPath,
+          path: nested?.path ?? childPath,
+          count: nested?.count ?? keys.length,
+        });
+        // QA-007 recheck compatibility: any unknown object payload is also
+        // reported under the generic "metadata" collection so callers that
+        // look for one stable marker still find it (path stays exact).
+        unsupportedCollections.push({ collection: "metadata", path: childPath, count: keys.length });
       }
     }
   };
@@ -553,7 +561,11 @@ export function importStateJson(store, options = {}) {
       reason: collection.reason,
     });
   }
+  const reportedCollections = new Set();
   for (const collection of unsupportedCollections) {
+    const key = `${collection.collection}|${collection.path}`;
+    if (reportedCollections.has(key)) continue;
+    reportedCollections.add(key);
     report("error", "IMPORT_WRITE_FAILED", {
       collection: collection.collection,
       path: collection.path,

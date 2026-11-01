@@ -62,6 +62,7 @@ import {
   validateSchedulingPolicies,
   validateTaskStatus,
 } from "./model.mjs";
+import { verifySwitchReadiness } from "./import-export.mjs";
 
 function clone(value) {
   return value === null || value === undefined ? value : structuredClone(value);
@@ -288,6 +289,9 @@ export function createMemoryStore() {
         },
       };
     },
+
+    /** JSON -> SQLite switch pre-flight (m6-contracts §1); shared with CLI. */
+    verifySwitchReadiness: () => verifySwitchReadiness(store),
 
     // --- Projects ---------------------------------------------------------
     listProjects() {

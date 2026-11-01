@@ -108,6 +108,14 @@ export function normalizeEventFilters(filters = {}) {
     if (typeof value !== "string" || value.trim() === "" || value.length > 256) {
       fail("VALIDATION_ERROR", `${key} must be a non-empty string`, { [key]: value });
     }
+    // QA7-05: aggregateId is an entity id, not free text; HTTP already 400s
+    // malformed ids, so the store must agree (details.field=aggregateId).
+    if (key === "aggregateId" && !ID_RE.test(value)) {
+      fail("VALIDATION_ERROR", "aggregateId must be an id string", {
+        field: "aggregateId",
+        value,
+      });
+    }
     normalized[key] = value;
   }
   if (filters.afterSeq !== undefined && filters.afterSeq !== null) {
