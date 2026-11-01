@@ -92,13 +92,13 @@ export function queryString(searchParams, name) {
 export function parseIntegerParam(searchParams, name, { min = 1, max = 1000, fallback = undefined } = {}) {
   if (!searchParams.has(name)) return fallback;
   const raw = searchParams.get(name);
-  if (raw === null || raw.trim() === "") {
-    throw new ApiError("VALIDATION_ERROR", `${name} must be an integer between ${min} and ${max}`);
-  }
+  const invalid = () =>
+    new ApiError("VALIDATION_ERROR", `${name} must be an integer between ${min} and ${max}`, {
+      details: { field: name, errors: [`${name} must be an integer between ${min} and ${max}`] },
+    });
+  if (raw === null || raw.trim() === "") throw invalid();
   const value = Number(raw);
-  if (!Number.isInteger(value) || value < min || value > max) {
-    throw new ApiError("VALIDATION_ERROR", `${name} must be an integer between ${min} and ${max}`);
-  }
+  if (!Number.isInteger(value) || value < min || value > max) throw invalid();
   return value;
 }
 

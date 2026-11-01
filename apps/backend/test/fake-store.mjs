@@ -34,6 +34,7 @@ export function createFakeStore(seed = {}) {
   let seq = 0;
   let counters = { task: 0, run: 0, requirement: 0, approval: 0, command: 0, review: 0 };
   let snapshotVersion = 1;
+  let switchReadiness = { ok: true, blockers: [] };
 
   for (const project of seed.projects ?? []) projects.set(project.id, { version: 0, createdAt: nowIso(), ...clone(project) });
   for (const requirement of seed.requirements ?? []) {
@@ -1023,12 +1024,21 @@ export function createFakeStore(seed = {}) {
       events.push(event);
       return clone(event);
     },
-    listEvents({ projectId, afterSeq = 0, limit } = {}) {
+    listEvents({ projectId, afterSeq = 0, limit, aggregateId, aggregateType, type } = {}) {
       let items = events.filter((event) => event.seq > afterSeq);
       if (projectId) items = items.filter((event) => event.projectId === projectId);
+      if (aggregateId) items = items.filter((event) => event.aggregateId === aggregateId);
+      if (aggregateType) items = items.filter((event) => event.aggregateType === aggregateType);
+      if (type) items = items.filter((event) => event.type === type);
       items = items.sort((a, b) => a.seq - b.seq);
       if (Number.isInteger(limit)) items = items.slice(0, limit);
       return items.map(clone);
+    },
+    verifySwitchReadiness() {
+      return clone(switchReadiness);
+    },
+    _setSwitchReadiness(value) {
+      switchReadiness = clone(value);
     },
     latestSeq() {
       return seq;

@@ -12,7 +12,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { ID_RE, ApiError, isEnumValue, validateProject, validateTask } from "@atk/contracts";
+import { EVENT_TYPES, ID_RE, ApiError, isEnumValue, validateProject, validateTask } from "@atk/contracts";
 
 import {
   CLI_CLIENT_HEADER,
@@ -197,7 +197,25 @@ export function createServer({
       logger?.error?.(`[atk] store.health() failed: ${error?.message ?? error}`);
       db = { ok: false, error: "store-health-unavailable" };
     }
-    return { ok: true, version: BACKEND_VERSION, db, uptimeMs: Math.max(0, now() - startedAt) };
+    const payload = { ok: true, version: BACKEND_VERSION, db, uptimeMs: Math.max(0, now() - startedAt) };
+    // M6: can this database be switched to SQLite right now? Older stores do
+    // not implement verifySwitchReadiness: omit the field instead of failing.
+    if (typeof store.verifySwitchReadiness === "function") {
+      try {
+        const readiness = store.verifySwitchReadiness();
+        payload.switchReadiness = {
+          ok: Boolean(readiness?.ok),
+          blockers: Array.isArray(readiness?.blockers) ? readiness.blockers : [],
+        };
+      } catch (error) {
+        logger?.error?.(`[atk] store.verifySwitchReadiness() failed: ${error?.message ?? error}`);
+        payload.switchReadiness = {
+          ok: false,
+          blockers: [{ code: "switch-readiness-error", message: String(error?.message ?? error) }],
+        };
+      }
+    }
+    return payload;
   }
 
   function sessionPayload() {
@@ -785,12 +803,68 @@ export function createServer({
         return;
       }
       case "events.list": {
+        // M6: server-side aggregate filters, so a Run timeline does not have to
+        // page the whole log and filter client-side (which truncates).
         const afterSeq = parseIntegerParam(url.searchParams, "afterSeq", { min: 0, max: Number.MAX_SAFE_INTEGER });
-        const limit = parseIntegerParam(url.searchParams, "limit", { min: 1, max: 1000 });
+        const limit = parseIntegerParam(url.searchParams, "limit", { min: 1, max: 1000, fallback: 100 });
+        const aggregateId = queryString(url.searchParams, "aggregateId");
+        const aggregateType = queryString(url.searchParams, "aggregateType");
+        const type = queryString(url.searchParams, "type");
         const filter = {};
         if (afterSeq !== undefined) filter.afterSeq = afterSeq;
-        if (limit !== undefined) filter.limit = limit;
-        sendJson(res, 200, listPayload(store.listEvents(filter)));
+        if (aggregateId !== undefined) {
+          if (!ID_RE.test(aggregateId)) throw validationError("invalid event filter", ["aggregateId must be an id string"]);
+          filter.aggregateId = aggregateId;
+        }
+        if (aggregateType !== undefined) {
+          if (typeof aggregateType !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]*$/.test(aggregateType)) {
+            throw validationError("invalid event filter", ["aggregateType must be a non-empty identifier"]);
+          }
+          filter.aggregateType = aggregateType;
+        }
+        if (type !== undefined) {
+          if (!EVENT_TYPES.includes(type)) {
+            throw validationError("invalid event filter", ["type must be one of the known event types"]);
+          }
+          filter.type = type;
+        }
+
+        // Fetch one extra row to compute hasMore without a second store call.
+        const fetchLimit = limit < 1000 ? limit + 1 : limit;
+        const raw = store.listEvents({ ...filter, limit: fetchLimit });
+        let items;
+        let hasMore;
+        let nextAfterSeq;
+        if (Array.isArray(raw)) {
+          items = raw.slice(0, limit);
+          // @atk/database annotates the array with a filtered hasMore/nextAfterSeq
+          // (non-enumerable), which is authoritative for filtered pages.
+          if (typeof raw.hasMore === "boolean") {
+            hasMore = raw.hasMore;
+            if (Number.isInteger(raw.nextAfterSeq)) nextAfterSeq = raw.nextAfterSeq;
+            else if (hasMore && items.length > 0) nextAfterSeq = Number(items[items.length - 1].seq);
+          } else {
+            hasMore = raw.length > limit;
+            if (!hasMore && limit === 1000 && items.length === 1000 && typeof store.latestSeq === "function") {
+              hasMore = store.latestSeq() > Number(items[items.length - 1].seq);
+            }
+          }
+        } else if (raw && Array.isArray(raw.items)) {
+          // Forward-compatible: a store may return {items, hasMore, nextAfterSeq}.
+          items = raw.items.slice(0, limit);
+          hasMore = typeof raw.hasMore === "boolean" ? raw.hasMore : raw.items.length > limit;
+          nextAfterSeq = raw.nextAfterSeq;
+        } else {
+          items = [];
+          hasMore = false;
+        }
+        if (nextAfterSeq === undefined && hasMore && items.length > 0) {
+          const lastSeq = Number(items[items.length - 1].seq);
+          if (Number.isInteger(lastSeq)) nextAfterSeq = lastSeq;
+        }
+        const body = { items, hasMore };
+        if (nextAfterSeq !== undefined) body.nextAfterSeq = nextAfterSeq;
+        sendJson(res, 200, body);
         return;
       }
       case "events.stream": {

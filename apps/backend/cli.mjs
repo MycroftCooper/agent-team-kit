@@ -38,8 +38,12 @@ Commands:
            Read-only diagnostics: node, paths, database availability, web build,
            port availability and the security configuration summary.
            Exit 1 when at least one check FAILs (usable as a health gate).
-  export   --out <file> [--data <file>] [--project <id>] [--json]
-           Export the SQLite store back to a state JSON document.
+  export   --data <db> --to <file> [--project <id>] [--json]
+           Export the SQLite store to readable JSON ({ stateJson, runtime, manifest }).
+           --out is kept as an alias for --to.
+  import   --from <file> --data <db> [--mode merge|replace] [--force] [--json]
+           Import that JSON into SQLite (merge default; replace needs an empty
+           database or --force; the whole import is transactional).
   backup   --data <db> --to <dir> [--force] [--json]
            Write a consistent SQLite snapshot (read-only source + backup API)
            plus manifest.json ({createdAt, schemaVersion, bytes, sha256, source}).
@@ -515,6 +519,16 @@ async function serve(flags) {
   ensureDirFor(dataFile);
   const database = await loadDatabase();
   const store = openStore(database, dataFile);
+  // M6: @atk/database exports verifySwitchReadiness(store); older stores expose
+  // it as a method. Bridge the function onto the injected store so the server
+  // keeps its "store is the only dependency" boundary.
+  if (typeof store.verifySwitchReadiness !== "function" && typeof database.verifySwitchReadiness === "function") {
+    Object.defineProperty(store, "verifySwitchReadiness", {
+      value: () => database.verifySwitchReadiness(store),
+      enumerable: false,
+      configurable: true,
+    });
+  }
   const server = createServer({ store, webDist, logger: console });
 
   let info;
@@ -739,23 +753,55 @@ async function doctor(flags) {
   return report.ok ? 0 : 1;
 }
 
+/** Minimal runtime.json-compatible snapshot derived from the store's agents. */
+function deriveRuntime(store, exportedAt) {
+  const agents = typeof store.listAgents === "function" ? store.listAgents() : [];
+  return {
+    schemaVersion: 3,
+    exportedAt,
+    agents: agents.map((agent) => ({
+      id: agent.id,
+      role: agent.role,
+      capabilities: Array.isArray(agent.capabilities) ? agent.capabilities : [],
+      status: typeof agent.status === "string" ? agent.status.toLowerCase() : "idle",
+    })),
+  };
+}
+
 async function exportCommand(flags) {
-  if (!flags.out) throw new CliError("export requires --out <file>");
-  const outFile = path.resolve(flags.out);
+  const target = flags.to ?? flags.out;
+  if (!target) throw new CliError("export requires --to <file>");
+  const outFile = path.resolve(target);
   const paths = runtimePaths();
   const dataFile = flags.data ? path.resolve(flags.data) : paths.dbFile;
   const database = await loadDatabase();
   if (typeof database.exportStateJson !== "function") {
-    throw new CliError("@atk/database does not export exportStateJson(); cannot export");
+    throw new CliError("@atk/database does not export exportStateJson(); cannot export", 1);
   }
   const store = openStore(database, dataFile);
   try {
     const result = database.exportStateJson(store, flags.project ? { projectId: flags.project } : {});
+    const exportedAt = new Date().toISOString();
+    const stateJson = result && typeof result === "object" && "state" in result ? result.state : result;
+    const runtime = (result && typeof result === "object" && result.runtime) || deriveRuntime(store, exportedAt);
+    // Readable, cross-version/audit format. backup/restore remain the binary
+    // rollback path; this JSON is NOT a byte-for-byte database snapshot.
+    const document = { exportedAt, stateJson, runtime, manifest: result?.manifest ?? null };
     ensureDirFor(outFile);
-    const state = result && typeof result === "object" && "state" in result ? result.state : result;
-    fs.writeFileSync(outFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-    if (flags.json) printJson({ ok: true, out: outFile, source: dataFile, projectId: flags.project ?? null, manifest: result?.manifest ?? null });
-    else process.stdout.write(`exported ${dataFile} -> ${outFile}\n`);
+    fs.writeFileSync(outFile, `${JSON.stringify(document, null, 2)}\n`, "utf8");
+    if (flags.json) {
+      printJson({
+        ok: true,
+        command: "export",
+        data: dataFile,
+        to: outFile,
+        projectId: flags.project ?? null,
+        manifest: document.manifest,
+      });
+    } else {
+      process.stdout.write(`exported ${dataFile} -> ${outFile}\n`);
+      if (document.manifest?.counts) process.stdout.write(`counts: ${JSON.stringify(document.manifest.counts)}\n`);
+    }
   } finally {
     try {
       store.close?.();
@@ -764,6 +810,74 @@ async function exportCommand(flags) {
     }
   }
   return 0;
+}
+
+async function importCommand(flags) {
+  if (!flags.from) throw new CliError("import requires --from <file>");
+  const fromFile = path.resolve(flags.from);
+  const mode = flags.mode ?? "merge";
+  if (mode !== "merge" && mode !== "replace") {
+    throw new CliError('--mode must be "merge" or "replace"');
+  }
+  const force = Boolean(flags.force);
+  const document = readRequiredJson(fromFile);
+  // Accept both the export wrapper ({stateJson,runtime}) and a raw legacy state.
+  let stateJson = document;
+  let runtime = null;
+  let ownership = null;
+  let config = null;
+  if (document && typeof document === "object" && !Array.isArray(document) && document.stateJson !== undefined) {
+    stateJson = document.stateJson;
+    runtime = document.runtime ?? null;
+    ownership = document.ownership ?? null;
+    config = document.config ?? null;
+  }
+  const paths = runtimePaths();
+  const dataFile = flags.data ? path.resolve(flags.data) : paths.dbFile;
+  const database = await loadDatabase();
+  if (typeof database.importStateJson !== "function") {
+    throw new CliError("@atk/database does not export importStateJson(); cannot import", 1);
+  }
+  ensureDirFor(dataFile);
+  const store = openStore(database, dataFile);
+  try {
+    const projects = typeof store.listProjects === "function" ? store.listProjects() : [];
+    const tasks = typeof store.listTasks === "function" ? store.listTasks({}) : [];
+    const nonEmpty = projects.length > 0 || tasks.length > 0;
+    if (mode === "replace" && nonEmpty && !force) {
+      throw new CliError(
+        `target database is not empty (${projects.length} project(s), ${tasks.length} task(s)); import --mode replace requires --force`,
+        1,
+      );
+    }
+    const report = await database.importStateJson(store, { stateJson, runtime, ownership, config, mode, force });
+    const status = report?.status ?? "UNKNOWN";
+    if (flags.json) {
+      printJson({
+        ok: status === "PASS",
+        command: "import",
+        from: fromFile,
+        data: dataFile,
+        mode,
+        forced: force,
+        report,
+      });
+    } else {
+      process.stdout.write(`import ${status} (mode: ${mode}${force ? ", force" : ""}) from: ${fromFile}\n`);
+      if (report?.counts) process.stdout.write(`counts: ${JSON.stringify(report.counts)}\n`);
+      const problems = Array.isArray(report?.problems) ? report.problems : [];
+      for (const problem of problems) {
+        process.stdout.write(`  [${problem?.level ?? "info"}] ${problem?.code ?? ""}: ${JSON.stringify(problem?.detail ?? null)}\n`);
+      }
+    }
+    return status === "PASS" ? 0 : 1;
+  } finally {
+    try {
+      store.close?.();
+    } catch {
+      // ignore
+    }
+  }
 }
 
 /** Command dispatcher (exported so tests can drive it without spawning). */
@@ -786,6 +900,8 @@ export async function run(argv = process.argv.slice(2)) {
       return doctor(flags);
     case "export":
       return exportCommand(flags);
+    case "import":
+      return importCommand(flags);
     case "backup":
       return backup(flags);
     case "restore":
