@@ -385,7 +385,13 @@ export function createFakeStore(seed = {}) {
         throw error;
       }
       if (command.ownerId !== ownerId || command.generation !== generation) {
-        staleGeneration({ commandId: id, expectedGeneration: command.generation, receivedGeneration: generation });
+        staleGeneration({
+          commandId: id,
+          generation,
+          expectedGeneration: command.generation,
+          currentOwnerId: command.ownerId,
+          reason: "lease-mismatch",
+        });
       }
       command.status = status;
       command.result = clone(result);
@@ -394,12 +400,15 @@ export function createFakeStore(seed = {}) {
     },
     renewRunLease({ runId, ownerId, generation, leaseMs = 30_000 } = {}) {
       const lease = leases.get(runId);
-      if (!lease) staleGeneration({ runId, expectedGeneration: null, receivedGeneration: generation });
-      if (lease.ownerId !== ownerId || lease.generation !== generation) {
-        staleGeneration({ runId, expectedGeneration: lease.generation, receivedGeneration: generation });
+      if (!lease) staleGeneration({ runId, generation, reason: "lease-missing", currentGeneration: null });
+      if (lease.ownerId !== ownerId) {
+        staleGeneration({ runId, generation, reason: "holder-mismatch", currentGeneration: lease.generation });
+      }
+      if (lease.generation !== generation) {
+        staleGeneration({ runId, generation, reason: "generation-mismatch", currentGeneration: lease.generation });
       }
       if (Date.parse(lease.expiresAt) <= Date.now()) {
-        staleGeneration({ runId, expectedGeneration: lease.generation, receivedGeneration: generation });
+        staleGeneration({ runId, generation, reason: "lease-expired", currentGeneration: lease.generation });
       }
       lease.generation += 1;
       lease.expiresAt = new Date(Date.now() + leaseMs).toISOString();
@@ -415,24 +424,28 @@ export function createFakeStore(seed = {}) {
         error.details = { generation };
         throw error;
       }
-      if (!Array.isArray(mappedEvents) || mappedEvents.length === 0) {
-        const error = new Error("run.events must be a non-empty array");
+      if (!Array.isArray(mappedEvents)) {
+        const error = new Error("run.events must be an array");
         error.code = "VALIDATION_ERROR";
         error.details = { events: mappedEvents ?? null };
         throw error;
       }
+      if (mappedEvents.length > 1000) {
+        const error = new Error("run.events accepts at most 1000 events per call");
+        error.code = "VALIDATION_ERROR";
+        error.details = { length: mappedEvents.length };
+        throw error;
+      }
       const lease = leases.get(runId);
-      if (!lease || lease.generation !== generation) {
-        staleGeneration({
-          runId,
-          generation,
-          reason: lease ? "generation-mismatch" : "lease-missing",
-          currentGeneration: lease?.generation ?? null,
-        });
+      if (!lease) staleGeneration({ runId, generation, reason: "lease-missing", currentGeneration: null });
+      if (lease.generation !== generation) {
+        staleGeneration({ runId, generation, reason: "generation-mismatch", currentGeneration: lease.generation });
       }
       if (Date.parse(lease.expiresAt) <= Date.now()) {
         staleGeneration({ runId, generation, reason: "lease-expired", currentGeneration: lease.generation });
       }
+      // M2 MINOR-1: an empty batch is a pure generation fence and writes nothing.
+      if (mappedEvents.length === 0) return [];
       const task = tasks.get(run.taskId);
       const inserted = mappedEvents.map((mapped) => {
         seq += 1;
@@ -448,6 +461,23 @@ export function createFakeStore(seed = {}) {
         return clone(event);
       });
       return inserted;
+    },
+    sweepDispatchCommands({ now: at } = {}) {
+      const terminalRuns = new Set(["COMPLETED", "FAILED", "INTERRUPTED", "CANCELLED"]);
+      const completedAt = typeof at === "string" && !Number.isNaN(Date.parse(at)) ? at : nowIso();
+      const closed = [];
+      for (const command of dispatchCommands.values()) {
+        if (command.status !== "CLAIMED") continue;
+        const run = runs.get(command.runId);
+        if (!run || !terminalRuns.has(run.status)) continue;
+        const status = run.status === "COMPLETED" ? "DONE" : "FAILED";
+        command.status = status;
+        command.result = { derivedFrom: "run-terminal", runStatus: run.status };
+        command.completedAt = completedAt;
+        command.updatedAt = completedAt;
+        closed.push({ commandId: command.id, runId: command.runId, status });
+      }
+      return { closed, count: closed.length };
     },
     reconcileRun({ runId } = {}) {
       const run = requireRun(runId);
@@ -736,6 +766,12 @@ export function createFakeStore(seed = {}) {
       const record = { id: nextId("R", "run"), status: "RUNNING", ...clone(run) };
       runs.set(record.id, record);
       return clone(record);
+    },
+    _listDispatchCommands() {
+      return [...dispatchCommands.values()].map(clone);
+    },
+    _getDispatchCommand(id) {
+      return clone(dispatchCommands.get(id) ?? null);
     },
   };
 }

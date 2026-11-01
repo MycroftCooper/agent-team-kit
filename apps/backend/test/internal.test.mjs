@@ -280,8 +280,10 @@ test("dispatch result is idempotent and fences stale generations", async (t) => 
     body: { ownerId: "host-9", generation: 99, status: "DONE" },
   });
   assertErrorEnvelope(stale, "STALE_GENERATION", 409);
-  assert.equal(stale.json.error.details.expectedGeneration, 1);
-  assert.equal(stale.json.error.details.receivedGeneration, 99);
+  assert.equal(stale.json.error.details.commandId, claim2.json.command.id);
+  assert.equal(stale.json.error.details.generation, 99);
+  assert.equal(stale.json.error.details.currentGeneration, 1);
+  assert.equal(stale.json.error.details.reason, "generation-mismatch");
 
   assertErrorEnvelope(
     await request(base, { method: "POST", path: `/internal/v1/dispatch/${commandId}/result`, headers: internalHeaders(), body: { ownerId: "host-1", status: "DONE" } }),
@@ -311,9 +313,12 @@ test("renew bumps the generation and rejects stale/expired leases", async (t) =>
     body: renewBody,
   });
   assertErrorEnvelope(stale, "STALE_GENERATION", 409);
-  assert.equal(stale.json.error.details.runId, "RUN-1");
-  assert.equal(stale.json.error.details.expectedGeneration, 2);
-  assert.equal(stale.json.error.details.receivedGeneration, 1);
+  assert.deepEqual(stale.json.error.details, {
+    runId: "RUN-1",
+    generation: 1,
+    currentGeneration: 2,
+    reason: "generation-mismatch",
+  });
 
   const wrongOwner = await request(base, {
     method: "POST",
@@ -322,8 +327,10 @@ test("renew bumps the generation and rejects stale/expired leases", async (t) =>
     body: { ownerId: "host-2", generation: 2, leaseMs: 5000 },
   });
   assertErrorEnvelope(wrongOwner, "STALE_GENERATION", 409);
-  assert.equal(wrongOwner.json.error.details.expectedGeneration, 2);
-  assert.equal(wrongOwner.json.error.details.receivedGeneration, 2);
+  assert.equal(wrongOwner.json.error.details.runId, "RUN-1");
+  assert.equal(wrongOwner.json.error.details.generation, 2);
+  assert.equal(wrongOwner.json.error.details.currentGeneration, 2);
+  assert.equal(wrongOwner.json.error.details.reason, "generation-mismatch");
 
   // Expired lease: claim with a 1ms lease directly, then renew after it lapsed.
   const scenario = createScenario();
@@ -338,6 +345,9 @@ test("renew bumps the generation and rejects stale/expired leases", async (t) =>
     body: { ownerId: "host-3", generation: 1, leaseMs: 5000 },
   });
   assertErrorEnvelope(expired, "STALE_GENERATION", 409);
+  assert.equal(expired.json.error.details.reason, "lease-expired");
+  assert.equal(expired.json.error.details.generation, 1);
+  assert.equal(expired.json.error.details.currentGeneration, 1);
 
   // An unknown run has no lease either: the store fences it as stale rather
   // than leaking existence (database renewRunLease reports lease-missing).
@@ -349,7 +359,9 @@ test("renew bumps the generation and rejects stale/expired leases", async (t) =>
   });
   assertErrorEnvelope(unknown, "STALE_GENERATION", 409);
   assert.equal(unknown.json.error.details.runId, "RUN-NOPE");
-  assert.equal(unknown.json.error.details.receivedGeneration, 1);
+  assert.equal(unknown.json.error.details.generation, 1);
+  assert.equal(unknown.json.error.details.currentGeneration, null);
+  assert.equal(unknown.json.error.details.reason, "lease-missing");
 });
 
 test("session.started advances STARTING -> RUNNING and the store persists run.updated", async (t) => {
@@ -502,7 +514,12 @@ test("stale generation is 409 STALE_GENERATION and never touches the run", async
     body: { generation: 7, events: [{ type: "session.started", sessionId: "S-1", at: AT }] },
   });
   assertErrorEnvelope(res, "STALE_GENERATION", 409);
-  assert.deepEqual(res.json.error.details, { runId: "RUN-1", expectedGeneration: 1, receivedGeneration: 7 });
+  assert.deepEqual(res.json.error.details, {
+    runId: "RUN-1",
+    generation: 7,
+    currentGeneration: 1,
+    reason: "generation-mismatch",
+  });
   assert.equal(store.getRun("RUN-1").status, "STARTING");
   assert.equal(store.latestSeq(), seqBefore, "fenced-out report writes nothing");
 });
@@ -651,6 +668,147 @@ test("SSE receives business run.updated and run.log frames produced by the inter
   assert.equal(client.frames.some((frame) => JSON.stringify(frame).includes(TEST_INTERNAL_TOKEN)), false);
 });
 
+test("an empty events batch is a real generation fence (QA MINOR-1)", async (t) => {
+  const { store, base } = await claimedScenario(t);
+  const seqBefore = store.latestSeq();
+
+  const ok = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runs/RUN-1/events",
+    headers: internalHeaders(),
+    body: { generation: 1, events: [] },
+  });
+  assert.equal(ok.status, 200, ok.text);
+  assert.deepEqual(ok.json.appended, []);
+  assert.equal(ok.json.skipped, 0);
+  assert.equal(ok.json.run.id, "RUN-1");
+  assert.equal(ok.json.run.status, "STARTING");
+  assert.equal(store.latestSeq(), seqBefore, "pure fence writes nothing");
+
+  const stale = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runs/RUN-1/events",
+    headers: internalHeaders(),
+    body: { generation: 7, events: [] },
+  });
+  assertErrorEnvelope(stale, "STALE_GENERATION", 409);
+  assert.deepEqual(stale.json.error.details, {
+    runId: "RUN-1",
+    generation: 7,
+    currentGeneration: 1,
+    reason: "generation-mismatch",
+  });
+  assert.equal(store.latestSeq(), seqBefore, "rejected pure fence writes nothing");
+});
+
+test("D3 crash window: sweep derives command DONE from a COMPLETED Run (MAJOR-2)", async (t) => {
+  const { store, claim, base } = await claimedScenario(t);
+  const headers = internalHeaders();
+
+  // Host pushed the Run to COMPLETED but "crashes" before POSTing the result.
+  await request(base, {
+    method: "POST",
+    path: "/internal/v1/runs/RUN-1/events",
+    headers,
+    body: { generation: 1, events: [{ type: "session.started", sessionId: "S-1", at: AT }] },
+  });
+  await request(base, {
+    method: "POST",
+    path: "/internal/v1/runs/RUN-1/events",
+    headers,
+    body: { generation: 1, events: [{ type: "session.ended", sessionId: "S-1", reason: "completed", exitCode: 0, at: "2026-11-02T03:01:00.000Z" }] },
+  });
+  assert.equal(store.getRun("RUN-1").status, "COMPLETED");
+  assert.equal(store._getDispatchCommand(claim.command.id).status, "CLAIMED", "D3: command is stuck CLAIMED");
+
+  // Unauthenticated sweep is rejected.
+  assertErrorEnvelope(await request(base, { method: "POST", path: "/internal/v1/dispatch/sweep" }), "NOT_AUTHORIZED", 403);
+
+  const sweep = await request(base, { method: "POST", path: "/internal/v1/dispatch/sweep", headers });
+  assert.equal(sweep.status, 200, sweep.text);
+  assert.deepEqual(Object.keys(sweep.json).sort(), ["closed", "count"]);
+  assert.equal(sweep.json.count, 1);
+  assert.deepEqual(sweep.json.closed, [{ commandId: claim.command.id, runId: "RUN-1", status: "DONE" }]);
+
+  const command = store._getDispatchCommand(claim.command.id);
+  assert.equal(command.status, "DONE");
+  assert.deepEqual(command.result, { derivedFrom: "run-terminal", runStatus: "COMPLETED" });
+  assert.equal(Number.isNaN(Date.parse(command.completedAt)), false);
+
+  // Idempotent: a second sweep closes nothing.
+  const second = await request(base, { method: "POST", path: "/internal/v1/dispatch/sweep", headers });
+  assert.equal(second.status, 200);
+  assert.deepEqual(second.json, { closed: [], count: 0 });
+});
+
+test("sweep maps FAILED/INTERRUPTED/CANCELLED Runs to a FAILED command", async (t) => {
+  for (const reason of ["failed", "interrupted", "cancelled"]) {
+    const { store, claim, base } = await claimedScenario(t);
+    const headers = internalHeaders();
+    await request(base, {
+      method: "POST",
+      path: "/internal/v1/runs/RUN-1/events",
+      headers,
+      body: { generation: 1, events: [{ type: "session.started", sessionId: "S-1", at: AT }] },
+    });
+    await request(base, {
+      method: "POST",
+      path: "/internal/v1/runs/RUN-1/events",
+      headers,
+      body: { generation: 1, events: [{ type: "session.ended", sessionId: "S-1", reason, exitCode: 1, at: "2026-11-02T03:01:00.000Z" }] },
+    });
+    const sweep = await request(base, { method: "POST", path: "/internal/v1/dispatch/sweep", headers });
+    assert.equal(sweep.status, 200, sweep.text);
+    assert.deepEqual(sweep.json.closed, [{ commandId: claim.command.id, runId: "RUN-1", status: "FAILED" }]);
+    assert.equal(store._getDispatchCommand(claim.command.id).status, "FAILED");
+  }
+});
+
+test("a claim poll sweeps stuck commands before trying to claim", async (t) => {
+  const scenario = createScenario();
+  const { server, base } = await startServer({ store: scenario.store });
+  t.after(() => server.close());
+  const headers = internalHeaders();
+
+  // Host claims the command, completes the Run, then never reports the result.
+  const claimed = scenario.store.claimDispatchCommand({ ownerId: "host-1", leaseMs: 5000 });
+  await request(base, {
+    method: "POST",
+    path: "/internal/v1/runs/RUN-1/events",
+    headers,
+    body: { generation: 1, events: [{ type: "session.started", sessionId: "S-1", at: AT }] },
+  });
+  await request(base, {
+    method: "POST",
+    path: "/internal/v1/runs/RUN-1/events",
+    headers,
+    body: { generation: 1, events: [{ type: "session.ended", sessionId: "S-1", reason: "completed", exitCode: 0, at: "2026-11-02T03:01:00.000Z" }] },
+  });
+  assert.equal(scenario.store._getDispatchCommand(claimed.command.id).status, "CLAIMED");
+
+  const poll = await request(base, { path: "/internal/v1/dispatch/claim?owner=host-2&leaseMs=5000", headers });
+  assert.equal(poll.status, 204, poll.text);
+  assert.equal(scenario.store._getDispatchCommand(claimed.command.id).status, "DONE", "claim-start sweep closed it");
+});
+
+test("sweep degrades to a logged no-op when the store has no sweepDispatchCommands", async (t) => {
+  const scenario = createScenario();
+  delete scenario.store.sweepDispatchCommands;
+  const logger = recordingLogger();
+  const { server, base } = await startServer({ store: scenario.store, logger });
+  t.after(() => server.close());
+
+  const sweep = await request(base, { method: "POST", path: "/internal/v1/dispatch/sweep", headers: internalHeaders() });
+  assert.equal(sweep.status, 200, sweep.text);
+  assert.deepEqual(sweep.json, { closed: [], count: 0 });
+  assert.ok(logger.lines.warn.some((line) => line.includes("sweepDispatchCommands is unavailable")));
+
+  // Claim polling still works and does not 500.
+  const poll = await request(base, { path: "/internal/v1/dispatch/claim?owner=host-2&leaseMs=5000", headers: internalHeaders() });
+  assert.equal(poll.status, 200, poll.text);
+  assert.equal(poll.json.command.status, "CLAIMED");
+});
+
 function heartbeatBody() {
   return {
     ownerId: "host-1",
@@ -659,3 +817,4 @@ function heartbeatBody() {
     sessions: ["S-1"],
   };
 }
+

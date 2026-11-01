@@ -45,6 +45,7 @@ const CLAIM_IDEMPOTENCY_LIMIT = 1000;
 
 const ROUTES = [
   { name: "dispatch.claim", method: "GET", regex: /^\/internal\/v1\/dispatch\/claim$/, keys: [] },
+  { name: "dispatch.sweep", method: "POST", regex: /^\/internal\/v1\/dispatch\/sweep$/, keys: [] },
   { name: "dispatch.result", method: "POST", regex: /^\/internal\/v1\/dispatch\/([^/]+)\/result$/, keys: ["id"] },
   { name: "runs.renew", method: "POST", regex: /^\/internal\/v1\/runs\/([^/]+)\/renew$/, keys: ["id"] },
   { name: "runs.events", method: "POST", regex: /^\/internal\/v1\/runs\/([^/]+)\/events$/, keys: ["id"] },
@@ -59,9 +60,24 @@ function validationError(message, errors) {
   return new ApiError("VALIDATION_ERROR", message, { details: { errors } });
 }
 
-function staleError({ runId, expectedGeneration, receivedGeneration }) {
-  return new ApiError("STALE_GENERATION", `stale generation for ${runId}`, {
-    details: { runId, expectedGeneration: expectedGeneration ?? null, receivedGeneration: receivedGeneration ?? null },
+/** m2-contracts §6.2: the only STALE_GENERATION reasons Backend may emit. */
+const STALE_REASONS = new Set(["generation-mismatch", "lease-missing", "lease-expired"]);
+
+/**
+ * Normalise every stale-generation 409 into the contract shape:
+ * `{ runId?, commandId?, generation, currentGeneration, reason }`.
+ */
+function staleError({ runId = null, commandId = null, generation = null, currentGeneration = null, reason = "generation-mismatch" }) {
+  const normalizedReason = STALE_REASONS.has(reason) ? reason : "generation-mismatch";
+  const target = runId !== null ? ` for run ${runId}` : commandId !== null ? ` for command ${commandId}` : "";
+  return new ApiError("STALE_GENERATION", `stale generation${target}`, {
+    details: {
+      ...(runId === null ? {} : { runId }),
+      ...(commandId === null ? {} : { commandId }),
+      generation: Number.isInteger(generation) ? generation : null,
+      currentGeneration: Number.isInteger(currentGeneration) ? currentGeneration : null,
+      reason: normalizedReason,
+    },
   });
 }
 
@@ -267,15 +283,31 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
     }
   }
 
-  function staleFrom(error, fallback) {
-    if (error?.code === "STALE_GENERATION") {
-      const details = error.details ?? {};
-      throw staleError({
-        runId: details.runId ?? fallback.runId,
-        expectedGeneration: resolveGenerationAfterFailure(fallback.runId, details),
-        receivedGeneration: details.generation ?? details.receivedGeneration ?? fallback.receivedGeneration,
-      });
+  /**
+   * Map a store STALE_GENERATION into the contract details shape. The read on
+   * `reconcileRun` happens only on the failure path (reporting), never fencing.
+   */
+  function normalizeStale(error, fallback = {}) {
+    const details = error?.details ?? {};
+    let currentGeneration = Number.isInteger(details.currentGeneration)
+      ? details.currentGeneration
+      : Number.isInteger(details.expectedGeneration)
+        ? details.expectedGeneration
+        : null;
+    if (currentGeneration === null && (fallback.runId ?? details.runId)) {
+      currentGeneration = resolveGenerationAfterFailure(fallback.runId ?? details.runId, details);
     }
+    return staleError({
+      runId: fallback.runId ?? details.runId ?? null,
+      commandId: fallback.commandId ?? details.commandId ?? null,
+      generation: Number.isInteger(details.generation) ? details.generation : fallback.generation ?? null,
+      currentGeneration,
+      reason: details.reason ?? (currentGeneration === null ? "lease-missing" : "generation-mismatch"),
+    });
+  }
+
+  function staleFrom(error, fallback) {
+    if (error?.code === "STALE_GENERATION") throw normalizeStale(error, fallback);
     throw error;
   }
 
@@ -295,6 +327,30 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
 
   function filesOf(record) {
     return asArray(record?.files).filter((file) => typeof file === "string" && file !== "");
+  }
+
+  /**
+   * D3 crash-window backstop: close CLAIMED commands whose Run already reached a
+   * terminal state (the Host may never come back to POST the result). The store
+   * owns the truth; this helper degrades to a logged no-op on older stores.
+   */
+  function sweepClosedCommands() {
+    if (typeof store.sweepDispatchCommands !== "function") {
+      logger?.warn?.("[atk] store.sweepDispatchCommands is unavailable; skipping dispatch command sweep");
+      return { closed: [], count: 0 };
+    }
+    try {
+      const result = store.sweepDispatchCommands({ now: new Date(now()).toISOString() });
+      const closed = asArray(result?.closed).map((entry) => ({
+        commandId: entry?.commandId ?? null,
+        runId: entry?.runId ?? null,
+        status: entry?.status ?? null,
+      }));
+      return { closed, count: Number.isInteger(result?.count) ? result.count : closed.length };
+    } catch (error) {
+      logger?.error?.(`[atk] dispatch command sweep failed: ${error?.message ?? error}`);
+      return { closed: [], count: 0 };
+    }
   }
 
   function claimError(code, message, details) {
@@ -545,6 +601,8 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
 
     switch (route.name) {
       case "dispatch.claim": {
+        // D3 backstop: derive terminal command states from terminal Runs first.
+        sweepClosedCommands();
         const ownerId = queryString(url.searchParams, "owner");
         requireId(ownerId, "owner");
         const leaseMs = parseIntegerParam(url.searchParams, "leaseMs", { min: 1000, max: 86_400_000, fallback: 30_000 });
@@ -557,6 +615,12 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
         const run = store.getRun(command.runId);
         const task = run?.taskId ? store.getTask(run.taskId) : null;
         sendJson(res, 200, { command, run, task: slimTask(task), lease: normalizeLease(claimed.lease) });
+        return;
+      }
+
+      case "dispatch.sweep": {
+        const result = sweepClosedCommands();
+        sendJson(res, 200, { closed: result.closed, count: result.count });
         return;
       }
 
@@ -587,14 +651,7 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
           command = store.completeDispatchCommand({ id: params.id, ownerId, generation, status: body.status, result });
         } catch (error) {
           if (error?.code === "STALE_GENERATION") {
-            const details = error.details ?? {};
-            throw new ApiError("STALE_GENERATION", `stale generation for dispatch command ${params.id}`, {
-              details: {
-                commandId: params.id,
-                expectedGeneration: details.expectedGeneration ?? null,
-                receivedGeneration: details.receivedGeneration ?? generation,
-              },
-            });
+            throw normalizeStale(error, { commandId: params.id, generation });
           }
           throw error;
         }
@@ -619,7 +676,7 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
         try {
           lease = store.renewRunLease({ runId, ownerId, generation, leaseMs });
         } catch (error) {
-          staleFrom(error, { runId, expectedGeneration: null, receivedGeneration: generation });
+          staleFrom(error, { runId, generation });
         }
         sendJson(res, 200, { lease: normalizeLease(lease) });
         return;
@@ -651,6 +708,19 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
         }
 
         const runBefore = store.getRun(runId);
+
+        // MINOR-1: an empty batch is still a generation fence. It must go through
+        // the store fence call so a stale pure fence answers 409.
+        if (body.events.length === 0) {
+          try {
+            store.appendRunEvent({ runId, generation, events: [] });
+          } catch (error) {
+            staleFrom(error, { runId, generation });
+          }
+          sendJson(res, 200, { run: runBefore, appended: [], skipped: 0 });
+          return;
+        }
+
         const plan = planRunEvents(runBefore, runId, uniqueEvents);
 
         // Status changes first: `updateRunStatus(..., { generation })` validates
@@ -663,7 +733,7 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
               run = store.updateRunStatus(runId, { ...update, generation });
             }
           } catch (error) {
-            staleFrom(error, { runId, expectedGeneration: null, receivedGeneration: generation });
+            staleFrom(error, { runId, generation });
           }
         }
 
@@ -673,7 +743,7 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
           try {
             appended = store.appendRunEvent({ runId, generation, events: plan.logs });
           } catch (error) {
-            staleFrom(error, { runId, expectedGeneration: null, receivedGeneration: generation });
+            staleFrom(error, { runId, generation });
           }
         }
 
