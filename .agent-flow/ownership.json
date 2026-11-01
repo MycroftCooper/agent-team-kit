@@ -52,6 +52,11 @@
       "note": "toolkit product code and adjacent modules"
     },
     {
+      "prefix": "packages/",
+      "role": "LEAD",
+      "note": "shared contracts (single-writer policy: the contract owner approves every change, see ADR-005)"
+    },
+    {
       "prefix": "plugins/",
       "role": "DEV",
       "note": "legacy DSH board plugin (removed in the local-service UI batch)"
@@ -80,6 +85,11 @@
       "prefix": "test/",
       "role": "QA",
       "note": "acceptance tests and evidence checks"
+    },
+    {
+      "prefix": "test/contracts.test.mjs",
+      "role": "LEAD",
+      "note": "contract tests belong to the contract owner (single-writer, see .agent-flow/ownership.json packages/ rule)"
     },
     {
       "prefix": "tools/",

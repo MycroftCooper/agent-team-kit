@@ -1,0 +1,25 @@
+{
+  "name": "@atk/contracts",
+  "version": "0.1.0-draft.1",
+  "private": true,
+  "description": "DRAFT: shared API/event/error contracts for Agent Team Kit 2.0 (enums, error codes, DTO validators, SSE envelope). Not wired into the workspace yet.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./enums": "./src/enums.mjs",
+    "./errors": "./src/errors.mjs",
+    "./dto": "./src/dto.mjs",
+    "./events": "./src/events.mjs",
+    "./version": "./src/version.mjs",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20.11"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ]
+}
