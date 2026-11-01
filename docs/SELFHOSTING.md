@@ -18,6 +18,11 @@ that makes self-hosting safe.
 Do **not** run `atk init --force` in this repository: it would regenerate the
 workflow from the generic preset and overwrite the self-host configuration.
 
+The repository is still **main-only**: `branch.development` and
+`branch.release` both point at `main` so the config matches reality, and
+`atk release` is not part of the self-host loop until a dev/release split is
+decided.
+
 ## Baseline
 
 Before a risky batch, record a known-good point:
