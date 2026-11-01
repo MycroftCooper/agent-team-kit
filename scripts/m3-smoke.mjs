@@ -316,11 +316,28 @@ try {
     await waitFor(async () => (await getTask("M3-A")).status === "CLAIMED", 5000, "task claimed");
     await host.stop();
 
-    // The scheduler does not auto-accept: a human/CLI walks the legal chain.
-    for (const status of ["RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE", "DONE"]) {
+    // The scheduler does not auto-accept, and since M4 DONE is reachable only
+    // through a human approval. Walk the legal chain, then approve with the
+    // matching target hash.
+    for (const status of ["RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE"]) {
       await patchTask("M3-A", { status });
     }
-    expect((await getTask("M3-A")).status === "DONE", "expected M3-A DONE after the legal chain");
+    const targetHash = "a".repeat(64); // contracts: a target hash is a sha256 hex digest
+    const auth = { "x-atk-token": publicToken, "x-atk-csrf": csrf, "content-type": "application/json", origin: base };
+    const created = await fetch(`${base}/api/v1/approvals`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ taskId: "M3-A", scope: "task", targetHash }),
+    });
+    if (!created.ok) throw new Error(`POST /approvals: ${created.status} ${await created.text()}`);
+    const approval = await created.json();
+    const decided = await fetch(`${base}/api/v1/approvals/${encodeURIComponent(approval.id)}/decide`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ decision: "APPROVED", targetHash }),
+    });
+    if (!decided.ok) throw new Error(`POST /approvals/:id/decide: ${decided.status} ${await decided.text()}`);
+    expect((await getTask("M3-A")).status === "DONE", "expected M3-A DONE after the human approval");
 
     const runner = scheduler();
     const round = await runner.runOnce();
@@ -331,6 +348,23 @@ try {
     return `M3-A accepted by legal transitions; claimed ${claimed.join(",")}`;
   });
 
+  check("the scheduler CLI process starts and completes a round", async () => {
+    // QA-004 found the CLI could not start at all while every library test stayed
+    // green. The gate must therefore execute the real process entry point.
+    const cli = path.join(ROOT, "apps", "scheduler", "cli.mjs");
+    const result = spawnSync(process.execPath, [cli, "--once", "--owner", "cli-smoke"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 30000,
+      env: { ...process.env, ATK_BACKEND_URL: base, ATK_INTERNAL_TOKEN: internalToken, SCHEDULER_OWNER: "cli-smoke" },
+    });
+    expect(result.status === 0, `the scheduler CLI exited ${result.status}: ${result.stderr}`);
+    const line = result.stdout.trim().split("\n").pop();
+    const payload = JSON.parse(line);
+    expect(payload?.result?.ok === true, `expected a completed round, got ${line}`);
+    return `CLI exit 0, round ok (${payload.result.proposals} proposal(s), ${payload.result.skipped} skipped)`;
+  });
   // Run every check while the backend is still up (the finally block stops it).
   for (const runCheck of checks) results.push(await runCheck());
 } finally {

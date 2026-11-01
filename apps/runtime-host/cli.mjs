@@ -6,13 +6,14 @@
 //   ATK_BACKEND_URL      default http://127.0.0.1:1421
 //   ATK_INTERNAL_TOKEN   required (printed once by `atk-backend serve`)
 //   ATK_HOST_OWNER       default host-<pid>
+//   ATK_HOST_STATE_FILE  in-flight run records (default %LOCALAPPDATA%/AgentTeamKit/runtime/host-<owner>.json)
 //   AGENT_RUNTIME        mock | dsh (default mock)
 import process from "node:process";
 import path from "node:path";
 import { createMockRuntime } from "@atk/runtime-sdk/mock";
 import { createDshRuntimeStub } from "@atk/runtime-sdk/dsh";
-import { createInternalClient } from "./client.mjs";
-import { createHost } from "./host.mjs";
+import { createInternalClient } from "./src/client.mjs";
+import { createHost } from "./src/host.mjs";
 
 const USAGE = [
   "Usage: atk-runtime-host [--once] [--owner <id>]",
@@ -21,6 +22,7 @@ const USAGE = [
   "  ATK_BACKEND_URL      backend base URL (default http://127.0.0.1:1421)",
   "  ATK_INTERNAL_TOKEN   internal credential from `atk-backend serve` (required)",
   "  ATK_HOST_OWNER       lease owner id (default host-<pid>)",
+  "  ATK_HOST_STATE_FILE  where in-flight runs are recorded for crash recovery",
   "  AGENT_RUNTIME        mock (default) | dsh (experimental, capabilities all false)",
   "",
   "Exit codes: 0 ok, 2 usage/config error.",
@@ -65,7 +67,8 @@ if (!token) {
 const logger = console;
 const runtime = buildRuntime(runtimeKind, logger);
 const client = createInternalClient({ baseUrl, token });
-const stateFile = process.env.ATK_HOST_STATE_FILE ?? path.join(process.env.LOCALAPPDATA ?? process.cwd(), "AgentTeamKit", "runtime", `host-${ownerId}.json`);
+const stateFile =
+  process.env.ATK_HOST_STATE_FILE ?? path.join(process.env.LOCALAPPDATA ?? process.cwd(), "AgentTeamKit", "runtime", `host-${ownerId}.json`);
 const host = createHost({ client, runtime, ownerId, logger, stateFile });
 
 async function main() {

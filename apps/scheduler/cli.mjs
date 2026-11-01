@@ -10,8 +10,8 @@
 //   MAX_PER_AGENT                default 1
 import process from "node:process";
 import { planDispatch } from "@atk/scheduler-core";
-import { createSchedulerClient } from "./client.mjs";
-import { createScheduler } from "./index.mjs";
+import { createSchedulerClient } from "./src/client.mjs";
+import { createScheduler } from "./src/index.mjs";
 
 const USAGE = [
   "Usage: atk-scheduler [--once] [--owner <id>]",
@@ -74,7 +74,7 @@ if (args.once) {
   await scheduler.stop();
 } else {
   scheduler.start();
-  process.stdout.write(`[scheduler] ${ownerId} attached to ${baseUrl} (poll ${policies})\n`);
+  process.stdout.write(`[scheduler] ${ownerId} attached to ${baseUrl} (policies ${JSON.stringify(policies)})\n`);
 }
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
