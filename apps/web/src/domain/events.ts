@@ -16,6 +16,7 @@ export const EVENT_TYPE_KEYS: Record<EventType, MessageKey> = {
   "task.blocked": "events.type.task.blocked",
   "run.created": "events.type.run.created",
   "run.updated": "events.type.run.updated",
+  "run.log": "events.type.run.log",
   "review.requested": "events.type.review.requested",
   "review.updated": "events.type.review.updated",
   "integration.updated": "events.type.integration.updated",

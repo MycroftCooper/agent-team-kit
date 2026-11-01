@@ -16,15 +16,22 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PACKAGES = ["web", "backend", "database", "contracts"];
+const PACKAGES = ["web", "backend", "database", "contracts", "runtime-sdk", "workspace"];
 const APP_PREFIXES = { web: "apps/web", backend: "apps/backend" };
-const PKG_PREFIXES = { database: "packages/database", contracts: "packages/contracts" };
+const PKG_PREFIXES = {
+  database: "packages/database",
+  contracts: "packages/contracts",
+  "runtime-sdk": "packages/runtime-sdk",
+  workspace: "packages/workspace",
+};
 
 const ALLOWED = {
   web: new Set(["contracts"]),
   backend: new Set(["contracts", "database"]),
   database: new Set(["contracts"]),
   contracts: new Set(),
+  "runtime-sdk": new Set(["contracts"]),
+  workspace: new Set([]),
 };
 
 const IMPORT_RE = /(?:^|\n)\s*(?:import|export)[^;]*?from\s+["']([^"']+)["']|(?:^|\n)\s*import\s+["']([^"']+)["']|import\(\s*["']([^"']+)["']\s*\)/g;

@@ -12,6 +12,9 @@ export const ERROR_CODES = Object.freeze({
   NOT_FOUND: { http: 404, retryable: false },
   TASK_VERSION_CONFLICT: { http: 409, retryable: true },
   TASK_DEPENDENCY_BLOCKED: { http: 409, retryable: true },
+  // Leases and dispatch commands are fenced by a monotonic generation: a report
+  // from an older holder must never overwrite the current run (ADR-003).
+  STALE_GENERATION: { http: 409, retryable: false },
   // Generic optimistic-concurrency conflict for entities that are not Tasks
   // (Project, Run, ...). Tasks keep TASK_VERSION_CONFLICT because the spec's
   // public error list names it explicitly; both are 409 and both carry

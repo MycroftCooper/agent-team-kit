@@ -1,0 +1,16 @@
+{
+  "name": "@atk/workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "M2: per-Run git worktrees outside the repository, with safety checks before removal.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

@@ -18,6 +18,9 @@ export const EVENT_TYPES = Object.freeze([
   "task.blocked",
   "run.created",
   "run.updated",
+  // A chunk of run output (stdout/stderr/log line). Large logs live in files;
+  // this event carries the pointer/summary the SSE stream needs (spec §6.2).
+  "run.log",
   "review.requested",
   "review.updated",
   "integration.updated",
