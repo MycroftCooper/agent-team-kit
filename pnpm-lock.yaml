@@ -23,6 +23,12 @@ importers:
         specifier: workspace:*
         version: link:../../packages/runtime-sdk
 
+  apps/scheduler:
+    dependencies:
+      '@atk/scheduler-core':
+        specifier: workspace:*
+        version: link:../../packages/scheduler-core
+
   apps/web:
     dependencies:
       '@atk/contracts':
@@ -64,6 +70,8 @@ importers:
       '@atk/contracts':
         specifier: workspace:*
         version: link:../contracts
+
+  packages/scheduler-core: {}
 
   packages/workspace: {}
 
