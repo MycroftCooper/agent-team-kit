@@ -6,8 +6,9 @@
 //
 // Usage: node scripts/m6-smoke.mjs
 // Exit: 0 = all checks pass, 1 = a check failed, 2 = prerequisites missing.
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -41,6 +42,116 @@ function expect(condition, message) {
 }
 function cli(args) {
   return spawnSync(process.execPath, [BACKEND, ...args], { cwd: ROOT, encoding: "utf8", windowsHide: true, timeout: 120000 });
+}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function waitFor(predicate, timeoutMs = 30000, label = "condition") {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await predicate()) return;
+    await sleep(100);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      server.close(() => resolve(port));
+    });
+  });
+}
+/** Run `fn` against a real backend serving `dbFile`, then always stop it. */
+async function withBackend(dbFile, fn) {
+  const port = await freePort();
+  const base = `http://127.0.0.1:${port}`;
+  const child = spawn(process.execPath, [BACKEND, "serve", "--port", String(port), "--data", dbFile], {
+    cwd: ROOT,
+    windowsHide: true,
+    env: { ...process.env, LOCALAPPDATA: tmp },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => (output += chunk));
+  child.stderr.on("data", (chunk) => (output += chunk));
+  try {
+    await waitFor(async () => {
+      try {
+        return (await fetch(`${base}/api/v1/system/health`)).ok;
+      } catch {
+        return false;
+      }
+    }, 30000, `backend health for ${dbFile}`);
+    const session = await (await fetch(`${base}/api/v1/session`)).json();
+    return await fn({ base, token: session.token });
+  } finally {
+    child.kill();
+    await waitFor(() => child.exitCode !== null || child.signalCode !== null, 5000, "backend stop").catch(() => {});
+  }
+}
+/** Seed a throwaway DB with exactly `count` events and nothing else (seq 1..count). */
+function seedOnlyEvents(dbFile, count, aggregateId) {
+  mkdirSync(path.dirname(dbFile), { recursive: true });
+  const store = openStore({ file: dbFile, migrate: true });
+  try {
+    for (let index = 0; index < count; index += 1) {
+      store.appendEvent({ type: "task.updated", aggregateType: "task", aggregateId, payload: { index } });
+    }
+  } finally {
+    store.close();
+  }
+}
+async function httpEvents(base, token, query) {
+  const response = await fetch(`${base}/api/v1/events?${query}`, { headers: { "x-atk-token": token } });
+  const text = await response.text();
+  let body = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = null;
+  }
+  return { status: response.status, body, text };
+}
+/**
+ * Page until hasMore is false. The assertion is the *concatenated seq list*
+ * JSON-equal to `expected`, plus every page length <= the requested limit — a
+ * single hasMore/nextAfterSeq value can be wrong without anyone noticing.
+ */
+async function collectEventSeqs({ base, token, aggregateId, limit, expected, pagesExpected }) {
+  const pageSizes = [];
+  const seqs = [];
+  let afterSeq;
+  for (let page = 0; page < 10; page += 1) {
+    const params = [`aggregateId=${encodeURIComponent(aggregateId)}`];
+    if (limit !== undefined) params.push(`limit=${limit}`);
+    if (afterSeq !== undefined) params.push(`afterSeq=${afterSeq}`);
+    const response = await httpEvents(base, token, params.join("&"));
+    expect(response.status === 200, `page ${page + 1} expected 200, got ${response.status}: ${response.text.slice(0, 300)}`);
+    expect(Array.isArray(response.body?.items), `page ${page + 1} has no items array: ${response.text.slice(0, 300)}`);
+    const pageLimit = limit ?? 100; // backend default limit
+    expect(
+      response.body.items.length <= pageLimit,
+      `page ${page + 1} returned ${response.body.items.length} items > limit ${pageLimit} (the pagination bug's direct symptom)`,
+    );
+    pageSizes.push(response.body.items.length);
+    for (const event of response.body.items) seqs.push(Number(event.seq));
+    if (response.body.hasMore === true) {
+      expect(Number.isInteger(response.body.nextAfterSeq), `page ${page + 1} has hasMore:true but no integer nextAfterSeq: ${response.text.slice(0, 300)}`);
+      expect(response.body.nextAfterSeq > (afterSeq ?? 0), `nextAfterSeq did not advance: ${afterSeq} -> ${response.body.nextAfterSeq}`);
+      afterSeq = response.body.nextAfterSeq;
+    } else if (response.body.hasMore === false) {
+      expect(response.body.nextAfterSeq === undefined, `page ${page + 1} has hasMore:false but nextAfterSeq=${response.body.nextAfterSeq}`);
+      break;
+    } else {
+      throw new Error(`page ${page + 1} has no boolean hasMore: ${response.text.slice(0, 300)}`);
+    }
+  }
+  expect(pageSizes.length === pagesExpected, `expected ${pagesExpected} page(s), got ${pageSizes.length} (${pageSizes.join("/")})`);
+  expect(new Set(seqs).size === seqs.length, `pagination returned duplicate seq: ${JSON.stringify(seqs)}`);
+  expect(JSON.stringify(seqs) === JSON.stringify(expected), `paged seq mismatch: got ${JSON.stringify(seqs)} expected ${JSON.stringify(expected)}`);
+  return `${pageSizes.join("/")} -> seq ${expected[0]}..${expected[expected.length - 1]} exactly once`;
 }
 function countsOf(dbFile) {
   const store = openStore({ file: dbFile, migrate: false });
@@ -124,6 +235,55 @@ try {
     } finally {
       store.close();
     }
+  });
+
+  check("HTTP /api/v1/events pagination returns every seq exactly once (3/4/105)", async () => {
+    const pageDir = path.join(tmp, "http-events");
+    const cases = [
+      { count: 3, limit: 2, pagesExpected: 2 },
+      { count: 4, limit: 2, pagesExpected: 2 },
+      { count: 105, limit: undefined, pagesExpected: 2 }, // default limit (100)
+    ];
+    const evidence = [];
+    for (const { count, limit, pagesExpected } of cases) {
+      const aggregateId = `M6-HTTP-${count}`;
+      const file = path.join(pageDir, `events-${count}.db`);
+      seedOnlyEvents(file, count, aggregateId);
+      const expected = Array.from({ length: count }, (_, index) => index + 1);
+      const detail = await withBackend(file, ({ base, token }) =>
+        collectEventSeqs({ base, token, aggregateId, limit, expected, pagesExpected }),
+      );
+      evidence.push(`${count} events limit=${limit ?? "default"} => ${detail}`);
+    }
+    return evidence.join("; ");
+  });
+
+  check("HTTP /api/v1/events pagination rejects invalid parameters (400 naming the field)", async () => {
+    const file = path.join(tmp, "http-events", "invalid.db");
+    seedOnlyEvents(file, 3, "M6-HTTP-INVALID");
+    return withBackend(file, async ({ base, token }) => {
+      const cases = [
+        ["limit=0", "limit"],
+        ["limit=1001", "limit"],
+        ["afterSeq=-1", "afterSeq"],
+        ["aggregateId=not%20a%20valid%20id%21", "aggregateId"],
+      ];
+      const evidence = [];
+      for (const [query, field] of cases) {
+        const response = await httpEvents(base, token, query);
+        expect(response.status === 400, `${query} expected 400, got ${response.status}: ${response.text.slice(0, 300)}`);
+        expect(
+          response.body?.error?.code === "VALIDATION_ERROR",
+          `${query} expected VALIDATION_ERROR, got ${response.body?.error?.code}: ${response.text.slice(0, 300)}`,
+        );
+        expect(
+          JSON.stringify(response.body?.error?.details ?? "").includes(field),
+          `${query} details must name "${field}": ${response.text.slice(0, 300)}`,
+        );
+        evidence.push(`${query} -> 400 (${field})`);
+      }
+      return evidence.join("; ");
+    });
   });
 
   check("switchReadiness blocks while a run is active and clears when it ends", async () => {

@@ -103,6 +103,74 @@ test("GET /events defaults to 100 items and reports hasMore", async (t) => {
   assert.equal(next.json.hasMore, false);
 });
 
+test("GET /events never loses a seq when the last page is short (QA-007)", async (t) => {
+  // 3 remaining, limit=2: fetch limit+1 must NOT make the store claim completion.
+  const three = createFakeStore({ projects: [{ id: "P-1", name: "Demo", repoPath: "C:\\repo", defaultBranch: "main" }] });
+  for (let index = 0; index < 3; index += 1) {
+    three.appendEvent({ projectId: "P-1", aggregateType: "task", aggregateId: "T-1", type: "task.updated", payload: { index } });
+  }
+  const ctx3 = await withServer(t, three);
+  const page1 = await request(ctx3.base, { path: "/api/v1/events?limit=2", headers: readHeaders() });
+  assert.deepEqual(page1.json.items.map((event) => event.seq), [1, 2]);
+  assert.equal(page1.json.hasMore, true);
+  assert.equal(page1.json.nextAfterSeq, 2);
+  const page2 = await request(ctx3.base, { path: `/api/v1/events?limit=2&afterSeq=${page1.json.nextAfterSeq}`, headers: readHeaders() });
+  assert.deepEqual(page2.json.items.map((event) => event.seq), [3]);
+  assert.equal(page2.json.hasMore, false);
+  assert.equal(page2.json.nextAfterSeq, undefined);
+
+  // 4 remaining, limit=2: nextAfterSeq must be the last RETURNED item (2), not
+  // the store's limit+1 page (3), otherwise seq 3 is skipped.
+  const four = createFakeStore({ projects: [{ id: "P-1", name: "Demo", repoPath: "C:\\repo", defaultBranch: "main" }] });
+  for (let index = 0; index < 4; index += 1) {
+    four.appendEvent({ projectId: "P-1", aggregateType: "task", aggregateId: "T-1", type: "task.updated", payload: { index } });
+  }
+  const ctx4 = await withServer(t, four);
+  const first = await request(ctx4.base, { path: "/api/v1/events?limit=2", headers: readHeaders() });
+  assert.deepEqual(first.json.items.map((event) => event.seq), [1, 2]);
+  assert.equal(first.json.nextAfterSeq, 2);
+  const second = await request(ctx4.base, { path: `/api/v1/events?limit=2&afterSeq=${first.json.nextAfterSeq}`, headers: readHeaders() });
+  assert.deepEqual(second.json.items.map((event) => event.seq), [3, 4]);
+  assert.equal(second.json.hasMore, false);
+  assert.deepEqual([...first.json.items, ...second.json.items].map((event) => event.seq), [1, 2, 3, 4]);
+
+  // Default page size 100 with 105 events: 100 + 5, no gaps.
+  const many = createFakeStore({ projects: [{ id: "P-1", name: "Demo", repoPath: "C:\\repo", defaultBranch: "main" }] });
+  for (let index = 0; index < 105; index += 1) {
+    many.appendEvent({ projectId: "P-1", aggregateType: "task", aggregateId: "T-1", type: "task.updated", payload: { index } });
+  }
+  const ctxMany = await withServer(t, many);
+  const defaultFirst = await request(ctxMany.base, { path: "/api/v1/events", headers: readHeaders() });
+  assert.equal(defaultFirst.json.items.length, 100);
+  assert.equal(defaultFirst.json.hasMore, true);
+  assert.equal(defaultFirst.json.nextAfterSeq, 100);
+  const defaultSecond = await request(ctxMany.base, { path: `/api/v1/events?afterSeq=${defaultFirst.json.nextAfterSeq}`, headers: readHeaders() });
+  assert.equal(defaultSecond.json.items.length, 5);
+  assert.equal(defaultSecond.json.hasMore, false);
+  assert.deepEqual(
+    [...defaultFirst.json.items, ...defaultSecond.json.items].map((event) => event.seq),
+    Array.from({ length: 105 }, (_, index) => index + 1),
+  );
+
+  // limit=1000 boundary: 1001 events -> 1000 + 1.
+  const boundary = createFakeStore({ projects: [{ id: "P-1", name: "Demo", repoPath: "C:\\repo", defaultBranch: "main" }] });
+  for (let index = 0; index < 1001; index += 1) {
+    boundary.appendEvent({ projectId: "P-1", aggregateType: "task", aggregateId: "T-1", type: "task.updated", payload: { index } });
+  }
+  const ctxBoundary = await withServer(t, boundary);
+  const boundaryFirst = await request(ctxBoundary.base, { path: "/api/v1/events?limit=1000", headers: readHeaders() });
+  assert.equal(boundaryFirst.json.items.length, 1000);
+  assert.equal(boundaryFirst.json.hasMore, true);
+  assert.equal(boundaryFirst.json.nextAfterSeq, 1000);
+  const boundarySecond = await request(ctxBoundary.base, { path: `/api/v1/events?limit=1000&afterSeq=${boundaryFirst.json.nextAfterSeq}`, headers: readHeaders() });
+  assert.equal(boundarySecond.json.items.length, 1);
+  assert.equal(boundarySecond.json.hasMore, false);
+  assert.deepEqual(
+    [...boundaryFirst.json.items, ...boundarySecond.json.items].map((event) => event.seq),
+    Array.from({ length: 1001 }, (_, index) => index + 1),
+  );
+});
+
 test("GET /events validates every filter with a field-naming 400", async (t) => {
   const ctx = await withServer(t);
   const read = readHeaders();

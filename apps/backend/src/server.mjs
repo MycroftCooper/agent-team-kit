@@ -829,38 +829,30 @@ export function createServer({
           filter.type = type;
         }
 
-        // Fetch one extra row to compute hasMore without a second store call.
-        const fetchLimit = limit < 1000 ? limit + 1 : limit;
-        const raw = store.listEvents({ ...filter, limit: fetchLimit });
+        // Pagination must be computed for the REQUESTED limit. Never reuse a
+        // store page's hasMore/nextAfterSeq when that page was fetched with
+        // limit+1 (it thinks the page is complete and drops the next cursor).
         let items;
         let hasMore;
         let nextAfterSeq;
-        if (Array.isArray(raw)) {
-          items = raw.slice(0, limit);
-          // @atk/database annotates the array with a filtered hasMore/nextAfterSeq
-          // (non-enumerable), which is authoritative for filtered pages.
-          if (typeof raw.hasMore === "boolean") {
-            hasMore = raw.hasMore;
-            if (Number.isInteger(raw.nextAfterSeq)) nextAfterSeq = raw.nextAfterSeq;
-            else if (hasMore && items.length > 0) nextAfterSeq = Number(items[items.length - 1].seq);
-          } else {
-            hasMore = raw.length > limit;
-            if (!hasMore && limit === 1000 && items.length === 1000 && typeof store.latestSeq === "function") {
-              hasMore = store.latestSeq() > Number(items[items.length - 1].seq);
-            }
+        if (typeof store.listEventsPage === "function") {
+          const page = store.listEventsPage({ ...filter, limit });
+          items = page && Array.isArray(page.items) ? page.items.slice(0, limit) : [];
+          hasMore = Boolean(page?.hasMore);
+          if (hasMore && items.length > 0) {
+            nextAfterSeq = Number.isInteger(page?.nextAfterSeq) ? page.nextAfterSeq : Number(items[items.length - 1].seq);
           }
-        } else if (raw && Array.isArray(raw.items)) {
-          // Forward-compatible: a store may return {items, hasMore, nextAfterSeq}.
-          items = raw.items.slice(0, limit);
-          hasMore = typeof raw.hasMore === "boolean" ? raw.hasMore : raw.items.length > limit;
-          nextAfterSeq = raw.nextAfterSeq;
         } else {
-          items = [];
-          hasMore = false;
-        }
-        if (nextAfterSeq === undefined && hasMore && items.length > 0) {
-          const lastSeq = Number(items[items.length - 1].seq);
-          if (Number.isInteger(lastSeq)) nextAfterSeq = lastSeq;
+          const raw = store.listEvents({ ...filter, limit: Math.min(limit + 1, 10_000) });
+          const rows = Array.isArray(raw) ? raw : raw && Array.isArray(raw.items) ? raw.items : [];
+          items = rows.slice(0, limit);
+          hasMore = rows.length > limit;
+          // limit=1000 cannot fetch one extra row from the store's hard cap;
+          // fall back to seq monotonicity (conservative: never lose events).
+          if (!hasMore && limit === 1000 && items.length === 1000 && typeof store.latestSeq === "function") {
+            hasMore = store.latestSeq() > Number(items[items.length - 1].seq);
+          }
+          if (hasMore && items.length > 0) nextAfterSeq = Number(items[items.length - 1].seq);
         }
         const body = { items, hasMore };
         if (nextAfterSeq !== undefined) body.nextAfterSeq = nextAfterSeq;

@@ -272,6 +272,79 @@ test("replace refuses to switch while the backend is running; succeeds after sto
   assert.deepEqual(taskIds(target), ["T-1"]);
 });
 
+test("replace refuses an active Run/lease before writing; --force-switch discards it explicitly", { skip: DB_SKIP }, async () => {
+  const dir = tempDir();
+  const source = seedDatabase(dir, "source.db", ["T-NEW"]);
+  const out = path.join(dir, "state.json");
+  assert.equal(runCli(["export", "--data", source, "--to", out]).status, 0);
+
+  // Target with an in-flight Run + lease + dispatch command.
+  const target = path.join(dir, "active.db");
+  const store = database.openStore({ file: target, migrate: true });
+  let readiness;
+  try {
+    store.createProject({ id: "P-OLD", name: "Old", repoPath: "C:\\repo", defaultBranch: "main" });
+    store.upsertAgent({ id: "agent-1", role: "BE", capabilities: ["WORKER"], status: "IDLE" });
+    store.createTask({ id: "T-ACTIVE", projectId: "P-OLD", title: "Active", description: "d", functionRequired: "WORKER", roleRequired: "BE", priority: 2, deps: [] });
+    const claimed = store.claimTask({
+      taskId: "T-ACTIVE",
+      agentId: "agent-1",
+      expectedTaskVersion: 0,
+      policies: { maxConcurrentPerProject: 5, maxPerAgent: 5 },
+      idempotencyKey: "switch-active",
+    });
+    store.updateRunStatus(claimed.run.id, { status: "RUNNING" });
+    readiness = database.verifySwitchReadiness(store);
+  } finally {
+    store.close();
+  }
+  assert.equal(readiness.ok, false);
+  assert.ok(readiness.blockers.some((blocker) => blocker.code === "active-run"));
+
+  const before = contentHash(target);
+  const beforeStore = database.openStore({ file: target, migrate: false });
+  let countsBefore;
+  try {
+    countsBefore = { tasks: beforeStore.listTasks({}).length, runs: beforeStore.listRuns({}).length, events: beforeStore.listEvents({}).length };
+  } finally {
+    beforeStore.close();
+  }
+
+  const refused = runCli(["import", "--from", out, "--data", target, "--mode", "replace", "--force", "--json"]);
+  assert.equal(refused.status, 1, refused.stdout);
+  assert.match(refused.stderr, /cannot switch: database is not ready/);
+  assert.match(refused.stderr, /active-run/);
+  assert.match(refused.stderr, /run=RUN-/);
+  assert.match(refused.stderr, /--force-switch/);
+  assert.equal(contentHash(target), before, "a blocked switch must not change the database");
+  const unchanged = database.openStore({ file: target, migrate: false });
+  try {
+    assert.deepEqual(
+      { tasks: unchanged.listTasks({}).length, runs: unchanged.listRuns({}).length, events: unchanged.listEvents({}).length },
+      countsBefore,
+    );
+  } finally {
+    unchanged.close();
+  }
+
+  const forced = runCli(["import", "--from", out, "--data", target, "--mode", "replace", "--force", "--force-switch", "--json"]);
+  assert.equal(forced.status, 0, forced.stderr);
+  const report = JSON.parse(forced.stdout);
+  assert.equal(report.ok, true);
+  assert.equal(report.forced, true);
+  assert.equal(report.switchForced, true);
+  assert.equal(report.switchReadiness.ok, false);
+  assert.match(forced.stderr, /--force-switch discards in-flight Runs\/leases/);
+  const after = database.openStore({ file: target, migrate: false });
+  try {
+    assert.deepEqual(after.listTasks({}).map((task) => task.id), ["T-NEW"]);
+    assert.equal(after.listRuns({}).length, 0);
+    assert.equal(after.listEvents({}).length, 0);
+  } finally {
+    after.close();
+  }
+});
+
 test("import usage errors exit 2; human output names mode/status", { skip: DB_SKIP }, () => {
   const dir = tempDir();
   const source = seedDatabase(dir, "source.db", ["T-1"]);

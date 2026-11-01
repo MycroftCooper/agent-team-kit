@@ -41,9 +41,12 @@ Commands:
   export   --data <db> --to <file> [--project <id>] [--json]
            Export the SQLite store to readable JSON ({ stateJson, runtime, manifest }).
            --out is kept as an alias for --to.
-  import   --from <file> --data <db> [--mode merge|replace] [--force] [--json]
+  import   --from <file> --data <db> [--mode merge|replace] [--force] [--force-switch] [--json]
            Import that JSON into SQLite (merge default; replace needs an empty
            database or --force; the whole import is transactional).
+           replace refuses while the backend is running OR while an active Run /
+           lease exists (verifySwitchReadiness). --force-switch DISCARDS in-flight
+           Runs/leases; only use it when you really intend to lose that state.
   backup   --data <db> --to <dir> [--force] [--json]
            Write a consistent SQLite snapshot (read-only source + backup API)
            plus manifest.json ({createdAt, schemaVersion, bytes, sha256, source}).
@@ -74,6 +77,8 @@ function parseArgs(argv) {
       flags["dry-run"] = true;
     } else if (arg === "--force") {
       flags.force = true;
+    } else if (arg === "--force-switch") {
+      flags["force-switch"] = true;
     } else if (arg === "--help" || arg === "-h") {
       flags.help = true;
     } else if (arg.startsWith("--")) {
@@ -899,6 +904,23 @@ async function detectRunningBackend({ port, targetFile } = {}) {
   };
 }
 
+/** Resolve the switch-readiness probe (store method or @atk/database export). */
+function resolveSwitchReadiness(database, store) {
+  if (typeof store.verifySwitchReadiness === "function") return () => store.verifySwitchReadiness();
+  if (typeof database.verifySwitchReadiness === "function") return () => database.verifySwitchReadiness(store);
+  return null;
+}
+
+function formatSwitchBlockers(blockers) {
+  return blockers.map((blocker) => {
+    const code = blocker?.code ?? blocker?.reason ?? "blocker";
+    const run = blocker?.runId ? ` run=${blocker.runId}` : "";
+    const status = blocker?.status ? ` status=${blocker.status}` : "";
+    const message = blocker?.message ? ` (${blocker.message})` : "";
+    return `${code}${run}${status}${message}`;
+  });
+}
+
 async function importCommand(flags) {
   if (!flags.from) throw new CliError("import requires --from <file>");
   const fromFile = path.resolve(flags.from);
@@ -907,6 +929,10 @@ async function importCommand(flags) {
     throw new CliError('--mode must be "merge" or "replace"');
   }
   const force = Boolean(flags.force);
+  const forceSwitch = Boolean(flags["force-switch"]);
+  if (forceSwitch && mode !== "replace") {
+    throw new CliError("--force-switch only applies to --mode replace");
+  }
   const document = readRequiredJson(fromFile);
   // Accept both the export wrapper ({stateJson,runtime}) and a raw legacy state.
   let stateJson = document;
@@ -927,6 +953,7 @@ async function importCommand(flags) {
   }
   ensureDirFor(dataFile);
   const store = openStore(database, dataFile);
+  let switchReadiness = null;
   try {
     const projects = typeof store.listProjects === "function" ? store.listProjects() : [];
     const tasks = typeof store.listTasks === "function" ? store.listTasks({}) : [];
@@ -952,6 +979,25 @@ async function importCommand(flags) {
           1,
         );
       }
+      // Offline is necessary but not sufficient: an active Run / lease owns
+      // in-flight state that replace would silently discard.
+      const readinessProbe = resolveSwitchReadiness(database, store);
+      if (readinessProbe) {
+        switchReadiness = readinessProbe();
+        if (!switchReadiness?.ok) {
+          const blockers = formatSwitchBlockers(Array.isArray(switchReadiness?.blockers) ? switchReadiness.blockers : []);
+          if (!forceSwitch) {
+            throw new CliError(
+              `cannot switch: database is not ready (${blockers.join("; ")}); finish or cancel the run, or use --force-switch if you really intend to discard in-flight state`,
+              1,
+            );
+          }
+          process.stderr.write(
+            "warning: --force-switch discards in-flight Runs/leases; " +
+              `blockers: ${blockers.join("; ")}\n`,
+          );
+        }
+      }
     }
     const report = await database.importStateJson(store, { stateJson, runtime, ownership, config, mode, force });
     const status = report?.status ?? "UNKNOWN";
@@ -962,11 +1008,17 @@ async function importCommand(flags) {
         from: fromFile,
         data: dataFile,
         mode,
-        forced: force,
+        // --force-switch is a distinct risk from --force (overwrite): it also
+        // accepts DISCARDING in-flight runs/leases.
+        forced: Boolean(force || forceSwitch),
+        switchForced: forceSwitch,
+        switchReadiness,
         report,
       });
     } else {
-      process.stdout.write(`import ${status} (mode: ${mode}${force ? ", force" : ""}) from: ${fromFile}\n`);
+      process.stdout.write(
+        `import ${status} (mode: ${mode}${force ? ", force" : ""}${forceSwitch ? ", FORCE-SWITCH: in-flight Runs/leases discarded" : ""}) from: ${fromFile}\n`,
+      );
       if (report?.counts) process.stdout.write(`counts: ${JSON.stringify(report.counts)}\n`);
       const problems = Array.isArray(report?.problems) ? report.problems : [];
       for (const problem of problems) {
