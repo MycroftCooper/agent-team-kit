@@ -123,3 +123,29 @@ node apps/launcher/cli.mjs start --port 1421
 2. 没有安装包/签名/自动更新；`atk start` 从源码目录运行。
 3. 真实 DSH 适配器不可用：当前只能跑 MockRuntime，因此"M5 真实 3 Agent 协作"只完成了 Mock 版本，真实协作需要 RT-P07/P08 验证后再评估。
 4. 日志没有轮转（本地单机，按需手工清理）。
+
+---
+
+## 6. Phase C：旧 CLI 只读（SQLite 单一事实源）
+
+ADR-006 的 Phase C 一旦开始，**SQLite 是唯一写者**；旧 `lib/**` CLI（`atk` 命令）降级为只读兼容入口。判据只有一处：
+
+```text
+<dataDir>/runtime/migration.lock
+{ "owner": "sqlite", "phase": "C", "pid": 12345,
+  "startedAt": "2026-11-02T12:00:00+08:00", "toolVersion": "0.2.0" }
+```
+
+`dataDir` 默认 `%LOCALAPPDATA%\AgentTeamKit`，`ATK_DATA_DIR` 可覆盖；Launcher 与旧 CLI 读同一文件。锁缺失 = 尚未进入 Phase B（旧 JSON 行为保持）；锁存在但 owner=sqlite / phase=C = **旧 CLI 只读**。
+
+**只读命令（可用）**：`atk board` / `board --json` / `serve` / `status` / `doctor` / `verify` / `export`，以及 `atk state check|queue|task`。它们直接从 SQLite 投影事实（`lib/sqlite-read.mjs`），不读取也不回写 state.json。
+
+**被拒绝的写命令**（exit 1，code `READ_ONLY_MODE`，提示 `read-only compatibility mode; use atk export or the Backend API`）：
+`init`、`state import|archive|restore`、`batch apply`、`evidence`、`ownership`、`permit`、`gate`、`todo`（非 list）、`measure record`、`docs rotate`、`baseline start`、`release`、`plugin sync`、`cache clean`。
+`saveState` 是中心守卫，但 evidence 直写、init、batch、ownership、gate 各自入口也会判锁——不是只守一个函数。
+
+**陈旧/非法锁**：pid 已死 → `MIGRATION_LOCK_STALE`，**不会静默绕过**；按错误里的指引确认无进程后删除锁，或 `atk migrate --resume`；处理前先 `atk-backend backup`。
+**切换只允许停机时进行**：Backend 运行时（launcher.json 存活 PID 或 `/api/v1/system/health` 可达）执行 `atk-backend import --mode replace` 会被拒绝，错误为
+`database switch must run while the backend is stopped (detected backend pid <pid> on port <port>); stop it with atk stop first`。
+
+**只读期取 JSON**：`atk export --out <file>`（可读投影，跨版本/审计用）。二进制回滚仍用 `atk-backend backup/restore`；两者职责不同：backup 是 WAL 一致性快照（回滚），export 是 JSON（迁移/审计）。

@@ -1,7 +1,7 @@
 // M6 export/import CLI: readable JSON round-trip, merge/replace semantics and
 // the transactional failure path (a bad record must never corrupt the target).
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -23,8 +23,15 @@ try {
 }
 const DB_SKIP = database === null ? "@atk/database is not available/healthy in this checkout" : false;
 
-function runCli(args) {
-  return spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", timeout: 60_000, windowsHide: true });
+function runCli(args, { env } = {}) {
+  return spawnSync(process.execPath, [CLI, ...args], {
+    encoding: "utf8",
+    timeout: 60_000,
+    windowsHide: true,
+    // Isolate from a real local backend on 1421; the online-guard test supplies
+    // an explicit launcher.json port instead.
+    env: { ...process.env, ATK_PORT: "1", ...(env ?? {}) },
+  });
 }
 
 function tempDir() {
@@ -202,6 +209,67 @@ test("a rejected write-phase import exits non-zero with SKIPPED + IMPORT_WRITE_F
   );
   assert.equal(contentHash(target), before, "the failed replace must not clear or rewrite the database");
   assert.deepEqual(taskIds(target), beforeTasks);
+});
+
+test("replace refuses to switch while the backend is running; succeeds after stop", { skip: DB_SKIP }, async (t) => {
+  const dir = tempDir();
+  const source = seedDatabase(dir, "source.db", ["T-1"]);
+  const out = path.join(dir, "state.json");
+  assert.equal(runCli(["export", "--data", source, "--to", out]).status, 0);
+  const target = seedDatabase(dir, "target.db", ["OLD-1"]);
+  const before = contentHash(target);
+
+  // Fake launcher.json + a real listening health endpoint (same checks the
+  // launcher/Backend expose, without booting the whole stack).
+  const launcherRoot = path.join(dir, "AgentTeamKit");
+  fs.mkdirSync(path.join(launcherRoot, "runtime"), { recursive: true });
+  const child = spawn(
+    process.execPath,
+    [
+      "-e",
+      'const http=require("node:http");const s=http.createServer((q,r)=>{r.writeHead(200,{"content-type":"application/json"});r.end(JSON.stringify({ok:true}));});s.listen(0,"127.0.0.1",()=>console.log(s.address().port));',
+    ],
+    { stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
+  );
+  t.after(() => {
+    try {
+      child.kill();
+    } catch {
+      // already stopped
+    }
+  });
+  const port = await new Promise((resolve, reject) => {
+    let buffer = "";
+    const timer = setTimeout(() => reject(new Error("fake backend did not report a port")), 5000);
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const match = buffer.match(/(\d+)/);
+      if (match) {
+        clearTimeout(timer);
+        resolve(Number(match[1]));
+      }
+    });
+    child.once("error", reject);
+  });
+  fs.writeFileSync(
+    path.join(launcherRoot, "launcher.json"),
+    JSON.stringify({ version: 1, port, children: [{ name: "backend", pid: child.pid, role: "backend" }] }),
+    "utf8",
+  );
+
+  const env = { LOCALAPPDATA: dir };
+  const refused = runCli(["import", "--from", out, "--data", target, "--mode", "replace", "--force", "--json"], { env });
+  assert.equal(refused.status, 1, refused.stdout);
+  assert.match(refused.stderr, /database switch must run while the backend is stopped/);
+  assert.match(refused.stderr, /stop it with atk stop first/);
+  assert.equal(contentHash(target), before, "a refused switch must not touch the target database");
+  assert.deepEqual(taskIds(target), ["OLD-1"]);
+
+  child.kill();
+  await new Promise((resolve) => child.once("exit", resolve));
+  const allowed = runCli(["import", "--from", out, "--data", target, "--mode", "replace", "--force", "--json"], { env });
+  assert.equal(allowed.status, 0, allowed.stderr);
+  assert.deepEqual(taskIds(target), ["T-1"]);
 });
 
 test("import usage errors exit 2; human output names mode/status", { skip: DB_SKIP }, () => {

@@ -812,6 +812,93 @@ async function exportCommand(flags) {
   return 0;
 }
 
+/** Is a PID alive without signalling it? EPERM still means "alive". */
+function pidIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+/**
+ * M6 online guard: a database switch is only safe while the Backend is stopped.
+ * Detect a live backend from launcher.json (PID) or its health endpoint. A
+ * failed probe means "not running", but the method is always reported.
+ */
+async function detectRunningBackend({ port, targetFile } = {}) {
+  const paths = runtimePaths();
+  const launcherFile = path.join(paths.root, "launcher.json");
+  let launcher = null;
+  let launcherError = null;
+  try {
+    launcher = readJsonFile(launcherFile, { optional: true });
+  } catch (error) {
+    launcherError = shortError(error);
+  }
+  let launcherPid = null;
+  let launcherPort = null;
+  if (launcher && typeof launcher === "object" && !Array.isArray(launcher)) {
+    if (Number.isInteger(launcher.port)) launcherPort = launcher.port;
+    const children = Array.isArray(launcher.children) ? launcher.children : [];
+    const backend = children.find((child) => child?.name === "backend" || child?.role === "backend");
+    if (backend && pidIsAlive(backend.pid)) launcherPid = backend.pid;
+  }
+  const envPort = Number(process.env.ATK_PORT);
+  const probePort = Number.isInteger(port)
+    ? port
+    : Number.isInteger(launcherPort)
+      ? launcherPort
+      : Number.isInteger(envPort) && envPort > 0
+        ? envPort
+        : 1421;
+  let health = false;
+  let healthFile = null;
+  let healthTargetMatch = null;
+  let healthError = null;
+  try {
+    const response = await fetch(`http://127.0.0.1:${probePort}/api/v1/system/health`, {
+      signal: AbortSignal.timeout(750),
+    });
+    if (response.ok) {
+      health = true;
+      try {
+        const body = await response.json();
+        healthFile = typeof body?.db?.file === "string" ? body.db.file : null;
+      } catch {
+        healthFile = null;
+      }
+      healthTargetMatch =
+        healthFile === null ? null : path.resolve(healthFile) === path.resolve(targetFile ?? "");
+    }
+  } catch (error) {
+    healthError = shortError(error);
+  }
+  // A health endpoint on the default port may belong to a DIFFERENT database
+  // (e.g. a developer's demo instance). Refuse only when the backend owns the
+  // target database (or when it cannot prove otherwise).
+  const healthOwnsTarget = health && healthTargetMatch !== false;
+  return {
+    running: launcherPid !== null || healthOwnsTarget,
+    pid: launcherPid,
+    port: probePort,
+    method: {
+      launcherFile,
+      launcherPresent: launcher !== null,
+      launcherPidAlive: launcherPid !== null,
+      launcherError,
+      healthUrl: `http://127.0.0.1:${probePort}/api/v1/system/health`,
+      healthOk: health,
+      healthFile,
+      healthTargetMatch,
+      healthError,
+      envATK_PORT: Number.isInteger(envPort) ? envPort : null,
+    },
+  };
+}
+
 async function importCommand(flags) {
   if (!flags.from) throw new CliError("import requires --from <file>");
   const fromFile = path.resolve(flags.from);
@@ -849,6 +936,22 @@ async function importCommand(flags) {
         `target database is not empty (${projects.length} project(s), ${tasks.length} task(s)); import --mode replace requires --force`,
         1,
       );
+    }
+    if (mode === "replace") {
+      // Transaction rollback cannot save a switch that overwrites a database
+      // while the Backend is writing it. Refuse while any backend is alive.
+      const backend = await detectRunningBackend({
+        port: flags.port !== undefined ? parsePort(flags.port) : undefined,
+        targetFile: dataFile,
+      });
+      if (backend.running) {
+        throw new CliError(
+          `database switch must run while the backend is stopped (detected backend pid ${
+            backend.pid ?? "unknown"
+          } on port ${backend.port}); stop it with atk stop first`,
+          1,
+        );
+      }
     }
     const report = await database.importStateJson(store, { stateJson, runtime, ownership, config, mode, force });
     const status = report?.status ?? "UNKNOWN";
