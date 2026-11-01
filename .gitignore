@@ -14,3 +14,8 @@ tools/agent-board/
 
 *.tgz
 
+apps/web/dist/
+apps/web/.vite/
+*.db
+*.db-wal
+*.db-shm

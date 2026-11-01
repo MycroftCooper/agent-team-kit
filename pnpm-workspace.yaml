@@ -1,0 +1,9 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# pnpm blocks dependency build scripts by default. Vite's bundler needs
+# esbuild's install script to place its platform binary, so it is the only
+# dependency allowed to run one.
+allowBuilds:
+  esbuild: true

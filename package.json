@@ -46,6 +46,11 @@
   ],
   "scripts": {
     "test": "node scripts/test.mjs",
+    "test:workspace": "node scripts/test-workspace.mjs",
+    "boundaries": "node scripts/check-boundaries.mjs",
+    "web:build": "pnpm --filter @atk/web build",
+    "backend:start": "node apps/backend/cli.mjs serve",
+    "backend:migrate": "node apps/backend/cli.mjs migrate",
     "selftest": "node scripts/test.mjs && node plugins/dsh-agent-board/selftest.mjs && node plugins/dsh-agent-board/selftest-client.mjs",
     "plugin:selftest": "node plugins/dsh-agent-board/selftest.mjs && node plugins/dsh-agent-board/selftest-client.mjs",
     "selfhost": "node scripts/selfhost.mjs",
@@ -61,5 +66,10 @@
   "bugs": {
     "url": "https://github.com/MycroftCooper/agent-team-kit/issues"
   },
-  "homepage": "https://github.com/MycroftCooper/agent-team-kit#readme"
+  "homepage": "https://github.com/MycroftCooper/agent-team-kit#readme",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
 }
