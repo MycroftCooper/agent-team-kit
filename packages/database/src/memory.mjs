@@ -1,5 +1,5 @@
 // In-memory Store: the same interface and the same behaviour as the SQLite
-// store (contracts §1), for backend/QA flows that must not touch a database
+// store (contracts 搂1), for backend/QA flows that must not touch a database
 // file (unit tests, read-only demos, dry-run style tools).
 //
 // Behaviour parity is structural, not accidental: validation, defaults, CAS
@@ -16,6 +16,7 @@ import {
   DEFAULT_LEASE_MS,
   DEFAULT_MAX_REVIEW_ATTEMPTS,
   MAX_EVENT_LIMIT,
+  MAX_EVENT_PAGE_LIMIT,
   MAX_OVERVIEW_EVENTS,
   ACTIVE_RUN_STATUSES,
   RUN_TERMINAL_STATUSES,
@@ -38,6 +39,7 @@ import {
   mergeRunStatus,
   mergeTask,
   normalizeAgent,
+  normalizeEventFilters,
   normalizeApproval,
   normalizeLimit,
   normalizeProject,
@@ -241,6 +243,32 @@ export function createMemoryStore() {
       .slice(0, normalizeLimit(limit, { fallback: 50 }));
   }
 
+  /** Shared event pagination (M6); mirrors sqlite's buildEventPage. */
+  function buildEventPage(filters = {}) {
+    const normalized = normalizeEventFilters(filters);
+    let list = events;
+    if (normalized.projectId !== undefined) {
+      list = list.filter((event) => event.projectId === normalized.projectId);
+    }
+    if (normalized.aggregateId !== undefined) {
+      list = list.filter((event) => event.aggregateId === normalized.aggregateId);
+    }
+    if (normalized.aggregateType !== undefined) {
+      list = list.filter((event) => event.aggregateType === normalized.aggregateType);
+    }
+    if (normalized.type !== undefined) {
+      list = list.filter((event) => event.type === normalized.type);
+    }
+    if (normalized.afterSeq !== undefined) {
+      list = list.filter((event) => event.seq > normalized.afterSeq);
+    }
+    const sorted = [...list].sort((a, b) => a.seq - b.seq);
+    const hasMore = sorted.length > normalized.limit;
+    const items = (hasMore ? sorted.slice(0, normalized.limit) : sorted).map(clone);
+    const nextAfterSeq = hasMore ? items[items.length - 1].seq : undefined;
+    return { items, hasMore, ...(nextAfterSeq === undefined ? {} : { nextAfterSeq }) };
+  }
+
   const store = {
     close() {
       // Nothing to release; kept for interface parity.
@@ -388,7 +416,7 @@ export function createMemoryStore() {
       return clone(run);
     },
 
-    // --- Run lifecycle (m2-contracts §2/§3) -------------------------------
+    // --- Run lifecycle (m2-contracts 搂2/搂3) -------------------------------
     createRun(dto) {
       ensurePlainObject(dto, "run");
       const task = requireTaskEntry(dto.taskId);
@@ -484,7 +512,7 @@ export function createMemoryStore() {
       return clone(next);
     },
 
-    // --- Durable dispatch commands + leases (ADR-003 / m2-contracts §3) ---
+    // --- Durable dispatch commands + leases (ADR-003 / m2-contracts 搂3) ---
     enqueueDispatchCommand({ runId, commandType, payload, idempotencyKey } = {}) {
       const commandTypeValue = validateCommandType(commandType);
       const key = validateIdempotencyKey(idempotencyKey);
@@ -807,7 +835,7 @@ export function createMemoryStore() {
       return { run: clone(run), lease: lease === null ? null : clone(lease), sessions: [] };
     },
 
-    // --- Scheduling (m3-contracts §2: snapshot + atomic claim) ------------
+    // --- Scheduling (m3-contracts 搂2: snapshot + atomic claim) ------------
     schedulingSnapshot({ projectId } = {}) {
       if (projectId !== undefined && projectId !== null) requireId(projectId, "project.id");
       const generatedAt = nowIso();
@@ -1557,7 +1585,7 @@ export function createMemoryStore() {
         });
       }
       const at = nowIso();
-      // Rejected acceptance re-queues directly (m4-contracts §1 / Lead ruling):
+      // Rejected acceptance re-queues directly (m4-contracts 搂1 / Lead ruling):
       // Task.REJECTED is reserved for "review requested changes" and is only
       // escapable via reworkTask (CHANGES_REQUESTED Review); an acceptance
       // rejection has a PASS Review, so REJECTED would be a dead end.
@@ -1637,20 +1665,21 @@ export function createMemoryStore() {
       return appendEventEntry(makeEvent({ ...input, now: nowIso() }));
     },
 
-    listEvents({ projectId, afterSeq, limit } = {}) {
-      if (projectId !== undefined && projectId !== null) requireId(projectId, "event.projectId");
-      if (afterSeq !== undefined && afterSeq !== null) {
-        if (!Number.isInteger(afterSeq) || afterSeq < 0) {
-          fail("VALIDATION_ERROR", "afterSeq must be a non-negative integer", { afterSeq });
-        }
-      }
-      const max = normalizeLimit(limit, { fallback: 200, max: MAX_EVENT_LIMIT });
-      return events
-        .filter((event) => (projectId === undefined || projectId === null ? true : event.projectId === projectId))
-        .filter((event) => (afterSeq === undefined || afterSeq === null ? true : event.seq > afterSeq))
-        .sort((a, b) => a.seq - b.seq)
-        .slice(0, max)
-        .map(clone);
+    listEvents(filters = {}) {
+      const page = buildEventPage(filters);
+      // Array-compatible (see sqlite.mjs): legacy callers keep using `.map`,
+      // while new code can read `items`/`hasMore`/`nextAfterSeq`.
+      const result = page.items.slice();
+      Object.defineProperties(result, {
+        items: { value: result, enumerable: false },
+        hasMore: { value: page.hasMore, enumerable: false },
+        nextAfterSeq: { value: page.nextAfterSeq, enumerable: false },
+      });
+      return result;
+    },
+
+    listEventsPage(filters = {}) {
+      return buildEventPage(filters);
     },
 
     latestSeq() {
@@ -1663,6 +1692,69 @@ export function createMemoryStore() {
       kind: "memory",
       schemaVersion: SCHEMA_VERSION,
       debugPragmas: () => ({ journalMode: null, foreignKeys: null, busyTimeout: null, inTransaction: false }),
+      /** Run `work` with a full snapshot; restore everything if it throws. */
+      transaction: (work) => {
+        const snapshot = {
+          projects: new Map([...projects].map(([key, value]) => [key, clone(value)])),
+          requirements: new Map([...requirements].map(([key, value]) => [key, clone(value)])),
+          tasks: new Map([...tasks].map(([key, value]) => [key, clone(value)])),
+          agents: new Map([...agents].map(([key, value]) => [key, clone(value)])),
+          reviews: new Map([...reviews].map(([key, value]) => [key, clone(value)])),
+          reviewAttempts: new Map([...reviewAttempts].map(([key, value]) => [key, clone(value)])),
+          approvals: new Map([...approvals].map(([key, value]) => [key, clone(value)])),
+          projectMeta: new Map([...projectMeta].map(([key, value]) => [key, clone(value)])),
+          taskMeta: new Map([...taskMeta].map(([key, value]) => [key, clone(value)])),
+          runs: new Map([...runs].map(([key, value]) => [key, clone(value)])),
+          runLeases: new Map([...runLeases].map(([key, value]) => [key, clone(value)])),
+          dispatchCommands: new Map([...dispatchCommands].map(([key, value]) => [key, clone(value)])),
+          commandIdempotency: new Map([...commandIdempotency].map(([key, value]) => [key, value])),
+          events: events.map(clone),
+          seq,
+        };
+        try {
+          return work();
+        } catch (error) {
+          const restore = (target, source) => {
+            target.clear();
+            for (const [key, value] of source) target.set(key, value);
+          };
+          restore(projects, snapshot.projects);
+          restore(requirements, snapshot.requirements);
+          restore(tasks, snapshot.tasks);
+          restore(agents, snapshot.agents);
+          restore(reviews, snapshot.reviews);
+          restore(reviewAttempts, snapshot.reviewAttempts);
+          restore(approvals, snapshot.approvals);
+          restore(projectMeta, snapshot.projectMeta);
+          restore(taskMeta, snapshot.taskMeta);
+          restore(runs, snapshot.runs);
+          restore(runLeases, snapshot.runLeases);
+          restore(dispatchCommands, snapshot.dispatchCommands);
+          restore(commandIdempotency, snapshot.commandIdempotency);
+          events.length = 0;
+          events.push(...snapshot.events);
+          seq = snapshot.seq;
+          throw error;
+        }
+      },
+      /** Clear every business row; the migration ledger is SQLite-only. */
+      clearBusinessTables: () => {
+        projects.clear();
+        requirements.clear();
+        tasks.clear();
+        agents.clear();
+        reviews.clear();
+        reviewAttempts.clear();
+        approvals.clear();
+        projectMeta.clear();
+        taskMeta.clear();
+        runs.clear();
+        runLeases.clear();
+        dispatchCommands.clear();
+        commandIdempotency.clear();
+        events.length = 0;
+        seq = 0;
+      },
       getProjectLegacy: (id) => clone(projectMeta.get(id)?.legacy ?? null),
       getProjectSettings: (id) => clone(projectMeta.get(id)?.settings ?? null),
       getTaskLegacy: (id) => clone(taskMeta.get(id)?.legacy ?? null),
@@ -1689,7 +1781,7 @@ export function createMemoryStore() {
       },
       /**
        * Migration-only writer (see sqlite.mjs): writes a legacy status without
-       * the §5.2 transition check. Only importStateJson may use it.
+       * the 搂5.2 transition check. Only importStateJson may use it.
        */
       setTaskStatus: (id, status) => {
         validateTaskStatus(status);
@@ -1713,3 +1805,4 @@ export function createMemoryStore() {
 
   return store;
 }
+

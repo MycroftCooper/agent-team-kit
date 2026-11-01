@@ -1,4 +1,4 @@
-// Legacy JSON <-> SQLite import/export (M1 `atk migrate` / `atk export` carrier).
+﻿// Legacy JSON <-> SQLite import/export (M1 `atk migrate` / `atk export` carrier).
 //
 // Import maps the pre-M1 workflow files into the store:
 //   state.json    -> project (+ requirement from `batch`) + tasks
@@ -10,7 +10,7 @@
 // Old files contain no Run records, so `runs` is imported as genuinely empty:
 // we report that explicitly in `manifest.runs` instead of fabricating rows.
 //
-// Rules from contracts §1:
+// Rules from contracts 搂1:
 //   * `dryRun` only counts, never writes;
 //   * duplicate execution is idempotent (same id -> skip, never a second row);
 //   * a duplicate id *inside one input* is an error (`DUPLICATE_ID`), not a
@@ -28,7 +28,7 @@ const MANIFEST_SCHEMA_VERSION = 1;
 const LEGACY_STATE_SCHEMA_VERSION = 1;
 
 // --- Legacy vocabulary maps -------------------------------------------------
-// package/subitem stage -> Task.status (INTERNALS.md §4.1 stage enum)
+// package/subitem stage -> Task.status (INTERNALS.md 搂4.1 stage enum)
 const PACKAGE_STAGE_TO_STATUS = Object.freeze({
   done: "DONE",
   implemented: "AWAITING_ACCEPTANCE",
@@ -194,7 +194,7 @@ function roleFromOwner(owner, report, context) {
     report("warning", "ROLE_DERIVED", { ...context, reason: "missing owner", role: "DEV" });
     return "DEV";
   }
-  const token = owner.split(/[;；,，、/+|]+/).map((part) => part.trim()).find((part) => part !== "");
+  const token = owner.split(/[;锛?锛屻€?+|]+/).map((part) => part.trim()).find((part) => part !== "");
   const role = (token ?? "").toUpperCase().replace(/[^A-Z0-9_]/g, "_");
   if (!/^[A-Z][A-Z0-9_]*$/.test(role)) {
     report("warning", "ROLE_DERIVED", { ...context, owner, reason: "unparseable owner", role: "DEV" });
@@ -229,7 +229,7 @@ function legacyDeps(item, report, context) {
   if (Array.isArray(item.deps)) return stringArray(item.deps);
   if (typeof item.depsRaw === "string" && item.depsRaw.trim() !== "") {
     return item.depsRaw
-      .split(/[,;，；\s]+/)
+      .split(/[,;锛岋紱\s]+/)
       .map((part) => part.trim())
       .filter((part) => part !== "");
   }
@@ -366,6 +366,8 @@ export function importStateJson(store, options = {}) {
     now,
     dryRun = false,
     config,
+    mode = "merge",
+    force = false,
     projectId: explicitProjectId,
     projectName,
     repoPath,
@@ -374,6 +376,13 @@ export function importStateJson(store, options = {}) {
   if (typeof dryRun !== "boolean") {
     fail("VALIDATION_ERROR", "importStateJson.dryRun must be a boolean", { dryRun });
   }
+  if (mode !== "merge" && mode !== "replace") {
+    fail("VALIDATION_ERROR", 'importStateJson.mode must be "merge" or "replace"', { mode });
+  }
+  if (typeof force !== "boolean") {
+    fail("VALIDATION_ERROR", "importStateJson.force must be a boolean", { force });
+  }
+  const replaceMode = mode === "replace";
   const at = nowIso(now);
   const problems = [];
   const report = (level, code, detail) => {
@@ -557,16 +566,20 @@ export function importStateJson(store, options = {}) {
   }
 
   // --- Existence checks (read-only, also used by dryRun) --------------------
+  // replace ignores the existing rows entirely (the write phase clears them
+  // inside the same transaction), so it must count/insert everything.
   const queryableProject = typeof projectId === "string" && ID_RE.test(projectId);
-  const projectExists = queryableProject && readOrNull(store.getProject, projectId) !== null;
+  const projectExists = !replaceMode && queryableProject && readOrNull(store.getProject, projectId) !== null;
   const existingRequirements = new Set(
-    projectExists ? store.listRequirements({ projectId }).map((requirement) => requirement.id) : [],
+    !replaceMode && projectExists ? store.listRequirements({ projectId }).map((requirement) => requirement.id) : [],
   );
   const existingTaskIds = new Set();
-  for (const record of records) {
-    if (readOrNull(store.getTask, record.mapped.id) !== null) existingTaskIds.add(record.mapped.id);
+  if (!replaceMode) {
+    for (const record of records) {
+      if (readOrNull(store.getTask, record.mapped.id) !== null) existingTaskIds.add(record.mapped.id);
+    }
   }
-  const existingAgentIds = new Set(store.listAgents().map((agent) => agent.id));
+  const existingAgentIds = new Set(replaceMode ? [] : store.listAgents().map((agent) => agent.id));
 
   const skipped = {
     projects: projectExists ? 1 : 0,
@@ -599,7 +612,7 @@ export function importStateJson(store, options = {}) {
   // --- Write phase ---------------------------------------------------------
   let writeFailed = false;
   if (!hasErrors() && !dryRun) {
-    try {
+    const writeAll = () => {
       if (!projectExists) {
         store.createProject({
           id: projectId,
@@ -646,8 +659,8 @@ export function importStateJson(store, options = {}) {
       for (const record of createdRecords) {
         const deps = depPlans.get(record.mapped.id) ?? [];
         // Legacy statuses are a *snapshot*, not a client transition: a package
-        // that was already DONE did not walk READY→…→DONE in this store. The
-        // migration-only writer bypasses the §5.2 chain deliberately; public
+        // that was already DONE did not walk READY鈫掆€︹啋DONE in this store. The
+        // migration-only writer bypasses the 搂5.2 chain deliberately; public
         // patchTask (Backend/Web) always enforces it.
         if (record.mapped.status !== "READY") {
           const internal = store[INTERNAL];
@@ -667,6 +680,23 @@ export function importStateJson(store, options = {}) {
         if (existingAgentIds.has(agent.id)) continue;
         store.upsertAgent(agent);
       }
+    };
+    try {
+      if (replaceMode) {
+        // ADR-006 phase 3: clear + import must be ONE transaction. A failing
+        // record rolls the clear back, so the previous database is untouched.
+        // The migration ledger (schema_migrations) is deliberately not cleared.
+        const internal = store[INTERNAL];
+        if (typeof internal?.transaction !== "function" || typeof internal?.clearBusinessTables !== "function") {
+          fail("INTERNAL_ERROR", "store does not support atomic replace", {});
+        }
+        internal.transaction(() => {
+          internal.clearBusinessTables();
+          writeAll();
+        });
+      } else {
+        writeAll();
+      }
     } catch (error) {
       writeFailed = true;
       report("error", "IMPORT_WRITE_FAILED", {
@@ -684,6 +714,7 @@ export function importStateJson(store, options = {}) {
     toolVersion: TOOL_VERSION,
     generatedAt: at,
     dryRun,
+    mode,
     source: state
       ? {
           schemaVersion: state.schemaVersion ?? null,
@@ -717,7 +748,59 @@ export function importStateJson(store, options = {}) {
     contentHash,
   };
 
-  return { status, dryRun, counts, problems, manifest, skipped, totals };
+  return { status, dryRun, mode, counts, problems, manifest, skipped, totals };
+}
+
+// ---------------------------------------------------------------------------
+// JSON -> SQLite switch readiness (ADR-006 phase 3)
+// ---------------------------------------------------------------------------
+
+const ACTIVE_RUN_STATUS = new Set(["QUEUED", "STARTING", "RUNNING"]);
+
+/**
+ * Pre-flight check before the one-way JSON -> SQLite switch. A running agent or
+ * a live lease would keep writing to the old JSON world, so the switch is
+ * blocked until the system is idle. Returns `{ok, schemaVersion, counts,
+ * blockers}`; blockers are machine-readable `{code, reason, message, ...}`.
+ */
+export function verifySwitchReadiness(store) {
+  ensureStore(store, "verifySwitchReadiness");
+  const health = store.health();
+  const blockers = [];
+  for (const run of store.listRuns({})) {
+    if (!ACTIVE_RUN_STATUS.has(run.status)) continue;
+    blockers.push({
+      code: "active-run",
+      reason: "active-run",
+      message: `run "${run.id}" is ${run.status}; finish or cancel it before switching`,
+      runId: run.id,
+      taskId: run.taskId,
+      status: run.status,
+    });
+    let lease = null;
+    try {
+      lease = store.reconcileRun({ runId: run.id }).lease;
+    } catch {
+      lease = null;
+    }
+    if (lease) {
+      blockers.push({
+        code: "active-lease",
+        reason: "active-lease",
+        message: `run "${run.id}" has a live lease held by "${lease.ownerId}"`,
+        runId: run.id,
+        ownerId: lease.ownerId,
+        generation: lease.generation,
+        claimedUntil: lease.claimedUntil,
+      });
+    }
+  }
+  return {
+    ok: blockers.length === 0,
+    schemaVersion: health.schemaVersion,
+    counts: health.counts,
+    blockers,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -884,3 +967,4 @@ export function exportStateJson(store, options = {}) {
 
   return { state, manifest };
 }
+

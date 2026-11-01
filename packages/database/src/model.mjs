@@ -23,11 +23,14 @@ import {
 import { fail } from "./errors.mjs";
 
 /** Schema version written by the latest migration file. */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 export const DEFAULT_LIST_LIMIT = 100;
 export const MAX_LIST_LIMIT = 10000;
 export const MAX_EVENT_LIMIT = 10000;
+/** Upper bound for a single events page (m6-contracts: listEvents limit <= 1000). */
+export const MAX_EVENT_PAGE_LIMIT = 1000;
 export const MAX_OVERVIEW_EVENTS = 20;
+export const DEFAULT_EVENT_PAGE_LIMIT = 100;
 
 const ROLE_RE = /^[A-Z][A-Z0-9_]*$/;
 const TASK_ID_RE = ID_RE;
@@ -87,6 +90,41 @@ export function normalizeLimit(value, { fallback = DEFAULT_LIST_LIMIT, max = MAX
   return Math.min(value, max);
 }
 
+/**
+ * Shared validation/canonicalisation for event queries (M6):
+ * `{ projectId?, aggregateId?, aggregateType?, type?, afterSeq?, limit? }`.
+ * `afterSeq` is exclusive; the page limit defaults to 100 and is capped at 1000.
+ */
+export function normalizeEventFilters(filters = {}) {
+  ensurePlainObject(filters, "listEvents filters");
+  const normalized = {};
+  if (filters.projectId !== undefined && filters.projectId !== null) {
+    requireId(filters.projectId, "event.projectId");
+    normalized.projectId = filters.projectId;
+  }
+  for (const key of ["aggregateId", "aggregateType", "type"]) {
+    const value = filters[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== "string" || value.trim() === "" || value.length > 256) {
+      fail("VALIDATION_ERROR", `${key} must be a non-empty string`, { [key]: value });
+    }
+    normalized[key] = value;
+  }
+  if (filters.afterSeq !== undefined && filters.afterSeq !== null) {
+    if (!Number.isInteger(filters.afterSeq) || filters.afterSeq < 0) {
+      fail("VALIDATION_ERROR", "afterSeq must be a non-negative integer", {
+        afterSeq: filters.afterSeq,
+      });
+    }
+    normalized.afterSeq = filters.afterSeq;
+  }
+  normalized.limit = normalizeLimit(filters.limit, {
+    fallback: DEFAULT_EVENT_PAGE_LIMIT,
+    max: MAX_EVENT_PAGE_LIMIT,
+  });
+  return normalized;
+}
+
 /** Deduplicate id arrays while preserving first-seen order. */
 export function dedupeIds(ids) {
   const out = [];
@@ -131,16 +169,16 @@ export function validateTaskStatus(status) {
 }
 
 // ---------------------------------------------------------------------------
-// Task lifecycle state machine (implementation spec §5.2)
+// Task lifecycle state machine (implementation spec 搂5.2)
 // ---------------------------------------------------------------------------
 //
 // This is a *pure* description of the legal task transitions, shared by the
 // SQLite and the in-memory store: there is exactly one table in this package.
-// See docs/architecture/m1-contracts.md §1 ("spec §5.2 状态机").
+// See docs/architecture/m1-contracts.md 搂1 ("spec 搂5.2 鐘舵€佹満").
 //
 // Main chain (forward only):
-//   DRAFT → READY → CLAIMED → RUNNING → REVIEWING → INTEGRATING
-//         → AWAITING_ACCEPTANCE → DONE
+//   DRAFT 鈫?READY 鈫?CLAIMED 鈫?RUNNING 鈫?REVIEWING 鈫?INTEGRATING
+//         鈫?AWAITING_ACCEPTANCE 鈫?DONE
 //
 // Branches:
 //   * every non-terminal state may become BLOCKED;
@@ -154,11 +192,11 @@ export function validateTaskStatus(status) {
 // *change* to another state may be).
 //
 // Deliberately NOT allowed in M1 (no edges):
-//   * skipping a main-chain step (READY → DONE, READY → REVIEWING, ...);
-//   * going backwards (DONE → READY, REVIEWING → RUNNING, BLOCKED → RUNNING);
-//   * DONE → CANCELLED (a finished task is not cancellable);
-//   * any state → DRAFT (DRAFT is the initial state only).
-// Rework loops (REVIEWING → RUNNING, INTEGRATING → RUNNING) need run/session
+//   * skipping a main-chain step (READY 鈫?DONE, READY 鈫?REVIEWING, ...);
+//   * going backwards (DONE 鈫?READY, REVIEWING 鈫?RUNNING, BLOCKED 鈫?RUNNING);
+//   * DONE 鈫?CANCELLED (a finished task is not cancellable);
+//   * any state 鈫?DRAFT (DRAFT is the initial state only).
+// Rework loops (REVIEWING 鈫?RUNNING, INTEGRATING 鈫?RUNNING) need run/session
 // knowledge and belong to the scheduler (M3); adding them here without that
 // context would let a client re-open reviewed work.
 export const TASK_MAIN_CHAIN = Object.freeze([
@@ -193,7 +231,7 @@ const TASK_TRANSITIONS = Object.freeze(
       add(status, "CANCELLED");
     }
     add("BLOCKED", "READY");
-    // M4 rework loop (ADR-005, m4-contracts §1). REJECTED is the "changes were
+    // M4 rework loop (ADR-005, m4-contracts 搂1). REJECTED is the "changes were
     // requested" waiting room, deliberately NOT on the main chain: it can only
     // be entered from REVIEWING / AWAITING_ACCEPTANCE and can only leave toward
     // READY (re-queue) or the generic BLOCKED/CANCELLED branches. There is no
@@ -205,7 +243,7 @@ const TASK_TRANSITIONS = Object.freeze(
     // Review is already PASS, so parking the Task in REJECTED would leave it
     // with no legal exit (only reworkTask, which requires CHANGES_REQUESTED,
     // could move it). The acceptance workflow therefore re-queues directly:
-    // AWAITING_ACCEPTANCE -> READY (Lead ruling, m4-contracts §1 line 50).
+    // AWAITING_ACCEPTANCE -> READY (Lead ruling, m4-contracts 搂1 line 50).
     add("AWAITING_ACCEPTANCE", "READY");
     for (const status of TASK_STATUSES) {
       table[status].sort((a, b) => TASK_STATUS_ORDER.get(a) - TASK_STATUS_ORDER.get(b));
@@ -319,7 +357,7 @@ export function normalizeRequirement(dto, { now } = {}) {
 
 /**
  * `status` is never taken from the caller: `createTask` always starts at READY
- * (contracts §1: "客户端不得直接设 status"), every later transition goes
+ * (contracts 搂1: "瀹㈡埛绔笉寰楃洿鎺ヨ status"), every later transition goes
  * through `patchTask`. `dto.createdAt`/`dto.updatedAt` are internal migration
  * metadata and are ignored for API callers that do not send them.
  */
@@ -416,8 +454,8 @@ export function mergeTask(current, changes, { now } = {}) {
     } else merged[key] = value;
   }
   validateTaskStatus(merged.status);
-  // spec §5.2: transitions are validated by the pure state machine above, so a
-  // client cannot jump READY → DONE / CANCELLED or reopen a terminal task.
+  // spec 搂5.2: transitions are validated by the pure state machine above, so a
+  // client cannot jump READY 鈫?DONE / CANCELLED or reopen a terminal task.
   // Both store implementations call mergeTask, so they share this one judgement.
   assertTaskTransition(current.status, merged.status);
   assertValid(validateTask, merged, "task");
@@ -538,7 +576,7 @@ export function normalizeApproval(dto, { now, id } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Review / rework / approval (M4, m4-contracts §1, ADR-005)
+// Review / rework / approval (M4, m4-contracts 搂1, ADR-005)
 // ---------------------------------------------------------------------------
 //
 // Review state is the verdict itself: PENDING -> PASS | CHANGES_REQUESTED |
@@ -612,7 +650,7 @@ export function validateReviewVerdict(verdict) {
   return verdict;
 }
 
-/** Validate the test evidence block a PASS must carry (m4-contracts §1). */
+/** Validate the test evidence block a PASS must carry (m4-contracts 搂1). */
 export function validateReviewEvidence(evidence) {
   if (!isPlainObject(evidence)) {
     fail("VALIDATION_ERROR", "review.evidence must be an object", { evidence: evidence ?? null });
@@ -796,7 +834,7 @@ export function validateApprovalDecision(decision) {
 /**
  * Build an Event through contracts.createEvent() (the single definition of the
  * envelope) and let the store assign `seq`. Only the fields the contract names
- * exist here — no ad-hoc additions.
+ * exist here 鈥?no ad-hoc additions.
  */
 export function makeEvent({ projectId = null, aggregateType, aggregateId, type, payload, now } = {}) {
   if (projectId !== null && (typeof projectId !== "string" || projectId.trim() === "")) {
@@ -830,10 +868,10 @@ export function makeEvent({ projectId = null, aggregateType, aggregateId, type, 
 export { EVENT_SCHEMA_VERSION };
 
 // ---------------------------------------------------------------------------
-// Run lifecycle state machine (m2-contracts §2)
+// Run lifecycle state machine (m2-contracts 搂2)
 // ---------------------------------------------------------------------------
 //
-//   QUEUED → STARTING → RUNNING → COMPLETED | FAILED | CANCELLED | INTERRUPTED
+//   QUEUED 鈫?STARTING 鈫?RUNNING 鈫?COMPLETED | FAILED | CANCELLED | INTERRUPTED
 //
 //   * STARTING may go to RUNNING | FAILED | INTERRUPTED: a session that never
 //     started cannot "complete"; it failed/interrupted on the way up.
@@ -872,7 +910,7 @@ export function allowedRunTransitionsFrom(from) {
   return [...RUN_TRANSITIONS[from]];
 }
 
-/** Illegal Run transition → VALIDATION_ERROR + details {from,to,allowed}. */
+/** Illegal Run transition 鈫?VALIDATION_ERROR + details {from,to,allowed}. */
 export function assertRunTransition(from, to) {
   if (canTransitionRun(from, to)) return true;
   fail("VALIDATION_ERROR", `run.status cannot transition from ${from} to ${to}`, {
@@ -891,7 +929,7 @@ export const runStatusMachine = Object.freeze({
 });
 
 // ---------------------------------------------------------------------------
-// Run / dispatch / lease DTO helpers (m2-contracts §3)
+// Run / dispatch / lease DTO helpers (m2-contracts 搂3)
 // ---------------------------------------------------------------------------
 
 export const MAX_LEASE_MS = 24 * 60 * 60 * 1000;
@@ -1022,7 +1060,7 @@ export function normalizeRepoPath(value, label = "path") {
   return normalised;
 }
 
-/** `projects.policy_json` payload; NULL/missing → {}. */
+/** `projects.policy_json` payload; NULL/missing 鈫?{}. */
 export function normalizeProjectPolicy(value, label = "project.policy") {
   if (value === undefined || value === null) return {};
   if (!isPlainObject(value)) {
@@ -1034,7 +1072,7 @@ export function normalizeProjectPolicy(value, label = "project.policy") {
 const SCHEDULING_LIMIT_KEYS = Object.freeze(["maxConcurrentPerProject", "maxPerAgent"]);
 
 /**
- * Capacity limits travel with each claim (Backend env/config → claimTask). An
+ * Capacity limits travel with each claim (Backend env/config 鈫?claimTask). An
  * omitted limit means "no capacity check"; a provided one must be a
  * non-negative integer (0 blocks all new claims for that scope).
  */
@@ -1059,7 +1097,7 @@ export function validateSchedulingPolicies(policies) {
 /**
  * Write-scope overlap, segment-aware (QA4-03): two canonical repo-relative paths
  * conflict when they are equal OR one is a path-segment prefix of the other
- * ("src" ⊂ "src/a.js"). A plain string prefix is NOT enough: "src2/a.js" must
+ * ("src" 鈯?"src/a.js"). A plain string prefix is NOT enough: "src2/a.js" must
  * not conflict with "src/a.js". Comparison is case-sensitive on every platform
  * (the repository paths are canonical POSIX-style strings, and Windows checkouts
  * keep the declared case), so "Src/a.js" and "src/a.js" are different files.
@@ -1097,7 +1135,7 @@ export function leaseExpiryAfter(now, leaseMs) {
 }
 
 /**
- * Build a new Run in STARTING (m2-contracts §3 / §2). `attempt` is resolved by
+ * Build a new Run in STARTING (m2-contracts 搂3 / 搂2). `attempt` is resolved by
  * the store (same task, N-th run) and passed in; `dto.attempt` is validated but
  * the store's counter wins so two clients cannot collide on the same attempt.
  */
@@ -1211,7 +1249,7 @@ export function compareEventsAsc(a, b) {
   return a.seq - b.seq;
 }
 
-/** Shared overview projection so SQLite and memory cannot drift (contracts §1). */
+/** Shared overview projection so SQLite and memory cannot drift (contracts 搂1). */
 export function buildOverview({ project, tasks, recentEvents, runsRunning, runsTotal }) {
   const tasksByStatus = Object.fromEntries(TASK_STATUSES.map((status) => [status, 0]));
   for (const task of tasks) tasksByStatus[task.status] = (tasksByStatus[task.status] ?? 0) + 1;
@@ -1252,3 +1290,4 @@ export function assertEnumFilter(group, value) {
   }
   return value;
 }
+

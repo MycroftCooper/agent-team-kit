@@ -15,6 +15,7 @@ import {
   DEFAULT_LEASE_MS,
   DEFAULT_MAX_REVIEW_ATTEMPTS,
   MAX_EVENT_LIMIT,
+  MAX_EVENT_PAGE_LIMIT,
   MAX_LIST_LIMIT,
   MAX_OVERVIEW_EVENTS,
   SCHEMA_VERSION,
@@ -37,6 +38,7 @@ import {
   mergeTask,
   normalizeAgent,
   normalizeApproval,
+  normalizeEventFilters,
   normalizeLimit,
   normalizeProject,
   normalizeProjectPolicy,
@@ -94,7 +96,7 @@ function mapSqliteError(error) {
         errstr: error.errstr ?? null,
       },
     };
-    // 2067 UNIQUE, 1555 PRIMARY KEY, 787 FOREIGN KEY — all caller/data problems.
+    // 2067 UNIQUE, 1555 PRIMARY KEY, 787 FOREIGN KEY 鈥?all caller/data problems.
     if (errcode === 2067 || errcode === 1555) {
       return new StoreError("VALIDATION_ERROR", `unique constraint violated: ${error.errstr ?? "constraint"}`, details);
     }
@@ -162,7 +164,7 @@ export function openStore(options = {}) {
     db.exec(sql);
   }
 
-  /** Write operations run inside BEGIN IMMEDIATE ... COMMIT (contract §1). */
+  /** Write operations run inside BEGIN IMMEDIATE ... COMMIT (contract 搂1). */
   function transaction(work) {
     if (transactionDepth > 0) return work();
     exec("BEGIN IMMEDIATE");
@@ -527,8 +529,8 @@ export function openStore(options = {}) {
 
   function leaseJson(row) {
     // Lease JSON uses the names the internal API forwards to the Runtime Host
-    // (m2-contracts §2: `{ ownerId, generation, claimedUntil }`); the DB columns
-    // are the §3 names (`owner_id` / `claimed_until`).
+    // (m2-contracts 搂2: `{ ownerId, generation, claimedUntil }`); the DB columns
+    // are the 搂3 names (`owner_id` / `claimed_until`).
     return {
       runId: row.run_id,
       ownerId: row.owner_id,
@@ -608,6 +610,44 @@ export function openStore(options = {}) {
       payload: parseJsonColumn(row.payload_json) ?? {},
       happenedAt: row.happened_at,
     };
+  }
+
+  /**
+   * Shared event pagination (M6): strict afterSeq, ascending seq, limit capped
+   * at 1000. Fetches one extra row to compute `hasMore` without a COUNT query.
+   */
+  function buildEventPage(filters = {}) {
+    const normalized = normalizeEventFilters(filters);
+    const where = [];
+    const params = [];
+    if (normalized.projectId !== undefined) {
+      where.push("project_id = ?");
+      params.push(normalized.projectId);
+    }
+    if (normalized.aggregateId !== undefined) {
+      where.push("aggregate_id = ?");
+      params.push(normalized.aggregateId);
+    }
+    if (normalized.aggregateType !== undefined) {
+      where.push("aggregate_type = ?");
+      params.push(normalized.aggregateType);
+    }
+    if (normalized.type !== undefined) {
+      where.push("type = ?");
+      params.push(normalized.type);
+    }
+    if (normalized.afterSeq !== undefined) {
+      where.push("seq > ?");
+      params.push(normalized.afterSeq);
+    }
+    params.push(normalized.limit + 1);
+    const sql = `SELECT * FROM events${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY seq ASC LIMIT ?`;
+    const rows = stmt(sql).all(...params);
+    const hasMore = rows.length > normalized.limit;
+    const items = (hasMore ? rows.slice(0, normalized.limit) : rows).map(eventJson);
+    const nextAfterSeq = hasMore ? items[items.length - 1].seq : undefined;
+    return { items, hasMore, ...(nextAfterSeq === undefined ? {} : { nextAfterSeq }) };
   }
 
   /** Insert one event (caller owns the transaction) and return its JSON. */
@@ -1082,7 +1122,7 @@ export function openStore(options = {}) {
       return runJson(row);
     },
 
-    // --- Run lifecycle (m2-contracts §2/§3) -------------------------------
+    // --- Run lifecycle (m2-contracts 搂2/搂3) -------------------------------
     createRun(dto) {
       ensurePlainObject(dto, "run");
       return transaction(() => {
@@ -1142,7 +1182,7 @@ export function openStore(options = {}) {
     },
 
     /**
-     * Advance a Run along the §2 state machine. Illegal transitions throw
+     * Advance a Run along the 搂2 state machine. Illegal transitions throw
      * VALIDATION_ERROR + {from,to,allowed}; every legal transition appends one
      * `run.updated` event (the SSE/UI producer). Same-status calls are an
      * idempotent no-op (no version bump, no duplicate event).
@@ -1246,7 +1286,7 @@ export function openStore(options = {}) {
       });
     },
 
-    // --- Durable dispatch commands + leases (ADR-003 / m2-contracts §3) ---
+    // --- Durable dispatch commands + leases (ADR-003 / m2-contracts 搂3) ---
     enqueueDispatchCommand({ runId, commandType, payload, idempotencyKey } = {}) {
       const commandTypeValue = validateCommandType(commandType);
       const key = validateIdempotencyKey(idempotencyKey);
@@ -1419,8 +1459,7 @@ export function openStore(options = {}) {
     /**
      * D3 crash-window sweeper (QA-003): a Run can be terminal while its command
      * is still CLAIMED (the Host died before writing the result). The truth is
-     * the Run, so close those commands without needing lease/owner: COMPLETED →
-     * DONE, FAILED/INTERRUPTED/CANCELLED → FAILED. Already-terminal commands are
+     * the Run, so close those commands without needing lease/owner: COMPLETED 鈫?     * DONE, FAILED/INTERRUPTED/CANCELLED 鈫?FAILED. Already-terminal commands are
      * untouched (idempotent). Single transaction, one indexed scan.
      */
     sweepDispatchCommands({ now } = {}) {
@@ -1521,7 +1560,7 @@ export function openStore(options = {}) {
      * status (Backend owns that via updateRunStatus, single responsibility).
      * An empty `events` array is a valid *pure fence* call: it proves the caller
      * still holds the current generation without writing anything, which lets
-     * Backend order "verify generation → updateRunStatus" safely.
+     * Backend order "verify generation 鈫?updateRunStatus" safely.
      * Unknown event types are rejected by contracts.createEvent(), never dropped.
      */
     appendRunEvent({ runId, generation, events } = {}) {
@@ -1587,7 +1626,7 @@ export function openStore(options = {}) {
     /**
      * Reconcile facts for a restarted Host. `sessions` stays empty in M2 (M4
      * fills it). A run that was claimed and then completed reports its lease as
-     * EXPIRED with the generation retained — not null — because "release" means
+     * EXPIRED with the generation retained 鈥?not null 鈥?because "release" means
      * expiry here (see completeDispatchCommand): the Host compares the reported
      * generation to the authoritative one before doing anything.
      */
@@ -1598,7 +1637,7 @@ export function openStore(options = {}) {
       return { run, lease: lease === null ? null : leaseJson(lease), sessions: [] };
     },
 
-    // --- Scheduling (m3-contracts §2: snapshot + atomic claim) ------------
+    // --- Scheduling (m3-contracts 搂2: snapshot + atomic claim) ------------
     /**
      * Consistent read model for the Scheduler (it is stateless and rebuilds from
      * this on every round). `version` = MAX(events.seq): every successful
@@ -1653,7 +1692,7 @@ export function openStore(options = {}) {
     },
 
     /**
-     * Atomic task claim (m3-contracts §2, 7 ordered checks). Runs in ONE
+     * Atomic task claim (m3-contracts 搂2, 7 ordered checks). Runs in ONE
      * transaction: any failed check (or the CAS losing a race) rolls back to
      * byte-for-byte no change. Same idempotencyKey replays the original result.
      */
@@ -2451,7 +2490,7 @@ export function openStore(options = {}) {
           });
         }
         const at = nowIso();
-        // m4-contracts §1 line 50 + Lead ruling: a rejected acceptance re-queues
+        // m4-contracts 搂1 line 50 + Lead ruling: a rejected acceptance re-queues
         // the Task directly (AWAITING_ACCEPTANCE -> READY). It must NOT go
         // through Task.REJECTED: that state means "review requested changes" and
         // can only be left by reworkTask (which requires a CHANGES_REQUESTED
@@ -2541,25 +2580,24 @@ export function openStore(options = {}) {
       return transaction(() => insertEvent(event));
     },
 
-    listEvents({ projectId, afterSeq, limit } = {}) {
-      const where = [];
-      const params = [];
-      if (projectId !== undefined && projectId !== null) {
-        requireId(projectId, "event.projectId");
-        where.push("project_id = ?");
-        params.push(projectId);
-      }
-      if (afterSeq !== undefined && afterSeq !== null) {
-        if (!Number.isInteger(afterSeq) || afterSeq < 0) {
-          fail("VALIDATION_ERROR", "afterSeq must be a non-negative integer", { afterSeq });
-        }
-        where.push("seq > ?");
-        params.push(afterSeq);
-      }
-      params.push(normalizeLimit(limit, { fallback: 200, max: MAX_EVENT_LIMIT }));
-      const sql = `SELECT * FROM events${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""}
-        ORDER BY seq ASC LIMIT ?`;
-      return stmt(sql).all(...params).map(eventJson);
+    listEvents(filters = {}) {
+      const page = buildEventPage(filters);
+      // Backward compatibility: M1-M5 callers treat listEvents() as an array
+      // (`.map`, `.filter`, `Array.isArray`). The M6 pagination metadata is
+      // attached as non-enumerable properties so both `result[0]` and
+      // `result.items` / `result.hasMore` work. New code should call
+      // listEventsPage() for a plain page object.
+      const result = page.items.slice();
+      Object.defineProperties(result, {
+        items: { value: result, enumerable: false },
+        hasMore: { value: page.hasMore, enumerable: false },
+        nextAfterSeq: { value: page.nextAfterSeq, enumerable: false },
+      });
+      return result;
+    },
+
+    listEventsPage(filters = {}) {
+      return buildEventPage(filters);
     },
 
     latestSeq() {
@@ -2598,6 +2636,33 @@ export function openStore(options = {}) {
       }),
       /** Migration self-heal warnings recorded while opening this store. */
       migrationWarnings: () => migrationWarnings.map((warning) => structuredClone(warning)),
+      /** Run `work` inside one BEGIN IMMEDIATE transaction (import replace). */
+      transaction: (work) => transaction(work),
+      /**
+       * Delete every business row but NOT schema_migrations: a replace-import
+       * must keep the migration ledger intact or the next open would re-run
+       * migrations against an already-migrated schema.
+       */
+      clearBusinessTables: () => {
+        for (const table of [
+          "review_attempts",
+          "reviews",
+          "approvals",
+          "gate_results",
+          "plans",
+          "dispatch_commands",
+          "run_leases",
+          "runs",
+          "task_dependencies",
+          "tasks",
+          "requirements",
+          "agent_instances",
+          "projects",
+          "events",
+        ]) {
+          stmt(`DELETE FROM ${table}`).run();
+        }
+      },
       getProjectLegacy: (id) => {
         const row = getProjectRow(id);
         return row ? parseJsonColumn(row.legacy_json) : null;
@@ -2633,7 +2698,7 @@ export function openStore(options = {}) {
       /**
        * Migration-only writer: sets a task's status exactly as recorded in the
        * legacy file (e.g. a package that was already DONE) without pretending it
-       * walked the §5.2 chain. It is NOT part of the public Store contract and
+       * walked the 搂5.2 chain. It is NOT part of the public Store contract and
        * only `importStateJson` (same package) may call it; Backend/Web must use
        * patchTask, which always enforces the state machine.
        */
@@ -2667,3 +2732,4 @@ export function openStore(options = {}) {
 export { SCHEMA_VERSION };
 export { compareTasks };
 export { StoreError };
+
