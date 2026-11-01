@@ -168,7 +168,9 @@ export function TaskDetailPage({ taskId, refetchKey }: { taskId: string; refetch
                   {runs.map((run) => (
                     <tr key={run.id}>
                       <td className="mono">
-                        {run.id}
+                        <a className="link mono" href={routeToHash({ name: "run", id: run.id })} title={t("runs.open", { id: run.id })}>
+                          {run.id}
+                        </a>
                         {typeof run.attempt === "number" ? <span className="cell-meta">{t("task.runAttempt", { n: run.attempt })}</span> : null}
                       </td>
                       <td>

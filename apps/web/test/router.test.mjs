@@ -7,6 +7,7 @@ import { NAV_ITEMS, navNameOf, parseRoute, routeToHash } from "../src/router.ts"
 test("parses every top-level route", () => {
   assert.deepEqual(parseRoute("#/overview"), { name: "overview" });
   assert.deepEqual(parseRoute("#/tasks"), { name: "tasks" });
+  assert.deepEqual(parseRoute("#/runs"), { name: "runs" });
   assert.deepEqual(parseRoute("#/agents"), { name: "agents" });
   assert.deepEqual(parseRoute("#/reviews"), { name: "reviews" });
   assert.deepEqual(parseRoute("#/settings"), { name: "settings" });
@@ -16,6 +17,13 @@ test("parses the task detail route", () => {
   assert.deepEqual(parseRoute("#/tasks/T-42"), { name: "task", id: "T-42" });
   assert.deepEqual(parseRoute("/tasks/T-42"), { name: "task", id: "T-42" });
   assert.deepEqual(parseRoute("#/tasks/T%2042"), { name: "task", id: "T 42" });
+});
+
+test("parses the run detail route", () => {
+  assert.deepEqual(parseRoute("#/runs/RUN-1"), { name: "run", id: "RUN-1" });
+  assert.deepEqual(parseRoute("#/runs/RUN-1/"), { name: "run", id: "RUN-1" });
+  assert.deepEqual(parseRoute("#/runs/RUN%201"), { name: "run", id: "RUN 1" });
+  assert.deepEqual(parseRoute("#/runs/"), { name: "runs" });
 });
 
 test("tolerates trailing slashes and empty hashes", () => {
@@ -39,6 +47,9 @@ test("routeToHash round-trips through parseRoute", () => {
     { name: "tasks" },
     { name: "task", id: "T-42" },
     { name: "task", id: "T 42" },
+    { name: "runs" },
+    { name: "run", id: "RUN-42" },
+    { name: "run", id: "RUN 42" },
     { name: "agents" },
     { name: "reviews" },
     { name: "settings" },
@@ -49,12 +60,17 @@ test("routeToHash round-trips through parseRoute", () => {
   }
 });
 
-test("navigation items point at real routes and mark the task detail as tasks", () => {
-  assert.equal(NAV_ITEMS.length, 5);
+test("navigation items point at real routes and mark the task/run detail as their lists", () => {
+  assert.equal(NAV_ITEMS.length, 6);
+  assert.deepEqual(
+    NAV_ITEMS.map((item) => item.name),
+    ["overview", "tasks", "runs", "agents", "reviews", "settings"],
+  );
   for (const item of NAV_ITEMS) {
     assert.equal(routeToHash({ name: item.name }), item.href);
     assert.ok(item.labelKey.startsWith("nav."));
   }
   assert.equal(navNameOf({ name: "task", id: "T-1" }), "tasks");
+  assert.equal(navNameOf({ name: "run", id: "RUN-1" }), "runs");
   assert.equal(navNameOf({ name: "overview" }), "overview");
 });

@@ -122,3 +122,74 @@ test("write failures show the localized code plus the verbatim server message an
   assert.match(feedback, /data-testid="action-error-server-message"/);
   assert.doesNotMatch(feedback, /error\.code\.INTERNAL_ERROR/, "the panel must not replace server errors with a local guess");
 });
+
+// ------------------------------------------------ M5 runs + live timeline ---
+
+test("the runs routes are wired into the shell and the sidebar", () => {
+  const app = read("src/App.tsx");
+  assert.match(app, /<RunsPage refetchKey=\{resyncCount\} \/>/);
+  assert.match(app, /<RunDetailPage runId=\{route\.id\}/);
+  assert.match(app, /frames=\{streamFrames\}/, "live frames must reach the run detail page");
+
+  const router = read("src/router.ts");
+  assert.match(router, /name: "runs", href: "#\/runs"/, "Runs must be a navigation entry");
+  assert.match(router, /case "runs": \{/);
+  assert.match(router, /case "run":/);
+
+  const sidenav = read("src/components/SideNav.tsx");
+  assert.match(sidenav, /data-testid=\{`nav-\$\{item\.name\}`\}/, "nav-runs is derived from the nav name");
+});
+
+test("the runs list renders the contract fields and links into the detail page", () => {
+  const page = read("src/pages/RunsPage.tsx");
+  for (const testId of ["runs-page", "runs-table"]) {
+    assert.ok(page.includes(testId), `RunsPage is missing data-testid=${testId}`);
+  }
+  for (const column of ["runs.columnRun", "runs.columnStatus", "runs.columnAttempt", "runs.columnExitCode", "runs.columnTask"]) {
+    assert.ok(page.includes(column), `RunsPage is missing column ${column}`);
+  }
+  assert.match(page, /shortRunId\(/, "the list shows the short run id");
+  assert.match(page, /routeToHash\(\{ name: "run"/, "rows link to #/runs/:id");
+  assert.match(page, /run\.exitCode/, "exitCode must be displayed");
+  assert.match(page, /LoadingState|ErrorState|EmptyState/, "list states must be handled");
+});
+
+test("the run detail page is read-only and merges snapshot + live frames", () => {
+  const page = read("src/pages/RunDetailPage.tsx");
+  assert.match(page, /data-testid="run-detail"/);
+  assert.match(page, /data-testid="run-info"/);
+  assert.match(page, /timelineFromEvents/);
+  assert.match(page, /timelineFromFrames/);
+  assert.match(page, /mergeTimeline/, "snapshot and live frames must be merged by seq");
+  assert.match(page, /<RunTimeline/);
+  for (const field of ["runs.fieldExitCode", "runs.fieldStartedAt", "runs.fieldEndedAt", "runs.fieldDuration", "runs.fieldTask"]) {
+    assert.ok(page.includes(field), `RunDetailPage is missing ${field}`);
+  }
+  // Read-only: no write helper may appear on the runs pages.
+  assert.doesNotMatch(page, /apiPost|apiPatch|useWriteAction|ActionFeedback/, "M5 runs pages must not offer writes");
+  const list = read("src/pages/RunsPage.tsx");
+  assert.doesNotMatch(list, /apiPost|apiPatch|useWriteAction/, "the runs list is read-only");
+});
+
+test("the timeline renders seq-ordered rows plus the reconnect notices", () => {
+  const timeline = read("src/components/RunTimeline.tsx");
+  for (const testId of ["run-timeline", "run-timeline-list", "timeline-stream-notice", "timeline-empty"]) {
+    assert.ok(timeline.includes(testId), `RunTimeline is missing data-testid=${testId}`);
+  }
+  assert.match(timeline, /data-testid=\{`run-timeline-entry-\$\{entry\.seq\}`\}/, "entries are keyed by seq");
+  assert.match(timeline, /streamNotice/, "reconnect state must come from the pure notice helper");
+  assert.match(timeline, /runs\.timelineLastSeq/, "the last seq must be visible (reconnect evidence)");
+  assert.match(timeline, /runLogFields/, "run.log payloads must render as log lines");
+  assert.match(timeline, /runStatusChange/, "run.updated payloads must render as status transitions");
+});
+
+test("the live stream still uses fetch + ReadableStream (never EventSource)", () => {
+  const hook = read("src/api/useEventStream.ts");
+  assert.doesNotMatch(hook, /new\s+EventSource/, "EventSource cannot send x-atk-token and is forbidden");
+  assert.match(hook, /openEventStream/, "the stream must go through the shared fetch client");
+  assert.match(hook, /Last-Event-ID|lastSeq/, "reconnects must resume with Last-Event-ID");
+  assert.match(hook, /onEvent/, "every frame must reach the timeline");
+  const client = read("src/api/client.ts");
+  assert.match(client, /streamHeaders/);
+  assert.doesNotMatch(client, /new\s+EventSource/);
+});

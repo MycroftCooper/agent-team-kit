@@ -23,6 +23,7 @@ export function createScheduler({ client, core, policies, ownerId, pollMs = 1000
   const lastFailures = [];
   let pollTimer = null;
   let heartbeatTimer = null;
+  let keepAlive = false;
   let stopped = true;
 
   function remember(failure) {
@@ -77,7 +78,9 @@ export function createScheduler({ client, core, policies, ownerId, pollMs = 1000
 
   function schedule(fn, ms) {
     const timer = setInterval(fn, ms);
-    timer.unref?.();
+    // Library/test mode keeps the event loop free; a long-running CLI must keep
+    // it alive or the process exits right after printing "attached".
+    if (!keepAlive) timer.unref?.();
     return timer;
   }
 
@@ -86,15 +89,16 @@ export function createScheduler({ client, core, policies, ownerId, pollMs = 1000
     failures: () => [...lastFailures],
     runOnce,
 
-    start() {
+    start(options = {}) {
       stopped = false;
+      keepAlive = options?.keepAlive === true;
       const loop = async () => {
         if (stopped) return;
         const result = await runOnce();
         if (stopped) return;
         const delay = result.ok ? pollMs : Math.max(pollMs, stats.backoffMs);
         pollTimer = setTimeout(loop, delay);
-        pollTimer.unref?.();
+        if (!keepAlive) pollTimer.unref?.();
       };
       void loop();
       heartbeatTimer = schedule(() => {

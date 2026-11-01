@@ -47,11 +47,15 @@ export function createHost({
   let heartbeatTimer = null;
   let stopped = false;
   let capabilities = null;
+  let keepAlive = false;
   const stats = { claimed: 0, started: 0, completed: 0, interrupted: 0, fenced: 0, staleDropped: 0, eventsSent: 0, errors: 0 };
 
   function schedule(fn, ms) {
     const timer = setInterval(fn, ms);
-    timer.unref?.();
+    // Library/test mode keeps the event loop free (unref). A long-running CLI
+    // must keep the loop alive, otherwise the process exits immediately after the
+    // "attached" banner (found while writing the M4 gate's process check).
+    if (!keepAlive) timer.unref?.();
     return timer;
   }
 
@@ -290,8 +294,9 @@ export function createHost({
     /** One claim attempt; exposed so tests do not need timers. */
     tick,
 
-    start() {
+    start(options = {}) {
       stopped = false;
+      keepAlive = options?.keepAlive === true;
       void safe("capabilities", async () => {
         capabilities = await runtime.capabilities();
         return capabilities;

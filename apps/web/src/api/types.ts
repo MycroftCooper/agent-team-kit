@@ -44,11 +44,18 @@ export type Run = {
   taskId: string;
   agentId?: string;
   function?: string;
+  role?: string | null;
   status: string;
   attempt?: number;
+  /** Set when the attempted process ended (M5 shows it in the Runs list). */
+  exitCode?: number | null;
+  version?: number;
+  workspaceId?: string;
   startedAt?: string | null;
   endedAt?: string | null;
   createdAt?: string;
+  updatedAt?: string;
+  error?: unknown;
 };
 
 export type Agent = {

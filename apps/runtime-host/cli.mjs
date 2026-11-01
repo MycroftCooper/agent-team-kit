@@ -90,7 +90,7 @@ async function main() {
     await host.stop();
     return;
   }
-  host.start();
+  host.start({ keepAlive: true });
   process.stdout.write(`[host] ${ownerId} attached to ${baseUrl} (runtime ${runtime.kind})\n`);
 }
 

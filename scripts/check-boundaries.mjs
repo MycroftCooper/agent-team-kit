@@ -16,8 +16,8 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PACKAGES = ["web", "backend", "database", "contracts", "runtime-sdk", "workspace", "scheduler", "scheduler-core"];
-const APP_PREFIXES = { web: "apps/web", backend: "apps/backend", scheduler: "apps/scheduler" };
+const PACKAGES = ["web", "backend", "database", "contracts", "runtime-sdk", "workspace", "scheduler", "scheduler-core", "launcher"];
+const APP_PREFIXES = { web: "apps/web", backend: "apps/backend", scheduler: "apps/scheduler", launcher: "apps/launcher" };
 const PKG_PREFIXES = {
   database: "packages/database",
   contracts: "packages/contracts",
@@ -35,6 +35,8 @@ const ALLOWED = {
   workspace: new Set([]),
   scheduler: new Set(["scheduler-core", "contracts"]),
   "scheduler-core": new Set([]),
+  // The launcher orchestrates processes; it must not import the apps it starts.
+  launcher: new Set(["contracts"]),
 };
 
 const IMPORT_RE = /(?:^|\n)\s*(?:import|export)[^;]*?from\s+["']([^"']+)["']|(?:^|\n)\s*import\s+["']([^"']+)["']|import\(\s*["']([^"']+)["']\s*\)/g;

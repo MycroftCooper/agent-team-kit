@@ -34,6 +34,8 @@ export type UseEventStreamResult = {
 
 export type UseEventStreamOptions = {
   onResync?: () => void;
+  /** Called for every event frame (not heartbeats, not the resync frame). */
+  onEvent?: (event: StreamEvent) => void;
   enabled?: boolean;
 };
 
@@ -44,6 +46,8 @@ export function useEventStream(options: UseEventStreamOptions = {}): UseEventStr
   const [resyncCount, setResyncCount] = useState(0);
   const onResyncRef = useRef<UseEventStreamOptions["onResync"]>(options.onResync);
   onResyncRef.current = options.onResync;
+  const onEventRef = useRef<UseEventStreamOptions["onEvent"]>(options.onEvent);
+  onEventRef.current = options.onEvent;
 
   useEffect(() => {
     if (!enabled) {
@@ -100,7 +104,11 @@ export function useEventStream(options: UseEventStreamOptions = {}): UseEventStr
               break;
             }
             lastSeq = advanceLastSeq(lastSeq, frame);
-            setLastEvent({ seq: frame.id, type: frame.type ?? "message", data: frame.data });
+            const event: StreamEvent = { seq: frame.id, type: frame.type ?? "message", data: frame.data };
+            setLastEvent(event);
+            // Every frame reaches listeners: the timeline must not lose frames
+            // that arrived in the same chunk as a later one.
+            onEventRef.current?.(event);
           }
           if (resyncSeen) {
             setResyncCount((count) => count + 1);

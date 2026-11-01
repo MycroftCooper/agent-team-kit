@@ -6,6 +6,56 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (M5 / v0.8)
+
+- `apps/launcher`: `atk start|stop|status|logs`. One command brings up the
+  backend, the scheduler and N runtime hosts; a detached supervisor holds the
+  backend's stdout just long enough to capture the one-time internal credential
+  and pass it to children through their environment only. The credential is
+  filtered out of every log line, never written to `launcher.json` and never
+  returned by `status`. Stops are ordered (hosts → scheduler → backend, SIGTERM
+  then SIGKILL) and idempotent; a second `start` exits 2 with the existing PIDs;
+  a stale state file is cleaned instead of blocking startup.
+- `apps/backend`: `backup` and `restore` subcommands plus `serve --pidfile`.
+  Backups use SQLite's backup API from a read-only connection, so data committed
+  in the WAL is included (copying the `.db` file alone fails under WAL);
+  `manifest.json` records schemaVersion, size and sha256; restore verifies the
+  hash and version, writes through a temporary file and atomically renames, and
+  refuses to overwrite without `--force`.
+- `apps/web`: `#/runs` and `#/runs/:id` with a seq-ordered, de-duplicated
+  timeline and a live stream over fetch + ReadableStream (never `EventSource`,
+  never a token in a URL). A `system.resync-required` frame triggers a snapshot
+  refetch and a visible "gap detected" notice instead of pretending to be live.
+- `scripts/m5-smoke.mjs`: the M5 gate over the real launcher, backend, scheduler
+  and two hosts — the tree comes up and executes work, the credential is not
+  persisted, a killed host is reported down, stop is idempotent, and a backup
+  restores and starts. 4/4.
+- `docs/operations/install-upgrade-rollback.md`: install, upgrade, rollback and
+  crash-recovery runbook with the criteria that must hold for a rollback to count
+  as finished.
+
+### Fixed (M5 / v0.8)
+
+- Both long-running CLIs (`apps/scheduler`, `apps/runtime-host`) printed their
+  "attached" banner and then exited immediately: every timer was unref'd, so the
+  event loop had nothing left. `start({ keepAlive: true })` now keeps the timers
+  referenced for the CLI and leaves library/test mode unref'd.
+- The launcher initially wrote the backend's stdout verbatim into
+  `logs/backend.log`, which persisted the internal credential banner. Credential
+  lines are now redacted; the M5 gate asserts no credential value appears in the
+  state file, logs or `status` output.
+- QA-005 (M4 review): a self-review could be smuggled past the guard with a
+  leading space, trailing space or different case (`" agent-1"`, `"AGENT-1"`);
+  actors must now be fully normalised and comparisons are case-folded.
+- QA-005: approval hash binding was only an echo — nothing in production wrote
+  `tasks.target_hash`, so any 64-hex string could approve a task. A PASS review
+  now writes the candidate hash in the same transaction, `createApproval`
+  requires that exact hash, and the M4 gate covers "old approval + old hash is
+  refused after a new PASS".
+- QA-005: `store.patchTask` could move a task straight to DONE; it now refuses
+  with `human-approval-required`. Rework no longer creates duplicate attempt
+  numbers, and evidence counts are bounded.
+
 ### Added (M4 / v0.7)
 
 - `packages/contracts`: a `REJECTED` task state (the rework waiting room) and

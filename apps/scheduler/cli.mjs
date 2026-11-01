@@ -73,7 +73,7 @@ if (args.once) {
   process.stdout.write(`${JSON.stringify({ result, stats: scheduler.stats })}\n`);
   await scheduler.stop();
 } else {
-  scheduler.start();
+  scheduler.start({ keepAlive: true });
   process.stdout.write(`[scheduler] ${ownerId} attached to ${baseUrl} (policies ${JSON.stringify(policies)})\n`);
 }
 

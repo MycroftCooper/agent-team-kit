@@ -4,12 +4,14 @@
 // Pure functions so `node:test` can cover the mapping (no DOM needed).
 import type { MessageKey } from "./i18n/en.ts";
 
-export type NavName = "overview" | "tasks" | "agents" | "reviews" | "settings";
+export type NavName = "overview" | "tasks" | "runs" | "agents" | "reviews" | "settings";
 
 export type Route =
   | { name: "overview" }
   | { name: "tasks" }
   | { name: "task"; id: string }
+  | { name: "runs" }
+  | { name: "run"; id: string }
   | { name: "agents" }
   | { name: "reviews" }
   | { name: "settings" };
@@ -17,6 +19,7 @@ export type Route =
 export const NAV_ITEMS: readonly { name: NavName; href: string; labelKey: MessageKey }[] = [
   { name: "overview", href: "#/overview", labelKey: "nav.overview" },
   { name: "tasks", href: "#/tasks", labelKey: "nav.tasks" },
+  { name: "runs", href: "#/runs", labelKey: "nav.runs" },
   { name: "agents", href: "#/agents", labelKey: "nav.agents" },
   { name: "reviews", href: "#/reviews", labelKey: "nav.reviews" },
   { name: "settings", href: "#/settings", labelKey: "nav.settings" },
@@ -39,6 +42,11 @@ export function parseRoute(hash: string | null | undefined): Route {
       const id = decodeURIComponent(rest.join("/"));
       return id === "" ? { name: "tasks" } : { name: "task", id };
     }
+    case "runs": {
+      if (rest.length === 0) return { name: "runs" };
+      const id = decodeURIComponent(rest.join("/"));
+      return id === "" ? { name: "runs" } : { name: "run", id };
+    }
     case "agents":
       return { name: "agents" };
     case "reviews":
@@ -58,6 +66,10 @@ export function routeToHash(route: Route): string {
       return `#/tasks/${encodeURIComponent(route.id)}`;
     case "tasks":
       return "#/tasks";
+    case "run":
+      return `#/runs/${encodeURIComponent(route.id)}`;
+    case "runs":
+      return "#/runs";
     case "agents":
       return "#/agents";
     case "reviews":
@@ -72,5 +84,7 @@ export function routeToHash(route: Route): string {
 
 /** Which nav item should look active for the current route. */
 export function navNameOf(route: Route): NavName {
-  return route.name === "task" ? "tasks" : route.name;
+  if (route.name === "task") return "tasks";
+  if (route.name === "run") return "runs";
+  return route.name;
 }
