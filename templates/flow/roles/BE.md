@@ -30,13 +30,17 @@ product paths, QA acceptance code, package versions or the release chain
 6. Apply, as the only executor:
 
    ```bash
-   atk ownership check --role BE
-   atk batch verify --manifest <f> --qa <qa-approval.json>   # must PASS
-   atk batch apply --manifest <f>                            # dry-run plan
-   atk batch apply --manifest <f> --apply --confirm-dev-closed
+   atk ownership check --role BE --strict
+   atk batch verify --manifest <f> --qa <qa-approval.json> --require-qa   # must PASS
+   atk batch apply --manifest <f> --qa <qa-approval.json>                 # dry-run plan
+   atk batch apply --manifest <f> --qa <qa-approval.json> --apply --confirm-dev-closed
    atk evidence                                              # derive applied
    ```
 
+   Every `apply`, the dry-run included, requires a structurally valid QA receipt;
+   without one it prints `status: FAIL` with the reason and exits `1`, and the
+   original tree is untouched. Legacy `passed: true` receipts are refused unless
+   the project opts in with `batch.legacyReceipts` / `--legacy-receipts`.
    On drift, stop immediately and report affected files; never overwrite user
    changes.
 

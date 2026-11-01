@@ -61,8 +61,25 @@ atk gate quick                                # when the ticket requires freeze
 atk gate local                                # when the ticket requires delivery
 ```
 
-`skipped` is not a pass. A gate that runs in a group that the change does not
-match never ran. Write down what ran and what did not.
+Every gate run ends in exactly one of five states. The report's `ok` field is
+always exactly `status === "PASS"`, so a consumer that only reads `ok` can never
+be told a skipped / unconfigured / error run passed.
+
+| status | meaning | exit code | counts as a pass? |
+|---|---|---|---|
+| `PASS` | at least one step ran and every step exited 0 | `0` | yes |
+| `FAIL` | a configured step ran and exited non-zero | `1` | no — fix it |
+| `SKIPPED` | configured, but no step applies to these changes | `0` | **no** — nothing was verified |
+| `UNCONFIGURED` | `gates.fast.steps` is empty, or no `gates.quick` / `gates.local` command | `2` | **no** — configuration error |
+| `ERROR` | a step could not be started or executed (spawn failure, signal kill, invalid exit code) | `2` | **no** |
+
+The same `status`, `ok`, `note`, `steps[]` and `finishedAt` are written to
+`<artifactDir>/ci-fast-latest.json`; every gate run overwrites that report, so a
+SKIPPED / UNCONFIGURED / ERROR run cannot leave a stale PASS behind. Delivery
+(`atk release`) accepts only a report whose `status` is exactly `PASS`: a legacy
+report with only `{ "ok": true }` and no `status` is rejected. A gate step that
+runs in a group the change does not match never ran — write down what ran and
+what did not.
 
 ## 4. Freeze (executor)
 
@@ -88,49 +105,102 @@ QA verifies the frozen manifest only:
 
 ```bash
 atk task <ID> --for QA --agent <qa-agent-id>   # review dispatch: --agent is required
-atk ownership check --role QA
-atk batch verify --manifest <manifest.json> --qa <previous-or-omit>
+atk ownership check --role QA --strict
+atk batch verify --manifest <manifest.json> --qa <qa-approval.json>   # omit --qa only for a diagnostic run
 ```
 
 The review dispatch refuses without `--agent`, and refuses when the task belongs
 to QA's own role or when a manifest already names that instance as the producer.
 
 Then the semantic pass: boundaries, honest mocks, `partial`/`unknown` reporting,
-single-writer preserved. QA writes `qa-approval.json`, binding the current
-`manifestSha256` and recording the reviewing Run:
+single-writer preserved. QA writes a signed `qa-approval.json` that binds the
+frozen manifest hash and records the reviewing Run:
 
 ```jsonc
 {
+  "schemaVersion": 1,
+  "kind": "qa-approval",
   "manifestSha256": "...",
-  "passed": true,
-  "originalApplied": false,
-  "reviewer": { "agent": "agent-qa-01", "role": "QA", "function": "REVIEWER" }
+  "verdict": "PASS",
+  "reviewer": {
+    "run": "run-qa-01",
+    "agent": "agent-qa-01",
+    "role": "QA",
+    "function": "REVIEWER"
+  },
+  "targetRunId": "run-20261102-001",      // the producing WORKER run (manifest.run.id)
+  "gates": [
+    { "name": "quick", "status": "PASS", "reportSha256": "..." }
+  ],
+  "originalApplied": false
 }
 ```
 
-A changed hash voids any previous approval, and a reviewer that produced the
-manifest voids the approval entirely (see [ENTITIES.md](ENTITIES.md)).
+`passed: true` on its own is not a QA fact. An approval counts only when all of
+the following hold:
+
+- `verdict` is `"PASS"` and `manifestSha256` is non-empty and equals the frozen
+  `manifestSha256`;
+- `reviewer.function` is `"REVIEWER"`, with non-empty `reviewer.run` and
+  `reviewer.agent`;
+- `reviewer.agent` is neither the manifest's producing `run.agent` nor one of its
+  `run.contributors` (no self-review, see [ENTITIES.md](ENTITIES.md));
+- `targetRunId` equals `manifest.run.id` when both sides carry the field;
+- every declared `gates[]` entry has `status: "PASS"`; in controlled integration
+  (see §6/§7) at least one gate must be declared;
+- in `batch verify` / `batch apply`, the approval has not already been applied
+  (`originalApplied` is not `true`);
+
+A changed manifest hash, a changed candidate byte or a new commit voids any
+previous approval: re-freeze and re-review. Receipts that only self-report
+`passed: true` / `noninteractiveQA: "passed"` (the pre-M0 format) are refused by
+default with a readable `legacy-receipt` reason. They keep working only through
+the explicit escape hatches `"batch": { "legacyReceipts": true }` or
+`--legacy-receipts` (on `batch verify` / `batch apply` / `evidence`).
 
 Exit condition: PASS/FAIL plus concrete gaps and the approval JSON path; no edits
 to product code.
 
 ## 6. Verify (QA, or the integrator before apply)
 
-`atk batch verify --manifest <f> --qa <f>` fails on: stale manifest, candidate
-changed since freeze, QA approval not bound to the manifest hash, or drift in the
-original tree. It also fails the identity checks — missing producer/reviewer
-identity, an instance absent from `runtime.json`, a capability the declared
-Function needs, or a reviewer that produced the manifest (`no-self-review`).
-`atk batch apply` runs the same checks. Treat any of them as a stop, not a retry.
+`atk batch verify --manifest <f> --qa <qa-approval.json>` checks the frozen
+manifest, the candidate bytes, the original tree, the QA receipt structure and
+the reviewer identity. Its verdict is `status: "PASS" | "FAIL" | "SKIPPED"`,
+with a `rejected: [{ reason, detail }]` list naming every refused receipt.
+
+- **Controlled integration** — `atk batch verify --require-qa`: a structurally
+  valid QA receipt is mandatory. Missing or refused → `status: FAIL`, exit `1`,
+  and a readable reason such as `missing-qa-approval`, `legacy-receipt`,
+  `manifest-sha-mismatch`, `target-run-mismatch`, `self-review`, `gate-not-pass`
+  or `missing-gates`.
+- **Read-only diagnostic** — `atk batch verify` without `--qa`: still usable, but
+  the report is `status: "SKIPPED"` with `diagnosticOnly: true`, and the human
+  output never prints PASS:
+
+  ```
+  SKIPPED BATCH-01: diagnostic-only, no qa-approval supplied; QA was not evaluated; 3 structural check(s) ok | receipt artifacts/evidence/BATCH-01/verify-....json
+  ```
+
+  Treat it as "no QA verdict yet", never as an approval.
+
+`atk batch apply` runs the same checks and is always controlled integration (see
+§7). Treat any failing check as a stop, not a retry.
 
 ## 7. Apply (integrator only)
 
 ```bash
-atk ownership check --role BE
-atk batch verify --manifest <f> --qa <qa-approval.json>   # must PASS
-atk batch apply --manifest <f>                            # dry-run plan
-atk batch apply --manifest <f> --apply --confirm-dev-closed
+atk ownership check --role BE --strict
+atk batch verify --manifest <f> --qa <qa-approval.json>   # must PRINT PASS
+atk batch apply --manifest <f> --qa <qa-approval.json>    # dry-run plan
+atk batch apply --manifest <f> --qa <qa-approval.json> --apply --confirm-dev-closed
 ```
+
+Every form of `atk batch apply` — the dry-run plan included — is controlled
+integration and requires a structurally valid QA approval bound to the manifest.
+Without one the plan is still printed, but with `"status": "FAIL"`, the
+`rejected` reasons (`missing-qa-approval`, `legacy-receipt`, ...) and exit code
+`1`; the original tree is never touched. A dry-run is still a dry-run: it writes
+the plan receipt, not product files.
 
 Apply requires **both** `--apply` and `--confirm-dev-closed`; the second flag is
 the explicit user confirmation that the dev server / app is closed. On drift the
@@ -140,9 +210,9 @@ apply.
 A real apply is also the permission-checked operation
 `integration.merge.development`: it refuses without a QA approval bound to the
 manifest, and (when `gates.quick` / `gates.local` are configured) without a green
-gate report. The dry-run plan stays available. The denial carries a reason code
-(`REVIEW_EVIDENCE_INVALID`, `GATE_NOT_GREEN`, `APPROVAL_REQUIRED`, ...); see
-[PERMISSIONS.md](PERMISSIONS.md).
+gate report — a self-declared gate inside the QA receipt is not a gate report.
+The denial carries a reason code (`REVIEW_EVIDENCE_INVALID`, `GATE_NOT_GREEN`,
+`APPROVAL_REQUIRED`, ...); see [PERMISSIONS.md](PERMISSIONS.md).
 
 ## 8. Evidence (LEAD)
 
@@ -154,6 +224,13 @@ atk sync                  # import -> evidence -> board -> measure -> state chec
 `atk evidence` is idempotent and only derives facts backed by receipts. It never
 advances `blocked`, `paused` or `done`, and never writes `humanAccepted`. If a
 fact looks wrong, the missing input is a receipt, not a manual edit.
+
+A receipt that does not validate is never silently ignored: it is counted in the
+`rejected` list of the JSON report and printed on stderr with a readable
+`reason` / `detail`, for example `legacy-receipt`, `self-review`,
+`manifest-sha-mismatch` or `gate-not-pass`. Legacy `passed: true` receipts are
+refused by default; the explicit escape hatches are
+`"batch": { "legacyReceipts": true }` or `atk evidence --legacy-receipts`.
 
 ## 9. Acceptance and archive (human + LEAD)
 
@@ -172,7 +249,9 @@ fact looks wrong, the missing input is a receipt, not a manual edit.
   `--no-ff` and create the `v<version>` tag; the command switches back to dev.
 - The release command refuses an unclean worktree, a mismatched version file, a
   stale/red gate report or a duplicate tag; `--skip-gate` / `--allow-dirty` are
-  explicit escape hatches.
+  explicit escape hatches. A gate report is accepted only when its `status` is
+  exactly `PASS` — `ok: true` alone, or any SKIPPED / UNCONFIGURED / ERROR report,
+  is not green. A UTF-8 BOM on the report is tolerated.
 - No push is performed: push both branches and the tag yourself.
 
 ## The proof ladder

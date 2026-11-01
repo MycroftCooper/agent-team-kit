@@ -67,7 +67,7 @@ all hold), `N` = denied. A conditional cell is not a default pass.
 | `WRITE_SCOPE_VIOLATION` | A file is outside the subject Role's write scope. |
 | `WORKSPACE_NOT_ISOLATED` | The candidate workspace is inside the original tree. |
 | `SELF_REVIEW_DENIED` | The reviewer is an author/contributor of the candidate. |
-| `REVIEW_EVIDENCE_INVALID` | The QA approval does not bind the frozen manifest. |
+| `REVIEW_EVIDENCE_INVALID` | The QA approval does not bind the frozen manifest, is already applied, or does not carry a well-formed PASS verdict. |
 | `GATE_NOT_GREEN` | The latest quick/local gate report is not green. |
 | `STATE_CONSTRAINT_FAILED` | The task/run state forbids the operation. |
 | `BUDGET_EXCEEDED` | The task budget is exhausted. |
@@ -104,14 +104,39 @@ all hold), `N` = denied. A conditional cell is not a default pass.
 - **`SYSTEM` is not a superuser Agent.** It executes predefined actions and
   records decisions; it never invents approvals.
 
+## QA verdict: structured receipt vs legacy flag
+
+`review-evidence` evaluates the QA approval attached to the manifest. Since M0
+the canonical receipt is the signed `kind: "qa-approval"` object (verdict,
+manifestSha256, reviewer, targetRunId, declared gates) documented in
+[WORKFLOW.md](WORKFLOW.md) §5. The shared predicate lives in
+`lib/evidence.mjs` (`qaPassVerdict`, also used by `atk batch verify`): a QA PASS
+is either a legacy self-reported flag (`passed: true` / `noninteractiveQA:
+"passed"`) or a structured `verdict: "PASS"` that also carries
+`reviewer.function: "REVIEWER"` and a non-empty `manifestSha256`. A bare
+`{ "verdict": "PASS" }` is not evidence and is denied with
+`REVIEW_EVIDENCE_INVALID`.
+
+**Known limitation (M0, planned for M4).** `atk permit check qa.result.submit`
+evaluates only that minimum predicate, so its `review-evidence` condition still
+accepts a legacy `passed: true` receipt. This is kept for compatibility with
+existing projects and receipts — it is a known gap, not a fixed behavior. The
+authoritative QA validation is `atk batch verify` / `atk batch apply`: those
+reject legacy receipts by default (escape hatch `batch.legacyReceipts` /
+`--legacy-receipts`) and additionally bind the run identity, target run, manifest
+hash, declared gates and applied state. Do not treat a standalone `permit check`
+decision as a QA sign-off. Tightening `review-evidence` to the full structured
+rule (including `policyVersion`) is deferred to M4 and lands together with the
+policy-version work.
+
 ## Where it is enforced
 
 | Command | Operation | Behaviour |
 |---|---|---|
 | `atk state task <ID> --for <ROLE> [--agent <id>]` | `task.claim` | Claiming is conditional on an eligible task; review dispatches additionally need a reviewer identity (no self-review). |
 | `atk batch manifest --agent <id>` | `qa.manifest.freeze` | A conditional WORKER/ORCHESTRATOR action; a REVIEWER instance is denied by the matrix. |
-| `atk batch verify --manifest <f> --qa <f>` | `qa.result.submit` | Adds the permission decision to the verify checks; a self-authored review is `SELF_REVIEW_DENIED`. |
-| `atk batch apply --apply --confirm-dev-closed` | `integration.merge.development` | A real write requires QA evidence bound to the manifest, no drift, and a green quick/local gate report when those gates are configured. The dry-run plan stays available. |
+| `atk batch verify --manifest <f> --qa <f>` | `qa.result.submit` | Adds the permission decision to the verify checks; a self-authored review is `SELF_REVIEW_DENIED`. Controlled integration (`--require-qa`) refuses without a valid QA receipt (`status: FAIL`, exit `1`); a plain verify without `--qa` is diagnostic-only (`status: SKIPPED`) and is never an approval. |
+| `atk batch apply ...` | `integration.merge.development` | Every form — dry-run included — requires a structurally valid QA receipt (exit `1` otherwise). A real write additionally needs no drift and a green quick/local gate report when those gates are configured; a self-declared gate in the receipt is not a gate report. |
 | `atk state archive <ID> --note "why"` | `integration.archive` | Conditional on `humanAccepted`; the Orchestrator records the archive. |
 
 Everything not wired into an existing command can be queried before acting:

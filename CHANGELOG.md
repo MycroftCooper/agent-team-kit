@@ -36,10 +36,10 @@ semantic versioning.
   dispatch, `qa.manifest.freeze` on manifest freeze, `qa.result.submit` on QA
   verify, `integration.merge.development` on real applies, and
   `integration.archive` on archive.
-- Strict integration: `atk batch apply --apply --confirm-dev-closed` now
-  requires a QA approval bound to the manifest (and a green quick/local gate
-  report when those gates are configured); the dry-run plan stays available
-  without evidence.
+- Strict integration: `atk batch apply --apply --confirm-dev-closed` requires a
+  QA approval bound to the manifest (and a green quick/local gate report when
+  those gates are configured). Every form of `apply`, the dry-run included, now
+  needs a structurally valid approval — see the QA receipt entry above.
 - Tests for the registry, matrix spot checks, deny-by-default, reason codes,
   write scope, review independence, gate proof, append-only audit and the
   `atk permit` CLI surface.
@@ -67,21 +67,69 @@ semantic versioning.
 - Generated flow docs (README and commands cheat sheet, both languages) document
   the branch model and release command; `test/release.test.mjs` covers dry-run,
   version mismatch, wrong branch and apply.
+- Fail-closed ownership check: `atk ownership check --strict` (or
+  `"ownership": { "mode": "strict" }` in `agent-flow.config.json`). Strict mode
+  requires a Role (`--role` / `$AGENT_ROLE`, exit `2` when missing or unknown),
+  blocks unmapped paths (exit `1`), reports an empty change list as `SKIPPED`
+  (exit `0`, never PASS) and writes `status` / `mode` into the JSON report.
+  Loose mode keeps the v0.2 output, report shape and exit codes unchanged.
+- Structured QA receipts ([docs/WORKFLOW.md](docs/WORKFLOW.md) §5): a
+  `kind: "qa-approval"` receipt with `verdict`, `manifestSha256`,
+  `reviewer { run, agent, role, function }`, `targetRunId` and per-gate
+  `status: "PASS"` is now the only QA fact. A bare `passed: true` is refused by
+  default with a readable `legacy-receipt` reason; the explicit escape hatches
+  are `"batch": { "legacyReceipts": true }` and the `--legacy-receipts` flag.
+- `atk batch verify --require-qa` and every `atk batch apply` (dry-run included)
+  are controlled integration: a structurally valid QA receipt bound to the
+  manifest is mandatory, otherwise exit `1` with the missing reason. Plain
+  `atk batch verify` without `--qa` stays usable as a read-only diagnostic that
+  reports `status: "SKIPPED"` and `diagnosticOnly: true` without ever printing
+  PASS.
+- `atk evidence --legacy-receipts` mirrors the config escape hatch for
+  deriving facts from pre-M0 receipts.
 
 ### Changed
 
+- Gate runs now report one of five statuses — `PASS`, `FAIL`, `SKIPPED`,
+  `UNCONFIGURED`, `ERROR` — with `ok` fixed to `status === "PASS"`. Exit codes:
+  `PASS 0`, `SKIPPED 0`, `FAIL 1`, `UNCONFIGURED 2`, `ERROR 2`. A gate that
+  applies no step is `SKIPPED` (not a pass), an empty configuration is
+  `UNCONFIGURED` (previously exited `0` silently) and a step that cannot be
+  launched is `ERROR` instead of `FAIL`. Gate reports always carry `status`, and
+  every run overwrites `<artifactDir>/ci-fast-latest.json` so a stale PASS cannot
+  survive a non-PASS run. `atk release` accepts only a report whose `status` is
+  exactly `PASS` and whose `ok` is true; a legacy `{ "ok": true }` report or any
+  SKIPPED / FAIL / UNCONFIGURED / ERROR report is refused.
+- `qa-approval.json` moves to the signed structure; manifests should carry the
+  producing `run` and reviews should carry a `reviewer` run. A manifest frozen
+  without `--agent` can no longer pass a QA review while the no-self-review rule
+  is enforced. `atk batch verify` / `atk batch apply` and `atk evidence` no
+  longer treat a self-reported `passed: true` as QA evidence; old receipts must
+  be re-issued or explicitly accepted through `batch.legacyReceipts` /
+  `--legacy-receipts`. `atk evidence` now reports every refused receipt with a
+  readable reason instead of silently ignoring it.
+- **Breaking (JSON field):** `atk evidence` report `rejected` entries changed
+  from `[{ file, manifestSha256, agent }]` (self-reviewed approvals only) to
+  `[{ file, path, reason, detail, legacy, reasons }]` (every refused QA receipt).
+  `selfReviewed` remains a number. Consumers of the old `rejected` shape must be
+  updated; see [docs/INTERNALS.md](docs/INTERNALS.md) §4.9.
 - `runtime.json` moves to schema version 3 (`id` + `capabilities` per Agent
   Instance). Existing version 2 files still load, but `atk state check` warns
   about missing ids and a review cannot pass the identity checks until every
   instance is registered.
-- `qa-approval.json` should carry a `reviewer` identity block and manifests
-  should carry a `run` identity block. A manifest frozen without `--agent` no
-  longer passes a QA review while the no-self-review rule is enforced.
 - The role-change recipe (`docs/ROLES.md`, `agent-team-roles` skill) gains the
   `functions.roles` edit and an Agent Instance entry with an id.
 
 ### Fixed
 
+- `atk release --version x.y.z` is no longer swallowed by the global `--version`
+  handler: `--version` / `-v` only act as global flags before the first
+  positional argument, so the command-level flag reaches `release` (which
+  previously printed the CLI version and exited `0`). Top-level `atk --version`
+  still prints the CLI version.
+- `atk release` reads the gate report through `readJsonStrict`/`stripBom`, so a
+  UTF-8 BOM on a valid `ci-fast-latest.json` is no longer reported as a missing
+  gate report (PowerShell's `Set-Content -Encoding utf8` writes one).
 - `atk baseline start` no longer hashes build output (`target/`, `target-qa/`,
   `dist/`, `artifacts/`, `.local/`, `coverage/`, ...) or generated files
   (`*.tsbuildinfo`, `*.log`). On projects with a large Rust/Cargo target this

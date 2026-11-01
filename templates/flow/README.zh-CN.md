@@ -34,12 +34,19 @@ atk state board --compact             # 给 agent 的极简看板
 
 ## 实体与 Function
 
-Role 只是权限模板。真正的执行者 `runtime.json` 里的 Agent Instance（`id` +
-`capabilities`），一次执行是回执物化的 Run：manifest 是产出方 `WORKER`， 
-`qa-approval.json` 是审查方 `REVIEWER`。
+Role 只是权限模板。真正的执行者是 `runtime.json` 里的 Agent Instance（`id` +
+`capabilities`），一次执行是回执物化的 Run：manifest 是产出方 `WORKER`，结构化签名的
+`qa-approval.json` 是审查方 `REVIEWER`（`kind: "qa-approval"`、`verdict`、
+`manifestSha256`、`reviewer`、`targetRunId`、声明的 `gates`）。单独一个
+`passed: true` 不是 QA 事实；旧式回执默认被拒，除非项目显式启用
+`batch.legacyReceipts` / `--legacy-receipts`。
 
 **不允许自审。** 审查派单必须带 `--agent <id>`；`atk batch verify` 会发现审查者就是
 产出者并拒绝。不要绕过 `no-self-review` 拒绝。
+
+**受控集成。** `atk batch verify --require-qa` 与任何形态的 `atk batch apply`
+（含 dry-run）都必须有合法 QA 回执，缺失直接退出 `1`；不带 `--qa` 的 `batch verify`
+只是只读诊断（`status: "SKIPPED"`，不构成批准）。
 
 **权限默认拒绝。** `atk permit check <操作>` 返回判定与机器可识别原因码（改码、审查、
 集成、预算、生产访问、验收等）；主体 × 操作矩阵由工具包维护，本项目不能放宽。
@@ -51,15 +58,16 @@ Role 只是权限模板。真正的执行者 `runtime.json` 里的 Agent Instanc
 2 LEAD    一条消息转发任务单（不要另写文档）
 3 DEV     在原树之外建候选快照
 4 DEV     冻结：atk batch manifest --candidate ... --packages <ID> --agent <id>
-5 QA      qa-approval.json 绑定冻结的 manifestSha256 + reviewer 身份
+5 QA      出结构化签名 qa-approval.json（kind: "qa-approval"、verdict、
+          manifestSha256、reviewer、targetRunId、声明的 gates）
 6 QA      verify：atk batch verify --manifest ... --qa ...
-7 BE/LEAD apply：先 dry-run，再 --apply --confirm-dev-closed
+7 BE/LEAD apply：先 dry-run（必须带合法 --qa），再 --apply --confirm-dev-closed
 8 LEAD    派生：atk evidence（QA -> 待应用，apply -> 待人工验收）
 9 人      验收；LEAD 写 humanAccepted，再 atk state archive 归档
 ```
 
-以下情况不得推进：manifest 未冻结、QA 未绑定、原树漂移、用户未确认 dev 已关闭、
-夹带未验切片。
+以下情况不得推进：manifest 未冻结、QA 未由合法签名回执绑定、原树漂移、用户未确认
+dev 已关闭、夹带未验切片。
 
 ## 门禁分层
 
@@ -70,6 +78,9 @@ Role 只是权限模板。真正的执行者 `runtime.json` 里的 Agent Instanc
 | 重层 | `atk gate local` | 交付候选可用 |
 | QA | 冻结快照上的定向检查 | 可放行 |
 | 人验 | dev 实机 / 原生 | 可归档 |
+
+只有 `status: "PASS"` 才是门禁通过；`SKIPPED` / `UNCONFIGURED` / `ERROR` 都不算通过，
+`atk release` 也只接受明确的 `PASS` 报告。
 
 ## 证据阶梯
 

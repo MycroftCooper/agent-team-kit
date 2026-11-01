@@ -20,6 +20,8 @@ The acceptance paths assigned to QA in `ownership.json` (typically `tests/`,
 - **Verify frozen snapshots only.** Testing while code changes is invalid.
 - Never reuse an old approval: if `manifestSha256` changed, the old
   `qa-approval.json` is void.
+- Never self-report a PASS: the approval must be a signed `qa-approval` receipt;
+  `passed: true` on its own is refused by default.
 - Report PASS / FAIL plus concrete gaps; never fix FE/BE code yourself.
 - `skipped` is not a pass; a mock pass is not "verified natively".
 
@@ -29,27 +31,46 @@ The acceptance paths assigned to QA in `ownership.json` (typically `tests/`,
 2. Run mechanical checks with scripts (do not compare hashes by hand):
 
    ```bash
-   atk ownership check --role QA
-   atk batch verify --manifest <manifest.json> --qa <previous-or-omit>
+   atk ownership check --role QA --strict
+   atk batch verify --manifest <manifest.json> --qa <qa-approval.json>
    ```
+
+   Controlled integration — `atk batch verify --require-qa` and every
+   `atk batch apply` (dry-run included) — needs a structurally valid
+   `qa-approval.json`; without one it exits `1` with a readable reason. A
+   `verify` run without `--qa` is a read-only diagnostic: `status: "SKIPPED"`,
+   never an approval.
 
 3. Judge semantics yourself: boundaries covered, mocks honest, partial/unknown
    reported, single-writer preserved.
-4. Write `qa-approval.json` binding `manifestSha256` and recording the reviewing
-   Run; store the receipt in the evidence directory configured in
-   `agent-flow.config.json`:
+4. Write the signed `qa-approval.json`; store it in the evidence directory
+   configured in `agent-flow.config.json`:
 
    ```jsonc
    {
-     "manifestSha256": "<hash from the manifest>",
-     "passed": true,
-     "originalApplied": false,
-     "reviewer": { "agent": "agent-qa-01", "role": "QA", "function": "REVIEWER" }
+     "schemaVersion": 1,
+     "kind": "qa-approval",
+     "manifestSha256": "...",
+     "verdict": "PASS",
+     "reviewer": {
+       "run": "run-qa-01",
+       "agent": "agent-qa-01",
+       "role": "QA",
+       "function": "REVIEWER"
+     },
+     "targetRunId": "run-20261102-001",      // the producing WORKER run (manifest.run.id)
+     "gates": [
+       { "name": "quick", "status": "PASS", "reportSha256": "..." }
+     ],
+     "originalApplied": false
    }
    ```
 
-   A reviewer identity that equals `manifest.run.agent` is refused
-   (`no-self-review`), and so is a missing identity.
+   A reviewer identity equal to `manifest.run.agent` (or one of its
+   `run.contributors`) is refused (`self-review`), and so is a missing reviewer
+   identity. Legacy receipts that only self-report `passed: true` are refused by
+   default; `"batch": { "legacyReceipts": true }` or `--legacy-receipts` is the
+   explicit, temporary escape hatch.
 5. Hand back: passed items / failed items / explicitly uncovered items /
    evidence paths.
 
@@ -69,9 +90,11 @@ Stop <yes/no; any half-written files>
 ```bash
 atk queue --for QA
 atk task <ID> --for QA --agent agent-qa-01     # review dispatch; --agent is required
-atk ownership check --role QA
+atk ownership check --role QA --strict
 atk gate fast --files <changed> --role QA
 atk batch verify --manifest <f> --qa <qa-approval.json>
+atk batch verify --manifest <f> --qa <qa-approval.json> --require-qa   # controlled integration
+atk batch apply --manifest <f> --qa <qa-approval.json>                # integrator: dry-run plan
 ```
 
 ## Round budget

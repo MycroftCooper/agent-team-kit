@@ -23,20 +23,24 @@
 | 审查派单必须带审查实例 | `atk task <ID> --for QA --agent <id>` |
 | 调度器拒绝自审 | 该 Role 拥有的任务，或该实例已产出的 manifest |
 | manifest 记录产出 Run | `atk batch manifest ... --agent <id>` |
-| 批准记录审查 Run | `qa-approval.json` → `reviewer` |
+| 批准记录审查 Run | `qa-approval.json` → 结构化签名 `kind: "qa-approval"` 回执 |
 | verify 拒绝自审 | `atk batch verify --manifest <f> --qa <f>`（`no-self-review`、`reviewer-identity` 等） |
+| 受控集成必须提供合法 QA | `atk batch verify --require-qa` / `atk batch apply` 缺合法 `qa-approval.json` 直接退出 `1`；省略 `--qa` 只是只读诊断（`status: SKIPPED`） |
 
 ## 证据与门禁
 
 | 命令 | 作用 |
 |---|---|
-| `atk evidence [--collect-temp] [--dry]` | 回执 → 验收事实（幂等） |
-| `atk ownership check --role <ROLE> [--files a,b]` | 写域越界检查 |
+| `atk evidence [--collect-temp] [--dry] [--legacy-receipts]` | 回执 → 验收事实（幂等）；无效回执计入 `rejected` |
+| `atk ownership check --role <ROLE> [--files a,b] [--strict]` | 写域越界检查（`--strict` 失败关闭：必须有 Role、未映射阻断） |
 | `atk ownership map <path>` | 查路径归属 |
 | `atk ownership verify-config` | 写域配置自查（重叠 / 缺口） |
 | `atk select-tests [--files a,b] [--since-baseline]` | 选测计划 |
 | `atk gate fast [--files a,b] [--role <ROLE>] [--since-baseline]` | 变更范围快速门禁 |
 | `atk gate quick` / `atk gate local` | 完整 / 重层门禁 |
+
+门禁状态只有 `PASS` / `FAIL` / `SKIPPED` / `UNCONFIGURED` / `ERROR`；只有 `PASS`
+满足门禁，`atk release` 也只接受明确的 `PASS` 报告。
 
 ## 权限
 
@@ -52,8 +56,8 @@
 | 命令 | 作用 |
 |---|---|
 | `atk batch manifest --candidate <dir> --paths a,b --packages <ID> --agent <id> [--contributors a,b]` | 冻结候选 manifest 并记录产出 Run |
-| `atk batch verify --manifest <f> --qa <f>` | 原树漂移 / 候选改动 / QA 绑定 / 审查者独立性 |
-| `atk batch apply --manifest <f> [--apply --confirm-dev-closed]` | 默认 dry-run；两个 flag 才真写 |
+| `atk batch verify --manifest <f> [--qa <f>] [--require-qa] [--legacy-receipts]` | 原树漂移 / 候选改动 / QA 回执绑定 / 审查者独立性；不带 `--qa` 只是只读诊断（`status: SKIPPED`，不算通过） |
+| `atk batch apply --manifest <f> [--qa <f>] [--apply --confirm-dev-closed]` | 默认 dry-run（计划本身也必须有合法 QA 回执）；两个 flag 才真写 |
 | `atk baseline start` / `atk baseline changed` | 不依赖 git commit 的本片基线 |
 | `atk release --version <semver> [--note] [--apply]` | 发布：开发分支 → 发布分支 `--no-ff` merge + tag（默认 dry-run，校验分支/工作树/版本/门禁） |
 | `atk cache status` / `atk cache clean` | 查看 / 清理共享构建缓存 |

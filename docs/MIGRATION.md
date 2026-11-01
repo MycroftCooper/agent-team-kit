@@ -127,13 +127,24 @@ in your `commands.md`.
 - Point `layout.evidenceDir` at the durable evidence directory the old tool used
   (`artifacts/evidence` for P4Deck) and run `atk evidence --dry` to see what would
   be derived before it is written.
-- Keep the old receipts: the manifest tag and `qa-approval.json` format are
-  preserved so `atk batch verify` still understands them.
-- Identity adoption is the one new step: add `functions` to the config (or rely
-  on the defaults), give every `runtime.json` agent an `id` and `capabilities`,
-  and put a `reviewer` block in new approvals. Old receipts still verify; a new
-  QA approval without a reviewer identity is refused while
-  `functions.enforceNoSelfReview` is on. See [ENTITIES.md](ENTITIES.md).
+- **The manifest freezing format is unchanged, but the QA receipt structure was
+  upgraded in M0.** `qa-approval.json` must now be a signed `kind:
+  "qa-approval"` receipt (`schemaVersion`, `verdict: "PASS"`, `manifestSha256`,
+  `reviewer { run, agent, role, function: "REVIEWER" }`, `targetRunId` when the
+  manifest records one, and every declared `gates[]` entry `status: "PASS"`).
+  The old `{ "passed": true }` shape is rejected by default; see
+  [WORKFLOW.md](WORKFLOW.md) §5.
+- **Migrate the receipts.** Either (a) re-issue each pending QA approval through
+  the QA loop with the signed structure, or (b) set
+  `"batch": { "legacyReceipts": true }` (or pass `--legacy-receipts`) as a
+  temporary switch while the old approvals are re-issued. Do not keep the switch
+  on permanently: it reopens the self-report gap the signed receipt closes.
+- **Adopt identities.** Add `functions` to the config (or rely on the defaults),
+  give every `runtime.json` agent an `id` and `capabilities`, and record
+  `reviewer.run` + `reviewer.agent` in new approvals. A new QA approval without a
+  reviewer identity is refused while `functions.enforceNoSelfReview` is on; `atk
+  batch verify` also compares `targetRunId` with `manifest.run.id`. See
+  [ENTITIES.md](ENTITIES.md).
 
 ## Step 7 — board and plugin
 
@@ -175,4 +186,6 @@ transition). Keep the old workflow directory untouched until step 8 passes.
 - [ ] One synthetic task completed end to end with evidence.
 - [ ] Board renders and the DSH panel appears after a restart.
 - [ ] Old scripts either shimmed or archived; no two tools write the same state.
+- [ ] Pending QA approvals re-issued in the signed structure (or
+      `batch.legacyReceipts` set as an explicit, temporary switch).
 - [ ] `batch.manifestTag` unchanged if old manifests must stay verifiable.

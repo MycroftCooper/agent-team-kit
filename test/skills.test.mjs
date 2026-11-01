@@ -100,6 +100,16 @@ test("skills only reference atk commands that exist", async () => {
   }
 });
 
+test("the self-hosted QA role card stays identical to the template", async () => {
+  // .agent-flow/roles/QA.md is this repository's own instance copy of
+  // templates/flow/roles/QA.md; keeping them byte-identical prevents the
+  // self-hosted project from teaching an older QA receipt format than `atk init`
+  // generates (ATK-005c).
+  const template = await readFile(path.join(ROOT, "templates", "flow", "roles", "QA.md"), "utf8");
+  const selfHosted = await readFile(path.join(ROOT, ".agent-flow", "roles", "QA.md"), "utf8");
+  assert.equal(selfHosted, template);
+});
+
 test("agent-team-roles documents the safe role edit order", async () => {
   const text = await readSkill("agent-team-roles");
   for (const needle of [

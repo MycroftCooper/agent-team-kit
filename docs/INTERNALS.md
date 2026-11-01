@@ -52,14 +52,15 @@ sub-command is missing) and return `2` in that case.
 |---|---|---|
 | `atk state` | `lib/state.mjs` | `check`, `board`, `queue`, `task`, `import`, `archive`, `restore` |
 | `atk board` / `atk serve` | `lib/board.mjs` | `--serve`, `--json`, `--compact` |
-| `atk evidence` | `lib/evidence.mjs` | `--collect-temp`, `--dry` |
-| `atk ownership` | `lib/ownership.mjs` | `map`, `check`, `verify-config` |
+| `atk evidence` | `lib/evidence.mjs` | `--collect-temp`, `--dry`, `--legacy-receipts` |
+| `atk ownership` | `lib/ownership.mjs` | `map`, `check` (`--strict` / `--no-strict`), `verify-config` |
 | `atk permit` | `lib/permissions.mjs` (+ `lib/permission-registry.mjs`) | `matrix`, `explain`, `check`, `audit` |
-| `atk batch` | `lib/batch.mjs` | `manifest`, `verify`, `apply` |
+| `atk batch` | `lib/batch.mjs` | `manifest`, `verify` (`--require-qa`, `--legacy-receipts`), `apply` (`--legacy-receipts`) |
 | `atk baseline` | `lib/baseline.mjs` | `start`, `changed` |
 | `atk cache` | `lib/cache.mjs` | `status`, `clean` |
 | `atk gate` | `lib/gate.mjs` | `fast`, `quick`, `local` |
 | `atk select-tests` | `lib/select-tests.mjs` | `--files`, `--since-baseline`, `--plan`, `--quiet` |
+| `atk release` | `lib/release.mjs` | `--version <semver>`, `--apply`, `--skip-gate`, `--allow-dirty` |
 | `atk todo` | `lib/human-todos.mjs` | list (default), `add`, `toggle`, `done`, `undone`, `remove` |
 | `atk measure` | `lib/measure.mjs` | `record`, `summary` |
 | `atk sync` | `lib/sync.mjs` | `--quiet` |
@@ -129,6 +130,36 @@ Archive is allowed only when `verification.humanAccepted === true`.
 }
 ```
 
+**Modes (`atk ownership check`).** `ownership.mode` in `agent-flow.config.json`
+is `"loose"` (default, the v0.2 behaviour) or `"strict"`; `--strict` /
+`--no-strict` override the config, and an unknown configured value is a config
+error (`exit 2`) so a typo can never silently downgrade a gate. Strict mode is
+the fail-closed variant used by execution/integration gates:
+
+1. a Role is mandatory — `--role <ROLE>` or `$AGENT_ROLE`; missing → `exit 2`
+   with a usage message (never a violation);
+2. an unknown Role (not in `ownership.json` roles, else `config.roles`) →
+   `exit 2`;
+3. unmapped paths become blocking violations → `exit 1`, and each one appears in
+   `violations[]` with `rule: "unmapped"`, `owner: null`;
+4. an empty changed-file list is `status: "SKIPPED"` → `exit 0`, printed as
+   "nothing was verified, this is not a pass" (never `PASS`).
+
+Strict JSON report (`--json`):
+
+```jsonc
+{ "status": "PASS", "mode": "strict", "ok": true, "role": "DEV",
+  "checked": 1, "violations": [], "unmapped": [], "ignored": 0 }
+```
+
+`ok` is true only for `status: "PASS"`. A strict usage/config error (for example
+a missing role or an unknown role) prints
+`{ "status": "ERROR", "mode": "strict", "ok": false, "error": "..." }` and exits
+`2`; an invalid `ownership.mode` value is rejected earlier by config loading
+(`exit 2`). Loose mode keeps the historical report shape and exit codes exactly:
+`{ ok, role, checked, violations, unmapped, ignored }`, unmapped paths are a
+hint and the Role is optional — `status` / `mode` appear only in strict reports.
+
 ### 4.3 `human-todos.json`
 
 ```jsonc
@@ -168,25 +199,55 @@ the optional `run` block does not change `manifestSha256`:
          "contributors": ["agent-be-02"] }
 ```
 
-`qa-approval.json` binds `manifestSha256`; do not change either format without a
-version bump + migration note. Root-level paths are accepted only when
-`batch.allowRootFiles` is `true` (prefixes cannot express them). Every gate —
-`fast`, `quick`, `local` — writes `<artifactDir>/ci-fast-latest.json`, which
-`batch apply` and `release` consume as the latest green report. Since the entity model it also carries the
-reviewing Run:
+`qa-approval.json` binds `manifestSha256`. The manifest framing above is stable:
+changing it needs a `batch.manifestTag` bump plus a migration note. The QA
+receipt now carries the signed structure below, versioned by `schemaVersion: 1`
+(the pre-M0 `passed: true` receipt is the legacy form; see the migration notes
+in [ENTITIES.md](ENTITIES.md#migration)). Root-level paths are accepted only
+when `batch.allowRootFiles` is `true` (prefixes cannot express them). Every gate
+— `fast`, `quick`, `local` — writes `<artifactDir>/ci-fast-latest.json`, which
+`batch apply` and `release` consume as the latest green report. The signed
+structure is the single definition exported from `lib/evidence.mjs` as
+`QA_APPROVAL_SCHEMA`; `batch.mjs` reuses `validateQaApproval`/`qaPassVerdict`:
 
 ```jsonc
-{ "manifestSha256": "...", "passed": true, "originalApplied": false,
-  "reviewer": { "agent": "agent-qa-01", "role": "QA", "function": "REVIEWER" } }
+{ "schemaVersion": 1, "kind": "qa-approval",
+  "manifestSha256": "...", "verdict": "PASS",
+  "reviewer": { "run": "run-qa-01", "agent": "agent-qa-01", "role": "QA",
+                "function": "REVIEWER" },
+  "targetRunId": "run-20261102-001",          // must match manifest.run.id when set
+  "policyVersion": "optional run policy snapshot",
+  "commitSha": "optional frozen commit",
+  "gates": [{ "name": "quick", "status": "PASS", "reportSha256": "optional" }],
+  "originalApplied": false }
 ```
 
-`verifyManifest` adds these checks when a QA approval is supplied and
+A receipt that only self-reports `{ "passed": true }` / `noninteractiveQA` is a
+legacy receipt: it is rejected by default with reason `legacy-receipt`, and is
+accepted only through the explicit escape hatch `batch.legacyReceipts: true`
+(config) or `--legacy-receipts` (CLI). Every refused receipt is reported in
+`rejected` — never silently ignored. `atk evidence` derives QA facts only from
+accepted receipts.
+
+`verifyManifest(ctx, manifest, qaPath, { requireQa, legacyReceipts })` returns:
+
+| field | meaning |
+|---|---|
+| `status` | `"PASS" \| "FAIL" \| "SKIPPED"`; `SKIPPED` only for a plain `verify` without `--qa` (diagnostic-only) |
+| `diagnosticOnly` | `true` when no `--qa` was supplied and `requireQa` is off |
+| `rejected` | `[{ reason, detail }]` readable refusals (`missing-qa-approval`, `legacy-receipt`, `manifest-sha-mismatch`, `target-run-mismatch`, `self-review`, `gate-not-pass`, `missing-gates`, `qa-already-applied`, ...) |
+| `ok` | `checks` all green **and** `rejected` empty (kept for old consumers) |
+| `checks` / `drift` | unchanged check list and drift list |
+
+`status: "PASS"` requires a valid approval, an independent REVIEWER run and
+every declared gate `PASS`; controlled integration (`--require-qa`, every
+`apply`) reports `FAIL` when the receipt is missing. The check names below are
+unchanged and are produced for an accepted approval when
 `functions.enforceNoSelfReview` is not `false`: `producer-identity`,
 `reviewer-identity`, `producer-function`, `reviewer-function`, `no-self-review`,
 `producer-registered`, `reviewer-registered`, `producer-capability`,
 `reviewer-capability`, `producer-role-match`, `reviewer-role-match`,
-`reviewer-role-capability`. `atk evidence` ignores an approval whose reviewer is
-the manifest's producer. `atk state task` refuses a REVIEWER dispatch without
+`reviewer-role-capability`. `atk state task` refuses a REVIEWER dispatch without
 `--agent`, when the target Role owns the task, or when a manifest under
 `evidenceDir` records the same instance as producer.
 
@@ -223,6 +284,76 @@ Enforcement inside existing commands: `state task` (`task.claim`),
 `batch manifest` (`qa.manifest.freeze`), `batch verify` (`qa.result.submit`),
 `batch apply` writes (`integration.merge.development`), `state archive`
 (`integration.archive`).
+
+### 4.8 gate report (`<artifactDir>/ci-fast-latest.json`)
+
+Every `atk gate fast|quick|local` run writes one report and returns one of five
+statuses. `ok` is always exactly `status === "PASS"`; the exit codes are
+`PASS 0`, `FAIL 1`, `SKIPPED 0`, `UNCONFIGURED 2`, `ERROR 2`.
+
+`fast` report:
+
+```jsonc
+{ "schemaVersion": 1, "status": "PASS", "ok": true, "role": "DEV",
+  "scope": { "total": 1, "tests": 0, "byGroup": { "code": 1 } },
+  "durationMs": 119, "finishedAt": "2026-11-01T18:33:33.325Z",
+  "steps": [{ "name": "lint", "status": "passed", "exitCode": 0,
+              "durationMs": 117 }],
+  "note": "Fast gate passed. This is not the freeze gate; ..." }
+```
+
+`quick` / `local` report:
+
+```jsonc
+{ "schemaVersion": 1, "gate": "quick", "status": "UNCONFIGURED", "ok": false,
+  "command": null, "exitCode": null, "durationMs": 0,
+  "finishedAt": "2026-11-01T18:31:42.147Z",
+  "note": "gates.quick.command is not configured. UNCONFIGURED is not a pass; ..." }
+```
+
+- `status` is the five-value model; `SKIPPED` means no step applied, not a pass.
+- `step.status` ∈ `"passed" | "failed" | "error"`. A step that cannot be launched
+  or ends abnormally is `"error"` and carries `exitCode: null` plus an `error`
+  string; a normal non-zero exit is `"failed"` with the real `exitCode`.
+- `stoppedAt: "preflight"` appears when a preflight step stopped the fast gate;
+  an internal exception adds a top-level `error` and status `ERROR`.
+- Every run overwrites the report (even UNCONFIGURED/ERROR), so a stale PASS can
+  never survive a gate run that did not pass. `release` accepts the report only
+  when `status === "PASS"` and `ok === true`; a legacy report without `status`
+  is rejected. The report is read BOM-tolerantly (`readJsonStrict`/`stripBom`).
+
+### 4.9 `atk evidence` report
+
+`deriveEvidence()` / `atk evidence --json` returns
+`{ ok, receipts, qaApprovals, applies, selfReviewed, rejected, legacyReceipts,
+attributedPaths: { qa, applied }, changes }` (the CLI adds `dryRun` and
+`collected`). `selfReviewed` stays a number (count of `self-review`
+rejections).
+
+**Breaking field change (M0):** `rejected` used to contain only
+`[{ file, manifestSha256, agent }]` (self-reviewed approvals). It is now a list
+of every refused QA receipt:
+
+```jsonc
+{ "file": "<absolute path>", "path": "artifacts/evidence/BATCH-01/qa-legacy.json",
+  "reason": "legacy-receipt", "detail": "self-reported passed:true: ...",
+  "legacy": true,
+  "reasons": [{ "reason": "legacy-receipt", "detail": "..." }] }
+```
+
+`reason` is the first (primary) refusal, `reasons` is the complete list, `path`
+is project-relative and `file` absolute. Legacy receipts are refused unless
+`batch.legacyReceipts: true` or `--legacy-receipts` is set; every rejection is
+also printed on stderr as `refused qa-approval <path>: <reason> - <detail>`.
+Consumers that read the old `rejected` entry fields must be updated; nothing is
+silently dropped.
+
+Receipt capture (`atk evidence --collect-temp`) copies recognisable
+manifest / apply / qa-approval JSON from `<os.tmpdir()>/<layout.tempPrefix>-*`
+into the evidence dir and skips build directories (`node_modules`, `target`,
+`dist`, ...). Classification is recognition, not acceptance: a legacy QA receipt
+is still copied (it may be needed for audit/migration) and is then reported in
+`rejected` when facts are derived, unless the legacy escape hatch is on.
 
 ## 5. Board rendering
 

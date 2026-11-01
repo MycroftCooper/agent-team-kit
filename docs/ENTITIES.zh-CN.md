@@ -60,10 +60,13 @@ Role 能执行哪些 Function 由配置声明：
    `producer-identity`、`reviewer-identity`、`producer-function`、`reviewer-function`、
    `no-self-review`、`producer-registered`、`reviewer-registered`、`producer-capability`、
    `reviewer-capability`、`producer-role-match`、`reviewer-role-match`、`reviewer-role-capability`。
-3. **证据**：`atk evidence` 不会把"审查者就是产出者"的批准计入 `qaPassed`，手抄回执无法绕过。
+3. **证据**：`atk evidence` 不会把"审查者就是产出者"的批准计入 `qaPassed`，也不会把
+   非结构化回执（含只自报 `passed: true` 的旧式回执）计入，手抄回执无法绕过。
 
-退出码：`1` = 规则拒绝；`2` = 身份格式错误或实例未注册。逃生开关
-`functions.enforceNoSelfReview: false` 仅用于尚未采用实例身份的旧项目，不推荐。
+退出码：`1` = 检查被拒绝（`batch verify` / `batch apply`）；`2` = 用法或配置错误。
+逃生开关 `functions.enforceNoSelfReview: false` 仅用于尚未采用实例身份的旧项目，不推荐；
+它关闭身份检查，但**不会**把自报回执变成 QA 事实——结构化结构或显式
+`batch.legacyReceipts` 仍然必需。
 
 ## 身份块
 
@@ -73,15 +76,34 @@ Role 能执行哪些 Function 由配置声明：
          "function": "WORKER", "startedAt": "...",
          "contributors": ["agent-fe-03"] /* 可选：共同产出的其他实例 */ }
 
-// qa-approval.json
-{ "manifestSha256": "...", "passed": true, "originalApplied": false,
-  "reviewer": { "agent": "agent-qa-01", "role": "QA", "function": "REVIEWER" } }
+// qa-approval.json（结构化签名回执；裸 passed:true 不是 QA 事实）
+{
+  "schemaVersion": 1,
+  "kind": "qa-approval",
+  "manifestSha256": "...",
+  "verdict": "PASS",
+  "reviewer": {
+    "run": "run-qa-01",
+    "agent": "agent-qa-01",
+    "role": "QA",
+    "function": "REVIEWER"
+  },
+  "targetRunId": "run-20261102-001",      // 产出方 WORKER 的 run id（manifest.run.id）
+  "gates": [
+    { "name": "quick", "status": "PASS", "reportSha256": "..." }
+  ],
+  "originalApplied": false
+}
 
 // runtime.json（schemaVersion 3）
 { "schemaVersion": 3,
   "agents": [{ "id": "agent-fe-02", "role": "FE", "capabilities": ["WORKER"],
                "status": "working", "task": "SHELVED-017", "detail": "", "since": "..." }] }
 ```
+
+`targetRunId`、`policyVersion`、`commitSha` 可选，但 manifest 与回执都携带时会校验一致。
+只自报 `passed: true` / `noninteractiveQA: "passed"` 的旧式回执默认被拒；
+`"batch": { "legacyReceipts": true }` 或 `--legacy-receipts` 是显式的临时逃生门。
 
 ## 完整链路
 
@@ -96,3 +118,16 @@ LEAD               --atk batch apply --qa <f> --apply --confirm-dev-closed-->
 
 实体模型不替代原有门禁：冻结 manifest、绑定 hash 的 QA 批准、apply 确认、人类验收仍然生效。
 它只多问一个问题：**谁在审查，这个实例是否写过这段代码？**
+
+## 迁移
+
+1. 在 `agent-flow.config.json` 增加 `functions`（或直接依赖默认值）；
+2. 给 `runtime.json` 每个 Agent Instance 补 `id` 与 `capabilities`；
+3. 冻结时带 `--agent <id>`；
+4. QA 写结构化签名回执：`kind: "qa-approval"`、`verdict: "PASS"`、`manifestSha256`、
+   `reviewer` 身份块，受控集成还要声明 `gates`；
+5. 用 `atk batch verify --manifest <f> --qa <f>` 复核，任何检查失败都按停止处理。
+
+旧式只有 `passed: true` 的回执默认被拒：重新签发结构化回执，或临时设置
+`"batch": { "legacyReceipts": true }`（或 `--legacy-receipts`）。该开关只用于迁移期，
+回执重签完成后应移除；它不会绕过声明 `kind: "qa-approval"` 回执的结构校验。

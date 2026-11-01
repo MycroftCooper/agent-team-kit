@@ -108,6 +108,23 @@ test("scaffolds the complete generic workflow", async () => {
   );
 });
 
+test("generated QA cards teach the signed receipt and controlled integration", async () => {
+  // Regression guard for ATK-005c: the scaffold must not tell QA that `--qa` is
+  // optional, or ship the legacy `passed: true` sample the CLI now refuses.
+  for (const language of ["en", "zh-CN"]) {
+    const root = await makeProject({ dirs: [], files: {} });
+    const { code, log } = await runInit(root, ["--project", "demo", "--language", language]);
+    assert.equal(code, 0, log.errorText());
+
+    const card = await readFile(path.join(root, ".agent-flow", "roles", "QA.md"), "utf8");
+    assert.match(card, /kind"\s*:\s*"qa-approval"/, `${language}: QA card must show the signed receipt structure`);
+    assert.ok(card.includes("--require-qa"), `${language}: QA card must mention controlled integration (--require-qa)`);
+    assert.ok(card.includes("legacyReceipts"), `${language}: QA card must document the legacy escape hatch`);
+    assert.doesNotMatch(card, /--qa <previous-or-omit>/, `${language}: QA card must not offer an optional-QA shortcut`);
+    assert.doesNotMatch(card, /"passed"\s*:\s*true/, `${language}: QA card must not ship a self-reported receipt sample`);
+  }
+});
+
 test("--dry-run prints the file list and writes nothing", async () => {
   const root = await makeProject();
   const { code, log } = await runInit(root, ["--dry-run", "--project", "demo"]);

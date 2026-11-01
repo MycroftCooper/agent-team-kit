@@ -70,8 +70,8 @@ atk task <ID> --for <ROLE> --message
 atk state check
 atk state board
 atk evidence
-atk ownership check --role LEAD
-atk batch verify --manifest <f> --qa <f>
+atk ownership check --role LEAD --strict
+atk batch verify --manifest <f> --qa <f> --require-qa   # 受控集成
 ```
 
 ## 轮次预算

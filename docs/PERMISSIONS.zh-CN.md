@@ -61,14 +61,32 @@ Permit = RBAC ∧ Scope ∧ Ownership ∧ State ∧ Policy ∧ Approval
   QA 可以跑测试、写独立用例，但不能在审查过程中修改被审候选代码。
 - **SYSTEM ≠ 超级用户 Agent**：只执行预定义动作与记录决策，不自行创造审批。
 
+## QA 判定：结构化回执 vs legacy 标志
+
+`review-evidence` 评估挂在 manifest 上的 QA 批准。M0 起规范回执是结构化签名的
+`kind: "qa-approval"` 对象（verdict、manifestSha256、reviewer、targetRunId、声明的
+gates），见 [WORKFLOW.zh-CN.md](WORKFLOW.zh-CN.md) 第 6 步。共享判定函数在
+`lib/evidence.mjs`（`qaPassVerdict`，`atk batch verify` 也使用）：QA PASS 要么是旧式
+自报标志（`passed: true` / `noninteractiveQA: "passed"`），要么是结构化
+`verdict: "PASS"` 且带 `reviewer.function: "REVIEWER"` 与非空 `manifestSha256`。裸
+`{ "verdict": "PASS" }` 不是证据，返回 `REVIEW_EVIDENCE_INVALID` 拒绝。
+
+**已知限制（M0，计划 M4 收紧）**：`atk permit check qa.result.submit` 只评估上述最小
+谓词，因此其 `review-evidence` 条件仍接受 legacy `passed: true` 回执。这是为兼容既有
+项目与既有回执保留的已知缺口，**不是已修复项**。权威校验在 `atk batch verify` /
+`atk batch apply`：默认拒绝 legacy（逃生门 `batch.legacyReceipts` /
+`--legacy-receipts`），并额外绑定审查身份、target run、manifest hash、声明的 gate 与
+已应用状态。不要把单独的 `permit check` 结果当作 QA sign-off；收紧到完整结构化规则
+（含 `policyVersion`）留到 M4 随 policyVersion 工作一起做。
+
 ## 强制位置
 
 | 命令 | 操作 | 行为 |
 |---|---|---|
 | `atk state task` | `task.claim` | 领取任务按任务资格判定；审查派单额外要求审查实例身份（禁自审） |
 | `atk batch manifest --agent` | `qa.manifest.freeze` | 条件允许的 WORKER/ORCHESTRATOR 动作；REVIEWER 实例被矩阵拒绝 |
-| `atk batch verify --qa` | `qa.result.submit` | 权限判定进入 verify 检查项；自审返回 `SELF_REVIEW_DENIED` |
-| `atk batch apply --apply --confirm-dev-closed` | `integration.merge.development` | 真实写入必须有绑定 manifest 的 QA 证据、无漂移；配置了 quick/local 门禁时还要求绿报告 |
+| `atk batch verify --qa` / `--require-qa` | `qa.result.submit` | 权限判定进入 verify 检查项；自审返回 `SELF_REVIEW_DENIED`。受控集成（`--require-qa`）缺合法 QA 回执即 `status: FAIL`、退出 `1`；不带 `--qa` 只是只读诊断（`status: SKIPPED`），不构成批准 |
+| `atk batch apply ...` | `integration.merge.development` | 任何形态（含 dry-run）都要求合法 QA 回执，否则退出 `1`。真实写入还要求无漂移；配置了 quick/local 门禁时要求真实绿报告（回执里自报的 gate 不算门禁报告） |
 | `atk state archive` | `integration.archive` | 条件为 `humanAccepted`，由组织者记录归档 |
 
 其余操作可先用 CLI 查询：

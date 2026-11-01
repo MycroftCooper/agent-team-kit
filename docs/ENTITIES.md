@@ -97,14 +97,19 @@ The rule has two sides and the scheduler checks both:
 | `producer-role-match` / `reviewer-role-match` | the instance's Role differs from the declared run Role |
 | `reviewer-role-capability` | the reviewer's Role is not allowed to perform `REVIEWER` |
 
-`atk evidence` also refuses to derive `qaPassed` from an approval whose reviewer
-is the manifest's producer, so a hand-copied receipt cannot bypass the gate. The
-smoke alarm is the exit code: `1` for a refused check, `2` for a malformed
-identity or unknown instance.
+`atk evidence` also refuses to derive `qaPassed` from a receipt whose reviewer is
+the manifest's producer, and it refuses any receipt that is not a valid signed
+`kind: "qa-approval"` (legacy `passed: true` receipts included, unless the
+project explicitly opts in with `batch.legacyReceipts` / `--legacy-receipts`),
+so a hand-copied receipt cannot bypass the gate. The smoke alarm is the exit code:
+a refused check exits `1` (`batch verify` / `batch apply`), while a usage or
+configuration error exits `2`.
 
 The escape hatch is `"functions": { "enforceNoSelfReview": false }`. It exists
 only for a project that has not adopted Agent Instance identities yet; it turns
-every identity check off and is not recommended.
+every identity check off and is not recommended. It does **not** turn a
+self-reported receipt into a QA fact: the signed structure (or the explicit
+legacy-receipts switch) is still required.
 
 ## Identity records
 
@@ -122,21 +127,35 @@ The manifest records the producing Run:
 }
 ```
 
-The QA approval records the reviewing Run:
+The QA approval records the reviewing Run as a **signed receipt**: a bare
+`passed: true` is not a QA fact (M0; see [WORKFLOW.md](WORKFLOW.md) §5).
 
 ```jsonc
 // qa-approval.json
 {
+  "schemaVersion": 1,
+  "kind": "qa-approval",
   "manifestSha256": "...",
-  "passed": true,
-  "originalApplied": false,
+  "verdict": "PASS",
   "reviewer": {
+    "run": "run-qa-01",
     "agent": "agent-qa-01",
     "role": "QA",
     "function": "REVIEWER"
-  }
+  },
+  "targetRunId": "run-20261102-001",   // the producing WORKER run (manifest.run.id)
+  "gates": [
+    { "name": "quick", "status": "PASS", "reportSha256": "..." }
+  ],
+  "originalApplied": false
 }
 ```
+
+`targetRunId`, `policyVersion` and `commitSha` are optional but are checked for
+equality when both the manifest and the receipt carry them. Legacy receipts
+that only self-report `passed: true` / `noninteractiveQA: "passed"` are refused
+by default; `"batch": { "legacyReceipts": true }` or `--legacy-receipts` is the
+explicit, temporary escape hatch.
 
 The Agent Instances live in `runtime.json` (schema version 3):
 
@@ -175,6 +194,15 @@ To enforce the rule:
 1. add `functions` to `agent-flow.config.json` (or rely on the defaults);
 2. give every Agent Instance an `id` and `capabilities` in `runtime.json`;
 3. freeze with `atk batch manifest --agent <id>`;
-4. have QA write `qa-approval.json` with a `reviewer` block;
-5. run `atk batch verify --manifest <f> --qa <f>` and treat any identity check
-   as a stop, not a warning.
+4. have QA write a signed `qa-approval.json` with `kind: "qa-approval"`,
+   `verdict: "PASS"`, the `manifestSha256`, a `reviewer` block and (in
+   controlled integration) the declared `gates`;
+5. run `atk batch verify --manifest <f> --qa <f>` and treat any failing check as
+   a stop, not a warning.
+
+Old receipts created before this model only carry `passed: true`. They are
+refused by default: re-issue them as signed receipts, or set
+`"batch": { "legacyReceipts": true }` (or pass `--legacy-receipts`) as a
+temporary migration switch. The switch is meant to be removed once every receipt
+has been re-issued; it does not bypass the signed-structure checks for any
+receipt that declares `kind: "qa-approval"`.

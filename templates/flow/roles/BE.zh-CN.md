@@ -25,13 +25,16 @@
 6. 作为唯一执行者 Apply：
 
    ```bash
-   atk ownership check --role BE
-   atk batch verify --manifest <f> --qa <qa-approval.json>   # 必须 PASS
-   atk batch apply --manifest <f>                            # dry-run 计划
-   atk batch apply --manifest <f> --apply --confirm-dev-closed
+   atk ownership check --role BE --strict
+   atk batch verify --manifest <f> --qa <qa-approval.json> --require-qa   # 必须 PASS
+   atk batch apply --manifest <f> --qa <qa-approval.json>                 # dry-run 计划
+   atk batch apply --manifest <f> --qa <qa-approval.json> --apply --confirm-dev-closed
    atk evidence                                              # 派生 applied
    ```
 
+   任何形态的 `apply`（含 dry-run）都要求结构合法的 QA 回执；缺失会打印
+   `status: FAIL`、原因并退出 `1`，原树不动。旧式 `passed: true` 回执默认被拒，除非
+   项目显式启用 `batch.legacyReceipts` / `--legacy-receipts`。
    出现漂移立即停，只报受影响文件，不覆盖用户改动。
 
 ## 回执格式（6 行）

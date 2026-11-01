@@ -18,6 +18,8 @@
 
 - **只验冻结快照**。开发中边改边测的结果无效。
 - 不复用旧批准：`manifestSha256` 变了，旧 `qa-approval.json` 自动作废。
+- 不允许自报 PASS：批准必须是结构化签名的 `qa-approval` 回执；单独一个
+  `passed: true` 默认会被拒绝。
 - 只报 PASS / FAIL + 具体缺口，不替 FE/BE 改代码。
 - `skipped` 不算通过；mock 通过不写"原生已验"。
 
@@ -27,26 +29,42 @@
 2. 机械门用脚本（不要人肉比 hash）：
 
    ```bash
-   atk ownership check --role QA
-   atk batch verify --manifest <manifest.json> --qa <上一版或省略>
+   atk ownership check --role QA --strict
+   atk batch verify --manifest <manifest.json> --qa <qa-approval.json>
    ```
+
+   受控集成——`atk batch verify --require-qa` 与任何形态的 `atk batch apply`
+   （含 dry-run）——必须有结构合法的 `qa-approval.json`，缺失会以可读原因退出
+   `1`；不带 `--qa` 的 `verify` 只是只读诊断：`status: "SKIPPED"`，不构成批准。
 
 3. 语义门自己看：边界是否覆盖、mock 是否冒充真实、partial / unknown 是否如实、
    单写者是否被破坏。
-4. 出 `qa-approval.json`，绑定 `manifestSha256` 并记录本次审查 Run；回执存到配置的
-   证据目录：
+4. 出结构化签名的 `qa-approval.json`，存到 `agent-flow.config.json` 配置的证据目录：
 
    ```jsonc
    {
-     "manifestSha256": "<manifest 里的 hash>",
-     "passed": true,
-     "originalApplied": false,
-     "reviewer": { "agent": "agent-qa-01", "role": "QA", "function": "REVIEWER" }
+     "schemaVersion": 1,
+     "kind": "qa-approval",
+     "manifestSha256": "...",
+     "verdict": "PASS",
+     "reviewer": {
+       "run": "run-qa-01",
+       "agent": "agent-qa-01",
+       "role": "QA",
+       "function": "REVIEWER"
+     },
+     "targetRunId": "run-20261102-001",      // 产出方 WORKER 的 run id（manifest.run.id）
+     "gates": [
+       { "name": "quick", "status": "PASS", "reportSha256": "..." }
+     ],
+     "originalApplied": false
    }
    ```
 
-   `reviewer.agent` 与 `manifest.run.agent` 相同会被判 `no-self-review` 拒绝；
-   缺少身份同样拒绝。
+   `reviewer.agent` 与 `manifest.run.agent`（或其 `run.contributors`）相同会被判
+   `self-review` 拒绝；缺少 reviewer 身份同样拒绝。旧式只自报 `passed: true` 的回执
+   默认被拒；显式逃生门是 `"batch": { "legacyReceipts": true }` 或
+   `--legacy-receipts`（临时兼容，不推荐长期使用）。
 5. 交回执：通过项 / 失败项 / 明确未覆盖项 / 证据路径。
 
 ## 回执格式（6 行）
@@ -65,9 +83,11 @@
 ```bash
 atk queue --for QA
 atk task <ID> --for QA --agent agent-qa-01     # 审查派单必须带 --agent
-atk ownership check --role QA
+atk ownership check --role QA --strict
 atk gate fast --files <改动> --role QA
 atk batch verify --manifest <f> --qa <qa-approval.json>
+atk batch verify --manifest <f> --qa <qa-approval.json> --require-qa   # 受控集成
+atk batch apply --manifest <f> --qa <qa-approval.json>                # 集成人：dry-run 计划
 ```
 
 ## 轮次预算

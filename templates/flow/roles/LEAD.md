@@ -78,8 +78,8 @@ atk task <ID> --for <ROLE> --message
 atk state check                            # validate before handoff
 atk state board
 atk evidence                               # derive acceptance facts
-atk ownership check --role LEAD
-atk batch verify --manifest <f> --qa <f>
+atk ownership check --role LEAD --strict
+atk batch verify --manifest <f> --qa <f> --require-qa   # controlled integration
 ```
 
 ## Round budget

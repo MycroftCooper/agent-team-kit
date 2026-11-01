@@ -64,21 +64,29 @@ atk gate quick                                # when the ticket says freeze/full
 atk gate local                                # only when the ticket requires it
 ```
 
-Report exactly what ran. `skipped` is not a pass; a gate you did not run is not a
+Report exactly what ran. A gate reports `PASS` / `FAIL` / `SKIPPED` /
+`UNCONFIGURED` / `ERROR`, and only `PASS` is a pass: `skipped` is not a pass, an
+unconfigured or errored gate is not a pass, and a gate you did not run is not a
 gate that passed.
 
 ## Freeze and hand off
 
 ```bash
 atk batch manifest --candidate <dir> --paths <changed> --packages <ID> --agent <id>
-atk batch verify --manifest <f> --qa <f>   # QA / integrator side
+atk batch verify --manifest <f> --qa <f> [--require-qa]   # QA / integrator side
 ```
 
 Keep the candidate frozen after freezing. QA verifies the manifest hash, not your
 working copy. `--agent` records the producing WORKER Run in `manifest.run`; a
-manifest without it cannot pass a QA review. QA writes `qa-approval.json` with a
-`reviewer` identity (`agent` / `role` / `function: "REVIEWER"`) — see
-[docs/ENTITIES.md](../../docs/ENTITIES.md).
+manifest without it cannot pass a QA review. QA writes a signed `qa-approval.json`
+(`schemaVersion`, `kind: "qa-approval"`, `verdict: "PASS"`, `manifestSha256`,
+`reviewer { run, agent, role, function: "REVIEWER" }`, `targetRunId`, declared
+`gates[]`); a bare `passed: true` is refused by default, with
+`batch.legacyReceipts` / `--legacy-receipts` as the explicit temporary escape
+hatch. Controlled integration (`verify --require-qa` and every `apply`, dry-run
+included) requires a valid receipt; `verify` without `--qa` is a read-only
+diagnostic (`status: SKIPPED`, never an approval). See
+[docs/ENTITIES.md](../../docs/ENTITIES.md) and [docs/WORKFLOW.md](../../docs/WORKFLOW.md).
 
 ## Receipt format (6 lines, nothing else)
 

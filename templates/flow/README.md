@@ -40,12 +40,20 @@ conflict.
 
 Roles are permission templates. The concrete worker is an Agent Instance in
 `runtime.json` (`id` + `capabilities`), and one execution is a Run recorded by a
-receipt: the manifest is the producing `WORKER` run, `qa-approval.json` is the
-reviewing `REVIEWER` run.
+receipt: the manifest is the producing `WORKER` run, the signed
+`qa-approval.json` receipt is the reviewing `REVIEWER` run (`kind: "qa-approval"`,
+`verdict`, `manifestSha256`, `reviewer`, `targetRunId`, declared `gates`). A bare
+`passed: true` is not a QA fact; legacy receipts are refused unless the project
+opts in with `batch.legacyReceipts` / `--legacy-receipts`.
 
 **No self-review.** A review ticket needs `--agent <id>`, and `atk batch verify`
 refuses when the reviewer instance produced the manifest. Never work around a
 `no-self-review` refusal.
+
+**Controlled integration.** `atk batch verify --require-qa` and every
+`atk batch apply` (dry-run included) need a valid QA receipt and exit `1` without
+one. A `batch verify` run without `--qa` is diagnostic only
+(`status: "SKIPPED"`, never an approval).
 
 **Permissions are deny-by-default.** `atk permit check <operation>` returns the
 decision plus a machine-readable reason code (edits, review, integration,
@@ -59,16 +67,18 @@ the toolkit docs; this project cannot relax it.
 2 LEAD    forward the ticket in one message (do not write a document)
 3 DEV     create a candidate snapshot outside the original tree
 4 DEV     freeze: atk batch manifest --candidate ... --packages <ID> --agent <id>
-5 QA      qa-approval.json binds the frozen manifestSha256 + reviewer identity
+5 QA      write the signed qa-approval.json (kind: "qa-approval", verdict,
+          manifestSha256, reviewer, targetRunId, declared gates)
 6 QA      verify: atk batch verify --manifest ... --qa ...
-7 BE/LEAD apply: dry-run first, then --apply --confirm-dev-closed
+7 BE/LEAD apply: dry-run first (a valid --qa is required), then
+          --apply --confirm-dev-closed
 8 LEAD    derive: atk evidence (QA -> ready to apply, apply -> awaiting acceptance)
 9 human   accept; LEAD writes humanAccepted, then atk state archive
 ```
 
-Never advance when: the manifest is not frozen, QA is not bound, the original
-tree drifted, the user has not confirmed dev is closed, or the batch carries
-unverified slices.
+Never advance when: the manifest is not frozen, QA is not bound by a valid signed
+receipt, the original tree drifted, the user has not confirmed dev is closed, or
+the batch carries unverified slices.
 
 ## Gate layers
 
@@ -79,6 +89,9 @@ unverified slices.
 | Heavy | `atk gate local` | delivery candidate is usable |
 | QA | targeted checks on the frozen snapshot | can be released |
 | Human | dev machine / native run | can be archived |
+
+A gate layer is green only when its status is `PASS`; `SKIPPED` / `UNCONFIGURED` /
+`ERROR` are not passes, and `atk release` accepts only an explicit `PASS` report.
 
 ## Proof ladder
 

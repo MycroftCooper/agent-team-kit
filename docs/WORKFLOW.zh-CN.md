@@ -24,20 +24,62 @@ Role 只是权限模板；真正干活的是 `runtime.json` 里的 Agent Instanc
 3. **候选（执行者）**：在原树之外建候选快照，原树对 agent 只读；一个切片同时只有
    一个候选。
 4. **门禁（执行者）**：`atk select-tests --files ...` 出计划，
-   `atk gate fast --files ... --role ...` 跑快速门禁；`skipped` 不算通过。
+   `atk gate fast --files ... --role ...` 跑快速门禁。门禁只有五种状态，且
+   `ok` 恒等于 `status === "PASS"`：
+
+   | 状态 | 含义 | 退出码 | 算通过？ |
+   |---|---|---|---|
+   | `PASS` | 至少跑了一个步骤且全部退出 0 | `0` | 是 |
+   | `FAIL` | 有步骤执行但非 0 退出 | `1` | 否 |
+   | `SKIPPED` | 有配置但没有步骤适用于本次变更 | `0` | **否**——什么都没验证 |
+   | `UNCONFIGURED` | 配置为空 | `2` | **否**——配置错误 |
+   | `ERROR` | 步骤无法启动 / 异常退出 | `2` | **否** |
+
+   报告写入 `<artifactDir>/ci-fast-latest.json`，每次运行都会覆盖，旧 PASS 不会残留；
+   `atk release` 只接受 `status` 恰好为 `PASS` 的报告，旧式只有 `ok: true` 的报告会被拒。
 5. **冻结（执行者）**：`atk batch manifest --candidate ... --paths ... --packages <ID> --agent <实例 id>`
    产出清单与 `manifestSha256`，并记录产出方 Run；没有 `--agent` 的 manifest 过不了 QA
    审查。冻结后不得再改候选。
 6. **QA**：审查派单必须带审查实例（`atk task <ID> --for QA --agent <id>`）；只验冻结
-   快照；`atk batch verify` 机械核对、语义检查人工判断；写 `qa-approval.json` 绑定当前
-   hash 并记录 `reviewer`。hash 变了旧批准自动作废；审查者就是产出者会被
-   `no-self-review` 拒绝。
-7. **apply（唯一集成人）**：先 `atk batch verify`（必须 PASS），再 dry-run，最后
-   `atk batch apply --apply --confirm-dev-closed`。漂移即停，退出码 3。真实写入还会按
+   快照；`atk batch verify` 机械核对、语义检查人工判断。QA 写结构化签名回执：
+
+   ```jsonc
+   {
+     "schemaVersion": 1,
+     "kind": "qa-approval",
+     "manifestSha256": "...",
+     "verdict": "PASS",
+     "reviewer": {
+       "run": "run-qa-01",
+       "agent": "agent-qa-01",
+       "role": "QA",
+       "function": "REVIEWER"
+     },
+     "targetRunId": "run-20261102-001",      // 产出方 WORKER 的 run id（manifest.run.id）
+     "gates": [
+       { "name": "quick", "status": "PASS", "reportSha256": "..." }
+     ],
+     "originalApplied": false
+   }
+   ```
+
+   判定：`verdict === "PASS"`、`manifestSha256` 非空且等于冻结值、`reviewer.function`
+   为 `REVIEWER` 且 `run` / `agent` 非空、`reviewer.agent` 不是产出者或 contributor、
+   `targetRunId` 与 `manifest.run.id` 一致（双方都有时）、声明的 `gates` 全部 `PASS`。
+   hash / 候选字节 / commit 一变旧批准即失效；旧式只自报 `passed: true` 的回执默认被拒，
+   显式逃生门为 `batch.legacyReceipts: true` 或 `--legacy-receipts`。
+7. **apply（唯一集成人）**：先 `atk batch verify --require-qa --manifest <f> --qa <f>`
+   （受控集成，必须 PASS）；再 `atk batch apply --manifest <f> --qa <f>` 看 dry-run 计划，
+   最后 `atk batch apply --manifest <f> --qa <f> --apply --confirm-dev-closed` 真写。
+   每次 `atk batch apply`（含 dry-run）都必须提供合法 QA 回执，缺失时会打印计划但
+   `status: FAIL`、给出原因并退出 `1`，原树不动。不带 `--qa` 的 `verify` 只是只读诊断
+   （`status: SKIPPED`，绝不打印 PASS）。漂移即停，退出码 3。真实写入还会按
    `integration.merge.development` 判定：必须有绑定 manifest 的 QA 证据，配置了
-   quick/local 门禁时还要绿报告；dry-run 计划不受限。
+   quick/local 门禁时还要真实的绿报告（回执里自报的 gate 不算门禁报告）。
 8. **证据派生（LEAD）**：`atk evidence` 从回执派生 `qaPassed` / `applied`，
-   幂等；`humanAccepted`、`blocked`、`paused` 只能由 LEAD 手写。
+   幂等；`humanAccepted`、`blocked`、`paused` 只能由 LEAD 手写。无效或旧式回执不会被
+   静默忽略：计入报告 `rejected` 并在 stderr 打印原因；旧式 `passed: true` 回执默认被拒，
+   显式逃生门是 `batch.legacyReceipts: true` 或 `atk evidence --legacy-receipts`。
 9. **验收与归档**：人工验收后 LEAD 写 `humanAccepted: true`，再
    `atk state archive <ID> --note "理由"`；未人验会被拒绝。`atk state restore` 撤销归档。
 
