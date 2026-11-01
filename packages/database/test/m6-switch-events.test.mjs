@@ -36,6 +36,17 @@ function normalizeEvents(events) {
   }));
 }
 
+function storeFingerprint(store) {
+  return {
+    schemaVersion: store.health().schemaVersion,
+    counts: store.health().counts,
+    projects: store.listProjects(),
+    tasks: store.listTasks({ limit: 1000 }),
+    agents: store.listAgents(),
+    events: store.listEvents({ limit: 1000 }),
+  };
+}
+
 test("listEvents filters by aggregate/type/afterSeq with ascending pages", (t) => {
   for (const { label, store } of bothStores(t)) {
     appendSampleEvents(store, 6);
@@ -207,10 +218,13 @@ test("replace clears old data, is idempotent and reports mode", (t) => {
   }
 });
 
-test("replace is one transaction: a failing record restores the old database", (t) => {
+test("replace is one transaction: a failing write restores the old database", (t) => {
   for (const { label, store } of bothStores(t)) {
-    const before = store.health();
-    const oldTask = store.getTask("TASK-SEED");
+    // Add an agent + event to the fingerprint: replace must restore all tables,
+    // not just tasks.
+    store.upsertAgent({ id: "agent-keep", role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
+    store.appendEvent({ projectId: "proj-1", aggregateType: "task", aggregateId: "TASK-SEED", type: "task.updated" });
+    const before = storeFingerprint(store);
     const nextState = sampleState({
       project: { id: "proj-1", name: "Replaced", repoPath: ".", defaultBranch: "main" },
       packages: [
@@ -225,6 +239,7 @@ test("replace is one transaction: a failing record restores the old database", (
     let calls = 0;
     store.createTask = (...args) => {
       calls += 1;
+      // Fail *after* clearBusinessTables() and the project/requirement writes.
       if (calls === 2) throw new Error("injected write failure");
       return originalCreateTask.apply(store, args);
     };
@@ -242,12 +257,48 @@ test("replace is one transaction: a failing record restores the old database", (
     }
     assert.equal(report.status, "SKIPPED", label);
     assert.ok(report.problems.some((problem) => problem.code === "IMPORT_WRITE_FAILED"), label);
-    // Everything is exactly as before: old task, old project, old counts.
-    const after = store.health();
-    assert.deepEqual(after.counts, before.counts, `${label}: counts restored`);
-    assert.deepEqual(store.getTask("TASK-SEED"), oldTask, `${label}: old task restored`);
-    assert.equal(store.getProject("proj-1").name, "Demo project", `${label}: old project untouched`);
+    // Everything is byte-for-byte identical: projects/tasks/agents/events and
+    // the migration ledger are all restored by the rollback.
+    assert.deepEqual(storeFingerprint(store), before, `${label}: full state restored after mid-write failure`);
     assert.throws(() => store.getTask("BOOM-01"), (error) => error.code === "NOT_FOUND", label);
+  }
+});
+
+test("an unsupported non-empty tasks array is rejected before any clear", (t) => {
+  for (const { label, store } of bothStores(t)) {
+    store.upsertAgent({ id: "agent-keep", role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
+    const before = storeFingerprint(store);
+    const broken = {
+      schemaVersion: 1,
+      project: { id: "BROKEN", name: "broken" },
+      batch: { id: "B", tasks: [{ id: "DUP", status: "READY" }, { id: "DUP", status: "READY" }] },
+      packages: [],
+      subitems: [],
+      slices: [],
+      counts: {},
+    };
+    const report = importStateJson(store, {
+      stateJson: broken,
+      runtime: { schemaVersion: 3, agents: [] },
+      mode: "replace",
+      now: T,
+    });
+    assert.equal(report.status, "SKIPPED", label);
+    assert.ok(
+      report.problems.some((problem) => problem.code === "IMPORT_WRITE_FAILED" && problem.detail.collection === "batch.tasks"),
+      `${label}: ${JSON.stringify(report.problems)}`,
+    );
+    assert.deepEqual(storeFingerprint(store), before, `${label}: validation failure must not clear anything`);
+
+    // Same for a top-level tasks array.
+    const topLevel = importStateJson(store, {
+      stateJson: { schemaVersion: 1, tasks: [{ id: "T1", status: "READY" }], packages: [] },
+      runtime: { schemaVersion: 3, agents: [] },
+      mode: "replace",
+      now: T,
+    });
+    assert.equal(topLevel.status, "SKIPPED", label);
+    assert.deepEqual(storeFingerprint(store), before, label);
   }
 });
 

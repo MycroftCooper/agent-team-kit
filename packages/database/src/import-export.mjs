@@ -1,4 +1,4 @@
-﻿// Legacy JSON <-> SQLite import/export (M1 `atk migrate` / `atk export` carrier).
+// Legacy JSON <-> SQLite import/export (M1 `atk migrate` / `atk export` carrier).
 //
 // Import maps the pre-M1 workflow files into the store:
 //   state.json    -> project (+ requirement from `batch`) + tasks
@@ -473,6 +473,28 @@ export function importStateJson(store, options = {}) {
   const batch = isPlainObject(state?.batch) ? state.batch : null;
   if (state?.batch !== undefined && state.batch !== null && !isPlainObject(state.batch)) {
     report("error", "INVALID_RECORD", { collection: "batch", reason: "must be an object" });
+  }
+  // Safety (M6 gate): `tasks` is NOT part of the legacy state schema — tasks
+  // live in packages/subitems/batch.slices. Silently ignoring a non-empty
+  // `tasks` array would make a replace import succeed while dropping exactly
+  // the data the caller asked to import. Fail closed before any clear/write.
+  for (const [label, list] of [
+    ["batch.tasks", batch?.tasks],
+    ["tasks", state?.tasks],
+  ]) {
+    if (list === undefined || list === null) continue;
+    if (!Array.isArray(list)) {
+      report("error", "INVALID_RECORD", { collection: label, reason: "must be an array" });
+      continue;
+    }
+    if (list.length > 0) {
+      report("error", "IMPORT_WRITE_FAILED", {
+        collection: label,
+        reason:
+          "legacy state.json does not define a tasks array; tasks must be provided as packages/subitems/batch.slices",
+        count: list.length,
+      });
+    }
   }
   collectList(state?.packages, "packages", "package");
   collectList(state?.subitems, "subitems", "subitem");
