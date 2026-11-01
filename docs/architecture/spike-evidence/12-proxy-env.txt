@@ -1,0 +1,33 @@
+﻿# Proxy / loopback environment evidence - ATK-006
+# captured: 2026-11-02T02:23:25+08:00
+
+## Proxy environment variables (current worker process)
+(none of the above variables is set in this process)
+
+## WinINET / system user proxy (registry, read-only)
+ProxyEnable  = 1
+ProxyServer  = 127.0.0.1:7897
+ProxyOverride= localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;<local>
+AutoConfigURL= 
+
+## WinHTTP proxy (netsh, read-only)
+Current WinHTTP proxy settings:
+
+    Direct access (no proxy server).
+
+## Clash presence (config dir listing only, no content)
+Name              Length 
+----              ------ 
+logs                     
+profiles                 
+providers                
+RuleSet                  
+.cache            567    
+cache.db          32768  
+cfw-settings.yaml 413    
+config.yaml       92     
+Country.mmdb      4156834
+wintun.dll        427552
+
+## TCP listeners on common local proxy ports
+

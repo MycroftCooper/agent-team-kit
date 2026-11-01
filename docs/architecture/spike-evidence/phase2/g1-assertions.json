@@ -1,0 +1,21 @@
+﻿{
+    "gate":  "G1 isolation",
+    "command":  "dsh --profile acp --dump-config",
+    "exitCode":  0,
+    "isolatedHome":  "%TEMP%\\atk-spike-phase2\\home",
+    "outputBytes":  12126,
+    "containsUserDshPath":  false,
+    "profileAutoCreatedUnderIsolatedHome":  true,
+    "createdFiles":  [
+                         "%TEMP%\\atk-spike-phase2\\home\\.anonymous-user-id",
+                         "%TEMP%\\atk-spike-phase2\\home\\profiles\\acp\\cordis.patch.yml",
+                         "%TEMP%\\atk-spike-phase2\\home\\profiles\\acp\\cordis.yml",
+                         "%TEMP%\\atk-spike-phase2\\home\\profiles\\acp\\package.json",
+                         "%TEMP%\\atk-spike-phase2\\home\\profiles\\acp\\pnpm-workspace.yaml",
+                         "%TEMP%\\atk-spike-phase2\\home\\sessions\\--C-Users-~51AF~5B89~8499-AppData-Local-Temp-atk-spike-phase2-work-ws--\\b5d1dc4c-b5b8-4d54-8d5c-03dc266e4f62\\session.v4.jsonl.zstd",
+                         "%TEMP%\\atk-spike-phase2\\home\\sessions\\--C-Users-~51AF~5B89~8499-AppData-Local-Temp-atk-spike-phase2-work-ws--\\bc3b66a7-b064-43ba-a8f9-10a3b7dff328\\session.v4.jsonl.zstd",
+                         "%TEMP%\\atk-spike-phase2\\home\\storages\\session_projcache\\sessions\\b5d1dc4c-b5b8-4d54-8d5c-03dc266e4f62.json",
+                         "%TEMP%\\atk-spike-phase2\\home\\storages\\session_projcache\\sessions\\bc3b66a7-b064-43ba-a8f9-10a3b7dff328.json"
+                     ],
+    "verdict":  "PASS"
+}

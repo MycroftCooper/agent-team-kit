@@ -1,0 +1,9 @@
+﻿{
+    "tag":  "after-acp-run",
+    "at":  "2026-11-02T02:33:44+08:00",
+    "magpieUsageBytes":  1546392,
+    "magpieRoutingBytes":  4012874,
+    "dshSessionsFiles":  28,
+    "tcp3425Established":  null,
+    "isolatedHomeFiles":  7
+}

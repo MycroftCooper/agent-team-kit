@@ -1,0 +1,45 @@
+﻿# Safety audit - ATK-006
+# captured: 2026-11-02T02:25:52+08:00
+
+## Spike window
+first probe: 2026-11-02T02:20:33+08:00
+last probe : 2026-11-02T02:25:52+08:00
+latest mtime among the CONFIG files captured in the BEFORE snapshot: 2026-11-02T01:55:48.8676174+08:00
+=> every config file already had a pre-spike mtime; none was touched (see 18-config-snapshot-diff.txt).
+
+## Commands executed by this spike (complete list; all read-only)
+- dsh --version  (x2)
+- dsh --help
+- dsh plugin --help
+- dsh --profile desktop --dump-config
+- dsh --profile desktop --dump-default-config
+- dsh --profile desktop --dump-config-schema
+- dsh --profile acp --dump-config
+- dsh --profile acp --dump-config-schema
+- Get-Content / Select-String on ~/.dsh and ~/.config/magpie configuration files (read-only, credentials redacted from evidence)
+- Get-FileHash on config files, installed app.asar and magpie.exe (read-only)
+- Get-NetTCPConnection / netstat -ano / Test-NetConnection (read-only)
+- Get-Process / Get-CimInstance Win32_Process (read-only)
+- Get-ItemProperty HKCU Internet Settings; netsh winhttp show proxy (read-only)
+- node loopback-probe.js  (TCP connect to 127.0.0.1:2675 / :3425 / :3426, then immediate socket destroy; no HTTP request bytes)
+- fsutil reparsepoint query on the magpie shim path (read-only)
+
+## Commands deliberately NOT executed (hard safety constraint)
+- dsh --profile acp / sdk / headless  (any form that boots an Agent)
+- dsh headless with a task argument  (would submit a real model request)
+- any ACP initialize / session/new / session/prompt frame
+- any HTTP request to 127.0.0.1:2675 or 127.0.0.1:3425 (only raw TCP connect)
+- any write to ~/.dsh or ~/.config/magpie
+
+## No new session created by this spike
+session files in ~/.dsh/sessions: 28 before and 28 after (see 19-session-and-process-audit.txt).
+The only session written by this worker is its own harness session a519dcc8-8730-408d-9338-bde9aa9bc8f7;
+other session logs were updated by other concurrently running DSH agents, not by this spike.
+No dsh --profile agent process existed in the node process list at audit time.
+
+## Repository write scope
+Only these paths were created by the spike: docs/architecture/runtime-spike-dsh-magpie.md and docs/architecture/spike-evidence/** .
+artifacts/spike/ (an earlier, git-ignored location) was removed after the Lead moved the evidence directory.
+This worker never wrote lib/**, test/**, package config, .agent-flow/** or other docs, and ran no git state-changing command.
+NOTE: the shared working tree became dirty during the spike because other Workers are editing lib/** and test/** in parallel;
+that is not authored by this spike (git status was empty when this worker started at 02:20:33). See 21-git-state.txt.

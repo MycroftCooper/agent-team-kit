@@ -1,0 +1,67 @@
+﻿# Magpie <-> DSH routing evidence (read-only config inspection) - ATK-006
+# captured: 2026-11-02T02:24:44+08:00
+# SECURITY: providers.json contains a provider API key; the key value is NOT reproduced here.
+
+## Magpie binary / version
+path      = %USERPROFILE%\AppData\Local\Programs\magpie\magpie.exe
+FileVersion = 0.1.2629; ProductVersion = 0.1.2629; FileDescription = magpie
+sha256    = F5CA478313076FA314E7ADD338D82A234B6B7C6D60AE1791AD8733DF5FA4AB7E
+last-version file = 0.1.2629
+
+## Magpie listening socket
+127.0.0.1:3425 LISTENING, OwningProcess=28160 (magpie.exe)  [see 10-ports.txt]
+
+## DSH -> Magpie route as configured by the user (read-only excerpt)
+Source: %USERPROFILE%\.dsh\settings.yaml (lines 1-9)
+----
+llm-pi-ai:
+  providers:
+    magpie:
+      displayName: Magpie
+      apiKeyEnv: MAGPIE_GATEWAY_KEY
+      api: openai-completions
+      # magpie: points at magpie's local gateway; Disconnect in magpie or `magpie uninstall` undoes it, or remove this entry and pick another model
+      baseURL: http://127.0.0.1:3425/v1
+      models:
+----
+Source: %USERPROFILE%\.dsh\profiles\acp\cordis.patch.yml (lines 1-8)
+----
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      magpie:
+----
+Source: %USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml (lines 1-7)
+----
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+- id: agent-default-model # magpie
+  config:
+    provider: magpie
+    model: "deepseek/deepseek-flash"
+----
+
+## Magpie upstream provider table (structure only; 'key' value redacted)
+providers[0]: id=deepseek  name=DeepSeek  preset=deepseek  catalog=deepseek
+              chat=https://api.deepseek.com/v1  responses=https://api.deepseek.com/v1  anthropic=https://api.deepseek.com/anthropic
+              key=<REDACTED: present in providers.json, not copied to this evidence tree>
+groups: smart-split (members codex/gpt-6-astra, deepseek/deepseek-flash), group (members codex/gpt-6.1-sol, deepseek/deepseek-flash, codex/gpt-5.6-sol)
+routing: order; rules: compact -> deepseek/deepseek-flash; hard task intent -> codex/gpt-6-astra; easy task intent -> deepseek/deepseek-flash
+classifier: deepseek/deepseek-flash
+
+## Live sockets DSH(exe 42588) -> 127.0.0.1:3425 (from netstat -ano, see 10-ports.txt)
+TCP 127.0.0.1:2615 -> 127.0.0.1:3425 ESTABLISHED pid 42588
+TCP 127.0.0.1:2670 -> 127.0.0.1:3425 ESTABLISHED pid 42588
+TCP 127.0.0.1:2695 -> 127.0.0.1:3425 ESTABLISHED pid 42588
+TCP 127.0.0.1:2696 -> 127.0.0.1:3425 ESTABLISHED pid 42588
+
+## Interpretation
+The user's native DSH configuration points its 'magpie' provider at http://127.0.0.1:3425/v1,
+Magpie listens on that port, and the running DSH desktop process holds established sockets to it.
+This proves the route EXISTS and is LIVE. It does NOT prove that a request sent by ATK is routed
+correctly or that Magpie health is contractually testable; no request was sent, so RT-P07 stays PARTIAL.

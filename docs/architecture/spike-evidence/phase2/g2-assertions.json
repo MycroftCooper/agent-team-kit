@@ -1,0 +1,13 @@
+﻿{
+    "gate":  "G2 endpoint substitution",
+    "command":  "dsh --profile acp --dump-config",
+    "exitCode":  0,
+    "mockBaseUrl":  "http://127.0.0.1:6168/v1",
+    "mockUrlInEffectiveConfig":  true,
+    "agentDefaultModelProviderMock":  true,
+    "acpProviderMock":  true,
+    "residualRealModelBaseUrl":  false,
+    "residualDeepseekOfficialOccurrences":  1,
+    "residualNote":  "one occurrence is searchProvider: deepseek-official (web search), not a model baseURL",
+    "verdict":  "PASS"
+}

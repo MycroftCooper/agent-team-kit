@@ -1,0 +1,59 @@
+﻿# Environment record - ATK-006 runtime spike
+# captured: 2026-11-02T02:21:53+08:00
+
+## OS
+Caption        : Microsoft Windows 11 专业版
+Version        : 10.0.26200
+BuildNumber    : 26200
+OSArchitecture : 64-bit
+Windows build from registry:
+HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion DisplayVersion=25H2 CurrentBuild=26200
+
+## PowerShell
+5.1.26100.9711
+
+## Node
+node path: C:\Program Files\nodejs\node.exe
+node --version: v24.16.0
+npm --version: 11.13.0
+
+## Git
+git --version: git version 2.45.1.windows.1
+ATK HEAD: aec31b6f95faa30b9e0cfcaf2d6235f59c94f780
+ATK branch: m0/baseline-and-p0
+ATK last commit: aec31b6f95faa30b9e0cfcaf2d6235f59c94f780 2026-11-02 01:59:09 +0800 docs(selfhost): note the main-only branch model
+
+## DSH CLI on PATH
+Get-Command dsh -> %USERPROFILE%\AppData\Roaming\npm\dsh.ps1
+dsh.cmd exists: True
+npm package: %USERPROFILE%\AppData\Roaming\npm\node_modules\@deepseek-ai\dsh
+package.json version: 0.2.1-rc.5
+
+## DSH desktop app files
+app.asar length: 182766714
+app.asar sha256: E1B6F25FA937DA98086C3E77AF77AA14791105963C4D337A1C42179D232C6915
+runtime/versions.json: {
+  "schemaVersion": 1,
+  "node": "24.21.0",
+  "pnpm": "11.28.5"
+}
+%DSH_APP%\resources\app.asar\dsh exists: False  (app.asar is a packed single file, not a directory)
+
+## Magpie
+binary: %USERPROFILE%\AppData\Roaming\magpie-windows-amd64.exe
+binary length: 1  LastWriteTime: 2026-10-22T22:59:04.5258642+08:00
+binary sha256: 
+magpie config dir: %USERPROFILE%\.config\magpie
+last-version file: 0.1.2629
+
+## DSH process environment (this worker shell)
+  DSH_HOME=%USERPROFILE%\.dsh
+  DSH_PROFILE=desktop
+  DSH_PROFILE_DIR=%USERPROFILE%\.dsh\profiles\desktop
+  DSH_SESSION_ID=a519dcc8-8730-408d-9338-bde9aa9bc8f7
+  DSH_SHELL=1
+  DSH_WEB_URL=http://127.0.0.1:2675
+
+## DSH sessions dir (count only, no content)
+session files: 28
+newest session file mtime: 2026-11-02T02:21:52.9260040+08:00

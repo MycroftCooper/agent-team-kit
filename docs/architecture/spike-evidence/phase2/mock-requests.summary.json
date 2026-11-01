@@ -1,0 +1,20 @@
+{
+  "source": "local mock endpoint HTTP capture (mock-requests)",
+  "note": "Full 53 KB captures are NOT stored in the repository; they are reproducible by re-running the phase-2 mock harness. Sample keeps the first 3 records with the tools schema omitted for weight; messages/prompts are intact and desensitized.",
+  "bytes": 53283,
+  "sha256": "9DC0AB31801949D24BBAB9743DCED20056A014F6FD5A950DC0302815262CA671",
+  "recordCount": 3,
+  "requestCount": 2,
+  "models": {
+    "mock/mock-model": 2
+  },
+  "paths": {
+    "/v1/chat/completions": 2
+  },
+  "statuses": {
+    "200 (mock design; status not logged per request)": 2
+  },
+  "sampleRecords": 3,
+  "sampleToolSchemasOmitted": 2,
+  "capturedAt": "2026-11-01T18:37:48.419Z"
+}

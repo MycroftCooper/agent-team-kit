@@ -1,0 +1,24 @@
+﻿# Session-creation counter check - ATK-006
+# captured: 2026-11-02T02:24:56+08:00
+# Purpose: show that this spike did not create any model session (no prompt, no session/new).
+
+session files now: 28  (before-probe record: 28; the spike shell itself is session a519dcc8-8730-408d-9338-bde9aa9bc8f7 and is the only writer)
+newest 5 files by mtime:
+  2026-11-02T02:24:55.7666399+08:00  370706  --E-CodeProject-agent-team-kit--\a519dcc8-8730-408d-9338-bde9aa9bc8f7\session.v4.jsonl.zstd
+  2026-11-02T02:24:54.3954086+08:00  426897  --E-CodeProject-agent-team-kit--\75ce0e25-34bd-4d9d-977c-2dab2492fa5a\session.v4.jsonl.zstd
+  2026-11-02T02:24:47.8640123+08:00  383085  --E-CodeProject-agent-team-kit--\88525b56-2612-4272-b18e-f1565ebb039e\session.v4.jsonl.zstd
+  2026-11-02T02:24:32.3802485+08:00  356583  --E-CodeProject-agent-team-kit--\d55e1319-71a3-44a3-af51-b531e0739c46\session.v4.jsonl.zstd
+  2026-11-02T02:24:04.1701596+08:00  556254  --E-CodeProject-agent-team-kit--\session-8bc7d964-6d1e-40b9-b9d4-5fdb18d23e52\session.v4.jsonl.zstd
+
+## DSH processes and their start time (no new dsh/agent process was spawned by the spike)
+  pid=27092 start=2026-11-01T23:27:27.1124500+08:00
+  pid=30892 start=2026-11-02T02:24:55.5208370+08:00
+  pid=32508 start=2026-11-01T23:27:27.0607031+08:00
+  pid=41352 start=2026-11-01T23:27:27.0660134+08:00
+  pid=42588 start=2026-11-01T23:27:27.4407030+08:00
+  pid=43760 start=2026-11-02T02:24:47.6091692+08:00
+  pid=51120 start=2026-11-01T23:27:26.6432566+08:00
+
+## node processes with command line (verify no 'dsh --profile acp/sdk/headless' was launched)
+  pid=22212 cmd="C:\Program Files\Adobe\Adobe Creative Cloud Experience\libs\node.exe" "C:\Program Files\Adobe\Adobe Creative Cloud Experience\js\main.js"
+  pid=37560 cmd=%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe %USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\node_modules\@oai\artifact-tool\dist\artifact-session\host-daemon.mjs

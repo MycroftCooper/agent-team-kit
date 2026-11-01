@@ -1,0 +1,38 @@
+﻿{
+  "capturedAt": "2026-11-01T18:23:26.721Z",
+  "node": "v24.16.0",
+  "cwd": "%TEMP%\\atk-spike-20261102",
+  "proxyEnvInChild": {
+    "HTTP_PROXY": null,
+    "HTTPS_PROXY": null,
+    "NO_PROXY": null
+  },
+  "cases": [
+    {
+      "host": "127.0.0.1",
+      "port": 2675,
+      "connected": true,
+      "ms": 2
+    },
+    {
+      "host": "127.0.0.1",
+      "port": 3425,
+      "connected": true,
+      "ms": 2
+    },
+    {
+      "host": "127.0.0.1",
+      "port": 3426,
+      "connected": false,
+      "error": "ECONNREFUSED",
+      "ms": 1
+    },
+    {
+      "host": "localhost",
+      "port": 2675,
+      "connected": true,
+      "ms": 20
+    }
+  ],
+  "note": "Raw TCP connect only; no HTTP request bytes sent, then socket destroyed immediately."
+}

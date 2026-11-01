@@ -1,0 +1,142 @@
+{
+  "startedAt": "2026-11-01T18:33:39.390Z",
+  "mockUrl": "http://127.0.0.1:6168/v1",
+  "home": "%TEMP%\\atk-spike-phase2\\home",
+  "workdir": "%TEMP%\\atk-spike-phase2\\work\\ws",
+  "steps": [
+    {
+      "name": "initialize",
+      "ok": true,
+      "at": "2026-11-01T18:33:43.728Z",
+      "detail": {
+        "protocolVersion": 1
+      }
+    },
+    {
+      "name": "session/new",
+      "ok": true,
+      "at": "2026-11-01T18:33:43.787Z",
+      "detail": {
+        "sessionId": "b5d1dc4c-b5b8-4d54-8d5c-03dc266e4f62"
+      }
+    },
+    {
+      "name": "session/prompt-1",
+      "ok": true,
+      "at": "2026-11-01T18:33:44.083Z",
+      "detail": {
+        "stopReason": "end_turn",
+        "updateCount": 2,
+        "updateKinds": [
+          "agent_message_chunk",
+          "usage_update"
+        ],
+        "assistantText": "MOCK_REPLY_1"
+      }
+    },
+    {
+      "name": "session/prompt-2",
+      "ok": true,
+      "at": "2026-11-01T18:33:44.128Z",
+      "detail": {
+        "stopReason": "end_turn",
+        "updateCount": 2,
+        "updateKinds": [
+          "agent_message_chunk",
+          "usage_update"
+        ],
+        "assistantText": "MOCK_REPLY_2"
+      }
+    },
+    {
+      "name": "session/close",
+      "ok": true,
+      "at": "2026-11-01T18:33:44.141Z",
+      "detail": {}
+    },
+    {
+      "name": "exit-after-close",
+      "ok": true,
+      "at": "2026-11-01T18:33:44.234Z",
+      "detail": {
+        "code": 0,
+        "sig": null
+      }
+    }
+  ],
+  "initialize": {
+    "protocolVersion": 1,
+    "agentInfo": {
+      "name": "deepseek-harness-acp",
+      "version": "0.0.1"
+    },
+    "agentCapabilities": {
+      "mcpCapabilities": {
+        "http": true
+      },
+      "promptCapabilities": {
+        "image": false,
+        "audio": false,
+        "embeddedContext": false
+      },
+      "sessionCapabilities": {
+        "close": {},
+        "list": {},
+        "resume": {}
+      }
+    },
+    "authMethods": []
+  },
+  "sessionNew": {
+    "sessionId": "b5d1dc4c-b5b8-4d54-8d5c-03dc266e4f62",
+    "configOptions": [
+      {
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": "[\"mock\",\"mock/mock-model\"]",
+        "options": [
+          {
+            "group": "mock",
+            "name": "Mock",
+            "options": [
+              {
+                "value": "[\"mock\",\"mock/mock-model\"]",
+                "name": "Mock Model"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "sessionId": "b5d1dc4c-b5b8-4d54-8d5c-03dc266e4f62",
+  "round1": {
+    "stopReason": "end_turn",
+    "updateCount": 2,
+    "updateKinds": [
+      "agent_message_chunk",
+      "usage_update"
+    ],
+    "assistantText": "MOCK_REPLY_1"
+  },
+  "round2": {
+    "stopReason": "end_turn",
+    "updateCount": 2,
+    "updateKinds": [
+      "agent_message_chunk",
+      "usage_update"
+    ],
+    "assistantText": "MOCK_REPLY_2"
+  },
+  "sessionClose": {},
+  "exitAfterClose": {
+    "code": 0,
+    "sig": null
+  },
+  "finishedAt": "2026-11-01T18:33:44.235Z",
+  "frameCount": 15,
+  "notificationCount": 4,
+  "elapsedMs": 4845
+}

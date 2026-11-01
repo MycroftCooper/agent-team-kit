@@ -1,0 +1,77 @@
+﻿# Key ACP protocol frames (truncated) - ATK-006b phase 2
+# generated: 2026-11-02T02:34:51+08:00
+# Source: acp-frames.ndjson / acp2-frames.ndjson (truncated for readability; full frames stay in those files).
+
+## run 1: initialize result (agent capabilities)
+{
+    "protocolVersion":  1,
+    "agentInfo":  {
+                      "name":  "deepseek-harness-acp",
+                      "version":  "0.0.1"
+                  },
+    "agentCapabilities":  {
+                              "mcpCapabilities":  {
+                                                      "http":  true
+                                                  },
+                              "promptCapabilities":  {
+                                                         "image":  false,
+                                                         "audio":  false,
+                                                         "embeddedContext":  false
+                                                     },
+                              "sessionCapabilities":  {
+                                                          "close":  {
+
+                                                                    },
+                                                          "list":  {
+
+                                                                   },
+                                                          "resume":  {
+
+                                                                     }
+                                                      }
+                          },
+    "authMethods":  [
+
+                    ]
+}
+
+## run 1: session/new result (sessionId + per-session config options)
+{
+    "sessionId":  "b5d1dc4c-b5b8-4d54-8d5c-03dc266e4f62",
+    "configOptions":  [
+                          {
+                              "id":  "model",
+                              "name":  "Model",
+                              "category":  "model",
+                              "type":  "select",
+                              "currentValue":  "[\"mock\",\"mock/mock-model\"]",
+                              "options":  [
+                                              {
+                                                  "group":  "mock",
+                                                  "name":  "Mock",
+                                                  "options":  [
+                                                                  {
+                                                                      "value":  "[\"mock\",\"mock/mock-model\"]",
+                                                                      "name":  "Mock Model"
+                                                                  }
+                                                              ]
+                                              }
+                                          ]
+                          }
+                      ]
+}
+
+## run 1: two prompt rounds (same sessionId)
+sessionId = b5d1dc4c-b5b8-4d54-8d5c-03dc266e4f62
+round1 = {"stopReason":"end_turn","updateCount":2,"updateKinds":["agent_message_chunk","usage_update"],"assistantText":"MOCK_REPLY_1"}
+round2 = {"stopReason":"end_turn","updateCount":2,"updateKinds":["agent_message_chunk","usage_update"],"assistantText":"MOCK_REPLY_2"}
+session/close result = {}
+process exit after close = {"code":0,"sig":null}
+
+## run 2: abrupt kill, session/list, session/resume, prompt on resumed session
+abrupt kill sessionId = bc3b66a7-b064-43ba-a8f9-10a3b7dff328
+abrupt kill exit = {"code":null,"sig":"SIGTERM"}
+session/list = {"list":{"sessions":[{"sessionId":"bc3b66a7-b064-43ba-a8f9-10a3b7dff328","cwd":"%TEMP%\\atk-spike-phase2\\work\\ws"},{"sessionId":"b5d1dc4c-b5b8-4d54-8d5c-03dc266e4f62","cwd":"%TEMP%\\atk-spike-phase2\\work\\ws"}]},"listError":null}
+session/resume = {"target":"bc3b66a7-b064-43ba-a8f9-10a3b7dff328","resume":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"[\"mock\",\"mock/mock-model\"]","options":[{"group":"mock","name":"Mock","options":["@{value=[\"mock\",\"mock/mock-model\"]; name=Mock Model}"]}]}]},"resumeError":null}
+prompt on resumed session = {"promptRes":{"stopReason":"end_turn"},"promptError":null,"updateKinds":["agent_message_chunk","usage_update"],"assistantText":"MOCK_REPLY_2"}
+process exit after second close = {"code":0,"sig":null}
