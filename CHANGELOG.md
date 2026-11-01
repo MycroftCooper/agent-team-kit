@@ -6,6 +6,42 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (M3 / v0.6)
+
+- `packages/scheduler-core`: a zero-dependency, zero-import, zero-clock planner —
+  cycle detection, topological order, ready candidates, deterministic scoring
+  (priority → waiting time → id), agent matching (role, capability, IDLE) and
+  write-scope conflicts. A cycle refuses the **whole** plan instead of dispatching
+  an incomplete DAG; every skipped task carries a reason from a fixed enum.
+- `packages/database` (M3): migration `0003_scheduling.sql` (`policy_json`,
+  `files_json`, schemaVersion 3), a single-transaction `claimTask` with seven
+  ordered checks (CAS, dependencies, agent eligibility, no active run, capacity,
+  write-scope, READY→CLAIMED) plus run/command/events in the same transaction, and
+  `schedulingSnapshot` whose version is `MAX(events.seq)` so a failed claim never
+  moves it. A two-connection barrier race yields exactly one winner.
+- `apps/backend` (M3): `GET /internal/v1/scheduling/snapshot`,
+  `POST /internal/v1/tasks/:id/claim` and `POST /internal/v1/scheduler/heartbeat`.
+  The claim route re-checks all seven conditions at the contract layer, maps each
+  failure to a specific code/reason, is idempotent by `idempotencyKey`, refuses a
+  non-atomic store (500 instead of a fake transaction) and pushes exactly two SSE
+  frames on success.
+- `apps/scheduler`: a stateless scheduling loop — snapshot → plan → claim, with
+  backoff, heartbeat, and a stop that does not cancel dispatched runs.
+- `scripts/m3-smoke.mjs`: the M3 gate over the real backend, SQLite, scheduler and
+  host (MockRuntime only): dependency order, wholesale cycle refusal, one live
+  lease per run, no duplicate dispatch after a restart, and the chain continuing
+  only after the root walks the legal status chain to DONE. 5/5.
+
+### Fixed (M3 / v0.6)
+
+- M2 review finding (BLOCKER): the runtime host's `result` requests omitted
+  `ownerId`, so every command completion failed with 400 and was swallowed while
+  `m2-smoke` stayed green. The host now sends the contract shape, reports a
+  failed start as `session.ended(failed)` (so the Run cannot be stranded in
+  STARTING), never calls `runtime.stop` on an already ended session, and the gate
+  asserts the dispatch command reaches DONE/FAILED, that nothing stays
+  PENDING/CLAIMED, and that the host logged zero errors.
+
 ### Added (M2 / v0.5)
 
 - `packages/runtime-sdk`: the `AgentRuntime` interface (probe/capabilities/start/
