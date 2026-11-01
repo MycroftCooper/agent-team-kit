@@ -74,6 +74,24 @@ async function readManifest(file) {
   return JSON.parse(await readFile(file, "utf8"));
 }
 
+/**
+ * Build a signed qa-approval receipt (lib/evidence.mjs `QA_APPROVAL_SCHEMA`).
+ * A bare `passed: true` is no longer a QA fact; tests must issue the real shape.
+ */
+function qaApproval(manifest, overrides = {}) {
+  const base = {
+    schemaVersion: 1,
+    kind: "qa-approval",
+    manifestSha256: manifest.manifestSha256,
+    verdict: "PASS",
+    reviewer: { run: "run-qa-01", agent: "agent-qa-01", role: "QA", function: "REVIEWER" },
+    targetRunId: manifest.run?.id,
+    gates: [{ name: "demo-local", status: "PASS", reportSha256: "A".repeat(64) }],
+    originalApplied: false,
+  };
+  return { ...base, ...overrides, reviewer: { ...base.reviewer, ...(overrides.reviewer ?? {}) } };
+}
+
 async function receiptNames(dir) {
   return readdir(dir).catch(() => []);
 }
@@ -107,11 +125,13 @@ test("batch manifest freezes hashes in the legacy-compatible format and copies t
   assert.ok(copies.some((name) => name.startsWith("manifest-")), "manifest is copied into the evidence dir");
 });
 
-test("batch verify passes on a clean freeze and fails after candidate tampering", async (t) => {
+test("batch verify without --qa is a diagnostic SKIPPED run and fails after candidate tampering", async (t) => {
   const env = await setup(t);
   await freeze(env);
   assert.equal(await env.run(["verify", "--manifest", env.manifestPath]), 0);
-  assert.match(env.logger.text(), /PASS BATCH-01/);
+  // Diagnostic mode must never read as an approval (spec 1.2 / 10.1).
+  assert.match(env.logger.text(), /SKIPPED BATCH-01/);
+  assert.doesNotMatch(env.logger.text(), /PASS/);
 
   const names = await receiptNames(path.join(env.evidenceDir, "BATCH-01"));
   assert.ok(names.some((name) => name.startsWith("verify-")), "verify writes a receipt");
@@ -119,7 +139,8 @@ test("batch verify passes on a clean freeze and fails after candidate tampering"
   await writeText(path.join(env.candidateRoot, "src", "app.ts"), "export const app = 999;\n");
   env.logger.lines.out.length = 0;
   assert.equal(await env.run(["verify", "--manifest", env.manifestPath]), 1);
-  assert.match(env.logger.text(), /FAIL BATCH-01/);
+  assert.match(env.logger.text(), /SKIPPED BATCH-01/);
+  assert.doesNotMatch(env.logger.text(), /PASS/);
   assert.match(env.logger.text(), /candidate:src\/app\.ts/);
 
   await writeText(path.join(env.candidateRoot, "src", "app.ts"), CANDIDATE_APP);
@@ -136,7 +157,7 @@ test("batch verify reports original-tree drift", async (t) => {
   await writeText(path.join(env.root, "src", "app.ts"), ORIGINAL_APP);
 });
 
-test("batch verify binds qa-approval.json to the manifest sha", async (t) => {
+test("batch verify binds a signed qa-approval.json to the manifest sha", async (t) => {
   const env = await setup(t);
   await freeze(env, ["--agent", "agent-dev-01"]);
   const manifest = await readManifest(env.manifestPath);
@@ -144,20 +165,19 @@ test("batch verify binds qa-approval.json to the manifest sha", async (t) => {
   assert.equal(manifest.run.role, "DEV");
   assert.equal(manifest.run.function, "WORKER");
   const qaPath = path.join(env.root, "qa-approval.json");
-  const approval = {
-    passed: true,
-    manifestSha256: manifest.manifestSha256,
-    originalApplied: false,
-    reviewer: { agent: "agent-qa-01", role: "QA", function: "REVIEWER" },
-  };
+  const approval = qaApproval(manifest);
 
   await writeJson(qaPath, approval);
   assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath]), 0);
+  assert.match(env.logger.text(), /PASS BATCH-01/);
 
   await writeJson(qaPath, { ...approval, manifestSha256: "0".repeat(64) });
+  env.logger.lines.err.length = 0;
   assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath]), 1);
+  assert.match(env.logger.errorText(), /manifest-sha-mismatch/);
 
   await writeJson(qaPath, { ...approval, noninteractiveQA: "passed", originalApplied: true });
+  env.logger.lines.err.length = 0;
   assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath]), 1, "a used approval cannot be replayed");
 });
 
@@ -167,25 +187,22 @@ test("batch verify refuses a reviewer that produced the manifest", async (t) => 
   const manifest = await readManifest(env.manifestPath);
   const qaPath = path.join(env.root, "qa-approval.json");
 
-  await writeJson(qaPath, {
-    passed: true,
-    manifestSha256: manifest.manifestSha256,
-    originalApplied: false,
-    reviewer: { agent: "agent-dev-01", role: "DEV", function: "WORKER" },
-  });
+  await writeJson(
+    qaPath,
+    qaApproval(manifest, { reviewer: { run: "run-dev-01", agent: "agent-dev-01", role: "DEV", function: "WORKER" } }),
+  );
   assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath]), 1);
-  assert.match(env.logger.text(), /no-self-review/);
+  assert.match(env.logger.text(), /self-review/);
 
   // A self-review is refused even when the approval claims a REVIEWER Function:
   // the instance's registered capabilities decide what it may do.
-  await writeJson(qaPath, {
-    passed: true,
-    manifestSha256: manifest.manifestSha256,
-    originalApplied: false,
-    reviewer: { agent: "agent-dev-01", role: "DEV", function: "REVIEWER" },
-  });
+  await writeJson(
+    qaPath,
+    qaApproval(manifest, { reviewer: { run: "run-dev-01", agent: "agent-dev-01", role: "DEV", function: "REVIEWER" } }),
+  );
+  env.logger.lines.out.length = 0;
   assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath]), 1);
-  assert.match(env.logger.text(), /reviewer-capability|no-self-review/);
+  assert.match(env.logger.text(), /self-review/);
 });
 
 test("batch verify refuses a reviewer listed as a contributor", async (t) => {
@@ -194,14 +211,9 @@ test("batch verify refuses a reviewer listed as a contributor", async (t) => {
   const manifest = await readManifest(env.manifestPath);
   assert.deepEqual(manifest.run.contributors, ["agent-qa-01"]);
   const qaPath = path.join(env.root, "qa-approval.json");
-  await writeJson(qaPath, {
-    passed: true,
-    manifestSha256: manifest.manifestSha256,
-    originalApplied: false,
-    reviewer: { agent: "agent-qa-01", role: "QA", function: "REVIEWER" },
-  });
+  await writeJson(qaPath, qaApproval(manifest));
   assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath]), 1);
-  assert.match(env.logger.text(), /no-self-review/);
+  assert.match(env.logger.text(), /self-review/);
   assert.match(env.logger.text(), /contributor/);
 });
 
@@ -211,16 +223,14 @@ test("batch verify refuses a review without identities", async (t) => {
   const manifest = await readManifest(env.manifestPath);
   const qaPath = path.join(env.root, "qa-approval.json");
 
-  await writeJson(qaPath, { passed: true, manifestSha256: manifest.manifestSha256, originalApplied: false });
+  const anonymous = qaApproval(manifest);
+  delete anonymous.reviewer;
+  await writeJson(qaPath, anonymous);
   assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath]), 1);
-  assert.match(env.logger.text(), /reviewer-identity/);
+  assert.match(env.logger.text(), /missing-reviewer/);
 
-  await writeJson(qaPath, {
-    passed: true,
-    manifestSha256: manifest.manifestSha256,
-    originalApplied: false,
-    reviewer: { agent: "agent-ghost-01", role: "QA", function: "REVIEWER" },
-  });
+  await writeJson(qaPath, qaApproval(manifest, { reviewer: { run: "run-ghost", agent: "agent-ghost-01" } }));
+  env.logger.lines.out.length = 0;
   assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath]), 1);
   assert.match(env.logger.text(), /reviewer-registered/);
 });
@@ -231,12 +241,7 @@ test("batch verify refuses a manifest with no producing run once a reviewer is c
   const manifest = await readManifest(env.manifestPath);
   assert.equal(manifest.run, undefined, "no --agent means no producing run");
   const qaPath = path.join(env.root, "qa-approval.json");
-  await writeJson(qaPath, {
-    passed: true,
-    manifestSha256: manifest.manifestSha256,
-    originalApplied: false,
-    reviewer: { agent: "agent-qa-01", role: "QA", function: "REVIEWER" },
-  });
+  await writeJson(qaPath, qaApproval(manifest));
   assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath]), 1);
   assert.match(env.logger.text(), /producer-identity/);
   assert.match(env.logger.errorText(), /no --agent given/);
@@ -271,13 +276,21 @@ test("batch manifest records --agent and validates the Agent Instance", async (t
   assert.equal(manifest.run.function, "WORKER");
 });
 
-test("functions.enforceNoSelfReview=false keeps identity-less approvals working", async (t) => {
+test("functions.enforceNoSelfReview=false keeps identity-less approvals working only through the legacy escape hatch", async (t) => {
   const env = await setup(t, { functions: { enforceNoSelfReview: false } });
   await freeze(env);
   const manifest = await readManifest(env.manifestPath);
   const qaPath = path.join(env.root, "qa-approval.json");
   await writeJson(qaPath, { passed: true, manifestSha256: manifest.manifestSha256, originalApplied: false });
-  assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath]), 0);
+
+  // Even with identity checks switched off, a bare passed:true is not a QA fact
+  // unless the operator explicitly opts into legacy receipts.
+  assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath]), 1);
+  assert.match(env.logger.errorText(), /legacy-receipt/);
+
+  env.logger.lines.out.length = 0;
+  assert.equal(await env.run(["verify", "--manifest", env.manifestPath, "--qa", qaPath, "--legacy-receipts"]), 0);
+  assert.match(env.logger.text(), /PASS BATCH-01/);
 });
 
 test("batch verify accepts a legacy manifest without the extra convenience fields", async (t) => {
@@ -308,11 +321,26 @@ test("batch verify accepts a legacy manifest without the extra convenience field
 
 test("batch apply defaults to dry-run and never writes the original tree", async (t) => {
   const env = await setup(t);
-  await freeze(env);
-  assert.equal(await env.run(["apply", "--manifest", env.manifestPath]), 0);
+  await freeze(env, ["--agent", "agent-dev-01"]);
+  const manifest = await readManifest(env.manifestPath);
+  const qaPath = path.join(env.root, "qa-approval.json");
+  await writeJson(qaPath, qaApproval(manifest));
+
+  // Controlled integration: the dry-run itself needs a valid QA receipt.
+  env.logger.lines.json.length = 0;
+  assert.equal(await env.run(["apply", "--manifest", env.manifestPath]), 1);
+  const refused = env.logger.lines.json.at(-1);
+  assert.equal(refused.status, "FAIL");
+  assert.equal(refused.dryRun, true);
+  assert.ok(refused.rejected.some((entry) => entry.reason === "missing-qa-approval"));
+  assert.match(env.logger.errorText(), /missing-qa-approval/);
+
+  assert.equal(await env.run(["apply", "--manifest", env.manifestPath, "--qa", qaPath]), 0);
   const plan = env.logger.lines.json.at(-1);
   assert.equal(plan.dryRun, true);
   assert.equal(plan.verify, true);
+  assert.equal(plan.status, "PASS");
+  assert.deepEqual(plan.rejected, []);
   assert.deepEqual(plan.modifies, ["src/app.ts"]);
   assert.deepEqual(plan.creates, ["src/new.ts"]);
   assert.match(env.logger.errorText(), /dry-run/);
@@ -326,12 +354,15 @@ test("batch apply defaults to dry-run and never writes the original tree", async
 
 test("batch apply refuses without confirmation, and exit 3 on original-tree drift", async (t) => {
   const env = await setup(t);
-  await freeze(env);
+  await freeze(env, ["--agent", "agent-dev-01"]);
+  const manifest = await readManifest(env.manifestPath);
+  const qaPath = path.join(env.root, "qa-approval.json");
+  await writeJson(qaPath, qaApproval(manifest));
   assert.equal(await env.run(["apply", "--manifest", env.manifestPath, "--apply"]), 2);
 
   await writeText(path.join(env.root, "src", "app.ts"), "export const app = 123;\n");
   assert.equal(
-    await env.run(["apply", "--manifest", env.manifestPath, "--apply", "--confirm-dev-closed"]),
+    await env.run(["apply", "--manifest", env.manifestPath, "--qa", qaPath, "--apply", "--confirm-dev-closed"]),
     3,
     "drift is a concurrency refusal (exit 3)",
   );
@@ -343,21 +374,17 @@ test("batch apply with confirmation writes the tree, backs up, and records recei
   await freeze(env, ["--agent", "agent-dev-01"]);
   const manifest = await readManifest(env.manifestPath);
   const qaPath = path.join(env.root, "qa-approval.json");
-  await writeJson(qaPath, {
-    passed: true,
-    manifestSha256: manifest.manifestSha256,
-    originalApplied: false,
-    reviewer: { agent: "agent-qa-01", role: "QA", function: "REVIEWER" },
-  });
+  await writeJson(qaPath, qaApproval(manifest));
   const backupDir = path.join(env.root, "artifacts", "test-backup");
 
-  // Strict integration permission: a real write needs QA evidence.
+  // Controlled integration: a real write needs a valid QA receipt first.
+  env.logger.lines.err.length = 0;
   assert.equal(
     await env.run(["apply", "--manifest", env.manifestPath, "--apply", "--confirm-dev-closed", "--backup", backupDir]),
     1,
     "a write without QA evidence is refused",
   );
-  assert.match(env.logger.errorText(), /permission denied/);
+  assert.match(env.logger.errorText(), /missing-qa-approval/);
 
   assert.equal(
     await env.run(["apply", "--manifest", env.manifestPath, "--qa", qaPath, "--apply", "--confirm-dev-closed", "--backup", backupDir]),
@@ -385,12 +412,9 @@ test("integration permission requires a green gate report when quick/local gates
   await freeze(env, ["--agent", "agent-dev-01"]);
   const manifest = await readManifest(env.manifestPath);
   const qaPath = path.join(env.root, "qa-approval.json");
-  await writeJson(qaPath, {
-    passed: true,
-    manifestSha256: manifest.manifestSha256,
-    originalApplied: false,
-    reviewer: { agent: "agent-qa-01", role: "QA", function: "REVIEWER" },
-  });
+  // The receipt declares its gates PASS; the integration permission still reads
+  // the real gate report, because a self-declared gate is not a gate run.
+  await writeJson(qaPath, qaApproval(manifest, { gates: [{ name: "quick", status: "PASS" }] }));
   const apply = (extra = []) => env.run(["apply", "--manifest", env.manifestPath, "--qa", qaPath, "--apply", "--confirm-dev-closed", ...extra]);
 
   env.logger.lines.err.length = 0;

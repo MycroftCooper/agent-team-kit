@@ -64,6 +64,19 @@ async function receipt(env, name, payload) {
   await writeJson(path.join(env.evidenceDir, "BATCH-01", name), payload);
 }
 
+/** Signed qa-approval receipt (lib/evidence.mjs `QA_APPROVAL_SCHEMA`). */
+function signedQa(sha, overrides = {}) {
+  const base = {
+    schemaVersion: 1,
+    kind: "qa-approval",
+    manifestSha256: sha,
+    verdict: "PASS",
+    reviewer: { run: "run-qa-01", agent: "agent-qa-01", role: "QA", function: "REVIEWER" },
+    gates: [{ name: "quick", status: "PASS", reportSha256: "F".repeat(64) }],
+  };
+  return { ...base, ...overrides, reviewer: { ...base.reviewer, ...(overrides.reviewer ?? {}) } };
+}
+
 test("evidence derives qaPassed from receipts and is idempotent", async (t) => {
   const env = await setup(t);
   await receipt(env, "manifest-aaaaaaaa.json", {
@@ -72,12 +85,7 @@ test("evidence derives qaPassed from receipts and is idempotent", async (t) => {
     manifestSha256: SHA,
     files: [{ path: "src/app.ts" }],
   });
-  await receipt(env, "qa-s1.json", {
-    noninteractiveQA: "passed",
-    manifestSha256: SHA,
-    batchId: "S1",
-    packages: ["PKG-01"],
-  });
+  await receipt(env, "qa-s1.json", signedQa(SHA, { batchId: "S1", packages: ["PKG-01"] }));
 
   assert.equal(await env.run([]), 0);
   assert.match(env.logger.text(), /evidence: 2 receipt\(s\), qa=1, applied=0/);
@@ -105,7 +113,7 @@ test("evidence advances a qa-passed slice to awaiting_accept once applied", asyn
     manifestSha256: SHA,
     files: [{ path: "src/app.ts" }],
   });
-  await receipt(env, "qa.json", { noninteractiveQA: "passed", manifestSha256: SHA, batchId: "S1" });
+  await receipt(env, "qa.json", signedQa(SHA, { batchId: "S1" }));
   await receipt(env, "apply.json", { originalApplied: true, manifestSha256: SHA, batchId: "S1" });
 
   assert.equal(await env.run([]), 0);
@@ -127,9 +135,9 @@ test("evidence never advances blocked/paused slices and keeps humanAccepted", as
       return state;
     })(),
     receipts: {
-      "artifacts/evidence/BATCH-01/qa-s2.json": { noninteractiveQA: "passed", manifestSha256: "B".repeat(64), batchId: "S2" },
+      "artifacts/evidence/BATCH-01/qa-s2.json": signedQa("B".repeat(64), { batchId: "S2" }),
       "artifacts/evidence/BATCH-01/apply-s3.json": { originalApplied: true, manifestSha256: "C".repeat(64), batchId: "S3" },
-      "artifacts/evidence/BATCH-01/qa-s1.json": { noninteractiveQA: "passed", manifestSha256: "D".repeat(64), batchId: "S1" },
+      "artifacts/evidence/BATCH-01/qa-s1.json": signedQa("D".repeat(64), { batchId: "S1" }),
       "artifacts/evidence/BATCH-01/apply-s1.json": { originalApplied: true, manifestSha256: "D".repeat(64), batchId: "S1" },
     },
   });
@@ -147,7 +155,7 @@ test("evidence never advances blocked/paused slices and keeps humanAccepted", as
 test("evidence --dry reports changes without writing state.json", async (t) => {
   const env = await setup(t, {
     receipts: {
-      "artifacts/evidence/BATCH-01/qa-s1.json": { noninteractiveQA: "passed", manifestSha256: "D".repeat(64), batchId: "S1" },
+      "artifacts/evidence/BATCH-01/qa-s1.json": signedQa("D".repeat(64), { batchId: "S1" }),
     },
   });
   const before = await readFile(env.statePath, "utf8");
@@ -216,19 +224,24 @@ test("evidence refuses a qa approval whose reviewer produced the manifest", asyn
     files: [{ path: "src/app.ts" }],
     run: { id: "run-1", agent: "agent-dev-01", role: "DEV", function: "WORKER", startedAt: "2026-01-01T00:00:00+00:00" },
   });
-  await receipt(env, "qa-self.json", {
-    passed: true,
-    manifestSha256: SHA,
-    batchId: "S1",
-    packages: ["PKG-01"],
-    reviewer: { agent: "agent-dev-01", role: "DEV", function: "REVIEWER" },
-  });
+  await receipt(
+    env,
+    "qa-self.json",
+    signedQa(SHA, {
+      batchId: "S1",
+      packages: ["PKG-01"],
+      targetRunId: "run-1",
+      reviewer: { run: "run-dev-01", agent: "agent-dev-01", role: "DEV", function: "REVIEWER" },
+    }),
+  );
 
   assert.equal(await env.run(["--json"]), 0);
   const report = env.logger.lines.json.at(-1);
   assert.equal(report.selfReviewed, 1);
   assert.equal(report.qaApprovals, 0, "a self-reviewed approval is never a QA fact");
-  assert.match(env.logger.errorText(), /refused self-reviewed qa-approval/);
+  assert.equal(report.rejected.length, 1);
+  assert.equal(report.rejected[0].reason, "self-review");
+  assert.match(env.logger.errorText(), /refused qa-approval .*self-review/);
 
   const state = await loadState(env);
   assert.equal(state.batch.slices.find((slice) => slice.id === "S1").qaPassed, null);
