@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning.
 
+## [1.0.0-candidate] - 2026-11-02
+
+The first end-to-end shape of the 2.0 local system: a backend that owns SQLite, a
+scheduler that decides, runtime hosts that execute, a review/approval chain that
+is the only way to `DONE`, a launcher that starts all of it with one command, and
+a bilingual web workbench. Every milestone was signed off by a reviewer who did
+not write the code.
+
+- **Capabilities and boundaries** are documented in
+  [docs/V1-READINESS.md](docs/V1-READINESS.md): eight working capabilities (each
+  with its gate) and the six things this version deliberately cannot do.
+- **Gates** must all be green: `test.mjs` 475/475, `test-workspace.mjs` 604/604,
+  `check-boundaries.mjs` PASS (9 packages / 6 edges / 0 cycles) and `m1`..`m6`
+  smoke (16/16, 4/4, 6/6, 9/9, 4/4, 12/12).
+- **One end-to-end demo** over real processes and real HTTP:
+  `node scripts/v1-demo.mjs` (output recorded in
+  [docs/evidence/v1.0-demo.md](docs/evidence/v1.0-demo.md)) — launcher up,
+  scheduler dispatch, hosts executing, review PASS with evidence, human approval
+  bound to a hash, legacy CLI reading the same facts and refusing to write.
+- **Independent reviews** QA-001..007 in `docs/architecture/qa-review-m*.md`,
+  plus milestone receipts in `docs/roadmap/m*-status.md`.
+- **Honest boundary**: real DSH remains unavailable (a stub whose capabilities are
+  all false), there is no installer, no CI browser E2E, the legacy CLI is a
+  read-only compatibility layer over SQLite, and the target is single-user
+  Windows. `QA PASS` is not production readiness.
+
 ## [Unreleased]
 
 ### Added (M5 / v0.8)
