@@ -36,14 +36,30 @@ Single writer: `atk ownership check --role <ROLE>` turns the convention into an
 enforced check. Two roles on one path is a configuration error, not a merge
 conflict.
 
+## Entities and Functions
+
+Roles are permission templates. The concrete worker is an Agent Instance in
+`runtime.json` (`id` + `capabilities`), and one execution is a Run recorded by a
+receipt: the manifest is the producing `WORKER` run, `qa-approval.json` is the
+reviewing `REVIEWER` run.
+
+**No self-review.** A review ticket needs `--agent <id>`, and `atk batch verify`
+refuses when the reviewer instance produced the manifest. Never work around a
+`no-self-review` refusal.
+
+**Permissions are deny-by-default.** `atk permit check <operation>` returns the
+decision plus a machine-readable reason code (edits, review, integration,
+budgets, production access, acceptance). The subject x operation matrix lives in
+the toolkit docs; this project cannot relax it.
+
 ## One task's lifecycle
 
 ```
 1 LEAD    open the slice in state.batch.slices, generate the ticket
 2 LEAD    forward the ticket in one message (do not write a document)
 3 DEV     create a candidate snapshot outside the original tree
-4 DEV     freeze: atk batch manifest --candidate ... --packages <ID>
-5 QA      qa-approval.json binds the frozen manifestSha256
+4 DEV     freeze: atk batch manifest --candidate ... --packages <ID> --agent <id>
+5 QA      qa-approval.json binds the frozen manifestSha256 + reviewer identity
 6 QA      verify: atk batch verify --manifest ... --qa ...
 7 BE/LEAD apply: dry-run first, then --apply --confirm-dev-closed
 8 LEAD    derive: atk evidence (QA -> ready to apply, apply -> awaiting acceptance)

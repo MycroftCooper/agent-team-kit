@@ -15,6 +15,10 @@ real TCP port, and plugin identifiers must be valid.
   "language": "en",
   "layout": { "flowDir": ".agent-flow", "artifactDir": "artifacts/agent-flow", "evidenceDir": "artifacts/evidence", "tempPrefix": "my-app" },
   "roles": ["LEAD", "DEV", "QA"],
+  "functions": {
+    "roles": { "LEAD": ["ORCHESTRATOR"], "DEV": ["WORKER"], "QA": ["REVIEWER"] },
+    "enforceNoSelfReview": true
+  },
   "gates": { "fast": { "parallel": true, "groups": {}, "steps": [] }, "quick": null, "local": null },
   "batch": { "manifestTag": "agent-flow-manifest-v1", "qaSchemaVersion": 1, "idPattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$", "allowedPrefixes": ["src", "docs"], "budgetRounds": 12 },
   "baseline": { "roots": ["src", "docs"] },
@@ -38,6 +42,7 @@ real TCP port, and plugin identifiers must be valid.
 | `project` | string \| null | Display name; defaults to the directory name. |
 | `language` | `"en"` \| `"zh-CN"` | Label language for boards, tasks and generated docs. |
 | `roles` | string[] | Role identifiers, e.g. `["LEAD","DEV","QA"]`. Order is the display order. |
+| `functions` | object | Role -> Function(s) plus `enforceNoSelfReview`; see below. |
 | `todoSource` | string \| null | Shortcut for `paths.todoSource`. |
 | `handoffDoc` | string \| null | Shortcut for `paths.handoffDoc`. |
 
@@ -67,7 +72,7 @@ the default filename.
 | `board` | `board.md` | Markdown board. |
 | `boardHtml` | `board.html` | Static HTML board. |
 | `humanTodos` | `human-todos.json` | Human-only todo list. |
-| `runtime` | `runtime.json` | Agents working now + recent events. |
+| `runtime` | `runtime.json` | Agent Instances (`id` + `capabilities`), who is working now, recent events. |
 | `currentBatch` | `current-batch.md` | Rolling batch notes. |
 | `taskTemplate` | `task-template.md` | The 9-line ticket format. |
 | `commandsDoc` | `commands.md` | Command cheat sheet. |
@@ -83,11 +88,42 @@ three are `LEAD`, `DEV`, `QA`; the `p4deck` preset uses `LEAD`, `FE`, `BE`, `QA`
 Every role gets a card in `rolesDir` (a generic card is generated for custom
 roles) and must appear in `ownership.json`.
 
-Changing this list on an initialized project also means editing `ownership.json`
-(its `roles` plus rules), `runtime.json` (`agents`), the role card and the flow
-README together - see the `agent-team-roles` skill and
-[ROLES.md](ROLES.md). Do not re-run `atk init --force` for it; that rewrites the
-whole flow directory, `state.json` included.
+Changing this list on an initialized project also means editing `functions.roles`
+(remove the old role, add the new one), `ownership.json` (its `roles` plus
+rules), `runtime.json` (`agents`), the role card and the flow README together -
+see the `agent-team-roles` skill and [ROLES.md](ROLES.md). Do not re-run
+`atk init --force` for it; that rewrites the whole flow directory, `state.json`
+included.
+
+## `functions`
+
+The Function taxonomy of the entity model: which Functions each Role may
+perform. `atk` uses it when it dispatches a ticket and when it verifies a review.
+
+```jsonc
+"functions": {
+  "roles": {
+    "LEAD": ["ORCHESTRATOR"],
+    "FE": ["WORKER"],
+    "BE": ["WORKER"],
+    "QA": ["REVIEWER"]
+  },
+  "enforceNoSelfReview": true
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `roles` | `{}` | Role -> one Function or a list. Every configured Role must be a key when present; a missing Role falls back to `LEAD=ORCHESTRATOR`, `QA=REVIEWER`, anything else `WORKER`. |
+| `enforceNoSelfReview` | `true` | Refuse a review whose reviewer Agent Instance is the manifest's producer; also requires producer/reviewer identities. Set `false` only for a project that has not adopted Agent Instance ids yet. |
+
+A value may be a single string (`"QA": "REVIEWER"`) or an array
+(`"DEV": ["WORKER", "REVIEWER"]`). Unknown names are a config error. The
+separation-of-duties checks are documented in [ENTITIES.md](ENTITIES.md).
+
+The subject x operation permission matrix is **not** configurable: it lives in
+`lib/permission-registry.mjs`, is deny-by-default, and `atk permit matrix` is its
+only source. See [PERMISSIONS.md](PERMISSIONS.md).
 
 ## `gates`
 
@@ -141,6 +177,7 @@ whole flow directory, `state.json` included.
 | `qaSchemaVersion` | Schema version written into `qa-approval.json`. |
 | `idPattern` | Regex package ids must match (default requires a `PREFIX-NN` shape). |
 | `allowedPrefixes` | Top-level prefixes a batch may touch. |
+| `allowRootFiles` | `false` by default; allow root-level files (package.json, README, config) in a manifest, which prefixes cannot express. Self-hosting projects set it `true`. |
 | `budgetRounds` | Default round budget shown in tickets (default 12). |
 
 ## `branch`

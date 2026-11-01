@@ -19,6 +19,18 @@ import {
 const ROLES = ["LEAD", "FE", "BE", "QA"];
 const LOCAL_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/;
 
+const SINCE = "2026-01-01T00:00:00+00:00";
+const RUNTIME_AGENTS = [
+  { id: "agent-lead-01", role: "LEAD", capabilities: ["ORCHESTRATOR"], status: "idle", task: "", detail: "", since: SINCE },
+  { id: "agent-fe-01", role: "FE", capabilities: ["WORKER"], status: "idle", task: "", detail: "", since: SINCE },
+  { id: "agent-qa-01", role: "QA", capabilities: ["REVIEWER"], status: "idle", task: "", detail: "", since: SINCE },
+  { id: "agent-hybrid-01", role: "FE", capabilities: ["WORKER", "REVIEWER"], status: "idle", task: "", detail: "", since: SINCE },
+];
+
+function runtimeFile(agents = RUNTIME_AGENTS) {
+  return JSON.stringify({ schemaVersion: 3, updatedAt: SINCE, agents, events: [] });
+}
+
 function memoryLogger() {
   const streams = { out: [], err: [], json: [] };
   return {
@@ -240,6 +252,89 @@ test("task ticket keeps 9 lines / under 200 words and has JSON form", async (t) 
   assert.equal(ticket.gates.length, 2);
   assert.match(ticket.budget, /12/);
   assert.equal(await run(["task", "NOPE-01"], ctx), 1);
+});
+
+test("the scheduler requires an Agent Instance for a REVIEWER ticket", async (t) => {
+  const { ctx, logger } = await makeProject(t, { files: { "flow/runtime.json": runtimeFile() } });
+  assert.equal(await run(["task", "FE-01", "--for", "QA"], ctx), 1);
+  assert.match(logger.errText(), /REVIEWER ticket for FE-01 requires --agent/);
+
+  logger.streams.err.length = 0;
+  logger.streams.json.length = 0;
+  assert.equal(await run(["task", "FE-01", "--for", "QA", "--agent", "agent-qa-01", "--json"], ctx), 0);
+  const ticket = logger.lastJson();
+  assert.equal(ticket.id, "FE-01");
+  assert.equal(ticket.function, "REVIEWER");
+  assert.equal(ticket.agent, "agent-qa-01");
+});
+
+test("functions.enforceNoSelfReview=false also relaxes the dispatch rule", async (t) => {
+  const { ctx } = await makeProject(t, {
+    config: { functions: { enforceNoSelfReview: false } },
+    files: { "flow/runtime.json": runtimeFile() },
+  });
+  assert.equal(await run(["task", "FE-01", "--for", "QA"], ctx), 0);
+});
+
+test("the scheduler refuses a role reviewing a task it owns", async (t) => {
+  const state = baseState();
+  state.packages[0].owner = "QA";
+  const { ctx, logger } = await makeProject(t, {
+    state,
+    files: { "flow/runtime.json": runtimeFile() },
+  });
+  assert.equal(await run(["task", "FE-01", "--for", "QA", "--agent", "agent-qa-01"], ctx), 1);
+  assert.match(logger.errText(), /role QA owns FE-01/);
+});
+
+test("the scheduler refuses an Agent Instance reviewing its own manifest", async (t) => {
+  const manifest = {
+    schemaVersion: 1,
+    batchId: "BATCH-01",
+    packages: ["FE-01"],
+    files: [{ path: "src/ui/a.ts", kind: "modify", sourceSha256: "A".repeat(64) }],
+    manifestSha256: "B".repeat(64),
+    run: { id: "run-1", agent: "agent-hybrid-01", role: "FE", function: "WORKER", startedAt: SINCE },
+  };
+  const { ctx, logger } = await makeProject(t, {
+    files: {
+      "flow/runtime.json": runtimeFile(),
+      "artifacts/evidence/BATCH-01/manifest-aaaa.json": JSON.stringify(manifest),
+    },
+  });
+  assert.equal(await run(["task", "FE-01", "--for", "QA", "--agent", "agent-hybrid-01"], ctx), 1);
+  assert.match(logger.errText(), /already produced FE-01/);
+
+  // A different REVIEWER instance is allowed.
+  logger.streams.err.length = 0;
+  assert.equal(await run(["task", "FE-01", "--for", "QA", "--agent", "agent-qa-01"], ctx), 0);
+});
+
+test("the scheduler validates Agent Instance capabilities on a WORKER ticket", async (t) => {
+  const { ctx, logger } = await makeProject(t, { files: { "flow/runtime.json": runtimeFile() } });
+  assert.equal(await run(["task", "FE-01", "--for", "FE", "--agent", "agent-qa-01"], ctx), 1);
+  assert.match(logger.errText(), /cannot perform WORKER/);
+
+  assert.equal(await run(["task", "FE-01", "--for", "FE", "--agent", "agent-ghost-01"], ctx), 1);
+  assert.match(logger.errText(), /unknown Agent Instance/);
+});
+
+test("state check validates Agent Instance ids and capabilities", async (t) => {
+  const runtime = {
+    schemaVersion: 3,
+    updatedAt: SINCE,
+    agents: [
+      { id: "agent-a", role: "FE", capabilities: ["WORKER"] },
+      { id: "agent-a", role: "FE", capabilities: ["WORKER"] },
+      { role: "QA", capabilities: ["REVIEWER"] },
+    ],
+    events: [],
+  };
+  const { ctx } = await makeProject(t, { files: { "flow/runtime.json": JSON.stringify(runtime) } });
+  const report = await checkState(ctx);
+  assert.equal(report.ok, false);
+  assert.ok(report.errors.some((entry) => /duplicate Agent Instance id agent-a/.test(entry)));
+  assert.ok(report.warnings.some((entry) => /missing id/.test(entry)));
 });
 
 test("buildTicket and renderTicketLines are usable as a library", async (t) => {

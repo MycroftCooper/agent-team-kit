@@ -8,6 +8,56 @@ semantic versioning.
 
 ### Added
 
+- Self-hosted development setup ([docs/SELFHOSTING.md](docs/SELFHOSTING.md)):
+  the repository now has real `fast`/`quick`/`local` gates, complete
+  `ownership.json` coverage for its own directories, `batch.allowRootFiles` for
+  root-level files, and a baseline-tag + snapshot recovery path.
+- `node scripts/selfhost.mjs status|guard|snapshot|restore|tag|prepare|remove|verify`:
+  snapshot/restore of code and workflow state, isolated external candidate
+  worktrees (`../agent-team-kit-candidates/`), and integrity checks that work
+  even when `lib/` is broken (the script imports no toolkit module).
+- `scripts/selftest.mjs` (suite + optional plugin selftests) and
+  `scripts/selfhost-verify.mjs` (suite + workflow integrity for `gate local`).
+- `batch.allowRootFiles` config key: a self-hosting project can freeze
+  root-level files that path prefixes cannot express.
+- `atk gate quick` / `atk gate local` now publish the same
+  `<artifactDir>/ci-fast-latest.json` report as `gate fast`, so `batch apply`
+  and `release` can consume a green report from any gate.
+- Deny-by-default permission layer ([docs/PERMISSIONS.md](docs/PERMISSIONS.md)):
+  a 75-operation subject x operation matrix over `HUMAN`, `ORCHESTRATOR`,
+  `WORKER`, `REVIEWER` and the trusted `SYSTEM` layer, plus the ordered
+  `RBAC ∧ Scope ∧ Ownership ∧ State ∧ Policy ∧ Approval` evaluation with
+  machine-readable reason codes (`ROLE_DENIED`, `WRITE_SCOPE_VIOLATION`,
+  `SELF_REVIEW_DENIED`, `APPROVAL_REQUIRED`, ...).
+- `atk permit matrix|explain|check|audit`: query the matrix, inspect a cell,
+  evaluate a decision before acting, and read the append-only decision trail at
+  `<artifactDir>/permission-audit.jsonl`.
+- Permission enforcement inside existing commands: `task.claim` on task
+  dispatch, `qa.manifest.freeze` on manifest freeze, `qa.result.submit` on QA
+  verify, `integration.merge.development` on real applies, and
+  `integration.archive` on archive.
+- Strict integration: `atk batch apply --apply --confirm-dev-closed` now
+  requires a QA approval bound to the manifest (and a green quick/local gate
+  report when those gates are configured); the dry-run plan stays available
+  without evidence.
+- Tests for the registry, matrix spot checks, deny-by-default, reason codes,
+  write scope, review independence, gate proof, append-only audit and the
+  `atk permit` CLI surface.
+- Entity model ([docs/ENTITIES.md](docs/ENTITIES.md)): Project, Role, Agent
+  Instance, Task and Run, plus the `ORCHESTRATOR` / `WORKER` / `REVIEWER`
+  Functions. Roles declare their Functions in the new `functions` config section;
+  Agent Instances carry `id` + `capabilities` in `runtime.json` (schema version 3).
+- Scheduler-enforced separation of duties: `atk state task --for <REVIEWER role>`
+  requires `--agent <id>` and refuses a role-owned task or a known producer;
+  `atk batch manifest --agent <id>` records the producing Run; `atk batch
+  verify`/`apply` refuse a self-review, a missing producer/reviewer identity, an
+  unregistered instance, or a capability mismatch; `atk evidence` never counts a
+  provably self-reviewed approval. `functions.enforceNoSelfReview` is the
+  documented escape hatch.
+- `atk init` writes the Function map and one Agent Instance per Role, and the
+  generated role table gains a Function column.
+- Tests for the identity checks, review-dispatch refusals, evidence rejection and
+  the new config surface.
 - `branch` config section (development/release/tagPrefix/versionFile/gateReport/
   requireCleanTree) with dev -> master defaults, scaffolded into every project by
   `atk init` (the kit repository itself keeps its single-branch flow).
@@ -17,6 +67,18 @@ semantic versioning.
 - Generated flow docs (README and commands cheat sheet, both languages) document
   the branch model and release command; `test/release.test.mjs` covers dry-run,
   version mismatch, wrong branch and apply.
+
+### Changed
+
+- `runtime.json` moves to schema version 3 (`id` + `capabilities` per Agent
+  Instance). Existing version 2 files still load, but `atk state check` warns
+  about missing ids and a review cannot pass the identity checks until every
+  instance is registered.
+- `qa-approval.json` should carry a `reviewer` identity block and manifests
+  should carry a `run` identity block. A manifest frozen without `--agent` no
+  longer passes a QA review while the no-self-review rule is enforced.
+- The role-change recipe (`docs/ROLES.md`, `agent-team-roles` skill) gains the
+  `functions.roles` edit and an Agent Instance entry with an id.
 
 ### Fixed
 

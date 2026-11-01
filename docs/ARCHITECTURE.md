@@ -22,6 +22,28 @@ enforce:
                    +---------------------------------------+
 ```
 
+## 0. Entities and Functions
+
+Above the four layers sits a small coordination model: **Project**, **Role**,
+**Agent Instance**, **Task** and **Run**, with three Functions —
+`ORCHESTRATOR` / `WORKER` / `REVIEWER`. A Role declares the Functions it may
+perform, an Agent Instance declares the Functions it supports, and a Run records
+the one it performed.
+
+The scheduler (`atk`) enforces the model's hard rule: **an Agent Instance may not
+review the code it produced.** Review dispatches require `--agent <id>`; the
+frozen manifest records the producing run; the QA approval records the reviewing
+run; `atk batch verify` / `apply` refuse a self-review; `atk evidence` refuses to
+count a provably self-reviewed approval. [ENTITIES.md](ENTITIES.md) is the
+reference; the data contracts are in [INTERNALS.md](INTERNALS.md).
+
+The same scheduler applies the **permission layer**: subjects `HUMAN`, the three
+Agent Functions and the trusted `SYSTEM` layer are mapped against every operation
+in a deny-by-default matrix. `atk permit check` evaluates
+`RBAC ∧ Scope ∧ Ownership ∧ State ∧ Policy ∧ Approval`, returns a machine-readable
+reason code, and appends the decision to an audit trail. [PERMISSIONS.md](PERMISSIONS.md)
+owns the matrix and the enforcement points.
+
 ## 1. State machine — `state.json` + `atk`
 
 `state.json` is the single source of truth: one `batch`, its `slices`, the active
@@ -80,6 +102,8 @@ The only write the board interface may perform is ticking a **human-only** todo.
 |---|---|
 | CLI / context | `bin/atk.mjs`, `lib/dispatch.mjs`, `lib/context.mjs` |
 | Config / labels | `lib/config.mjs`, `lib/labels.mjs`, `lib/util.mjs` |
+| Entities / Functions | `lib/functions.mjs` (taxonomy, runtime agents, separation-of-duties checks) |
+| Permissions | `lib/permission-registry.mjs` (matrix), `lib/permissions.mjs` (decision pipeline, audit, `atk permit`) |
 | State machine | `lib/state.mjs`, `lib/human-todos.mjs`, `lib/evidence.mjs` |
 | Batch / gates | `lib/batch.mjs`, `lib/gate.mjs`, `lib/select-tests.mjs`, `lib/baseline.mjs`, `lib/ownership.mjs` |
 | Board / plugin | `lib/board.mjs`, `lib/plugin.mjs`, `plugins/dsh-agent-board/` |

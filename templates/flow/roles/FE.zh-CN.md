@@ -19,7 +19,8 @@
 2. 建候选快照，只在候选里改。
 3. 实现 + 定向测试，零多余改动。
 4. 跑 `atk gate fast --files <改动> --role FE`。
-5. 用 `atk batch manifest --candidate <dir> --paths <改动> --packages <ID>` 冻结。
+5. 用 `atk batch manifest --candidate <dir> --paths <改动> --packages <ID> --agent <实例 id>` 冻结。
+   `--agent` 身份让 QA 能证明自己不是审查自己的代码。
 6. 交 6 行回执，等 QA；不要改已冻结快照。
 
 ## 回执格式（6 行）
@@ -40,7 +41,7 @@ atk queue --for FE
 atk select-tests --files <改动>
 atk gate fast --files <改动> --role FE
 atk ownership map <路径>
-atk batch manifest --candidate <dir> --paths <改动> --packages <ID>
+atk batch manifest --candidate <dir> --paths <改动> --packages <ID> --agent <实例 id>
 ```
 
 ## 轮次预算

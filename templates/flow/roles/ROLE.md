@@ -3,6 +3,13 @@
 > This is the generic role card. Customize it for your project; it is generated
 > once by `atk init` and never rewritten afterwards.
 
+## Function
+
+`{{FUNCTION}}` - declared under `functions.roles` in `agent-flow.config.json`.
+If the Function is `REVIEWER`, the dispatch requires `--agent <id>`, and the
+scheduler refuses reviewing a task your Role owns or a manifest your own Agent
+Instance produced. Never work around a `no-self-review` refusal.
+
 ## Write scope
 
 The paths assigned to {{ROLE}} in `ownership.json`. Check with

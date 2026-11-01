@@ -37,12 +37,30 @@ agent-team-kit 是一个**带角色合同与证据门禁的状态机**，外加�
    `atk serve`（文件监听 + SSE）、DSH 插件（同源只读路由）。三者都直接读
    `state.json`，看板永远不是输入；唯一可写回的是人工勾选人类待办。
 
+## 实体与 Function
+
+四层之上是一套协作模型：**Project / Role / Agent Instance / Task / Run**，以及
+`ORCHESTRATOR` / `WORKER` / `REVIEWER` 三个 Function。Role 声明可承担的 Function，
+Agent Instance（`runtime.json`）声明 `id` 与 `capabilities`，Run 由回执物化。
+
+调度器 （`atk`）强制执行硬规则：**同一个 Agent Instance 不允许审查自己产出的代码。**
+审查派单必须带 `--agent`；manifest 记录产出 Run；`qa-approval.json` 记录审查者；
+`atk batch verify/apply` 拒绝自审；`atk evidence` 不会把可证明的自审批准计入
+`qaPassed`。详见 [ENTITIES.zh-CN.md](ENTITIES.zh-CN.md)。
+
+同一调度器还执行**权限层**：用户、三个 Agent Function 与受控 `SYSTEM` 主体，对每项操作
+按默认拒绝矩阵判定；`atk permit check` 按
+`RBAC ∧ Scope ∧ Ownership ∧ State ∧ Policy ∧ Approval` 求值，返回机器可识别原因码，
+并把决策追加到审计文件。矩阵与强制点见 [PERMISSIONS.zh-CN.md](PERMISSIONS.zh-CN.md)。
+
 ## 模块地图
 
 | 层 | 模块 |
 |---|---|
 | CLI / 上下文 | `bin/atk.mjs`、`lib/dispatch.mjs`、`lib/context.mjs` |
 | 配置 / 标签 | `lib/config.mjs`、`lib/labels.mjs`、`lib/util.mjs` |
+| 实体 / Function | `lib/functions.mjs`（分类、运行时实例、职责分离检查） |
+| 权限 | `lib/permission-registry.mjs`（矩阵）、`lib/permissions.mjs`（判定流程、审计、`atk permit`） |
 | 状态机 | `lib/state.mjs`、`lib/human-todos.mjs`、`lib/evidence.mjs` |
 | 批次 / 门禁 | `lib/batch.mjs`、`lib/gate.mjs`、`lib/select-tests.mjs`、`lib/baseline.mjs`、`lib/ownership.mjs` |
 | 看板 / 插件 | `lib/board.mjs`、`lib/plugin.mjs`、`plugins/dsh-agent-board/` |

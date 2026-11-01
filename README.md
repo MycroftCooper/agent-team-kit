@@ -14,6 +14,15 @@ missing receipts, and a kanban board with a DeepSeek Harness plugin.
   `agent-flow.config.json`; no project knowledge is hard-coded.
 - **Agent-friendly.** 9-line tickets, 6-line receipts, a queue command per role,
   a compact board view and three installable skills.
+- **Enforced independence.** Roles declare Functions (`ORCHESTRATOR` / `WORKER` /
+  `REVIEWER`); Agent Instances carry ids and capabilities; the scheduler refuses
+  a review from the instance that produced the manifest. See
+  [docs/ENTITIES.md](docs/ENTITIES.md).
+- **Deny-by-default permissions.** A subject x operation registry (`HUMAN`, the
+  three Functions and the trusted `SYSTEM` layer) decides every sensitive
+  action; `atk permit check` returns machine-readable reason codes, and every
+  decision is appended to an audit trail. See
+  [docs/PERMISSIONS.md](docs/PERMISSIONS.md).
 
 ## 60-second quickstart
 
@@ -83,6 +92,7 @@ Read more in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `atk serve` | live board (file watch + SSE, polling fallback) |
 | `atk evidence [--collect-temp\|--dry]` | derive acceptance facts from receipts |
 | `atk ownership map\|check\|verify-config` | write-scope checks |
+| `atk permit matrix\|check\|explain\|audit` | deny-by-default permission decisions and audit |
 | `atk batch manifest\|verify\|apply` | freeze / verify / apply a candidate batch |
 | `atk baseline start\|changed` | change baseline that does not need git commits |
 | `atk cache status\|clean` | inspect and clean shared build caches |
@@ -128,6 +138,9 @@ node bin/atk.mjs --cwd examples/minimal board
 
 - [Quickstart](docs/QUICKSTART.md) · [中文摘要](docs/QUICKSTART.zh-CN.md)
 - [Architecture](docs/ARCHITECTURE.md) · [中文摘要](docs/ARCHITECTURE.zh-CN.md)
+- [Entities and Functions](docs/ENTITIES.md) · [中文摘要](docs/ENTITIES.zh-CN.md)
+- [Permissions](docs/PERMISSIONS.md) · [中文摘要](docs/PERMISSIONS.zh-CN.md)
+- [Self-hosting](docs/SELFHOSTING.md) · [中文摘要](docs/SELFHOSTING.zh-CN.md)
 - [Configuration](docs/CONFIG.md)
 - [Roles and write scopes](docs/ROLES.md)
 - [Workflow](docs/WORKFLOW.md) · [中文摘要](docs/WORKFLOW.zh-CN.md)

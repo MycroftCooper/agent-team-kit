@@ -9,6 +9,12 @@ ticket -> candidate -> freeze -> QA -> verify -> apply -> evidence -> archive
   LEAD      author      executor   QA    QA     integrator  evidence   LEAD
 ```
 
+Roles are permission templates; the work is performed by named **Agent
+Instances** (`runtime.json`) that declare the **Functions** they support. The
+manifest records the producing `WORKER` run and the QA approval records the
+reviewing `REVIEWER` run, which is how the scheduler proves independence. See
+[ENTITIES.md](ENTITIES.md).
+
 ## 0. Open the batch (LEAD)
 
 `state.json` records one batch: `id`, `goal`, `stopCondition`, `openQuestions` and
@@ -26,6 +32,10 @@ atk task <ID> --for <ROLE> --message
 The output is the 9-line ticket: task / scope / write scope / depends on / exit /
 do not / gates / evidence / budget. Forward it in one message. Do not attach a
 summary — the ticket is the message.
+
+The dispatch is permission-checked (`task.claim`); requesting a ticket for a task
+the acting Role does not participate in is refused with a reason code. See
+[PERMISSIONS.md](PERMISSIONS.md).
 
 Exit condition: the executor can answer "what do I change, what must pass, when do
 I stop" from the ticket alone.
@@ -57,8 +67,15 @@ match never ran. Write down what ran and what did not.
 ## 4. Freeze (executor)
 
 ```bash
-atk batch manifest --candidate <dir> --paths <changed> --packages <ID>
+atk batch manifest --candidate <dir> --paths <changed> --packages <ID> --agent <agent-id> [--contributors a,b]
 ```
+
+`--agent` records the producing Agent Instance and its Role in `manifest.run`;
+`--contributors` lists additional Agent Instances that helped produce the
+candidate. Without `--agent` the manifest still freezes, but it can never pass a
+QA review: the scheduler has no identity to compare the reviewer against. Pass
+`--function` only for a non-`WORKER` run (for example an orchestrator producing
+config changes).
 
 The manifest records the manifest tag, batch id, and a sorted line per file
 (path, kind, source sha, expected-original sha) plus `manifestSha256`. Copy the
@@ -70,14 +87,29 @@ the bytes named in the manifest.
 QA verifies the frozen manifest only:
 
 ```bash
+atk task <ID> --for QA --agent <qa-agent-id>   # review dispatch: --agent is required
 atk ownership check --role QA
 atk batch verify --manifest <manifest.json> --qa <previous-or-omit>
 ```
 
+The review dispatch refuses without `--agent`, and refuses when the task belongs
+to QA's own role or when a manifest already names that instance as the producer.
+
 Then the semantic pass: boundaries, honest mocks, `partial`/`unknown` reporting,
 single-writer preserved. QA writes `qa-approval.json`, binding the current
-`manifestSha256`, and stores it in the evidence directory. A changed hash voids
-any previous approval.
+`manifestSha256` and recording the reviewing Run:
+
+```jsonc
+{
+  "manifestSha256": "...",
+  "passed": true,
+  "originalApplied": false,
+  "reviewer": { "agent": "agent-qa-01", "role": "QA", "function": "REVIEWER" }
+}
+```
+
+A changed hash voids any previous approval, and a reviewer that produced the
+manifest voids the approval entirely (see [ENTITIES.md](ENTITIES.md)).
 
 Exit condition: PASS/FAIL plus concrete gaps and the approval JSON path; no edits
 to product code.
@@ -86,7 +118,10 @@ to product code.
 
 `atk batch verify --manifest <f> --qa <f>` fails on: stale manifest, candidate
 changed since freeze, QA approval not bound to the manifest hash, or drift in the
-original tree. Treat any of those as a stop, not a retry.
+original tree. It also fails the identity checks — missing producer/reviewer
+identity, an instance absent from `runtime.json`, a capability the declared
+Function needs, or a reviewer that produced the manifest (`no-self-review`).
+`atk batch apply` runs the same checks. Treat any of them as a stop, not a retry.
 
 ## 7. Apply (integrator only)
 
@@ -101,6 +136,13 @@ Apply requires **both** `--apply` and `--confirm-dev-closed`; the second flag is
 the explicit user confirmation that the dev server / app is closed. On drift the
 command exits `3` and changes nothing. Never carry an unverified slice into an
 apply.
+
+A real apply is also the permission-checked operation
+`integration.merge.development`: it refuses without a QA approval bound to the
+manifest, and (when `gates.quick` / `gates.local` are configured) without a green
+gate report. The dry-run plan stays available. The denial carries a reason code
+(`REVIEW_EVIDENCE_INVALID`, `GATE_NOT_GREEN`, `APPROVAL_REQUIRED`, ...); see
+[PERMISSIONS.md](PERMISSIONS.md).
 
 ## 8. Evidence (LEAD)
 

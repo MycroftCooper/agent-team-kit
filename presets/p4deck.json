@@ -25,6 +25,15 @@
     "handoffDoc": "ForAIDoc/PM/并行交接.md"
   },
   "roles": ["LEAD", "FE", "BE", "QA"],
+  "functions": {
+    "roles": {
+      "LEAD": ["ORCHESTRATOR"],
+      "FE": ["WORKER"],
+      "BE": ["WORKER"],
+      "QA": ["REVIEWER"]
+    },
+    "enforceNoSelfReview": true
+  },
   "gates": {
     "fast": {
       "parallel": true,

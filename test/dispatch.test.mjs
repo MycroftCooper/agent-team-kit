@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import { runCli, usageText, VERSION } from "../lib/dispatch.mjs";
 import { memoryLogger } from "./helpers.mjs";
@@ -40,7 +43,10 @@ test("unknown command exits 2 and explains", async () => {
 
 test("a command without a config reports a ConfigError instead of crashing", async () => {
   const log = memoryLogger();
-  const code = await runCli(["board", "--cwd", process.cwd()], { logger: log });
+  // A fresh temp directory, so the assertion does not depend on whether the
+  // checkout itself has been scaffolded with `atk init`.
+  const dir = await mkdtemp(path.join(os.tmpdir(), "atk-noconfig-"));
+  const code = await runCli(["board", "--cwd", dir], { logger: log });
   assert.equal(code, 2);
   assert.match(log.errorText(), /No agent-flow config found/);
 });

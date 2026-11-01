@@ -12,6 +12,12 @@
   代码里没有项目私有知识。
 - **对 agent 友好**：9 行任务单、6 行回执、每角色一个队列命令、极简看板视图，
   以及三个可安装的 skill。
+- **强制职责分离**：Role 声明 Function（`ORCHESTRATOR` / `WORKER` / `REVIEWER`），
+  Agent Instance 携带 id 与 capabilities；调度器拒绝让产出 manifest 的实例审查自己。
+  见 [docs/ENTITIES.zh-CN.md](docs/ENTITIES.zh-CN.md)。
+- **默认拒绝的权限层**：用户 / 三个 Function / 受控 `SYSTEM` 主体 × 操作矩阵决定每个
+  敏感动作；`atk permit check` 返回机器可识别原因码，所有决策追加到审计文件。
+  见 [docs/PERMISSIONS.zh-CN.md](docs/PERMISSIONS.zh-CN.md)。
 
 ## 60 秒开始
 
@@ -79,6 +85,7 @@ atk evidence                             # 从回执派生 qaPassed / applied
 | `atk serve` | 实时看板（文件监听 + SSE，兜底轮询） |
 | `atk evidence [--collect-temp\|--dry]` | 从回执派生验收事实 |
 | `atk ownership map\|check\|verify-config` | 写域检查 |
+| `atk permit matrix\|check\|explain\|audit` | 默认拒绝的实体权限判定与审计 |
 | `atk batch manifest\|verify\|apply` | 冻结 / 校验 / 应用候选批次 |
 | `atk baseline start\|changed` | 不依赖 git commit 的改动基线 |
 | `atk cache status\|clean` | 查看 / 清理共享构建缓存 |
@@ -120,6 +127,9 @@ node bin/atk.mjs --cwd examples/minimal board
 
 - [快速开始](docs/QUICKSTART.zh-CN.md)（[English](docs/QUICKSTART.md)）
 - [架构](docs/ARCHITECTURE.zh-CN.md)（[English](docs/ARCHITECTURE.md)）
+- [实体与 Function](docs/ENTITIES.zh-CN.md)（[English](docs/ENTITIES.md)）
+- [实体权限](docs/PERMISSIONS.zh-CN.md)（[English](docs/PERMISSIONS.md)）
+- [自举开发](docs/SELFHOSTING.zh-CN.md)（[English](docs/SELFHOSTING.md)）
 - [配置](docs/CONFIG.md) · [角色与写域](docs/ROLES.md) ·
   [工作流](docs/WORKFLOW.zh-CN.md)（[English](docs/WORKFLOW.md)）
 - [看板与插件](docs/BOARD.md) · [迁移](docs/MIGRATION.md) ·

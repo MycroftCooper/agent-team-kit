@@ -1,0 +1,106 @@
+{
+  "schemaVersion": 1,
+  "note": "Self-hosted agent-team-kit repository: path prefixes -> role. Longest prefix wins; one role per path.",
+  "roles": [
+    "LEAD",
+    "DEV",
+    "QA"
+  ],
+  "ignoredPrefixes": [
+    ".cache/",
+    ".git/",
+    "artifacts/",
+    "build/",
+    "coverage/",
+    "dist/",
+    "node_modules/",
+    "playwright-report/",
+    "target/",
+    "test-results/",
+    ".agent-flow/.backup/",
+    "tools/agent-board/"
+  ],
+  "rules": [
+    {
+      "prefix": ".agent-flow/",
+      "role": "LEAD",
+      "note": "workflow state, batches, tickets and role contracts"
+    },
+    {
+      "prefix": ".github/",
+      "role": "LEAD",
+      "note": "repository automation and CI"
+    },
+    {
+      "prefix": "bin/",
+      "role": "DEV",
+      "note": "CLI entry point"
+    },
+    {
+      "prefix": "docs/",
+      "role": "LEAD",
+      "note": "documentation, workflow and architecture pages"
+    },
+    {
+      "prefix": "examples/",
+      "role": "DEV",
+      "note": "committed example projects and fixtures"
+    },
+    {
+      "prefix": "lib/",
+      "role": "DEV",
+      "note": "toolkit product code and adjacent modules"
+    },
+    {
+      "prefix": "plugins/",
+      "role": "DEV",
+      "note": "legacy DSH board plugin (removed in the local-service UI batch)"
+    },
+    {
+      "prefix": "presets/",
+      "role": "DEV",
+      "note": "scaffolding presets"
+    },
+    {
+      "prefix": "scripts/",
+      "role": "LEAD",
+      "note": "build, gate and self-host tooling"
+    },
+    {
+      "prefix": "skills/",
+      "role": "LEAD",
+      "note": "agent skill contracts"
+    },
+    {
+      "prefix": "templates/",
+      "role": "DEV",
+      "note": "generated flow templates and role cards"
+    },
+    {
+      "prefix": "test/",
+      "role": "QA",
+      "note": "acceptance tests and evidence checks"
+    },
+    {
+      "prefix": "tools/",
+      "role": "LEAD",
+      "note": "local install/tooling directories"
+    }
+  ],
+  "rootFiles": {
+    "role": "LEAD",
+    "names": [
+      "agent-flow.config.json",
+      "agent-flow.config.schema.json",
+      "package.json",
+      "package-lock.json",
+      "LICENSE",
+      "README.md",
+      "README.zh-CN.md",
+      "CHANGELOG.md",
+      ".gitignore",
+      ".gitattributes",
+      ".editorconfig"
+    ]
+  }
+}

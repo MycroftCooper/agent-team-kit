@@ -54,6 +54,7 @@ sub-command is missing) and return `2` in that case.
 | `atk board` / `atk serve` | `lib/board.mjs` | `--serve`, `--json`, `--compact` |
 | `atk evidence` | `lib/evidence.mjs` | `--collect-temp`, `--dry` |
 | `atk ownership` | `lib/ownership.mjs` | `map`, `check`, `verify-config` |
+| `atk permit` | `lib/permissions.mjs` (+ `lib/permission-registry.mjs`) | `matrix`, `explain`, `check`, `audit` |
 | `atk batch` | `lib/batch.mjs` | `manifest`, `verify`, `apply` |
 | `atk baseline` | `lib/baseline.mjs` | `start`, `changed` |
 | `atk cache` | `lib/cache.mjs` | `status`, `clean` |
@@ -142,18 +143,86 @@ document it. Do not auto-tick anywhere.
 ### 4.4 `runtime.json`
 
 ```jsonc
-{ "schemaVersion": 2, "updatedAt": "...", "note": "...",
-  "agents": [{ "role": "BE", "status": "working|waiting|idle", "task": "...", "detail": "...", "since": "..." }],
+{ "schemaVersion": 3, "updatedAt": "...", "note": "...",
+  "agents": [{ "id": "agent-be-01", "role": "BE", "capabilities": ["WORKER"],
+               "status": "working|waiting|idle", "task": "...", "detail": "...", "since": "..." }],
   "events": [{ "at": "...", "role": "LEAD", "text": "..." }] }
 ```
+
+`id` is the Agent Instance identity used by the scheduler; `capabilities` lists
+the Functions that instance may perform. `schemaVersion: 2` files (no id) still
+load, but `atk state check` warns and identity checks cannot pass. `atk init`
+writes one instance per Role with `<role>` lower-cased in the id.
 
 ### 4.5 batch manifest (`atk batch manifest`) — keep the existing format
 
 Line 1 `p4deck-manifest-v1` (or `batch.manifestTag`), line 2 batch id, then the
 same fields as `scripts/workflow/batch.mjs` produces (`candidate`, `paths`,
 `files[{path,sha256,size}]`, `manifestSha256` over the deterministic payload).
+The frozen hash covers the tag, the batch id and the file lines only, so adding
+the optional `run` block does not change `manifestSha256`:
+
+```jsonc
+"run": { "id": "run-20261102-001", "agent": "agent-be-01", "role": "BE",
+         "function": "WORKER", "startedAt": "...",
+         "contributors": ["agent-be-02"] }
+```
+
 `qa-approval.json` binds `manifestSha256`; do not change either format without a
-version bump + migration note.
+version bump + migration note. Root-level paths are accepted only when
+`batch.allowRootFiles` is `true` (prefixes cannot express them). Every gate —
+`fast`, `quick`, `local` — writes `<artifactDir>/ci-fast-latest.json`, which
+`batch apply` and `release` consume as the latest green report. Since the entity model it also carries the
+reviewing Run:
+
+```jsonc
+{ "manifestSha256": "...", "passed": true, "originalApplied": false,
+  "reviewer": { "agent": "agent-qa-01", "role": "QA", "function": "REVIEWER" } }
+```
+
+`verifyManifest` adds these checks when a QA approval is supplied and
+`functions.enforceNoSelfReview` is not `false`: `producer-identity`,
+`reviewer-identity`, `producer-function`, `reviewer-function`, `no-self-review`,
+`producer-registered`, `reviewer-registered`, `producer-capability`,
+`reviewer-capability`, `producer-role-match`, `reviewer-role-match`,
+`reviewer-role-capability`. `atk evidence` ignores an approval whose reviewer is
+the manifest's producer. `atk state task` refuses a REVIEWER dispatch without
+`--agent`, when the target Role owns the task, or when a manifest under
+`evidenceDir` records the same instance as producer.
+
+### 4.6 `functions` config
+
+`agent-flow.config.json` carries `functions.roles` (Role -> Function(s), with
+`LEAD=ORCHESTRATOR`, `QA=REVIEWER`, otherwise `WORKER` defaults) and
+`functions.enforceNoSelfReview` (default `true`). `lib/functions.mjs` is the only
+module that owns the taxonomy; `config.mjs` normalizes it so every consumer sees
+a Function list for every Role.
+
+### 4.7 permission audit (`atk permit`)
+
+The subject x operation matrix is code-owned in `lib/permission-registry.mjs`
+(five-character rows in `HUMAN/ORCHESTRATOR/WORKER/REVIEWER/SYSTEM` order, plus
+conditions for conditional cells); it is not configurable per project.
+`lib/permissions.mjs` evaluates
+`RBAC ∧ Scope ∧ Ownership ∧ State ∧ Policy ∧ Approval` in the fixed order from
+[docs/PERMISSIONS.md](PERMISSIONS.md), returns a reason code, and appends every
+decision to `<artifactDir>/permission-audit.jsonl`:
+
+```jsonc
+{ "schemaVersion": 1, "matrixVersion": 1, "at": "...", "entry": "command",
+  "operation": "qa.result.submit", "subject": "REVIEWER", "subjectKind": "agent",
+  "role": "QA", "agent": "agent-qa-01", "action": "C", "allowed": true,
+  "reason": "ALLOWED", "task": "PKG-01", "project": "demo" }
+```
+
+The file is append-only (`appendFile`, never rewritten); `audit.modify` is denied
+for every subject. `atk permit check` exits `0` allowed, `1` denied, `2`
+usage/config error.
+
+Enforcement inside existing commands: `state task` (`task.claim`),
+`batch manifest` (`qa.manifest.freeze`), `batch verify` (`qa.result.submit`),
+`batch apply` writes (`integration.merge.development`), `state archive`
+(`integration.archive`).
 
 ## 5. Board rendering
 

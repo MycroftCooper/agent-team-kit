@@ -54,6 +54,10 @@ async function addDesignRole(project) {
   const { flow } = project;
   const config = await readJson(path.join(project.root, "agent-flow.config.json"));
   config.roles = ["LEAD", "DESIGN", "DEV", "QA"];
+  config.functions = {
+    ...config.functions,
+    roles: { ...config.functions.roles, DESIGN: ["WORKER"] },
+  };
   await writeJson(path.join(project.root, "agent-flow.config.json"), config);
 
   const ownershipPath = path.join(flow, "ownership.json");
@@ -85,8 +89,8 @@ async function addDesignRole(project) {
   const readme = await readFile(readmePath, "utf8");
   const updated = readme
     // init's fallback rule gave design/ to DEV; the new role takes it over.
-    .replace(/^\| DEV \| design\/, src\/ \|/m, "| DEV | src/ |")
-    .replace(/^\| DEV \|/m, "| DESIGN | design/ | Owns design tokens, specs and prototypes. |\n| DEV |");
+    .replace(/^\| DEV \| WORKER \| design\/, src\/ \|/m, "| DEV | WORKER | src/ |")
+    .replace(/^\| DEV \| WORKER \|/m, "| DESIGN | WORKER | design/ | Owns design tokens, specs and prototypes. |\n| DEV | WORKER |");
   assert.notEqual(updated, readme, "the role table should contain init's fallback rule for design/");
   assert.equal(updated.match(/design\//g).length, 1, "design/ must be listed exactly once");
   await writeFile(readmePath, updated, "utf8");
@@ -156,6 +160,9 @@ test("removing a role updates every machine-enforced record", async (t) => {
   const configPath = path.join(project.root, "agent-flow.config.json");
   const config = await readJson(configPath);
   config.roles = ["LEAD", "DEV"];
+  // The Function map is part of the machine-enforced record: a removed role
+  // must not stay behind, or `validateConfig` rejects the config.
+  delete config.functions.roles.QA;
   await writeJson(configPath, config);
 
   const ownershipPath = path.join(project.flow, "ownership.json");

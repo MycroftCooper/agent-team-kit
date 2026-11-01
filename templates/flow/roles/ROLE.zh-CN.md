@@ -2,6 +2,12 @@
 
 > 这是通用角色卡。请按项目需要修改；`atk init` 只生成一次，之后不会覆盖。
 
+## Function
+
+`{{FUNCTION}}` —— 在 `agent-flow.config.json` 的 `functions.roles` 中声明。
+若 Function 为 `REVIEWER`，派单必须带 `--agent <id>`；调度器会拒绝审查自己 Role
+拥有的任务，或自己实例产出的 manifest。不要绕过 `no-self-review` 拒绝。
+
 ## 写域
 
 `ownership.json` 中分配给 {{ROLE}} 的路径。拿不准时用 `atk ownership map <路径>`；

@@ -5,21 +5,24 @@ description: Reshape the agent team of an initialized agent-team-kit project - a
 
 # Agent team roles
 
-A role (agent) is four machine records that must agree, plus one human-readable
+A role (agent) is five machine records that must agree, plus one human-readable
 copy (the flow README table):
 
 | Record | Source of truth for |
 |---|---|
 | `agent-flow.config.json` -> `roles` | which ids exist, their board order, what `atk queue/task --for` accept |
+| `agent-flow.config.json` -> `functions.roles` | which Functions the role may perform (`ORCHESTRATOR` / `WORKER` / `REVIEWER`) |
 | `<flowDir>/ownership.json` -> `roles`, `rules`, `rootFiles` | which paths the role may write |
 | `<flowDir>/roles/<ROLE>.md` | what the agent reads: scope intent, bans, task loop, 6-line receipt, round budget, proof ladder |
-| `<flowDir>/runtime.json` -> `agents` | who the board and `atk serve` show as working now |
+| `<flowDir>/runtime.json` -> `agents` | the Agent Instance id, its `capabilities`, and who the board/`atk serve` show as working now |
 
 Ownership decides, the card explains. When they disagree, fix the card. A role
 that exists in only some of these places produces silent bugs: a missing config
-entry makes `atk queue --for X` fail, a missing runtime entry hides the role from
-the board, a stale runtime entry shows a ghost, and a stale ownership rule makes
-`atk ownership verify-config` fail.
+entry makes `atk queue --for X` fail, a missing `functions.roles` entry silently
+demotes the role to `WORKER`, a missing runtime entry hides the role from the
+board, a stale runtime entry shows a ghost, and a stale ownership rule makes
+`atk ownership verify-config` fail. See [docs/ENTITIES.md](../../docs/ENTITIES.md)
+for the entity model and the no-self-review rule the scheduler enforces.
 
 Run every command from the project root. `atk` below means whichever invocation
 the project uses: `atk`, `npx agent-team-kit`, or `node <checkout>/bin/atk.mjs`.
@@ -114,7 +117,7 @@ Proposal rules:
 
 ## Step 2 - Add a role
 
-Five record edits, then re-render and verify. Example: `DESIGN` owning `design/`.
+Six record edits, then re-render and verify. Example: `DESIGN` owning `design/`.
 
 1. **Config** - insert the id where it should display:
 
@@ -122,7 +125,19 @@ Five record edits, then re-render and verify. Example: `DESIGN` owning `design/`
    "roles": ["LEAD", "DESIGN", "DEV", "QA"]
    ```
 
-2. **Ownership** - keep both lists in sync, then **reassign an existing rule or
+2. **Functions** - give the role its Function(s) in the same config:
+
+   ```jsonc
+   "functions": {
+     "roles": { "LEAD": ["ORCHESTRATOR"], "DESIGN": ["WORKER"], "DEV": ["WORKER"], "QA": ["REVIEWER"] }
+   }
+   ```
+
+   A role omitted from the map falls back to `WORKER`; a role used for review
+   needs `REVIEWER`, or `atk task --for <ROLE>` refuses to dispatch its review
+   tickets.
+
+3. **Ownership** - keep both lists in sync, then **reassign an existing rule or
    add a new one**. `atk init` assigns every top-level directory to some role, so
    the prefix you want is often already there with a fallback note
    (`unclassified top-level directory - review this rule`). Change that rule's
@@ -144,27 +159,32 @@ Five record edits, then re-render and verify. Example: `DESIGN` owning `design/`
    does not satisfy `verify-config` ("has no write scope"), so a root-files-only
    role still needs one rule.
 
-3. **Card** - write `<flowDir>/roles/<ROLE>.md` using the skeleton at the end of
+4. **Card** - write `<flowDir>/roles/<ROLE>.md` using the skeleton at the end of
    this skill (skip the three sections that do not apply, keep the contract
    sections). For a `zh-CN` project use the Chinese section headings other cards
    use: 写域 / 禁做 / 任务循环 / 回执格式 / 命令 / 轮次预算 / 证据阶梯.
 
-4. **Runtime** - add an idle entry so `atk board` (HTML), `atk board --json` and
-   `atk serve` show the role (the Markdown `board.md` has no agents section):
+5. **Runtime** - add an idle Agent Instance so the scheduler can dispatch to it
+   and the board shows it (`atk board --json` / `atk serve`; the Markdown
+   `board.md` has no agents section):
 
    ```jsonc
-   { "role": "DESIGN", "status": "idle", "task": "", "detail": "", "since": "<ISO-8601 timestamp>" }
+   { "id": "agent-design-01", "role": "DESIGN", "capabilities": ["WORKER"],
+     "status": "idle", "task": "", "detail": "", "since": "<ISO-8601 timestamp>" }
    ```
 
-5. **Flow README** - add a row to the role table (`## Roles and write scopes`;
-   `## 角色与写域` in a `zh-CN` project):
-   `| DESIGN | design/ | Owns design tokens, specs and prototypes. |`
+   The `id` is the instance the scheduler names in `--agent`; `capabilities` must
+   include every Function the role will perform.
+
+6. **Flow README** - add a row to the role table (`## Roles and write scopes`;
+   `## 角色与写域` in a `zh-CN` project; the table has a Function column):
+   `| DESIGN | WORKER | design/ | Owns design tokens, specs and prototypes. |`
    If the prefix moved from another role, fix that role's row too - a table that
    gives one path to two roles reintroduces the silent bug this skill prevents.
    If the flow directory has no `README.md` or no `roles/` yet (the committed demo
    project is one example), create them in the same shape as the templates.
 
-6. Re-render the board (`state board` writes `board.md`; `board` writes only
+7. Re-render the board (`state board` writes `board.md`; `board` writes only
    `board.html`, the file with the agents panel):
 
    ```bash
@@ -193,7 +213,8 @@ config in the same change:
 - **Merge two roles** - reassign every rule of the loser to the survivor, then
   remove the loser (Step 4).
 - **Rename** - ids are keys, so a rename is an add plus a remove. Add the new id
-  everywhere first, move the rules/card/agents entry, then remove the old id
+  everywhere first (`roles`, `functions.roles`, ownership, a card, a runtime
+  `agent` entry), move the rules/card/agents entry, then remove the old id
   everywhere. `owner` strings in `state.json` are free text and no command
   rewrites them: update them only with explicit human approval (see Step 4). Also
   fix the generated docs that hard-code the old id (`commands.md`,
@@ -218,20 +239,23 @@ to explicitly authorize an owner rewrite. Never delete first and reassign later.
 
 Removal writes, in this order:
 
-1. remove the id from `agent-flow.config.json` -> `roles`;
-2. in `ownership.json`: remove the id from `roles`, reassign each rule (usually to
+1. remove the id from `agent-flow.config.json` -> `functions.roles` (a stale key
+   makes the config invalid: `functions.roles names "X", which is not a
+   configured role`);
+2. remove the id from `agent-flow.config.json` -> `roles`;
+3. in `ownership.json`: remove the id from `roles`, reassign each rule (usually to
    LEAD; for a merge, to the survivor) and repoint `rootFiles.role` if it named
    this role. After reassigning, update the receiving role's README table row and
    card write-scope paragraph, exactly like Step 3 - otherwise the docs keep a
    stale scope while the config passes. Deleting a rule instead leaves the path
    unmapped: `atk ownership check` still reports PASS with a hint, so
    single-writer protection is silently lost - delete only as an explicit choice;
-3. delete `<flowDir>/roles/<ROLE>.md`;
-4. remove the `runtime.json` -> `agents` entry;
-5. remove the README table row, then fix the generated docs that hard-code the
+4. delete `<flowDir>/roles/<ROLE>.md`;
+5. remove the `runtime.json` -> `agents` entry;
+6. remove the README table row, then fix the generated docs that hard-code the
    role (`commands.md`, `task-template.md`, the flow README lifecycle paragraph,
    `human-todos.json` notes);
-6. re-render the board (`atk state board` and `atk board`).
+7. re-render the board (`atk state board` and `atk board`).
 
 **Authorized owner rewrite** (only when the human approved it): `state.json` is
 the single source of truth and is normally command-owned, so treat this as a
@@ -268,6 +292,8 @@ Also check:
 
 - `<flowDir>/roles/` holds exactly one card per configured role, with no orphan
   cards left from a rename;
+- `functions.roles` has exactly the configured ids and gives each role its real
+  Function (`REVIEWER` only where a role may review); compare them yourself;
 - after a remove or rename, search the config and the flow directory for the old
   id (`state.json` owner strings, `runtime.json`, `README.md`, `current-batch.md`,
   `commands.md`, `task-template.md`, `human-todos.json`, docs). Hits in
@@ -294,6 +320,8 @@ Rollback <snapshot path, or git restore of the listed files>
 | `rule "tests" references unknown role "QA"` (verify-config, exit 1) | the id was removed from `ownership.json` roles but a rule still names it | reassign the rule (preferred) or delete it |
 | `prefix "design" is claimed by both DESIGN and DEV` (verify-config, exit 1) | two rules claim one prefix - usually init's fallback rule plus a new one | edit the existing rule's `role` instead of adding a second |
 | `role DESIGN has no write scope` (verify-config, exit 1) | role added without a rule | add a prefix rule, or accept the diagnostic for a scope-less reviewer |
+| `config: functions.roles names "QA", which is not a configured role` (any command) | role removed from `roles` but left in `functions.roles` | delete the `functions.roles` key (or add the role back) |
+| `scheduler: dispatching a REVIEWER ticket ... requires --agent` or `no-self-review` | a review was dispatched without an instance identity, or to the instance that produced the work | dispatch with `--agent <id>` of an instance that did not produce the task |
 | `unknown role "DESIGN" (configured: LEAD, DEV, QA)` from `atk queue/task` | id missing from `agent-flow.config.json` | add it to `config.roles` |
 | Board still shows a deleted role | `runtime.json` entry left behind | remove the agents entry and re-render |
 | Board does not show a new role | `runtime.json` entry missing | add the agents entry and re-render |
@@ -317,6 +345,13 @@ Rollback <snapshot path, or git restore of the listed files>
 
 ```markdown
 # Role: <ROLE>
+
+## Function
+
+`<FUNCTION>` - declared under `functions.roles` in `agent-flow.config.json`. If
+the Function is `REVIEWER`, a review dispatch needs `--agent <id>` and the
+scheduler refuses reviewing a task the role owns or a manifest its own Agent
+Instance produced.
 
 ## Write scope
 
@@ -371,17 +406,18 @@ Keep the rungs separate and never inflate evidence.
 
 1. 先读项目和现有配置，列出「角色 / 动作 / 写域 / 为什么」，让用户确认后再动文件。
 2. 一次只做一件事：新增、删除、改职责、改名。
-3. 每个角色都要同时改齐：`config.roles`、`ownership.json`（roles + rules；已有
-   prefix 要改指而不是追加第二条）、`roles/<ID>.md`、`runtime.json` 的 agents；再同步
-   `<flowDir>/README.md` 的角色表（新增/移动角色时把失去该 prefix 的原角色那一行一起
-   改掉），最后 `atk state board` + `atk board` 重新渲染看板。
+3. 每个角色都要同时改齐：`config.roles`、`functions.roles`、`ownership.json`（roles +
+   rules；已有 prefix 要改指而不是追加第二条）、`roles/<ID>.md`、`runtime.json` 的 agents
+   （`id` + `capabilities`）；再同步 `<flowDir>/README.md` 的角色表（新增/移动角色时把
+   失去该 prefix 的原角色那一行一起改掉），最后 `atk state board` + `atk board` 重新渲染看板。
 4. 删除前先跑 `atk queue --for <角色> --json`，`count` 必须为 0，并检查 `state.json` 的
    `batch.slices` / `subitems` 里没有该角色的 owner（`queue` 只看 packages，
    `state check` 不校验 owner）；删除时把规则改给幸存角色后，同步它的 README 行和卡
    写域。有在途工作就停下问人，不要先删再补。
 5. 校验：`atk ownership verify-config`、`atk state check`、`atk board --json`、
    `atk queue --for <角色>`；另外确认 `config.roles` 与 `ownership.json` 的 `roles`
-   完全一致（`verify-config` 不比对这两处）。
+   完全一致（`verify-config` 不比对这两处），以及 `functions.roles` 的 key 与
+   `config.roles` 一致、审查角色确实是 `REVIEWER`。
 6. 已有项目上绝不跑 `atk init --force`：它会重写 config、state、ownership、
    human-todos、看板和各角色卡（用户待办会被清空，`board.html` 却不会更新）。
 7. Windows PowerShell 里逗号列表必须加引号（`--roles "A,B"`、`--files "a,b"`），

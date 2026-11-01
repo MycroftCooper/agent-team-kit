@@ -19,7 +19,8 @@
 1. `atk task <ID> --for BE`。
 2. 建唯一候选快照，记录基线 hash。
 3. 实现并跑相关检查；项目配置了共享缓存时复用它。
-4. 冻结：`atk batch manifest --candidate <dir> --paths <改动> --packages <ID>`。
+4. 冻结：`atk batch manifest --candidate <dir> --paths <改动> --packages <ID> --agent <实例 id>`。
+   `--agent` 记录本次 WORKER Run；QA 会据此确认自己不是产出方（不允许自审）。
 5. 只集成已过 QA 的切片；多切片批次出联合 manifest。
 6. 作为唯一执行者 Apply：
 
@@ -50,6 +51,7 @@
 atk queue --for BE
 atk ownership check --role BE
 atk gate fast --files <改动> --role BE
+atk batch manifest --candidate <dir> --paths <改动> --packages <ID> --agent <实例 id>
 atk state board --compact
 ```
 

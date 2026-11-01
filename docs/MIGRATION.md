@@ -129,6 +129,11 @@ in your `commands.md`.
   be derived before it is written.
 - Keep the old receipts: the manifest tag and `qa-approval.json` format are
   preserved so `atk batch verify` still understands them.
+- Identity adoption is the one new step: add `functions` to the config (or rely
+  on the defaults), give every `runtime.json` agent an `id` and `capabilities`,
+  and put a `reviewer` block in new approvals. Old receipts still verify; a new
+  QA approval without a reviewer identity is refused while
+  `functions.enforceNoSelfReview` is on. See [ENTITIES.md](ENTITIES.md).
 
 ## Step 7 — board and plugin
 

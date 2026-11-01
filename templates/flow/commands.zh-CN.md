@@ -11,10 +11,20 @@
 | `atk state board` | 生成 Markdown 看板 |
 | `atk state board --compact` | 给 agent 的极简视图（ID / 状态 / 优先级 / 负责人） |
 | `atk queue --for <ROLE> [--json]` | 我的队列 |
-| `atk task <ID> --for <ROLE> [--message] [--json]` | 单个任务单 |
+| `atk task <ID> --for <ROLE> [--agent <id>] [--function <NAME>] [--message] [--json]` | 单个任务单 |
 | `atk state import` | 从 Markdown 台账（`paths.todoSource`）导入 |
 | `atk state archive <ID> --note "理由"` | 归档；前置 `verification.humanAccepted === true` |
 | `atk state restore <ID>` | 撤销归档 |
+
+## Function 与职责分离
+
+| 规则 | 命令 / 文件 |
+|---|---|
+| 审查派单必须带审查实例 | `atk task <ID> --for QA --agent <id>` |
+| 调度器拒绝自审 | 该 Role 拥有的任务，或该实例已产出的 manifest |
+| manifest 记录产出 Run | `atk batch manifest ... --agent <id>` |
+| 批准记录审查 Run | `qa-approval.json` → `reviewer` |
+| verify 拒绝自审 | `atk batch verify --manifest <f> --qa <f>`（`no-self-review`、`reviewer-identity` 等） |
 
 ## 证据与门禁
 
@@ -28,12 +38,21 @@
 | `atk gate fast [--files a,b] [--role <ROLE>] [--since-baseline]` | 变更范围快速门禁 |
 | `atk gate quick` / `atk gate local` | 完整 / 重层门禁 |
 
+## 权限
+
+| 命令 | 作用 |
+|---|---|
+| `atk permit check <操作> [--subject 主体\|--agent 实例] [--task ID] [--files a,b]` | 判定并返回机器可识别原因码；追加审计 |
+| `atk permit matrix [--group G] [--json]` | 主体 × 操作矩阵（A / C / N） |
+| `atk permit explain <操作>` | 单元格条件与原因码 |
+| `atk permit audit [--tail N]` | 只追加的决策审计 |
+
 ## 批次与缓存
 
 | 命令 | 作用 |
 |---|---|
-| `atk batch manifest --candidate <dir> --paths a,b --packages <ID>` | 冻结候选 manifest |
-| `atk batch verify --manifest <f> --qa <f>` | 原树漂移 / 候选改动 / QA 绑定 |
+| `atk batch manifest --candidate <dir> --paths a,b --packages <ID> --agent <id> [--contributors a,b]` | 冻结候选 manifest 并记录产出 Run |
+| `atk batch verify --manifest <f> --qa <f>` | 原树漂移 / 候选改动 / QA 绑定 / 审查者独立性 |
 | `atk batch apply --manifest <f> [--apply --confirm-dev-closed]` | 默认 dry-run；两个 flag 才真写 |
 | `atk baseline start` / `atk baseline changed` | 不依赖 git commit 的本片基线 |
 | `atk release --version <semver> [--note] [--apply]` | 发布：开发分支 → 发布分支 `--no-ff` merge + tag（默认 dry-run，校验分支/工作树/版本/门禁） |

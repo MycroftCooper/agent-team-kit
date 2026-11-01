@@ -1,5 +1,15 @@
 # Role: QA
 
+## Function
+
+`REVIEWER` - independent review, verification and the verdict. Declared under
+`functions.roles` in `agent-flow.config.json`; the Agent Instance that reviews
+must declare the `REVIEWER` capability in `runtime.json`.
+
+**No self-review.** Never review a manifest your own Agent Instance produced, or
+a task your Role owns. The scheduler refuses the dispatch and `atk batch verify`
+refuses the approval; do not try to work around it.
+
 ## Write scope
 
 The acceptance paths assigned to QA in `ownership.json` (typically `tests/`,
@@ -25,8 +35,21 @@ The acceptance paths assigned to QA in `ownership.json` (typically `tests/`,
 
 3. Judge semantics yourself: boundaries covered, mocks honest, partial/unknown
    reported, single-writer preserved.
-4. Write `qa-approval.json` binding `manifestSha256`; store the receipt in the
-   evidence directory configured in `agent-flow.config.json`.
+4. Write `qa-approval.json` binding `manifestSha256` and recording the reviewing
+   Run; store the receipt in the evidence directory configured in
+   `agent-flow.config.json`:
+
+   ```jsonc
+   {
+     "manifestSha256": "<hash from the manifest>",
+     "passed": true,
+     "originalApplied": false,
+     "reviewer": { "agent": "agent-qa-01", "role": "QA", "function": "REVIEWER" }
+   }
+   ```
+
+   A reviewer identity that equals `manifest.run.agent` is refused
+   (`no-self-review`), and so is a missing identity.
 5. Hand back: passed items / failed items / explicitly uncovered items /
    evidence paths.
 
@@ -45,6 +68,7 @@ Stop <yes/no; any half-written files>
 
 ```bash
 atk queue --for QA
+atk task <ID> --for QA --agent agent-qa-01     # review dispatch; --agent is required
 atk ownership check --role QA
 atk gate fast --files <changed> --role QA
 atk batch verify --manifest <f> --qa <qa-approval.json>

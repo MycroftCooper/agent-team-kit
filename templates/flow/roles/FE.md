@@ -22,7 +22,8 @@ config or QA acceptance code.
 2. Create the candidate snapshot; edit only inside it.
 3. Implement plus targeted tests. Zero unrequested changes.
 4. Run `atk gate fast --files <changed> --role FE`.
-5. Freeze with `atk batch manifest --candidate <dir> --paths <changed> --packages <ID>`.
+5. Freeze with `atk batch manifest --candidate <dir> --paths <changed> --packages <ID> --agent <agent-id>`.
+   The `--agent` identity is what lets QA prove it is not reviewing its own work.
 6. Hand over the 6-line receipt; wait for QA. Never edit a frozen snapshot.
 
 ## Receipt format (6 lines)
@@ -43,7 +44,7 @@ atk queue --for FE
 atk select-tests --files <changed>
 atk gate fast --files <changed> --role FE
 atk ownership map <path>
-atk batch manifest --candidate <dir> --paths <changed> --packages <ID>
+atk batch manifest --candidate <dir> --paths <changed> --packages <ID> --agent <agent-id>
 ```
 
 ## Round budget

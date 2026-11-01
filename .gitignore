@@ -8,6 +8,9 @@ coverage/
 Thumbs.db
 artifacts/
 .agent-flow/state.json.tmp-*
+.agent-flow/board.html
+.agent-flow/.backup/
+tools/agent-board/
 
 *.tgz
 

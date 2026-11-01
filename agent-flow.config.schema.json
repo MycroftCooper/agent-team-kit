@@ -46,6 +46,28 @@
       "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
       "description": "Role identifiers used by ownership.json, task tickets and the board."
     },
+    "functions": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Function taxonomy for the entity model: a Role declares which Functions it may perform; the scheduler refuses self-review.",
+      "properties": {
+        "roles": {
+          "type": "object",
+          "description": "Role -> Function(s). Missing Roles default to LEAD=ORCHESTRATOR, QA=REVIEWER, everything else=WORKER.",
+          "additionalProperties": {
+            "oneOf": [
+              { "enum": ["ORCHESTRATOR", "WORKER", "REVIEWER"] },
+              { "type": "array", "minItems": 1, "items": { "enum": ["ORCHESTRATOR", "WORKER", "REVIEWER"] } }
+            ]
+          }
+        },
+        "enforceNoSelfReview": {
+          "type": "boolean",
+          "default": true,
+          "description": "Refuse a QA review whose reviewer identity equals the manifest's producing Agent Instance. Set false only for a project that has not adopted identities yet."
+        }
+      }
+    },
     "gates": {
       "type": "object",
       "additionalProperties": false,
@@ -76,6 +98,7 @@
         "qaSchemaVersion": { "type": "integer" },
         "idPattern": { "type": "string" },
         "allowedPrefixes": { "type": "array", "items": { "type": "string" } },
+        "allowRootFiles": { "type": "boolean", "default": false, "description": "Allow root-level files (package.json, README, ...) in a batch manifest; prefixes cannot express them." },
         "budgetRounds": { "type": "integer", "minimum": 1 }
       }
     },

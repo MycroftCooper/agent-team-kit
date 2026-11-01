@@ -22,8 +22,14 @@ state; you work through tickets and receipts.
 - **Never edit the original tree.** Work in a candidate snapshot; only the
   designated integrator applies.
 - **Never self-approve.** QA accepts frozen snapshots; the human accepts the
-  product. A passing typecheck is not a passing test is not human acceptance.
+  product. The scheduler enforces this: a review ticket needs `--agent <id>`, and
+  `atk batch verify` refuses when the reviewer Agent Instance produced the
+  manifest (`no-self-review`). Never retry around that refusal.
 - **Human-only todos stay human.** Read and add with `atk todo`, never tick.
+- **Check the permission before a sensitive action.** `atk permit check
+  <operation> --agent <id> ...` returns a reason code; a denied operation is a
+  stop, not a retry. The registry covers edits, review, integration, budgets,
+  production access and human acceptance.
 - **State is derived, not narrated.** Run `atk evidence`; do not hand-edit
   `state.json`, `board.md` or `board.html`.
 
@@ -32,6 +38,8 @@ state; you work through tickets and receipts.
 ```bash
 atk queue --for <ROLE>                   # my queue
 atk task <ID> --for <ROLE> --message     # one ticket, ready to forward/execute
+atk task <ID> --for QA --agent agent-qa-01 --message   # review ticket: --agent is required
+atk permit check code.modify --agent agent-fe-01 --task <ID> --files src/ui/a.ts
 atk ownership map <path>                 # who owns this path
 ```
 
@@ -62,12 +70,15 @@ gate that passed.
 ## Freeze and hand off
 
 ```bash
-atk batch manifest --candidate <dir> --paths <changed> --packages <ID>
+atk batch manifest --candidate <dir> --paths <changed> --packages <ID> --agent <id>
 atk batch verify --manifest <f> --qa <f>   # QA / integrator side
 ```
 
 Keep the candidate frozen after freezing. QA verifies the manifest hash, not your
-working copy.
+working copy. `--agent` records the producing WORKER Run in `manifest.run`; a
+manifest without it cannot pass a QA review. QA writes `qa-approval.json` with a
+`reviewer` identity (`agent` / `role` / `function: "REVIEWER"`) — see
+[docs/ENTITIES.md](../../docs/ENTITIES.md).
 
 ## Receipt format (6 lines, nothing else)
 

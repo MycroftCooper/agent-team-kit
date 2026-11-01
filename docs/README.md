@@ -6,7 +6,10 @@ Chinese summary under `*.zh-CN.md`.
 | Page | What it covers | Read it when |
 |---|---|---|
 | [QUICKSTART.md](QUICKSTART.md) | 60-second setup, first ticket, board, plugin | first time |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | the four layers, module map, data flow | deciding whether to adopt it |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | the four layers, entities and Functions, module map, data flow | deciding whether to adopt it |
+| [ENTITIES.md](ENTITIES.md) | Project / Role / Agent Instance / Task / Run, the three Functions, the no-self-review rule | designing the team or the scheduler |
+| [PERMISSIONS.md](PERMISSIONS.md) | subject x operation matrix, decision order, reason codes, audit | deciding who may do what |
+| [SELFHOSTING.md](SELFHOSTING.md) | self-hosted setup, candidate isolation, snapshots, recovery runbook | developing the toolkit with the toolkit |
 | [CONFIG.md](CONFIG.md) | every `agent-flow.config.json` key, with examples | customizing paths, gates, roles, plugin |
 | [ROLES.md](ROLES.md) | defining roles and write scopes | adding, removing or re-scoping FE/BE/QA or your own roles |
 | [WORKFLOW.md](WORKFLOW.md) | ticket -> candidate -> freeze -> QA -> verify -> apply -> evidence -> archive | running a batch |
@@ -18,6 +21,9 @@ Chinese summary under `*.zh-CN.md`.
 
 Chinese summaries: [QUICKSTART.zh-CN.md](QUICKSTART.zh-CN.md),
 [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md),
+[ENTITIES.zh-CN.md](ENTITIES.zh-CN.md),
+[PERMISSIONS.zh-CN.md](PERMISSIONS.zh-CN.md),
+[SELFHOSTING.zh-CN.md](SELFHOSTING.zh-CN.md),
 [WORKFLOW.zh-CN.md](WORKFLOW.zh-CN.md).
 
 ## The 30-second version

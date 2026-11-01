@@ -22,7 +22,9 @@ product paths, QA acceptance code, package versions or the release chain
 2. Create the single candidate snapshot and record the baseline hash.
 3. Implement and run the relevant checks; reuse the configured shared build
    cache when the project has one.
-4. Freeze: `atk batch manifest --candidate <dir> --paths <changed> --packages <ID>`.
+4. Freeze: `atk batch manifest --candidate <dir> --paths <changed> --packages <ID> --agent <agent-id>`.
+   `--agent` records the producing WORKER Run; QA verifies it did not produce the
+   manifest (`no-self-review`).
 5. Integrate only QA-passed slices; produce a joint manifest when a batch has
    several slices.
 6. Apply, as the only executor:
@@ -55,6 +57,7 @@ Stop <yes/no; any half-written files>
 atk queue --for BE
 atk ownership check --role BE
 atk gate fast --files <changed> --role BE
+atk batch manifest --candidate <dir> --paths <changed> --packages <ID> --agent <agent-id>
 atk state board --compact
 ```
 

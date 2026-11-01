@@ -39,9 +39,10 @@ to be edited per project.
 
 ### How do I add, remove or change a role (agent)?
 
-Edit the config, `ownership.json`, `runtime.json`, the role card and the flow
-README together, then run `atk ownership verify-config`, `atk state check` and
-`atk board --json`. The
+Edit the config (`roles` and `functions.roles`), `ownership.json`,
+`runtime.json` (the Agent Instance's `id` and `capabilities`), the role card and
+the flow README together, then run `atk ownership verify-config`,
+`atk state check` and `atk board --json`. The
 [`agent-team-roles`](../skills/agent-team-roles/SKILL.md) skill has the exact
 order, the card skeleton and the failure table. Do not use `atk init --force` for
 this.
@@ -121,8 +122,41 @@ process dies, re-run `atk batch verify` first: drift or a partial write must be
 inspected, not blindly re-applied. The original tree is never modified by any
 earlier step.
 
+### How is "no self-review" enforced?
+
+By the scheduler, not by a role card. `atk state task <ID> --for QA` refuses
+without `--agent <id>`; the frozen manifest records the producing Agent Instance
+(`atk batch manifest --agent <id>`); `qa-approval.json` records the reviewer;
+`atk batch verify`/`apply` fail when the reviewer is the producer, when an
+identity is missing, or when `runtime.json` does not register the instance;
+`atk evidence` refuses to count a provably self-reviewed approval. Exit `1` means
+the rule refused; see [ENTITIES.md](ENTITIES.md) for the checks and the
+`functions.enforceNoSelfReview` escape hatch.
+
+### How do I know whether a subject may do an operation?
+
+Ask the permission layer:
+
+```bash
+atk permit check code.modify --agent agent-fe-01 --task FE-01 --files src/ui/a.ts
+```
+
+It evaluates the code-owned matrix plus scope/ownership/state/policy/approval,
+prints a machine-readable reason code (`ROLE_DENIED`, `WRITE_SCOPE_VIOLATION`,
+`SELF_REVIEW_DENIED`, `APPROVAL_REQUIRED`, ...) and appends the decision to
+`artifacts/agent-flow/permission-audit.jsonl`. `atk permit matrix` prints the
+whole subject x operation table, `atk permit explain <operation>` shows the
+conditions, and `atk permit audit` reads the trail. See
+[PERMISSIONS.md](PERMISSIONS.md).
+
 ### Does the kit enforce "no production access"?
 
 Not technically. It provides the gates, receipts and the stop conditions; the
 role cards state the non-negotiables. If you need a hard ban, express it as a gate
 step or a CI policy around the commands.
+
+### Does the kit enforce separation of duties?
+
+Yes, for review: the entity model's `REVIEWER`/`WORKER` runs carry Agent Instance
+identities, and the scheduler refuses a self-review (see the question above).
+Other social rules (the do-not lists) remain documentation plus gates.

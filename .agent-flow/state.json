@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-11-02T01:30:07+08:00",
+  "source": "created by `atk init`; state.json is the single source of truth",
+  "batch": {
+    "id": "SELFHOST-R01",
+    "goal": "Make agent-team-kit self-hostable: real gates, repo ownership, isolation and recovery, then use the pipeline to build the local-service UI.",
+    "stopCondition": "Bootstrap gates are green and the local-service UI batch is accepted by the user; the DSH plugin is retired.",
+    "devClosedByUser": false,
+    "applyMode": "local-tree",
+    "openQuestions": [],
+    "slices": [
+      {
+        "id": "SELFHOST-01",
+        "label": "Bootstrap the self-hosted workflow",
+        "status": "in_progress",
+        "qaPassed": null,
+        "applied": null,
+        "owner": "LEAD",
+        "exit": "fast/quick/local gates green, ownership covers the repo, isolation + recovery verified",
+        "evidence": "artifacts/evidence",
+        "note": "baseline tag + snapshot + candidate worktree isolation"
+      }
+    ]
+  },
+  "counts": {
+    "total": 0,
+    "byStage": {}
+  },
+  "packages": [],
+  "subitems": []
+}

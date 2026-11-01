@@ -22,7 +22,9 @@ unsure.
    the shared candidate location; record the baseline hash).
 3. Implement and add targeted tests. Zero unrequested changes.
 4. Run the gate: `atk gate fast --files <changed> --role {{ROLE}}`.
-5. Freeze: `atk batch manifest --candidate <dir> --paths <changed> --packages <ID>`.
+5. Freeze: `atk batch manifest --candidate <dir> --paths <changed> --packages <ID> --agent <agent-id>`.
+   `--agent` records the producing WORKER Run; a manifest without it cannot pass
+   a QA review (no-self-review rule).
 6. Send the 6-line receipt and wait for QA; do not edit the frozen snapshot.
 
 ## Receipt format (6 lines)
@@ -43,7 +45,7 @@ atk queue --for {{ROLE}}
 atk select-tests --files <changed>
 atk gate fast --files <changed> --role {{ROLE}}
 atk ownership map <path>
-atk batch manifest --candidate <dir> --paths <changed> --packages <ID>
+atk batch manifest --candidate <dir> --paths <changed> --packages <ID> --agent <agent-id>
 atk state board --compact
 ```
 

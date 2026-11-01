@@ -89,8 +89,23 @@ test("scaffolds the complete generic workflow", async () => {
 
   for (const name of ["human-todos.json", "runtime.json"]) {
     const parsed = await readJsonFile(path.join(flow, name));
-    assert.equal(parsed.schemaVersion, name === "runtime.json" ? 2 : 1);
+    assert.equal(parsed.schemaVersion, name === "runtime.json" ? 3 : 1);
   }
+  assert.deepEqual(config.functions.roles, {
+    LEAD: ["ORCHESTRATOR"],
+    DEV: ["WORKER"],
+    QA: ["REVIEWER"],
+  });
+  assert.equal(config.functions.enforceNoSelfReview, true);
+  const runtime = await readJsonFile(path.join(flow, "runtime.json"));
+  assert.deepEqual(
+    runtime.agents.map((agent) => [agent.id, agent.role, agent.capabilities]),
+    [
+      ["agent-lead-01", "LEAD", ["ORCHESTRATOR"]],
+      ["agent-dev-01", "DEV", ["WORKER"]],
+      ["agent-qa-01", "QA", ["REVIEWER"]],
+    ],
+  );
 });
 
 test("--dry-run prints the file list and writes nothing", async () => {

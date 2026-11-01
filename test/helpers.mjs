@@ -147,11 +147,11 @@ export function minimalOwnership(overrides = {}) {
 
 export function minimalRuntime() {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     updatedAt: "2026-01-01T00:00:00+00:00",
     agents: [
-      { role: "LEAD", status: "working", task: "coordination", detail: "dispatching", since: "2026-01-01T00:00:00+00:00" },
-      { role: "DEV", status: "waiting", task: "S1", detail: "waiting for review", since: "2026-01-01T00:00:00+00:00" },
+      { id: "agent-lead-01", role: "LEAD", capabilities: ["ORCHESTRATOR"], status: "working", task: "coordination", detail: "dispatching", since: "2026-01-01T00:00:00+00:00" },
+      { id: "agent-dev-01", role: "DEV", capabilities: ["WORKER"], status: "waiting", task: "S1", detail: "waiting for review", since: "2026-01-01T00:00:00+00:00" },
     ],
     events: [{ at: "2026-01-01T00:00:00+00:00", role: "LEAD", text: "batch opened" }],
   };

@@ -19,7 +19,8 @@
 2. 在原树之外建候选快照，记录基线 hash。
 3. 实现 + 定向测试；确认范围内零多余改动。
 4. 跑门禁：`atk gate fast --files <改动> --role {{ROLE}}`。
-5. 冻结：`atk batch manifest --candidate <dir> --paths <改动> --packages <ID>`。
+5. 冻结：`atk batch manifest --candidate <dir> --paths <改动> --packages <ID> --agent <实例 id>`。
+   `--agent` 记录本次 WORKER Run；没有它的 manifest 过不了 QA 审查（不允许自审）。
 6. 交 6 行回执，等 QA；不要边测边改同一份快照。
 
 ## 回执格式（6 行）
@@ -40,7 +41,7 @@ atk queue --for {{ROLE}}
 atk select-tests --files <改动>
 atk gate fast --files <改动> --role {{ROLE}}
 atk ownership map <路径>
-atk batch manifest --candidate <dir> --paths <改动> --packages <ID>
+atk batch manifest --candidate <dir> --paths <改动> --packages <ID> --agent <实例 id>
 atk state board --compact
 ```
 

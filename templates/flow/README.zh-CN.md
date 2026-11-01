@@ -32,14 +32,26 @@ atk state board --compact             # 给 agent 的极简看板
 单写者：`atk ownership check --role <ROLE>` 把"约定"变成可执行检查。同一路径
 命中两个角色属于配置错误，不是合并冲突。
 
+## 实体与 Function
+
+Role 只是权限模板。真正的执行者 `runtime.json` 里的 Agent Instance（`id` +
+`capabilities`），一次执行是回执物化的 Run：manifest 是产出方 `WORKER`， 
+`qa-approval.json` 是审查方 `REVIEWER`。
+
+**不允许自审。** 审查派单必须带 `--agent <id>`；`atk batch verify` 会发现审查者就是
+产出者并拒绝。不要绕过 `no-self-review` 拒绝。
+
+**权限默认拒绝。** `atk permit check <操作>` 返回判定与机器可识别原因码（改码、审查、
+集成、预算、生产访问、验收等）；主体 × 操作矩阵由工具包维护，本项目不能放宽。
+
 ## 一个任务的生命周期
 
 ```
 1 LEAD    在 state.batch.slices 开切片，生成任务单
 2 LEAD    一条消息转发任务单（不要另写文档）
 3 DEV     在原树之外建候选快照
-4 DEV     冻结：atk batch manifest --candidate ... --packages <ID>
-5 QA      qa-approval.json 绑定冻结的 manifestSha256
+4 DEV     冻结：atk batch manifest --candidate ... --packages <ID> --agent <id>
+5 QA      qa-approval.json 绑定冻结的 manifestSha256 + reviewer 身份
 6 QA      verify：atk batch verify --manifest ... --qa ...
 7 BE/LEAD apply：先 dry-run，再 --apply --confirm-dev-closed
 8 LEAD    派生：atk evidence（QA -> 待应用，apply -> 待人工验收）

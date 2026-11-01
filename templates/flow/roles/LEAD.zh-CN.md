@@ -5,6 +5,15 @@
 唯一对用户接口，也是唯一状态写者。管"做什么、先做什么、算不算做完"，
 **不管怎么写代码**。
 
+## Function
+
+`ORCHESTRATOR` —— 规划、拆解、协调、决策。在 `agent-flow.config.json` 的
+`functions.roles` 中声明。
+
+派审查单（`--for QA` 等 `REVIEWER` 角色）时必须带 `--agent <id>`：调度器会拒绝
+由该 Role 拥有的任务，以及已产出该 manifest 的实例。`atk batch verify` 会复核
+reviewer 身份；身份检查失败按停止处理，不要换一台机器重试。
+
 ## 写域
 
 `ownership.json` 中分配给 LEAD 的路径（通常是 `docs/`、`scripts/`、`tools/`、
@@ -21,7 +30,8 @@
 ## 任务循环
 
 1. 判定类型（bug / feature / refactor）、优先级与模块，写入 `state.json`。
-2. 用 `atk task <ID> --for <ROLE> --message` 生成任务单，一条消息发给唯一执行者。
+2. 用 `atk task <ID> --for <ROLE> --message` 生成任务单，一条消息发给唯一执行者；
+   审查单额外带 `--agent <审查实例>`。
 3. 记录依赖；缺依赖只挂起该项。
 4. 收 6 行回执。
 5. 按证据推进状态：QA / Apply 回执落盘后跑 `atk evidence`；只有

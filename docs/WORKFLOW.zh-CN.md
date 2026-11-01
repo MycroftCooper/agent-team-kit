@@ -9,22 +9,33 @@
  LEAD     执行者      执行者   QA    QA    集成人   evidence    LEAD
 ```
 
+Role 只是权限模板；真正干活的是 `runtime.json` 里的 Agent Instance，一次执行是回执
+物化的 Run（manifest = 产出方 WORKER，`qa-approval.json` = 审查方 REVIEWER）。
+**不允许自审**：审查派单必须带 `--agent`，`atk batch verify` 会发现审查者就是产出者
+并拒绝。详见 [ENTITIES.zh-CN.md](ENTITIES.zh-CN.md)。
+
 ## 各步要点
 
 1. **开批次（LEAD）**：`state.json` 记录一个批次（id / 目标 / 停机条件 / 切片）。
    切片是 QA 验收与 Apply 的最小单位。
 2. **任务单（LEAD）**：`atk task <ID> --for <ROLE> --message` 生成 9 行任务单，
-   一条消息转发。任务单只写本次，背景留在 state.json。
+   一条消息转发。任务单只写本次，背景留在 state.json。派单会做 `task.claim` 权限判定，
+   不匹配时带原因码拒绝（见 [PERMISSIONS.zh-CN.md](PERMISSIONS.zh-CN.md)）。
 3. **候选（执行者）**：在原树之外建候选快照，原树对 agent 只读；一个切片同时只有
    一个候选。
 4. **门禁（执行者）**：`atk select-tests --files ...` 出计划，
    `atk gate fast --files ... --role ...` 跑快速门禁；`skipped` 不算通过。
-5. **冻结（执行者）**：`atk batch manifest --candidate ... --paths ... --packages <ID>`
-   产出清单与 `manifestSha256`；冻结后不得再改候选。
-6. **QA**：只验冻结快照；`atk batch verify` 机械核对，语义检查人工判断；写
-   `qa-approval.json` 绑定当前 hash。hash 变了旧批准自动作废。
+5. **冻结（执行者）**：`atk batch manifest --candidate ... --paths ... --packages <ID> --agent <实例 id>`
+   产出清单与 `manifestSha256`，并记录产出方 Run；没有 `--agent` 的 manifest 过不了 QA
+   审查。冻结后不得再改候选。
+6. **QA**：审查派单必须带审查实例（`atk task <ID> --for QA --agent <id>`）；只验冻结
+   快照；`atk batch verify` 机械核对、语义检查人工判断；写 `qa-approval.json` 绑定当前
+   hash 并记录 `reviewer`。hash 变了旧批准自动作废；审查者就是产出者会被
+   `no-self-review` 拒绝。
 7. **apply（唯一集成人）**：先 `atk batch verify`（必须 PASS），再 dry-run，最后
-   `atk batch apply --apply --confirm-dev-closed`。漂移即停，退出码 3。
+   `atk batch apply --apply --confirm-dev-closed`。漂移即停，退出码 3。真实写入还会按
+   `integration.merge.development` 判定：必须有绑定 manifest 的 QA 证据，配置了
+   quick/local 门禁时还要绿报告；dry-run 计划不受限。
 8. **证据派生（LEAD）**：`atk evidence` 从回执派生 `qaPassed` / `applied`，
    幂等；`humanAccepted`、`blocked`、`paused` 只能由 LEAD 手写。
 9. **验收与归档**：人工验收后 LEAD 写 `humanAccepted: true`，再

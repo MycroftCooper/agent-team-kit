@@ -41,7 +41,7 @@ agent-flow.config.json      项目配置
   state.json                唯一真值：批次 / 切片 / 工作包
   ownership.json            路径前缀 → 角色
   human-todos.json          只有人能做的待办
-  runtime.json              谁在忙什么
+  runtime.json              Agent Instance（id + capabilities）+ 谁在忙什么
   task-template.md          9 行任务单模板
   commands.md               命令速查
   current-batch.md          当前批次滚动记录

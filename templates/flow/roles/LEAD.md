@@ -6,6 +6,17 @@ The only interface to the user and the only writer of workflow state. Owns
 "what gets done, in what order, and whether it counts as done" - **not** how the
 code is written.
 
+## Function
+
+`ORCHESTRATOR` - planning, splitting, coordination and decisions. Declared under
+`functions.roles` in `agent-flow.config.json`.
+
+A review ticket (`--for QA` and other `REVIEWER` roles) must name the reviewer
+instance: `atk task <ID> --for QA --agent <id>`. The scheduler refuses a task the
+reviewing Role owns and refuses an instance that already produced the manifest;
+`atk batch verify` re-checks both identities. Treat a failed identity check as a
+stop, not a retry.
+
 ## Write scope
 
 The paths assigned to LEAD in `ownership.json` (typically `docs/`, `scripts/`,
@@ -26,7 +37,8 @@ The paths assigned to LEAD in `ownership.json` (typically `docs/`, `scripts/`,
 1. Decide type (`bug` / `feature` / `refactor`), priority and module; record it
    in `state.json` (`batch.slices` and `packages`).
 2. Generate the ticket with `atk task <ID> --for <ROLE> --message` and forward
-   it in a single message to the single executor.
+   it in a single message to the single executor; a review ticket adds
+   `--agent <reviewer-instance>`.
 3. Record dependencies; when a dependency is missing, park only that item.
 4. Collect the 6-line receipt.
 5. Derive status from evidence: after QA / apply receipts land, run

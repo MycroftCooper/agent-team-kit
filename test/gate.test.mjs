@@ -112,6 +112,29 @@ test("gate fast runs applicable steps and writes the report", async (t) => {
   assert.equal(printed.ok, true);
 });
 
+test("gate quick and local publish the latest gate report", async (t) => {
+  const root = await makeProject(
+    t,
+    baseConfig({
+      fast: null,
+      quick: { command: ["node", "-e", "process.exit(0)"] },
+      local: { command: ["node", "-e", "process.exit(0)"] },
+    }),
+  );
+  const { ctx } = await contextFor(root);
+
+  assert.equal(await run(["quick"], ctx), 0);
+  let report = await readReport(root);
+  assert.equal(report.gate, "quick");
+  assert.equal(report.ok, true);
+
+  assert.equal(await run(["local"], ctx), 0);
+  report = await readReport(root);
+  assert.equal(report.gate, "local");
+  assert.equal(report.ok, true);
+  assert.match(report.finishedAt, /^\d{4}-\d{2}-\d{2}T/);
+});
+
 test("gate fast fails when a main step exits non-zero", async (t) => {
   const root = await makeProject(
     t,

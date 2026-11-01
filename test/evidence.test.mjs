@@ -206,3 +206,31 @@ test("evidence fails cleanly when state.json is missing", async (t) => {
   assert.equal(await runEvidence([], ctx), 2);
   assert.match(logger.errorText(), /evidence:/);
 });
+
+test("evidence refuses a qa approval whose reviewer produced the manifest", async (t) => {
+  const env = await setup(t);
+  await receipt(env, "manifest-self.json", {
+    schemaVersion: 1,
+    batchId: "BATCH-01",
+    manifestSha256: SHA,
+    files: [{ path: "src/app.ts" }],
+    run: { id: "run-1", agent: "agent-dev-01", role: "DEV", function: "WORKER", startedAt: "2026-01-01T00:00:00+00:00" },
+  });
+  await receipt(env, "qa-self.json", {
+    passed: true,
+    manifestSha256: SHA,
+    batchId: "S1",
+    packages: ["PKG-01"],
+    reviewer: { agent: "agent-dev-01", role: "DEV", function: "REVIEWER" },
+  });
+
+  assert.equal(await env.run(["--json"]), 0);
+  const report = env.logger.lines.json.at(-1);
+  assert.equal(report.selfReviewed, 1);
+  assert.equal(report.qaApprovals, 0, "a self-reviewed approval is never a QA fact");
+  assert.match(env.logger.errorText(), /refused self-reviewed qa-approval/);
+
+  const state = await loadState(env);
+  assert.equal(state.batch.slices.find((slice) => slice.id === "S1").qaPassed, null);
+  assert.equal(state.packages.find((pkg) => pkg.id === "PKG-01").verification.qaPassed, undefined);
+});

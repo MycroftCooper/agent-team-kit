@@ -10,6 +10,14 @@
     "tempPrefix": "agent-flow"
   },
   "roles": ["LEAD", "DEV", "QA"],
+  "functions": {
+    "roles": {
+      "LEAD": ["ORCHESTRATOR"],
+      "DEV": ["WORKER"],
+      "QA": ["REVIEWER"]
+    },
+    "enforceNoSelfReview": true
+  },
   "gates": {
     "fast": {
       "parallel": true,

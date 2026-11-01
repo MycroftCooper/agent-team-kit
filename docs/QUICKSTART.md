@@ -45,7 +45,7 @@ agent-flow.config.json       project configuration
   state.json                 source of truth: batch, slices, packages
   ownership.json             path prefix -> role
   human-todos.json           things only the human can do
-  runtime.json               who is working on what
+  runtime.json               Agent Instances (id + capabilities) + who is working on what
   task-template.md           the 9-line ticket format
   commands.md                command cheat sheet
   current-batch.md           rolling notes for the current batch

@@ -1,5 +1,14 @@
 # 角色：QA
 
+## Function
+
+`REVIEWER` —— 独立审查、验证、给出结论。在 `agent-flow.config.json` 的
+`functions.roles` 中声明；实际审查的 Agent Instance 必须在 `runtime.json`
+里声明 `REVIEWER` capability。
+
+**不允许自审。** 不要审查你所在实例产出的 manifest，也不要审查你自己 Role 拥有的
+任务。调度器会拒绝派单，`atk batch verify` 会拒绝批准；不要绕过它。
+
 ## 写域
 
 `ownership.json` 中分配给 QA 的验收路径（通常是 `tests/`、`tests/qa/`、`e2e/`
@@ -24,7 +33,20 @@
 
 3. 语义门自己看：边界是否覆盖、mock 是否冒充真实、partial / unknown 是否如实、
    单写者是否被破坏。
-4. 出 `qa-approval.json`，绑定 `manifestSha256`；回执存到配置的证据目录。
+4. 出 `qa-approval.json`，绑定 `manifestSha256` 并记录本次审查 Run；回执存到配置的
+   证据目录：
+
+   ```jsonc
+   {
+     "manifestSha256": "<manifest 里的 hash>",
+     "passed": true,
+     "originalApplied": false,
+     "reviewer": { "agent": "agent-qa-01", "role": "QA", "function": "REVIEWER" }
+   }
+   ```
+
+   `reviewer.agent` 与 `manifest.run.agent` 相同会被判 `no-self-review` 拒绝；
+   缺少身份同样拒绝。
 5. 交回执：通过项 / 失败项 / 明确未覆盖项 / 证据路径。
 
 ## 回执格式（6 行）
@@ -42,6 +64,7 @@
 
 ```bash
 atk queue --for QA
+atk task <ID> --for QA --agent agent-qa-01     # 审查派单必须带 --agent
 atk ownership check --role QA
 atk gate fast --files <改动> --role QA
 atk batch verify --manifest <f> --qa <qa-approval.json>
