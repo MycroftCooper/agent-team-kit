@@ -474,27 +474,46 @@ export function importStateJson(store, options = {}) {
   if (state?.batch !== undefined && state.batch !== null && !isPlainObject(state.batch)) {
     report("error", "INVALID_RECORD", { collection: "batch", reason: "must be an object" });
   }
-  // Safety (M6 gate): `tasks` is NOT part of the legacy state schema — tasks
-  // live in packages/subitems/batch.slices. Silently ignoring a non-empty
-  // `tasks` array would make a replace import succeed while dropping exactly
-  // the data the caller asked to import. Fail closed before any clear/write.
-  for (const [label, list] of [
-    ["batch.tasks", batch?.tasks],
-    ["tasks", state?.tasks],
-  ]) {
-    if (list === undefined || list === null) continue;
-    if (!Array.isArray(list)) {
-      report("error", "INVALID_RECORD", { collection: label, reason: "must be an array" });
-      continue;
+  // Safety (M6/QA-007): the legacy state schema is a fixed whitelist. Unknown
+  // keys that carry a non-empty array anywhere (any nesting, any casing) are
+  // data the importer would silently drop: fail closed BEFORE any clear/write.
+  // Empty arrays carry no data and stay allowed; known collections are trusted
+  // (their record payloads may legitimately contain arrays such as deps).
+  const WHITELISTED_STATE_KEYS = Object.freeze({
+    "": new Set(["schemaVersion", "updatedAt", "source", "project", "batch", "counts", "packages", "subitems"]),
+    batch: new Set(["id", "goal", "stopCondition", "devClosedByUser", "applyMode", "openQuestions", "slices"]),
+    project: new Set(["id", "name", "repoPath", "defaultBranch"]),
+    counts: new Set(["total", "byStage"]),
+  });
+  const WHITELISTED_STATE_ARRAYS = new Set(["packages", "subitems", "batch.slices", "batch.openQuestions"]);
+  const unsupportedCollections = [];
+  const scanUnsupportedCollections = (value, path) => {
+    if (Array.isArray(value)) {
+      if (value.length > 0) unsupportedCollections.push({ path, count: value.length });
+      return;
     }
-    if (list.length > 0) {
-      report("error", "IMPORT_WRITE_FAILED", {
-        collection: label,
-        reason:
-          "legacy state.json does not define a tasks array; tasks must be provided as packages/subitems/batch.slices",
-        count: list.length,
-      });
+    if (!isPlainObject(value)) return;
+    const allowedKeys = WHITELISTED_STATE_KEYS[path];
+    for (const [key, child] of Object.entries(value)) {
+      const childPath = path === "" ? key : `${path}.${key}`;
+      if (WHITELISTED_STATE_ARRAYS.has(childPath)) continue;
+      if (allowedKeys && allowedKeys.has(key) && isPlainObject(child)) {
+        scanUnsupportedCollections(child, childPath);
+        continue;
+      }
+      if (allowedKeys && allowedKeys.has(key) && !Array.isArray(child)) continue;
+      scanUnsupportedCollections(child, childPath);
     }
+  };
+  if (isPlainObject(state)) scanUnsupportedCollections(state, "");
+  for (const collection of unsupportedCollections) {
+    report("error", "IMPORT_WRITE_FAILED", {
+      collection: collection.path,
+      path: collection.path,
+      count: collection.count,
+      reason:
+        "legacy state.json does not define this collection; refusing to silently drop it (known task collections: packages, subitems, batch.slices)",
+    });
   }
   collectList(state?.packages, "packages", "package");
   collectList(state?.subitems, "subitems", "subitem");

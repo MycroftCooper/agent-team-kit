@@ -2,6 +2,7 @@
 // support (merge/replace, atomic replace rollback, readiness gate).
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import {
   createMemoryStore,
   exportStateJson,
@@ -264,41 +265,114 @@ test("replace is one transaction: a failing write restores the old database", (t
   }
 });
 
-test("an unsupported non-empty tasks array is rejected before any clear", (t) => {
-  for (const { label, store } of bothStores(t)) {
-    store.upsertAgent({ id: "agent-keep", role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
-    const before = storeFingerprint(store);
-    const broken = {
-      schemaVersion: 1,
-      project: { id: "BROKEN", name: "broken" },
-      batch: { id: "B", tasks: [{ id: "DUP", status: "READY" }, { id: "DUP", status: "READY" }] },
-      packages: [],
-      subitems: [],
+test("QA-007: every unknown non-empty legacy collection is rejected before any clear", (t) => {
+  const { store: sqlite, file } = useStore(t);
+  const memory = createMemoryStore();
+  t.after(() => memory.close());
+  const stores = [
+    { label: "sqlite", store: sqlite },
+    { label: "memory", store: memory },
+  ];
+  const migrationRows = () => {
+    const raw = new DatabaseSync(file);
+    try {
+      return Number(raw.prepare("SELECT COUNT(*) AS c FROM schema_migrations").get().c);
+    } finally {
+      raw.close();
+    }
+  };
+  const fingerprint = (store) => ({
+    schemaVersion: store.health().schemaVersion,
+    migrationRows: store === sqlite ? migrationRows() : null,
+    counts: store.health().counts,
+    projects: store.listProjects(),
+    tasks: store.listTasks({ limit: 1000 }),
+    agents: store.listAgents(),
+    events: store.listEvents({ limit: 1000 }),
+  });
+  const baseState = () => ({
+    schemaVersion: 1,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    source: "qa-007",
+    project: { id: "P", name: "P", repoPath: ".", defaultBranch: "main" },
+    batch: {
+      id: "B",
+      goal: "g",
+      stopCondition: "s",
+      devClosedByUser: false,
+      applyMode: "local-tree",
+      openQuestions: [],
       slices: [],
-      counts: {},
-    };
-    const report = importStateJson(store, {
-      stateJson: broken,
-      runtime: { schemaVersion: 3, agents: [] },
-      mode: "replace",
-      now: T,
-    });
-    assert.equal(report.status, "SKIPPED", label);
-    assert.ok(
-      report.problems.some((problem) => problem.code === "IMPORT_WRITE_FAILED" && problem.detail.collection === "batch.tasks"),
-      `${label}: ${JSON.stringify(report.problems)}`,
-    );
-    assert.deepEqual(storeFingerprint(store), before, `${label}: validation failure must not clear anything`);
+    },
+    counts: { total: 0, byStage: {} },
+    packages: [],
+    subitems: [],
+  });
+  const setPath = (obj, dotted, value) => {
+    const parts = dotted.split(".");
+    let cursor = obj;
+    for (const part of parts.slice(0, -1)) {
+      if (!cursor[part] || typeof cursor[part] !== "object" || Array.isArray(cursor[part])) {
+        cursor[part] = {};
+      }
+      cursor = cursor[part];
+    }
+    cursor[parts.at(-1)] = value;
+  };
+  const duplicateTasks = [{ id: "DUP", status: "READY" }, { id: "DUP", status: "READY" }];
+  const cases = [
+    ["batch.tasks", duplicateTasks],
+    ["tasks", duplicateTasks],
+    ["requirements", [{ id: "R1" }]],
+    ["batch.requirements", [{ id: "R1" }]],
+    ["Tasks", duplicateTasks],
+    ["batch.Tasks", duplicateTasks],
+    ["agents", [{ id: "A1" }]],
+    ["batch.nested.tasks", duplicateTasks],
+    ["runs", [{ id: "RUN-1" }]],
+    ["events", [{ seq: 1 }]],
+    ["slices", [{ id: "S1" }]],
+  ];
+  for (const { label, store } of stores) {
+    store.createProject(projectDto());
+    store.createTask(taskDto("proj-1", { id: "TASK-SEED" }));
+    store.upsertAgent({ id: "agent-keep", role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
+    store.appendEvent({ projectId: "proj-1", aggregateType: "task", aggregateId: "TASK-SEED", type: "task.updated" });
+    const before = fingerprint(store);
+    for (const [path, value] of cases) {
+      const state = baseState();
+      setPath(state, path, value);
+      const report = importStateJson(store, {
+        stateJson: state,
+        runtime: { schemaVersion: 3, agents: [] },
+        mode: "replace",
+        now: T,
+      });
+      assert.equal(report.status, "SKIPPED", `${label}: ${path}`);
+      const problem = report.problems.find(
+        (candidate) => candidate.code === "IMPORT_WRITE_FAILED" && candidate.detail?.collection === path,
+      );
+      assert.ok(problem, `${label}: ${path}: problems=${JSON.stringify(report.problems)}`);
+      assert.equal(problem.detail.path, path, `${label}: ${path}`);
+      assert.ok(problem.detail.count >= 1, `${label}: ${path}`);
+      assert.deepEqual(fingerprint(store), before, `${label}: ${path} must leave the whole DB untouched`);
+    }
+    assert.equal(store.getProject("proj-1").id, "proj-1", label);
+    assert.equal(store.getTask("TASK-SEED").id, "TASK-SEED", label);
 
-    // Same for a top-level tasks array.
-    const topLevel = importStateJson(store, {
-      stateJson: { schemaVersion: 1, tasks: [{ id: "T1", status: "READY" }], packages: [] },
+    // Empty unknown arrays carry no data, and batch.openQuestions is a known
+    // array: neither must trip the whitelist.
+    const accepted = baseState();
+    accepted.futureMetadata = [];
+    accepted.batch.openQuestions = ["is this allowed?"];
+    const ok = importStateJson(store, {
+      stateJson: accepted,
       runtime: { schemaVersion: 3, agents: [] },
       mode: "replace",
       now: T,
+      projectId: "proj-1",
     });
-    assert.equal(topLevel.status, "SKIPPED", label);
-    assert.deepEqual(storeFingerprint(store), before, label);
+    assert.equal(ok.status, "PASS", `${label}: empty unknown arrays / openQuestions are allowed`);
   }
 });
 
