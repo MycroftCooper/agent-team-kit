@@ -47,7 +47,11 @@ importers:
 
   packages/contracts: {}
 
-  packages/database: {}
+  packages/database:
+    dependencies:
+      '@atk/contracts':
+        specifier: workspace:*
+        version: link:../contracts
 
 packages:
 
