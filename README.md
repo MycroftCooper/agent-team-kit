@@ -8,6 +8,27 @@ A reusable multi-agent delivery workflow: a state-machine CLI (`atk`), role
 contracts with enforceable write scopes, evidence gates that refuse to advance on
 missing receipts, and a kanban board with a DeepSeek Harness plugin.
 
+> **2.0 本地系统（v1.0 candidate，Mock 运行时）**：仓库里已有 Backend + Scheduler
+> + Runtime Host + Web 工作台（`apps/*` 与 `packages/*`），一条命令启动：
+> `node apps/launcher/cli.mjs start --port 1421`，浏览器打开
+> `http://127.0.0.1:1421/`。能力、边界与门禁清单见
+> [docs/V1-READINESS.md](docs/V1-READINESS.md)。
+>
+> 里程碑回执：[M0](docs/roadmap/m0-status.md) · [M1](docs/roadmap/m1-status.md) ·
+> [M2](docs/roadmap/m2-status.md) · [M3](docs/roadmap/m3-status.md) ·
+> [M4](docs/roadmap/m4-status.md) · [M5](docs/roadmap/m5-status.md) ·
+> [M6](docs/roadmap/m6-status.md)；独立 QA 报告在
+> `docs/architecture/qa-review-m{0..6}.md`。
+>
+> 门禁（HEAD 实测，全部必须绿）：
+> `node scripts/test.mjs` · `node scripts/test-workspace.mjs` ·
+> `node scripts/check-boundaries.mjs` · `node scripts/m1-smoke.mjs` …
+> `node scripts/m6-smoke.mjs`。
+>
+> **旧的 0.x CLI（本 README 余下部分）在 2.0 里退化为只读兼容层**（ADR-006
+> Phase C）：它的写命令会以 `READ_ONLY_MODE` 拒绝，读操作走 SQLite 投影；需要
+> JSON 时用 `atk-backend export`。启动 2.0 系统后不要再用旧 CLI 写 `state.json`。
+
 - **Zero dependencies.** Node.js >= 20.11 built-ins only, ESM, runs from a bare
   `node` inside any project.
 - **Config-driven.** Paths, roles, gates and the board plugin identity come from
