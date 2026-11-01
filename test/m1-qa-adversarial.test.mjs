@@ -602,7 +602,18 @@ async function runSuite() {
     const raw = new DatabaseSync(dbFile);
     const applied = Number(raw.prepare("SELECT COUNT(*) AS c FROM schema_migrations").get().c);
     raw.close();
-    assert.equal(applied, 1, "the migration bookkeeping must record exactly one applied migration");
+    // Derive the expected count from the migrations directory instead of hard
+    // coding a generation: every ordered .sql file must be recorded exactly once,
+    // and re-opening the same file must not add a row (checked above/below).
+    const { readdirSync } = await import("node:fs");
+    const migrationFiles = readdirSync(new URL("../packages/database/migrations/", import.meta.url)).filter((name) =>
+      name.endsWith(".sql"),
+    );
+    assert.equal(
+      applied,
+      migrationFiles.length,
+      `schema_migrations must record exactly one row per ordered migration (${migrationFiles.join(", ")})`,
+    );
 
     store = openStore({ file: dbFile, migrate: true });
     const runtime = {
