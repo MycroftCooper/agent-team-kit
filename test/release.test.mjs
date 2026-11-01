@@ -37,7 +37,11 @@ async function writeGreenGate(root) {
   const dir = path.join(root, "artifacts", "agent-flow");
   await rm(dir, { recursive: true, force: true });
   execFileSync("node", ["-e", `require("fs").mkdirSync(${JSON.stringify(dir)},{recursive:true})`], { cwd: root });
-  await writeFile(path.join(dir, "ci-fast-latest.json"), `${JSON.stringify({ schemaVersion: 1, gate: "fast", ok: true })}\n`, "utf8");
+  await writeFile(
+    path.join(dir, "ci-fast-latest.json"),
+    `${JSON.stringify({ schemaVersion: 1, gate: "fast", status: "PASS", ok: true })}\n`,
+    "utf8",
+  );
 }
 
 test("init-style config carries dev/master branch defaults", async (t) => {
@@ -78,6 +82,51 @@ test("release refuses a red gate report", async (t) => {
   await writeFile(gateFile, `${JSON.stringify({ ok: false })}\n`, "utf8");
   assert.equal(await runRelease(["--version", "0.2.0"], ctx), 1);
   assert.match(logger.errorText(), /not green/i);
+});
+
+test("release refuses a legacy ok-only gate report that has no status", async (t) => {
+  const { root, ctx, logger } = await setup(t);
+  await writeGreenGate(root);
+  const gateFile = path.join(root, "artifacts", "agent-flow", "ci-fast-latest.json");
+  // A pre-status report claims green through `ok` alone: that must never pass.
+  await writeFile(gateFile, `${JSON.stringify({ schemaVersion: 1, gate: "fast", ok: true })}\n`, "utf8");
+  assert.equal(await runRelease(["--version", "0.2.0"], ctx), 1);
+  assert.match(logger.errorText(), /not green/i);
+  assert.match(logger.errorText(), /no status field|only an explicit PASS/i);
+});
+
+test("release reads a UTF-8 BOM gate report as a valid PASS", async (t) => {
+  const { root, ctx, logger } = await setup(t);
+  await writeGreenGate(root);
+  const gateFile = path.join(root, "artifacts", "agent-flow", "ci-fast-latest.json");
+  const report = { schemaVersion: 1, gate: "fast", status: "PASS", ok: true };
+  await writeFile(gateFile, `\uFEFF${JSON.stringify(report)}\n`, "utf8");
+  assert.equal(await runRelease(["--version", "0.2.0"], ctx), 0);
+  assert.equal(logger.lines.json.at(-1).dryRun, true);
+  assert.doesNotMatch(logger.errorText(), /missing gate report/i);
+});
+
+test("release still rejects a BOM-prefixed non-PASS gate report with the accurate reason", async (t) => {
+  const { root, ctx, logger } = await setup(t);
+  await writeGreenGate(root);
+  const gateFile = path.join(root, "artifacts", "agent-flow", "ci-fast-latest.json");
+  const report = { schemaVersion: 1, status: "SKIPPED", ok: false };
+  await writeFile(gateFile, `\uFEFF${JSON.stringify(report)}\n`, "utf8");
+  assert.equal(await runRelease(["--version", "0.2.0"], ctx), 1);
+  assert.match(logger.errorText(), /not green/i);
+  assert.match(logger.errorText(), /SKIPPED/);
+  assert.doesNotMatch(logger.errorText(), /missing gate report/i);
+});
+
+test("release reports an unreadable gate report instead of calling it missing", async (t) => {
+  const { root, ctx, logger } = await setup(t);
+  await writeGreenGate(root);
+  const gateFile = path.join(root, "artifacts", "agent-flow", "ci-fast-latest.json");
+  await writeFile(gateFile, "{ not valid json\n", "utf8");
+  assert.equal(await runRelease(["--version", "0.2.0"], ctx), 1);
+  assert.match(logger.errorText(), /unreadable gate report/i);
+  assert.match(logger.errorText(), /Invalid JSON/i);
+  assert.doesNotMatch(logger.errorText(), /missing gate report/i);
 });
 
 test("release --apply merges into master, tags and switches back to dev", async (t) => {

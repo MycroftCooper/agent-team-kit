@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createContext } from "../lib/context.mjs";
-import { run, stepApplies } from "../lib/select-tests.mjs";
+import { buildPlan, run, stepApplies } from "../lib/select-tests.mjs";
 
 function memoryLogger() {
   const out = [];
@@ -158,6 +158,15 @@ test("falls back to git collection when no files are given", async (t) => {
   assert.equal(plan.changed.total, 0);
   assert.equal(plan.source, undefined);
   assert.deepEqual(plan.changed.tests, []);
+});
+
+test("notes that a change set with no applicable step is SKIPPED, not a pass", () => {
+  const plan = buildPlan(["misc/note.txt"], { gates: { fast: { groups: GROUPS, steps: [] } } });
+  assert.deepEqual(Object.keys(plan.commands), []);
+  assert.ok(
+    plan.notes.some((note) => /SKIPPED/.test(note) && /not a pass/i.test(note)),
+    plan.notes.join("\n"),
+  );
 });
 
 test("stepApplies honours group, changed and includingTests conditions", () => {

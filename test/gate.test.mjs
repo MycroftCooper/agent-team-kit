@@ -97,6 +97,7 @@ test("gate fast runs applicable steps and writes the report", async (t) => {
 
   const report = await readReport(root);
   assert.equal(report.schemaVersion, 1);
+  assert.equal(report.status, "PASS");
   assert.equal(report.ok, true);
   assert.equal(report.role, null);
   assert.equal(report.scope.total, 1);
@@ -109,6 +110,7 @@ test("gate fast runs applicable steps and writes the report", async (t) => {
   assert.equal(typeof report.note, "string");
 
   const printed = JSON.parse(logger.text());
+  assert.equal(printed.status, "PASS");
   assert.equal(printed.ok, true);
 });
 
@@ -126,11 +128,13 @@ test("gate quick and local publish the latest gate report", async (t) => {
   assert.equal(await run(["quick"], ctx), 0);
   let report = await readReport(root);
   assert.equal(report.gate, "quick");
+  assert.equal(report.status, "PASS");
   assert.equal(report.ok, true);
 
   assert.equal(await run(["local"], ctx), 0);
   report = await readReport(root);
   assert.equal(report.gate, "local");
+  assert.equal(report.status, "PASS");
   assert.equal(report.ok, true);
   assert.match(report.finishedAt, /^\d{4}-\d{2}-\d{2}T/);
 });
@@ -151,6 +155,7 @@ test("gate fast fails when a main step exits non-zero", async (t) => {
   const code = await run(["fast", "--files", "src/a.js"], ctx);
   assert.equal(code, 1);
   const report = await readReport(root);
+  assert.equal(report.status, "FAIL");
   assert.equal(report.ok, false);
   assert.equal(report.steps.length, 1);
   assert.equal(report.steps[0].status, "failed");
@@ -179,6 +184,7 @@ test("gate fast aborts main steps when a preflight step fails", async (t) => {
   const code = await run(["fast", "--files", "src/a.js"], ctx);
   assert.equal(code, 1);
   const report = await readReport(root);
+  assert.equal(report.status, "FAIL");
   assert.equal(report.ok, false);
   assert.equal(report.stoppedAt, "preflight");
   assert.deepEqual(
@@ -295,32 +301,45 @@ test("gate fast --plan prints planned steps and runs nothing", async (t) => {
   await assert.rejects(stat(reportPath(root)));
 });
 
-test("gate fast without steps prints a note and succeeds", async (t) => {
+test("gate fast with no configured steps is UNCONFIGURED and exits 2", async (t) => {
   const root = await makeProject(
     t,
     baseConfig({ fast: { parallel: true, groups: {}, steps: [] }, quick: null, local: null }),
   );
   const { ctx, logger } = await contextFor(root);
   const code = await run(["fast"], ctx);
-  assert.equal(code, 0);
-  assert.match(logger.text(), /no fast gate steps configured/i);
-  await assert.rejects(stat(reportPath(root)));
+  assert.equal(code, 2);
+  assert.match(logger.errors(), /UNCONFIGURED/);
+  assert.match(logger.errors(), /not a pass/i);
+  const report = await readReport(root);
+  assert.equal(report.status, "UNCONFIGURED");
+  assert.equal(report.ok, false);
+  assert.equal(report.schemaVersion, 1);
 });
 
-test("quick gate prints a note when no command is configured", async (t) => {
+test("quick gate is UNCONFIGURED and exits 2 when no command is configured", async (t) => {
   const root = await makeProject(t, baseConfig({ fast: { groups: {}, steps: [] }, quick: null, local: null }));
   const { ctx, logger } = await contextFor(root);
   const code = await run(["quick"], ctx);
-  assert.equal(code, 0);
-  assert.match(logger.text(), /no quick command configured/i);
+  assert.equal(code, 2);
+  assert.match(logger.errors(), /UNCONFIGURED/);
+  assert.match(logger.errors(), /not a pass/i);
+  const report = await readReport(root);
+  assert.equal(report.gate, "quick");
+  assert.equal(report.status, "UNCONFIGURED");
+  assert.equal(report.ok, false);
 });
 
-test("local gate prints a note when no command is configured", async (t) => {
+test("local gate is UNCONFIGURED and exits 2 when no command is configured", async (t) => {
   const root = await makeProject(t, baseConfig({ fast: { groups: {}, steps: [] }, quick: null, local: null }));
   const { ctx, logger } = await contextFor(root);
   const code = await run(["local"], ctx);
-  assert.equal(code, 0);
-  assert.match(logger.text(), /no local command configured/i);
+  assert.equal(code, 2);
+  assert.match(logger.errors(), /UNCONFIGURED/);
+  const report = await readReport(root);
+  assert.equal(report.gate, "local");
+  assert.equal(report.status, "UNCONFIGURED");
+  assert.equal(report.ok, false);
 });
 
 test("quick gate runs the configured command and reports its exit code", async (t) => {
@@ -346,6 +365,7 @@ test("quick gate runs the configured command and reports its exit code", async (
   assert.equal(await run(["quick", "--json"], jsonRun.ctx), 0);
   const report = JSON.parse(jsonRun.logger.text());
   assert.equal(report.gate, "quick");
+  assert.equal(report.status, "PASS");
   assert.equal(report.ok, true);
 });
 
@@ -437,6 +457,7 @@ test("string commands run through the shell", async (t) => {
   const { ctx } = await contextFor(root);
   assert.equal(await run(["fast", "--files", "docs/a.md"], ctx), 0);
   const report = await readReport(root);
+  assert.equal(report.status, "PASS");
   assert.equal(report.ok, true);
   assert.equal(report.steps[0].name, "docs-string");
 });
