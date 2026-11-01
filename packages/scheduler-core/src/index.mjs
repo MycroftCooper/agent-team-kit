@@ -113,6 +113,9 @@ function taskDeps(task) {
   return [...seen].sort(compareIds);
 }
 
+/** Hard caps for simple-cycle enumeration (deterministic, never exponential). */
+export const CYCLE_LIMITS = Object.freeze({ perScc: 100, total: 1000, visitBudget: 250_000 });
+
 function buildTaskIndex(tasks) {
   const index = new Map();
   for (const task of asArray(tasks)) {
@@ -124,59 +127,162 @@ function buildTaskIndex(tasks) {
   return new Map([...index.entries()].sort(([a], [b]) => compareIds(a, b)));
 }
 
+/** Kosaraju SCCs, iterative (no recursion depth limit) and deterministic. */
+function stronglyConnectedComponents(ids, edges) {
+  const visited = new Set();
+  const order = [];
+  for (const start of ids) {
+    if (visited.has(start)) continue;
+    visited.add(start);
+    const stack = [{ id: start, next: 0 }];
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1];
+      const neighbors = edges.get(frame.id) ?? [];
+      if (frame.next < neighbors.length) {
+        const next = neighbors[frame.next];
+        frame.next += 1;
+        if (!visited.has(next)) {
+          visited.add(next);
+          stack.push({ id: next, next: 0 });
+        }
+      } else {
+        order.push(frame.id);
+        stack.pop();
+      }
+    }
+  }
+
+  const reverse = new Map(ids.map((id) => [id, []]));
+  for (const [from, tos] of edges) {
+    for (const to of tos) reverse.get(to).push(from);
+  }
+  for (const list of reverse.values()) list.sort(compareIds);
+
+  const assigned = new Set();
+  const components = [];
+  for (let index = order.length - 1; index >= 0; index -= 1) {
+    const start = order[index];
+    if (assigned.has(start)) continue;
+    const component = [];
+    const stack = [start];
+    assigned.add(start);
+    while (stack.length > 0) {
+      const id = stack.pop();
+      component.push(id);
+      for (const next of reverse.get(id) ?? []) {
+        if (!assigned.has(next)) {
+          assigned.add(next);
+          stack.push(next);
+        }
+      }
+    }
+    component.sort(compareIds);
+    components.push(component);
+  }
+  components.sort((a, b) => compareIds(a[0], b[0]));
+  return components;
+}
+
 /**
- * Find every cycle in the dependency graph.
+ * Enumerate every simple cycle inside one SCC (start node = smallest id in the
+ * cycle, so each cycle is produced exactly once and already canonical).
+ *
+ * `budget` bounds the total number of DFS edge inspections for the whole
+ * `detectCycles` call: a cyclic graph can have exponentially many simple paths,
+ * and the cycle cap alone does not bound the work needed to find them.
+ */
+function enumerateSimpleCycles(component, edges, limit, budget) {
+  const members = new Set(component);
+  const cycles = [];
+  let truncated = false;
+
+  for (const start of component) {
+    if (cycles.length >= limit) {
+      truncated = true;
+      break;
+    }
+    const path = [start];
+    const onPath = new Set([start]);
+    const dfs = (current) => {
+      for (const next of edges.get(current) ?? []) {
+        budget.visits += 1;
+        if (budget.visits > budget.max) {
+          truncated = true;
+          return;
+        }
+        if (cycles.length >= limit) {
+          truncated = true;
+          return;
+        }
+        if (!members.has(next)) continue;
+        if (next === start) {
+          cycles.push([...path]);
+          continue;
+        }
+        // The smallest id of a cycle must be its entry point; anything smaller
+        // than `start` is a different rotation that another start already sees.
+        if (compareIds(next, start) < 0) continue;
+        if (onPath.has(next)) continue; // only `start` may repeat (to close)
+        path.push(next);
+        onPath.add(next);
+        dfs(next);
+        path.pop();
+        onPath.delete(next);
+        if (truncated) return;
+      }
+    };
+    dfs(start);
+    if (truncated) break;
+  }
+  return { cycles, truncated };
+}
+
+/**
+ * Find every simple cycle in the dependency graph.
  *
  * - a self-dependency (`A -> A`) is a cycle of length one: `["A"]`;
  * - a dependency on a task that is not in the snapshot is NOT a cycle (it is a
- *   readiness problem reported by `readyCandidates` / `planDispatch`).
+ *   readiness problem reported by `readyCandidates` / `planDispatch`);
+ * - cycles inside one strongly-connected component are enumerated individually,
+ *   not just one per DFS branch: `A->B->D->A` and `A->C->D->A` are two cycles.
  *
- * Each cycle is returned once, rotated so the lexicographically smallest id is
- * first, and cycles are sorted, so the result is deterministic.
+ * Enumeration is bounded by {@link CYCLE_LIMITS} (per SCC and overall). When a
+ * cap is hit, the cycles found so far are returned with `truncated: true` — an
+ * explicit "incomplete" marker, never silently fewer cycles.
+ *
+ * Each cycle starts at its lexicographically smallest id; cycles are sorted, so
+ * the result is deterministic for the same graph regardless of input order.
  *
  * @param {Array<{id: string, deps?: string[]}>} tasks
- * @returns {{ok: boolean, cycles: string[][]}}
+ * @returns {{ok: boolean, cycles: string[][], truncated: boolean}}
  */
 export function detectCycles(tasks) {
   const index = buildTaskIndex(tasks);
   const ids = [...index.keys()];
   const edges = new Map(ids.map((id) => [id, taskDeps(index.get(id)).filter((dep) => index.has(dep))]));
 
-  const state = new Map(); // 0 = unvisited, 1 = in current stack, 2 = done
-  const stack = [];
+  const components = stronglyConnectedComponents(ids, edges);
   const found = new Map();
+  const budget = { visits: 0, max: CYCLE_LIMITS.visitBudget };
+  let truncated = false;
 
-  const canonical = (cycle) => {
-    let best = 0;
-    for (let i = 1; i < cycle.length; i += 1) {
-      if (compareIds(cycle[i], cycle[best]) < 0) best = i;
+  for (const component of components) {
+    if (found.size >= CYCLE_LIMITS.total || budget.visits > budget.max) {
+      truncated = true;
+      break;
     }
-    return [...cycle.slice(best), ...cycle.slice(0, best)];
-  };
+    const only = component[0];
+    const isSelfLoop = component.length === 1 && (edges.get(only) ?? []).includes(only);
+    if (component.length === 1 && !isSelfLoop) continue;
 
-  const visit = (id) => {
-    state.set(id, 1);
-    stack.push(id);
-    for (const next of edges.get(id) ?? []) {
-      const nextState = state.get(next) ?? 0;
-      if (nextState === 1) {
-        const start = stack.indexOf(next);
-        const cycle = canonical(stack.slice(start));
-        found.set(cycle.join("\u0000"), cycle);
-      } else if (nextState === 0) {
-        visit(next);
-      }
-    }
-    stack.pop();
-    state.set(id, 2);
-  };
-
-  for (const id of ids) {
-    if ((state.get(id) ?? 0) === 0) visit(id);
+    const limit = Math.min(CYCLE_LIMITS.perScc, CYCLE_LIMITS.total - found.size);
+    const result = enumerateSimpleCycles(component, edges, limit, budget);
+    for (const cycle of result.cycles) found.set(cycle.join("\u0000"), cycle);
+    if (result.truncated) truncated = true;
   }
 
   const cycles = [...found.values()].sort((a, b) => compareIds(a.join("\u0000"), b.join("\u0000")));
-  return { ok: cycles.length === 0, cycles };
+  return { ok: cycles.length === 0, cycles, truncated };
 }
 
 /**
@@ -215,22 +321,25 @@ export function topologicalOrder(tasks) {
  * READY tasks whose dependencies are all DONE and present.
  *
  * A dependency that does not exist in the snapshot is treated as incomplete and
- * reported in `missingDeps` instead of silently disappearing.
+ * reported in `missingDeps` (one entry per task, listing every missing dep id)
+ * instead of silently disappearing. Contract §5 shape:
+ * `[{ taskId, missing: string[] }]`.
  *
  * @param {{tasks?: Array}} input
- * @returns {{candidates: object[], missingDeps: Array<{taskId: string, depId: string}>}}
+ * @returns {{candidates: object[], missingDeps: Array<{taskId: string, missing: string[]}>}}
  */
 export function readyCandidates({ tasks } = {}) {
   const index = buildTaskIndex(tasks);
   const candidates = [];
-  const missing = new Map();
+  const missing = new Map(); // taskId -> Set<depId>
   for (const [taskId, task] of index) {
     if (task.status !== READY_TASK_STATUS) continue;
     let ready = true;
     for (const depId of taskDeps(task)) {
       const dep = index.get(depId);
       if (!dep) {
-        missing.set(`${taskId}\u0000${depId}`, { taskId, depId });
+        if (!missing.has(taskId)) missing.set(taskId, new Set());
+        missing.get(taskId).add(depId);
         ready = false;
         continue;
       }
@@ -238,9 +347,9 @@ export function readyCandidates({ tasks } = {}) {
     }
     if (ready) candidates.push(task);
   }
-  const missingDeps = [...missing.values()].sort(
-    (a, b) => compareIds(a.taskId, b.taskId) || compareIds(a.depId, b.depId),
-  );
+  const missingDeps = [...missing.entries()]
+    .sort(([a], [b]) => compareIds(a, b))
+    .map(([taskId, depIds]) => ({ taskId, missing: [...depIds].sort(compareIds) }));
   return { candidates, missingDeps };
 }
 

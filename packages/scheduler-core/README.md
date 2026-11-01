@@ -10,9 +10,9 @@
 
 | 函数 | 返回 |
 |---|---|
-| `detectCycles(tasks)` | `{ ok, cycles: string[][] }`（自依赖也算环；环路径规范化 + 确定性排序） |
+| `detectCycles(tasks)` | `{ ok, cycles: string[][], truncated }`（每个 SCC 内枚举**所有简单环**；自依赖也算环；环从最小 id 起始 + 确定性排序；超过上限时 `truncated: true`） |
 | `topologicalOrder(tasks)` | `{ ok:true, order, levels } \| { ok:false, cycles }` |
-| `readyCandidates({ tasks })` | `{ candidates, missingDeps: [{taskId, depId}] }` |
+| `readyCandidates({ tasks })` | `{ candidates, missingDeps: [{taskId, missing: string[]}] }` |
 | `scoreAndSort(tasks, { now })` | `[{ taskId, priority, waitingMs, score }]` |
 | `matchAgents({ task, agents, policies })` | `{ candidates, excluded: [{agentId, reason}] }` |
 | `detectConflicts({ task, activeRuns, ownership })` | `{ ok, reasons: [{kind, detail}] }` |
@@ -31,11 +31,15 @@
 
 ## 环与依赖规则
 
-- 环：直接环、间接环、自依赖都会被 `detectCycles` 报告；有环时 `planDispatch` **整体拒绝**：
+- 环：直接环、间接环、自依赖都会被 `detectCycles` 报告；**同一 SCC 内的每条简单环都单独报告**
+  （例如 `A→B→D→A` 与 `A→C→D→A` 是两条，而不是只报一条）。有环时 `planDispatch` **整体拒绝**：
   `proposals: []`，且快照里**每个 task** 都得到 `skipped[].reason = "cycle"`。
   绝不“跳过有环的部分、继续派发其余任务”。
+- 枚举上限：每个 SCC 最多 `CYCLE_LIMITS.perScc`（100）条、总计 `CYCLE_LIMITS.total`（1000）条，
+  另设 `CYCLE_LIMITS.visitBudget`（250,000 次 DFS 边检查）防止“指数级简单路径但环很少”的病态图；
+  达到任一上限时返回已找到的环并置 `truncated: true`，绝不静默少报。
 - 依赖：一个任务只有在所有 deps 都存在且 `DONE` 时才进入候选集；缺失 dep 视为未完成，
-  `readyCandidates` 单独报告 `missingDeps`，`planDispatch` 给出 `deps-incomplete`。
+  `readyCandidates` 按 `missingDeps: [{taskId, missing: [depId...]}]` 单独报告，`planDispatch` 给出 `deps-incomplete`。
 
 ## 跳过原因（机器可读枚举，不接受自由文本）
 

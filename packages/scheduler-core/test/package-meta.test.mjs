@@ -81,6 +81,7 @@ test("the public surface exposes the documented functions and enums", async () =
     "SKIP_REASONS",
     "SKIP_REASON_VALUES",
     "PRIORITY_WEIGHT",
+    "CYCLE_LIMITS",
   ]) {
     assert.ok(name in api, `missing export ${name}`);
   }
