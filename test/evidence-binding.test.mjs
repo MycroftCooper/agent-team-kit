@@ -259,6 +259,12 @@ test("atk evidence accepts legacy receipts only through the escape hatch (config
   const configured = await evidenceSetup(t, {
     config: { batch: { legacyReceipts: true } },
     receipts: {
+      // Q-02: the escape hatch still requires the named hash to bind a manifest.
+      "artifacts/evidence/BATCH-01/manifest.json": {
+        batchId: "BATCH-01",
+        manifestSha256: SHA,
+        files: [{ path: "src/app.ts" }],
+      },
       "artifacts/evidence/BATCH-01/qa-legacy.json": {
         passed: true,
         manifestSha256: SHA,
@@ -303,4 +309,130 @@ test("atk evidence accepts a signed receipt and refuses a failing gate or a brok
   assert.equal(state.batch.slices.find((slice) => slice.id === "S1").qaPassed, true);
   assert.equal(state.batch.slices.find((slice) => slice.id === "S2").qaPassed, null);
   assert.equal(state.packages.find((pkg) => pkg.id === "PKG-01").verification.qaPassed, true);
+});
+
+// ---------------------------------------------------------------------------
+// Q-02 / Q-04 (QA-001): fail-closed manifest binding and missing-kind reporting.
+// ---------------------------------------------------------------------------
+
+test("a QA-shaped receipt without kind is refused as missing-kind (Q-04)", () => {
+  const shaped = {
+    schemaVersion: 1,
+    manifestSha256: SHA,
+    verdict: "PASS",
+    reviewer: { run: "run-qa-1", agent: "agent-qa-01", role: "QA", function: "REVIEWER" },
+    gates: [{ name: "quick", status: "PASS" }],
+  };
+  const result = validateQaApproval(shaped, { manifest: manifestFixture() });
+  assert.equal(result.ok, false);
+  assert.deepEqual(reasonsOf(result), ["missing-kind"]);
+  assert.match(result.rejected[0].detail, /missing kind: "qa-approval"/);
+  assert.match(result.rejected[0].detail, /expected the signed structure/);
+
+  const escaped = validateQaApproval(shaped, { manifest: manifestFixture(), legacyReceipts: true });
+  assert.equal(escaped.ok, false, "the legacy escape hatch is not for QA-shaped receipts");
+  assert.deepEqual(reasonsOf(escaped), ["missing-kind"]);
+
+  const wrongKind = validateQaApproval({ ...shaped, kind: "qa" }, { manifest: manifestFixture() });
+  assert.deepEqual(reasonsOf(wrongKind), ["missing-kind"]);
+  assert.match(wrongKind.rejected[0].detail, /"qa"/);
+});
+
+test("atk evidence refuses a signed receipt whose hash binds no manifest (Q-02)", async (t) => {
+  const env = await evidenceSetup(t, {
+    receipts: {
+      "artifacts/evidence/BATCH-01/qa-forged.json": approvalFixture({
+        manifestSha256: "F".repeat(64),
+        batchId: "S1",
+        packages: ["PKG-01"],
+      }),
+    },
+  });
+
+  assert.equal(await env.run(["--json"]), 0, "a refused receipt is a report, not a crash");
+  const report = env.logger.lines.json.at(-1);
+  assert.equal(report.qaApprovals, 0, "a hash that binds no frozen manifest is not evidence");
+  assert.equal(report.changes.length, 0);
+  assert.equal(report.rejected.length, 1);
+  assert.equal(report.rejected[0].reason, "unbound-manifest");
+  assert.match(report.rejected[0].detail, /no manifest/);
+  assert.match(env.logger.errorText(), /unbound-manifest/);
+
+  const state = await loadState(env);
+  const slice = state.batch.slices.find((entry) => entry.id === "S1");
+  assert.equal(slice.qaPassed, null);
+  assert.equal(slice.status, "in_progress");
+  assert.equal(state.packages.find((pkg) => pkg.id === "PKG-01").verification.qaPassed, undefined);
+});
+
+test("atk evidence normalises hex case when binding a manifest (Q-02)", async (t) => {
+  const env = await evidenceSetup(t, {
+    receipts: {
+      "artifacts/evidence/BATCH-01/manifest.json": manifestFixture(),
+      "artifacts/evidence/BATCH-01/qa-lowercase.json": approvalFixture({
+        manifestSha256: SHA.toLowerCase(),
+        batchId: "S1",
+        packages: ["PKG-01"],
+      }),
+    },
+  });
+
+  assert.equal(await env.run(["--json"]), 0);
+  const report = env.logger.lines.json.at(-1);
+  assert.equal(report.qaApprovals, 1, "a case variant of the frozen hash is the same hash");
+  assert.deepEqual(report.rejected, []);
+
+  const state = await loadState(env);
+  const slice = state.batch.slices.find((entry) => entry.id === "S1");
+  assert.equal(slice.qaPassed, true);
+  assert.equal(slice.status, "awaiting_apply");
+  assert.equal(state.packages.find((pkg) => pkg.id === "PKG-01").verification.qaPassed, true);
+});
+
+test("atk evidence reports a QA-shaped receipt without kind (Q-04)", async (t) => {
+  const env = await evidenceSetup(t, {
+    receipts: {
+      "artifacts/evidence/BATCH-01/manifest.json": manifestFixture(),
+      "artifacts/evidence/BATCH-01/qa-nokind.json": {
+        schemaVersion: 1,
+        manifestSha256: SHA,
+        verdict: "PASS",
+        reviewer: { run: "run-qa-1", agent: "agent-qa-01", role: "QA", function: "REVIEWER" },
+        batchId: "S1",
+        packages: ["PKG-01"],
+        gates: [{ name: "quick", status: "PASS" }],
+      },
+    },
+  });
+
+  assert.equal(await env.run(["--json"]), 0);
+  const report = env.logger.lines.json.at(-1);
+  assert.equal(report.qaApprovals, 0);
+  assert.equal(report.rejected.length, 1);
+  assert.equal(report.rejected[0].reason, "missing-kind");
+  assert.match(env.logger.errorText(), /missing-kind/);
+  const state = await loadState(env);
+  assert.equal(state.batch.slices.find((entry) => entry.id === "S1").qaPassed, null);
+});
+
+test("the legacy escape hatch still requires the named hash to bind a manifest (Q-02)", async (t) => {
+  const env = await evidenceSetup(t, {
+    config: { batch: { legacyReceipts: true } },
+    receipts: {
+      "artifacts/evidence/BATCH-01/qa-legacy.json": {
+        passed: true,
+        manifestSha256: "F".repeat(64),
+        batchId: "S1",
+        packages: ["PKG-01"],
+      },
+    },
+  });
+
+  assert.equal(await env.run(["--json"]), 0);
+  const report = env.logger.lines.json.at(-1);
+  assert.equal(report.legacyReceipts, true);
+  assert.equal(report.qaApprovals, 0, "the escape hatch is not a binding escape hatch");
+  assert.equal(report.rejected[0].reason, "unbound-manifest");
+  const state = await loadState(env);
+  assert.equal(state.batch.slices.find((entry) => entry.id === "S1").qaPassed, null);
 });

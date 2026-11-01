@@ -9,7 +9,8 @@ import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
 import { createContext } from "../lib/context.mjs";
-import { run as runGate } from "../lib/gate.mjs";
+import { gateReportVerdict as gateVerdict, run as runGate } from "../lib/gate.mjs";
+import { evaluatePermission } from "../lib/permissions.mjs";
 import { gateReportVerdict, run as runRelease } from "../lib/release.mjs";
 import { createProject, memoryLogger } from "./helpers.mjs";
 
@@ -293,6 +294,7 @@ test("gate fast --plan still prints the parseable plan and writes no report", as
 // --- release: only an explicit PASS is green ---------------------------------
 
 test("gateReportVerdict requires status PASS and a consistent ok flag", () => {
+  assert.equal(gateReportVerdict, gateVerdict, "release must re-export the single lib/gate.mjs implementation");
   assert.deepEqual(gateReportVerdict({ status: "PASS", ok: true }), { ok: true, status: "PASS", reason: null });
   assert.equal(gateReportVerdict({ status: "PASS", ok: false }).ok, false);
   assert.match(gateReportVerdict({ status: "PASS", ok: false }).reason, /inconsistent/i);
@@ -359,4 +361,41 @@ test("a real PASS gate run is accepted by release end to end", async (t) => {
   const report = await readReport(root);
   assert.deepEqual(gateReportVerdict(report), { ok: true, status: "PASS", reason: null });
   assert.equal(await runRelease(["--version", "0.2.0"], ctx), 0);
+});
+
+test("release and the permission gate-green reach the same verdict on every report", async (t) => {
+  const { root, ctx } = await setupRepo(t, {
+    fast: null,
+    quick: { command: ["node", "-e", "process.exit(0)"] },
+    local: null,
+  });
+  // One parameterised fixture set feeds both consumers: release (delivery gate)
+  // and the permission layer's gate-green (batch apply integration gate). They
+  // must never drift apart again (Q-03).
+  const fixtures = [
+    { report: { schemaVersion: 1, gate: "quick", ok: true }, green: false },
+    { report: { schemaVersion: 1, status: "FAIL", ok: true }, green: false },
+    { report: { schemaVersion: 1, status: "SKIPPED", ok: false }, green: false },
+    { report: { schemaVersion: 1, status: "UNCONFIGURED", ok: false }, green: false },
+    { report: { schemaVersion: 1, status: "ERROR", ok: false }, green: false },
+    { report: { schemaVersion: 1, status: "PASS", ok: false }, green: false },
+    { report: { schemaVersion: 1, status: "PASS", ok: true }, green: true },
+  ];
+  for (const item of fixtures) {
+    await writeGateReport(root, item.report);
+    const releaseCode = await runRelease(["--version", "0.2.0"], ctx);
+    const decision = await evaluatePermission(ctx, {
+      operation: "integration.merge.development",
+      subject: "SYSTEM",
+      qaPassed: true,
+      noDrift: true,
+    });
+    assert.equal(releaseCode === 0, item.green, `release on ${JSON.stringify(item.report)}`);
+    assert.equal(decision.allowed, item.green, `gate-green on ${JSON.stringify(item.report)}: ${decision.detail}`);
+    assert.equal(
+      releaseCode === 0,
+      decision.allowed,
+      `release and gate-green drifted on ${JSON.stringify(item.report)}`,
+    );
+  }
 });

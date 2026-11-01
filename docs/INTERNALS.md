@@ -251,6 +251,16 @@ unchanged and are produced for an accepted approval when
 `--agent`, when the target Role owns the task, or when a manifest under
 `evidenceDir` records the same instance as producer.
 
+**`atk batch apply` output contract (M0):** every path prints one JSON plan on
+stdout — a dry-run plan, or a failure plan whose `error` is one of
+`"verify-failed"` (the manifest/QA verification did not pass) or
+`"permission-denied"` (the integration permission refused the write; `reason`
+carries the permission reason code such as `GATE_NOT_GREEN`, `detail` the readable
+why). The original tree is not touched on either failure path. This closes the
+only path that used to fail with stderr only, so a script can always read why an
+integration did not happen.
+
+
 ### 4.6 `functions` config
 
 `agent-flow.config.json` carries `functions.roles` (Role -> Function(s), with
@@ -321,6 +331,19 @@ statuses. `ok` is always exactly `status === "PASS"`; the exit codes are
   never survive a gate run that did not pass. `release` accepts the report only
   when `status === "PASS"` and `ok === true`; a legacy report without `status`
   is rejected. The report is read BOM-tolerantly (`readJsonStrict`/`stripBom`).
+- **One verdict implementation:** `gateReportVerdict(report)` in `lib/gate.mjs` is
+  the only place that decides whether a report is green. `atk release` and the
+  permission condition `gate-green` (used by `batch apply`) both call it, so the
+  two delivery paths cannot drift apart; a test asserts they are the same
+  function object. Only `status === "PASS" && ok === true` is green; a legacy
+  report without `status`, any SKIPPED/FAIL/UNCONFIGURED/ERROR status, and the
+  contradictory `status: "PASS", ok: false` are all refused with a specific
+  reason.
+- **`gate-green` without a configured gate:** when neither `gates.quick` nor
+  `gates.local` is configured the condition reports "not applicable" (allowed,
+  `detail: "no quick/local gate configured; gate-green does not apply"`). It
+  never claims a report was verified. An unconfigured gate is still caught
+  separately: `atk gate <name>` returns UNCONFIGURED with exit 2.
 
 ### 4.9 `atk evidence` report
 
@@ -347,6 +370,16 @@ is project-relative and `file` absolute. Legacy receipts are refused unless
 also printed on stderr as `refused qa-approval <path>: <reason> - <detail>`.
 Consumers that read the old `rejected` entry fields must be updated; nothing is
 silently dropped.
+
+**Binding rule (M0 QA fix):** a receipt that carries a non-empty `manifestSha256`
+is accepted only when a manifest with that hash exists in the evidence directory
+that the run scanned. Otherwise it is refused with reason `unbound-manifest` and
+no `qa`/`applied` fact is derived — a fabricated or typo'd hash must never advance
+`state.json`. Hex comparison is case-insensitive (the manifest side writes upper
+case); normalisation is used for comparison only and the receipt keeps its
+original value in the report. A receipt that looks like a QA approval (`verdict`,
+`reviewer` or `gates` present) but lacks `kind: "qa-approval"` is refused with
+reason `missing-kind`, even when the legacy escape hatch is on.
 
 Receipt capture (`atk evidence --collect-temp`) copies recognisable
 manifest / apply / qa-approval JSON from `<os.tmpdir()>/<layout.tempPrefix>-*`

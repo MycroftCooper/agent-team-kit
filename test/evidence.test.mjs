@@ -135,6 +135,10 @@ test("evidence never advances blocked/paused slices and keeps humanAccepted", as
       return state;
     })(),
     receipts: {
+      // Q-02: a QA receipt only counts when its hash binds a manifest in the scan.
+      "artifacts/evidence/BATCH-01/manifest-b.json": { batchId: "BATCH-01", manifestSha256: "B".repeat(64), files: [{ path: "src/app.ts" }] },
+      "artifacts/evidence/BATCH-01/manifest-c.json": { batchId: "BATCH-01", manifestSha256: "C".repeat(64), files: [{ path: "src/app.ts" }] },
+      "artifacts/evidence/BATCH-01/manifest-d.json": { batchId: "BATCH-01", manifestSha256: "D".repeat(64), files: [{ path: "src/app.ts" }] },
       "artifacts/evidence/BATCH-01/qa-s2.json": signedQa("B".repeat(64), { batchId: "S2" }),
       "artifacts/evidence/BATCH-01/apply-s3.json": { originalApplied: true, manifestSha256: "C".repeat(64), batchId: "S3" },
       "artifacts/evidence/BATCH-01/qa-s1.json": signedQa("D".repeat(64), { batchId: "S1" }),
@@ -155,6 +159,8 @@ test("evidence never advances blocked/paused slices and keeps humanAccepted", as
 test("evidence --dry reports changes without writing state.json", async (t) => {
   const env = await setup(t, {
     receipts: {
+      // Q-02: the QA receipt must bind a manifest that is part of the scan.
+      "artifacts/evidence/BATCH-01/manifest-d.json": { batchId: "BATCH-01", manifestSha256: "D".repeat(64), files: [{ path: "src/app.ts" }] },
       "artifacts/evidence/BATCH-01/qa-s1.json": signedQa("D".repeat(64), { batchId: "S1" }),
     },
   });
@@ -162,7 +168,9 @@ test("evidence --dry reports changes without writing state.json", async (t) => {
   assert.equal(await env.run(["--dry", "--json"]), 0);
   const report = env.logger.lines.json.at(-1);
   assert.equal(report.dryRun, true);
-  assert.equal(report.changes.length, 1);
+  // Two facts: the slice (S1 qaPassed/awaiting_apply) and PKG-01 (the manifest
+  // now binds src/app.ts, which is PKG-01's evidence path).
+  assert.equal(report.changes.length, 2);
   assert.equal(await readFile(env.statePath, "utf8"), before, "dry-run must not write");
 });
 

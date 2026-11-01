@@ -421,7 +421,14 @@ test("integration permission requires a green gate report when quick/local gates
   assert.equal(await apply(), 1, "no gate report means no integration");
   assert.match(env.logger.errorText(), /ATTRIBUTE_MISSING|GATE_NOT_GREEN/);
 
-  await writeJson(path.join(env.root, "artifacts", "agent-flow", "ci-fast-latest.json"), { ok: true, finishedAt: "2026-01-01T00:00:00+00:00" });
+  // Q-03: only an explicit five-value PASS report satisfies the integration
+  // gate; a legacy `{ ok: true }` report without `status` must not integrate.
+  await writeJson(path.join(env.root, "artifacts", "agent-flow", "ci-fast-latest.json"), {
+    schemaVersion: 1,
+    status: "PASS",
+    ok: true,
+    finishedAt: "2026-01-01T00:00:00+00:00",
+  });
   env.logger.lines.err.length = 0;
   assert.equal(await apply(), 0);
 });

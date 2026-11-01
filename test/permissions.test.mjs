@@ -2,9 +2,11 @@
 // reason codes, condition evaluation, the append-only audit and the
 // `atk permit` command.
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { run as runBatch } from "../lib/batch.mjs";
 import { createContext } from "../lib/context.mjs";
 import { runCli } from "../lib/dispatch.mjs";
 import { checkPermission, evaluatePermission, readAudit } from "../lib/permissions.mjs";
@@ -95,6 +97,70 @@ function contextFor(base, request) {
     dispatchAuthorized: request.dispatchAuthorized,
     protectedBranch: request.protectedBranch,
     runOwner: request.runOwner,
+  };
+}
+
+// --- Q-03: one shared PASS verdict for release and the permission gate ------
+
+const GATE_REPORT_REL = path.join("artifacts", "agent-flow", "ci-fast-latest.json");
+const APP_ORIGINAL = "export const app = 1;\n";
+const APP_CANDIDATE = "export const app = 2;\n";
+
+async function writeGateReport(root, report) {
+  const file = path.join(root, GATE_REPORT_REL);
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, `${JSON.stringify(report)}\n`, "utf8");
+}
+
+function qaApprovalFor(manifest) {
+  return {
+    schemaVersion: 1,
+    kind: "qa-approval",
+    manifestSha256: manifest.manifestSha256,
+    verdict: "PASS",
+    reviewer: { run: "run-qa-01", agent: "agent-qa-01", role: "QA", function: "REVIEWER" },
+    targetRunId: manifest.run?.id,
+    gates: [{ name: "quick", status: "PASS" }],
+    originalApplied: false,
+  };
+}
+
+/** Batch-apply fixture whose gate report is rewritten per case (Q-03). */
+async function applyFixture(t) {
+  const project = await setup(t, {
+    config: {
+      layout: { flowDir: "flow", artifactDir: "artifacts/agent-flow", evidenceDir: "artifacts/evidence" },
+      batch: { allowedPrefixes: ["src/"], manifestTag: "agent-flow-manifest-v1" },
+      gates: { fast: null, quick: { command: ["node", "-e", "process.exit(0)"] }, local: null },
+    },
+    files: { "src/app.mjs": APP_ORIGINAL },
+  });
+  const candidateRoot = await mkdtemp(path.join(os.tmpdir(), "atk-q03-candidate-"));
+  await mkdir(path.join(candidateRoot, "src"), { recursive: true });
+  await writeFile(path.join(candidateRoot, "src", "app.mjs"), APP_CANDIDATE, "utf8");
+  t.after(() => rm(candidateRoot, { recursive: true, force: true }));
+
+  const freeze = await runBatch(
+    ["manifest", "--candidate", candidateRoot, "--paths", "src/app.mjs", "--batch", "BATCH-01", "--agent", "agent-dev-01", "--json"],
+    project.ctx,
+  );
+  assert.equal(freeze, 0, project.logger.errorText());
+  const manifestPath = path.join(project.root, "artifacts", "agent-flow", "BATCH-01-manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const qaPath = path.join(project.root, "qa-approval.json");
+  await writeFile(qaPath, `${JSON.stringify(qaApprovalFor(manifest))}\n`, "utf8");
+  return {
+    ...project,
+    appPath: path.join(project.root, "src", "app.mjs"),
+    apply: async (report) => {
+      await writeGateReport(project.root, report);
+      project.logger.lines.err.length = 0;
+      project.logger.lines.json.length = 0;
+      return runBatch(
+        ["apply", "--manifest", manifestPath, "--qa", qaPath, "--apply", "--confirm-dev-closed", "--json"],
+        project.ctx,
+      );
+    },
   };
 }
 
@@ -277,7 +343,11 @@ test("human approval and gate proof are required where the matrix says so", asyn
   assert.equal(noReport.reason, REASON.ATTRIBUTE_MISSING);
 
   await mkdir(path.join(gated.root, "artifacts", "agent-flow"), { recursive: true });
-  await writeFile(path.join(gated.root, "artifacts", "agent-flow", "ci-fast-latest.json"), JSON.stringify({ ok: true }), "utf8");
+  await writeFile(
+    path.join(gated.root, "artifacts", "agent-flow", "ci-fast-latest.json"),
+    JSON.stringify({ schemaVersion: 1, status: "PASS", ok: true }),
+    "utf8",
+  );
   const green = await evaluatePermission(gatedCtx, {
     operation: "integration.merge.development",
     subject: "SYSTEM",
@@ -285,6 +355,97 @@ test("human approval and gate proof are required where the matrix says so", asyn
     noDrift: true,
   });
   assert.equal(green.allowed, true, green.detail);
+});
+
+test("gate-green accepts only an explicit, self-consistent PASS report", async (t) => {
+  const gated = await setup(t, { config: { gates: { quick: { command: ["node", "--version"] } } } });
+  const fixtures = [
+    { name: "legacy ok-only", report: { schemaVersion: 1, gate: "quick", ok: true }, green: false, pattern: /no status field/i },
+    { name: "status FAIL with ok true", report: { schemaVersion: 1, status: "FAIL", ok: true }, green: false, pattern: /not PASS/i },
+    { name: "status PASS with ok false", report: { schemaVersion: 1, status: "PASS", ok: false }, green: false, pattern: /inconsistent/i },
+    { name: "SKIPPED", report: { schemaVersion: 1, status: "SKIPPED", ok: false }, green: false, pattern: /SKIPPED/ },
+    { name: "UNCONFIGURED", report: { schemaVersion: 1, status: "UNCONFIGURED", ok: false }, green: false, pattern: /UNCONFIGURED/ },
+    { name: "explicit PASS", report: { schemaVersion: 1, status: "PASS", ok: true }, green: true },
+  ];
+  for (const item of fixtures) {
+    await writeGateReport(gated.root, item.report);
+    const decision = await evaluatePermission(gated.ctx, {
+      operation: "integration.merge.development",
+      subject: "SYSTEM",
+      qaPassed: true,
+      noDrift: true,
+    });
+    assert.equal(decision.allowed, item.green, `${item.name}: ${decision.detail}`);
+    const check = decision.checks.find((entry) => entry.name === "gate-green");
+    assert.equal(check.ok, item.green, item.name);
+    if (!item.green) {
+      assert.equal(decision.reason, REASON.GATE_NOT_GREEN, item.name);
+      assert.match(decision.detail, item.pattern, item.name);
+    }
+  }
+});
+
+test("gate-green reports the no-delivery-gate exemption as not applicable, never as a green report", async (t) => {
+  // Documented contract (docs/PERMISSIONS.md, docs/WORKFLOW.md): the delivery
+  // gate report is required only "when gates.quick / gates.local are
+  // configured". Without one, nothing is verified here and nothing claims green.
+  const { ctx } = await setup(t);
+  const decision = await evaluatePermission(ctx, {
+    operation: "integration.merge.development",
+    subject: "SYSTEM",
+    qaPassed: true,
+    noDrift: true,
+  });
+  assert.equal(decision.allowed, true);
+  const check = decision.checks.find((entry) => entry.name === "gate-green");
+  assert.equal(check.ok, true);
+  assert.match(check.detail, /no quick\/local gate configured; gate-green does not apply/);
+  assert.doesNotMatch(check.detail, /explicit PASS|says status|ok is not true/);
+});
+
+test("gate-green distinguishes a missing gate report from an unreadable one", async (t) => {
+  const gated = await setup(t, { config: { gates: { quick: { command: ["node", "--version"] } } } });
+  const request = {
+    operation: "integration.merge.development",
+    subject: "SYSTEM",
+    qaPassed: true,
+    noDrift: true,
+  };
+  const missing = await evaluatePermission(gated.ctx, request);
+  assert.equal(missing.allowed, false);
+  assert.equal(missing.reason, REASON.ATTRIBUTE_MISSING);
+
+  const file = path.join(gated.root, GATE_REPORT_REL);
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, "{ not valid json\n", "utf8");
+  const unreadable = await evaluatePermission(gated.ctx, request);
+  assert.equal(unreadable.allowed, false);
+  assert.equal(unreadable.reason, REASON.GATE_NOT_GREEN);
+  assert.match(unreadable.detail, /unreadable/i);
+});
+
+test("batch apply refuses every non-explicit-PASS gate report before writing the tree", async (t) => {
+  const env = await applyFixture(t);
+  const rejected = [
+    { name: "legacy ok-only", report: { schemaVersion: 1, gate: "quick", ok: true }, pattern: /no status field/i },
+    { name: "status FAIL with ok true", report: { schemaVersion: 1, status: "FAIL", ok: true }, pattern: /not PASS/i },
+    { name: "status PASS with ok false", report: { schemaVersion: 1, status: "PASS", ok: false }, pattern: /inconsistent/i },
+    { name: "SKIPPED", report: { schemaVersion: 1, status: "SKIPPED", ok: false }, pattern: /SKIPPED/ },
+  ];
+  for (const item of rejected) {
+    assert.equal(await env.apply(item.report), 1, item.name);
+    assert.match(env.logger.errorText(), /GATE_NOT_GREEN/, item.name);
+    assert.match(env.logger.errorText(), item.pattern, item.name);
+    const plan = env.logger.lines.json.at(-1);
+    assert.ok(plan, `${item.name}: apply must publish a machine-readable plan`);
+    assert.equal(plan.error, "permission-denied", item.name);
+    assert.equal(plan.reason, REASON.GATE_NOT_GREEN, item.name);
+    assert.match(String(plan.detail), item.pattern, item.name);
+    assert.equal(await readFile(env.appPath, "utf8"), APP_ORIGINAL, `${item.name}: nothing may be written`);
+  }
+
+  assert.equal(await env.apply({ schemaVersion: 1, status: "PASS", ok: true }), 0);
+  assert.equal(await readFile(env.appPath, "utf8"), APP_CANDIDATE, "an explicit PASS still integrates");
 });
 
 test("the audit trail is append-only and readable", async (t) => {
