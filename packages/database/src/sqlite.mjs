@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { EVENT_SCHEMA_VERSION, FUNCTIONS } from "@atk/contracts";
+import { EVENT_SCHEMA_VERSION, FUNCTIONS, ID_RE, eventDedupeKey } from "@atk/contracts";
 import { StoreError, fail, notFound } from "./errors.mjs";
 import { INTERNAL } from "./internal.mjs";
 import {
@@ -21,6 +21,7 @@ import {
   SCHEMA_VERSION,
   applyReviewVerdict,
   assertEnumFilter,
+  assertRunTransition,
   assertTaskTransition,
   buildOverview,
   canTransition,
@@ -48,6 +49,7 @@ import {
   normalizeTask,
   nowIso,
   parseJsonColumn,
+  planRuntimeEventBatch,
   requireId,
   safeJson,
   validateActor,
@@ -559,6 +561,18 @@ export function openStore(options = {}) {
     return agent;
   }
 
+  function integrationJson(row) {
+    return {
+      id: row.id,
+      taskId: row.task_id,
+      runId: row.run_id,
+      commitSha: row.commit_sha,
+      manifestHash: row.manifest_hash,
+      ...(row.actor === null || row.actor === undefined ? {} : { actor: row.actor }),
+      at: row.at,
+    };
+  }
+
   function reviewJson(row) {
     const review = {
       id: row.id,
@@ -579,6 +593,10 @@ export function openStore(options = {}) {
     const evidence = parseJsonColumn(row.evidence_json);
     if (evidence !== null) review.evidence = evidence;
     if (row.submitted_at !== null && row.submitted_at !== undefined) review.submittedAt = row.submitted_at;
+    review.assignedTo = row.assigned_to ?? "HUMAN";
+    if (row.reviewer_agent_id !== null && row.reviewer_agent_id !== undefined) {
+      review.reviewerAgentId = row.reviewer_agent_id;
+    }
     return review;
   }
 
@@ -600,7 +618,7 @@ export function openStore(options = {}) {
     return approval;
   }
 
-  function eventJson(row) {
+  function eventJson(row) {    const eventId = row.event_id ?? null;
     return {
       schemaVersion: Number(row.schema_version),
       seq: Number(row.seq),
@@ -610,6 +628,10 @@ export function openStore(options = {}) {
       type: row.type,
       payload: parseJsonColumn(row.payload_json) ?? {},
       happenedAt: row.happened_at,
+      ...(eventId === null ? { legacy: true } : { eventId }),
+      ...(row.session_seq === null || row.session_seq === undefined
+        ? {}
+        : { sessionSeq: Number(row.session_seq) }),
     };
   }
 
@@ -653,10 +675,12 @@ export function openStore(options = {}) {
 
   /** Insert one event (caller owns the transaction) and return its JSON. */
   function insertEvent(event) {
+    const runId = event.aggregateType === "run" ? event.aggregateId : null;
     const result = stmt(
       `INSERT INTO events
-         (schema_version, project_id, aggregate_type, aggregate_id, type, payload_json, happened_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         (schema_version, project_id, aggregate_type, aggregate_id, type, payload_json, happened_at,
+          run_id, event_id, session_seq)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       EVENT_SCHEMA_VERSION,
       event.projectId,
@@ -665,6 +689,9 @@ export function openStore(options = {}) {
       event.type,
       JSON.stringify(event.payload),
       event.happenedAt,
+      runId,
+      event.eventId ?? null,
+      event.sessionSeq ?? null,
     );
     return eventJson(stmt("SELECT * FROM events WHERE seq = ?").get(Number(result.lastInsertRowid)));
   }
@@ -743,14 +770,10 @@ export function openStore(options = {}) {
    * never persisted.
    */
   function latestProducerAgentId(taskId) {
-    const active = stmt(
-      `SELECT agent_id FROM runs
-        WHERE task_id = ? AND status IN ('QUEUED', 'STARTING', 'RUNNING')
-        ORDER BY created_at DESC, id DESC LIMIT 1`,
-    ).get(taskId);
-    if (active) return active.agent_id;
     const latest = stmt(
-      "SELECT agent_id FROM runs WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+      `SELECT agent_id FROM runs
+        WHERE task_id = ? AND status = 'COMPLETED'
+        ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1`,
     ).get(taskId);
     return latest ? latest.agent_id : null;
   }
@@ -1628,11 +1651,149 @@ export function openStore(options = {}) {
     },
 
     /**
-     * Reconcile facts for a restarted Host. `sessions` stays empty in M2 (M4
-     * fills it). A run that was claimed and then completed reports its lease as
-     * EXPIRED with the generation retained 鈥?not null 鈥?because "release" means
-     * expiry here (see completeDispatchCommand): the Host compares the reported
-     * generation to the authoritative one before doing anything.
+     * M6.1 F03/F08: apply one runtime-event batch atomically.
+     * Validation happens before the transaction; fencing, dedupe (eventId then
+     * legacy composite), Run transitions and event inserts all happen inside a
+     * single BEGIN IMMEDIATE. Any failure rolls the whole batch back.
+     */
+    applyRuntimeEventBatch({ runId, generation, events, now } = {}) {
+      requireId(runId, "run.id");
+      if (!Number.isInteger(generation) || generation < 1) {
+        fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
+      }
+      const plan = planRuntimeEventBatch({ runId, events });
+      return transaction(() => {
+        const at = nowIso(now);
+        const lease = getLeaseRow(runId);
+        const stale = (details) => {
+          fail("STALE_GENERATION", `run "${runId}" event report is fenced out`, {
+            runId,
+            generation,
+            ...details,
+          });
+        };
+        if (!lease) stale({ currentGeneration: null, reason: "lease-missing" });
+        if (Number(lease.generation) !== generation) {
+          stale({ currentGeneration: Number(lease.generation), reason: "generation-mismatch" });
+        }
+        if (lease.claimed_until <= at) {
+          stale({
+            currentGeneration: Number(lease.generation),
+            claimedUntil: lease.claimed_until,
+            reason: "lease-expired",
+          });
+        }
+        const taskRow = requireTaskRow(runJson(requireRunRow(runId)).taskId);
+        const seen = new Set(
+          stmt("SELECT * FROM events WHERE run_id = ?").all(runId).map((row) => eventDedupeKey(eventJson(row))),
+        );
+        const batchSeen = new Set();
+        let run = runJson(requireRunRow(runId));
+        let stateChanged = false;
+        let skipped = 0;
+        const applied = [];
+        for (const entry of plan) {
+          const hasEventId = entry.eventId !== null && entry.eventId !== undefined;
+          if (seen.has(entry.dedupeKey) || (hasEventId && batchSeen.has(entry.dedupeKey))) {
+            skipped += 1;
+            continue;
+          }
+          if (hasEventId) batchSeen.add(entry.dedupeKey);
+          if (entry.status !== undefined) {
+            if (entry.status === run.status) continue; // idempotent warm start / repeated end
+            try {
+              assertRunTransition(run.status, entry.status);
+            } catch (error) {
+              if (error?.code === "VALIDATION_ERROR") {
+                fail("VALIDATION_ERROR", `run.events[${entry.index}] has an illegal run transition`, {
+                  index: entry.index,
+                  field: "type",
+                  from: run.status,
+                  to: entry.status,
+                });
+              }
+              throw error;
+            }
+            const current = run;
+            const merge = mergeRunStatus(current, {
+              status: entry.status,
+              exitCode: entry.exitCode,
+              endedAt: entry.endedAt,
+            }, { now: at });
+            if (!merge.updated) continue;
+            const next = merge.run;
+            const result = stmt(
+              `UPDATE runs
+                  SET status = ?, exit_code = ?, started_at = ?, ended_at = ?, version = ?, updated_at = ?
+                WHERE id = ? AND version = ?`,
+            ).run(
+              next.status,
+              next.exitCode ?? null,
+              next.startedAt ?? null,
+              next.endedAt ?? null,
+              next.version,
+              next.updatedAt,
+              runId,
+              current.version,
+            );
+            if (Number(result.changes) === 0) {
+              const latest = requireRunRow(runId);
+              fail("VERSION_CONFLICT", `run "${runId}" version conflict`, {
+                entity: "run",
+                id: runId,
+                expectedVersion: current.version,
+                currentVersion: Number(latest.version),
+              });
+            }
+            run = runJson(requireRunRow(runId));
+            stateChanged = true;
+            applied.push(
+              insertEvent(
+                makeEvent({
+                  projectId: taskRow.project_id,
+                  aggregateType: "run",
+                  aggregateId: runId,
+                  type: "run.updated",
+                  payload: {
+                    runId,
+                    taskId: run.taskId,
+                    status: next.status,
+                    previousStatus: current.status,
+                    version: next.version,
+                    sessionId: entry.sessionId ?? undefined,
+                    ...(next.exitCode === undefined ? {} : { exitCode: next.exitCode }),
+                    ...(next.endedAt === undefined ? {} : { endedAt: next.endedAt }),
+                  },
+                  eventId: entry.eventId,
+                  sessionSeq: entry.sessionSeq,
+                  now: at,
+                }),
+              ),
+            );
+          }
+          if (entry.status === undefined) {
+            applied.push(
+              insertEvent(
+                makeEvent({
+                  projectId: taskRow.project_id,
+                  aggregateType: "run",
+                  aggregateId: runId,
+                  type: entry.type,
+                  payload: entry.payload,
+                  eventId: entry.eventId,
+                  sessionSeq: entry.sessionSeq,
+                  now: at,
+                }),
+              ),
+            );
+          }
+        }
+        return { ok: true, run, applied, skipped, duplicate: skipped, stateChanged };
+      });
+    },
+
+    /**
+     * Reconcile facts for a restarted Host. `sessions` stays empty until M4.
      */
     reconcileRun({ runId } = {}) {
       requireId(runId, "run.id");
@@ -2034,13 +2195,60 @@ export function openStore(options = {}) {
       return stmt(sql).all(...params, capped).map(reviewJson);
     },
 
+    /**
+     * M6.1 F11: filter first, then keyset-paginate. `cursor` is opaque
+     * base64url("<createdAt>|<id>"); `listReviews` stays array-compatible.
+     */
+    listReviewsPage({ taskId, status, limit, cursor } = {}) {
+      const where = [];
+      const params = [];
+      if (taskId !== undefined && taskId !== null) {
+        requireId(taskId, "review.taskId");
+        where.push("task_id = ?");
+        params.push(taskId);
+      }
+      if (status !== undefined && status !== null) {
+        assertEnumFilter("review", status);
+        where.push("status = ?");
+        params.push(status);
+      }
+      if (cursor !== undefined && cursor !== null && cursor !== "") {
+        let decoded;
+        try {
+          decoded = Buffer.from(String(cursor), "base64url").toString("utf8");
+        } catch {
+          decoded = "";
+        }
+        const split = decoded.lastIndexOf("|");
+        const createdAt = split > 0 ? decoded.slice(0, split) : "";
+        const id = split > 0 ? decoded.slice(split + 1) : "";
+        if (!createdAt || !ID_RE.test(id) || Number.isNaN(Date.parse(createdAt))) {
+          fail("VALIDATION_ERROR", "review.cursor is invalid", { field: "cursor", cursor });
+        }
+        where.push("(created_at < ? OR (created_at = ? AND id < ?))");
+        params.push(createdAt, createdAt, id);
+      }
+      const capped = normalizeLimit(limit, { fallback: 50, max: 100 });
+      const sql = `SELECT * FROM reviews${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""}
+        ORDER BY created_at DESC, id DESC LIMIT ?`;
+      const rows = stmt(sql).all(...params, capped + 1);
+      const hasMore = rows.length > capped;
+      const items = rows.slice(0, capped).map(reviewJson);
+      const last = items.at(-1);
+      return {
+        items,
+        hasMore,
+        ...(hasMore && last
+          ? { nextCursor: Buffer.from(`${last.createdAt}|${last.id}`, "utf8").toString("base64url") }
+          : {}),
+      };
+    },
+
     createReview(dto = {}) {
       ensurePlainObject(dto, "review");
-      // Validate the actor before the state checks so a bad request is a
-      // VALIDATION_ERROR, not a confusing "already has an active review".
-      validateActor(dto.actor, "review.actor");
+      requireId(dto.taskId, "review.taskId");
+      if (dto.actor !== undefined && dto.actor !== null) validateActor(dto.actor, "review.actor");
       return transaction(() => {
-        requireId(dto.taskId, "review.taskId");
         const taskRow = getTaskRow(dto.taskId);
         if (!taskRow) {
           fail("TASK_VERSION_CONFLICT", `task "${dto.taskId}" is not reviewable`, {
@@ -2049,13 +2257,49 @@ export function openStore(options = {}) {
             reason: "task-not-found",
           });
         }
-        if (taskRow.status !== "REVIEWING") {
-          fail("TASK_VERSION_CONFLICT", `task "${dto.taskId}" is not REVIEWING`, {
-            taskId: dto.taskId,
-            status: taskRow.status,
-            currentVersion: Number(taskRow.version),
-            reason: "not-reviewing",
-          });
+        const needsTransition = taskRow.status !== "REVIEWING";
+        let producerAgentId = null;
+        if (needsTransition) {
+          // M6.1 F06: a review needs a COMPLETED Run for THIS task.
+          let runRow = null;
+          if (dto.runId !== undefined && dto.runId !== null) {
+            requireId(dto.runId, "review.runId");
+            runRow = getRunRow(dto.runId);
+            if (!runRow || runRow.task_id !== taskRow.id) {
+              fail("VALIDATION_ERROR", `run "${dto.runId}" does not belong to task "${taskRow.id}"`, {
+                runId: dto.runId,
+                taskId: taskRow.id,
+              });
+            }
+          } else {
+            runRow = stmt(
+              "SELECT * FROM runs WHERE task_id = ? AND status = 'COMPLETED' ORDER BY updated_at DESC, id DESC LIMIT 1",
+            ).get(taskRow.id);
+          }
+          if (!runRow || runRow.status !== "COMPLETED") {
+            fail("VALIDATION_ERROR", "task has no COMPLETED run to review", {
+              taskId: taskRow.id,
+              reason: "no-completed-run",
+            });
+          }
+          if (!["RUNNING", "CLAIMED"].includes(taskRow.status)) {
+            fail("TASK_VERSION_CONFLICT", `task "${dto.taskId}" is not reviewable`, {
+              taskId: dto.taskId,
+              status: taskRow.status,
+              currentVersion: Number(taskRow.version),
+              reason: "not-reviewable",
+            });
+          }
+          producerAgentId = runRow.agent_id;
+          if (dto.assignedTo === "AGENT" && dto.reviewerAgentId) {
+            if (canonicalAgentId(dto.reviewerAgentId) === canonicalAgentId(producerAgentId)) {
+              fail("SELF_REVIEW_FORBIDDEN", "a reviewer cannot review their own work", {
+                taskId: taskRow.id,
+                assignedAgentId: producerAgentId,
+                presentedAgentId: dto.reviewerAgentId,
+              });
+            }
+          }
         }
         if (dto.runId !== undefined && dto.runId !== null) {
           requireId(dto.runId, "review.runId");
@@ -2087,22 +2331,53 @@ export function openStore(options = {}) {
             stmt("SELECT COUNT(*) AS count FROM reviews WHERE task_id = ?").get(taskRow.id).count,
           ) + 1;
         const at = nowIso();
-        const { review, actor } = normalizeReview(
-          { taskId: dto.taskId, runId: dto.runId, actor: dto.actor },
+        const { review } = normalizeReview(
+          {
+            taskId: dto.taskId,
+            runId: dto.runId ?? (needsTransition ? undefined : undefined),
+            actor: dto.actor,
+            reviewerAgentId: dto.reviewerAgentId,
+            assignedTo: dto.assignedTo,
+            createdByRole: dto.createdByRole,
+          },
           { now: at, attempt: nextAttempt },
         );
         stmt(
           `INSERT INTO reviews
              (id, task_id, run_id, status, verdict, manifest_hash, commit_sha, findings_json, attempt,
-              version, reviewer, evidence_json, submitted_at, created_at, updated_at)
-           VALUES (?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, ?, 0, NULL, NULL, NULL, ?, ?)`,
-        ).run(review.id, review.taskId, review.runId ?? null, review.attempt, at, at);
+              version, reviewer, evidence_json, submitted_at, created_at, updated_at,
+              reviewer_agent_id, assigned_to)
+           VALUES (?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, ?, 0, NULL, NULL, NULL, ?, ?, ?, ?)`,
+        ).run(
+          review.id,
+          review.taskId,
+          review.runId ?? null,
+          review.attempt,
+          at,
+          at,
+          review.reviewerAgentId ?? null,
+          review.assignedTo ?? "HUMAN",
+        );
         stmt(
           `INSERT INTO review_attempts
              (id, review_id, run_id, attempt, status, verdict, manifest_hash, findings_json,
               evidence_json, created_at)
            VALUES (?, ?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, ?)`,
         ).run(generateId("RVA"), review.id, review.runId ?? null, review.attempt, at);
+        if (needsTransition) {
+          const previousStatus = taskRow.status;
+          transitionTaskInTx(taskRow.id, "REVIEWING");
+          insertEvent(
+            makeEvent({
+              projectId: taskRow.project_id,
+              aggregateType: "task",
+              aggregateId: taskRow.id,
+              type: "task.updated",
+              payload: { taskId: taskRow.id, status: "REVIEWING", previousStatus, reviewId: review.id },
+              now: at,
+            }),
+          );
+        }
         insertEvent(
           makeEvent({
             projectId: taskRow.project_id,
@@ -2113,9 +2388,6 @@ export function openStore(options = {}) {
             now: at,
           }),
         );
-        // `actor` is the human/agent opening the review; it is not persisted on
-        // the review (the reviewer is the actor who submits the verdict).
-        void actor;
         return reviewJson(requireReviewRow(review.id));
       });
     },
@@ -2129,6 +2401,7 @@ export function openStore(options = {}) {
       findings,
       evidence,
       actor,
+      reviewerAgentId,
       targetHash,
     } = {}) {
       requireId(id, "review.id");
@@ -2152,6 +2425,18 @@ export function openStore(options = {}) {
             status: row.status,
           });
         }
+        if ((row.assigned_to ?? "HUMAN") === "AGENT") {
+          const assigned = row.reviewer_agent_id ?? null;
+          const presented = typeof reviewerAgentId === "string" ? reviewerAgentId : null;
+          if (!presented || !assigned || canonicalAgentId(presented) !== canonicalAgentId(assigned)) {
+            fail("SELF_REVIEW_FORBIDDEN", "review must be submitted by its assigned reviewer", {
+              reviewId: id,
+              taskId: row.task_id,
+              assignedAgentId: assigned,
+              presentedAgentId: presented,
+            });
+          }
+        }
         const taskRow = requireTaskRow(row.task_id);
         // QA-005: compare producer identity on canonical ids (trim + casefold)
         // BEFORE actor-shape validation, so a whitespace/case variant of the
@@ -2160,12 +2445,22 @@ export function openStore(options = {}) {
         const rawActor = typeof actor === "string" ? actor : "";
         const canonicalActor = canonicalAgentId(rawActor);
         const authors = new Map();
+        // Author = the Run under review (`review.runId`). Legacy rows without a
+        // runId fall back to the latest COMPLETED producer; never an active Run.
+        let producerAgentId = null;
         if (row.run_id !== null && row.run_id !== undefined) {
           const producerRow = getRunRow(row.run_id);
-          if (producerRow) authors.set(canonicalAgentId(producerRow.agent_id), producerRow.agent_id);
+          if (producerRow) producerAgentId = producerRow.agent_id;
         }
-        const latestProducer = latestProducerAgentId(row.task_id);
-        if (latestProducer) authors.set(canonicalAgentId(latestProducer), latestProducer);
+        if (!producerAgentId) producerAgentId = latestProducerAgentId(row.task_id);
+        if (!producerAgentId) {
+          fail("VALIDATION_ERROR", "cannot resolve the reviewed producer Run", {
+            reviewId: id,
+            taskId: row.task_id,
+            reason: "review-run-unknown",
+          });
+        }
+        authors.set(canonicalAgentId(producerAgentId), producerAgentId);
         if (canonicalActor !== "" && authors.has(canonicalActor)) {
           fail("SELF_REVIEW_FORBIDDEN", "an actor cannot review their own work", {
             actor: rawActor,
@@ -2454,6 +2749,76 @@ export function openStore(options = {}) {
       });
     },
 
+    /**
+     * M6.1 F01: persist integration evidence and advance INTEGRATING ->
+     * AWAITING_ACCEPTANCE in one transaction. (taskId, manifestHash) is
+     * idempotent; a hash that does not match task.target_hash is APPROVAL_STALE.
+     */
+    recordIntegration({ taskId, runId, commitSha, manifestHash, actor } = {}) {
+      requireId(taskId, "integration.taskId");
+      requireId(runId, "integration.runId");
+      if (typeof commitSha !== "string" || !/^[0-9a-fA-F]{7,64}$/.test(commitSha)) {
+        fail("VALIDATION_ERROR", "integration.commitSha must be a git commit sha", { commitSha });
+      }
+      const manifest = validateTargetHash(manifestHash, "integration.manifestHash");
+      const actorValue = actor === undefined || actor === null ? null : validateActor(actor, "integration.actor");
+      return transaction(() => {
+        const taskRow = requireTaskRow(taskId);
+        const runRow = getRunRow(runId);
+        if (!runRow) notFound("run", runId);
+        if (runRow.task_id !== taskId) {
+          fail("VALIDATION_ERROR", `run "${runId}" does not belong to task "${taskId}"`, { runId, taskId });
+        }
+        const existing = stmt(
+          "SELECT * FROM integrations WHERE task_id = ? AND manifest_hash = ?",
+        ).get(taskId, manifest);
+        if (existing) {
+          return { integration: integrationJson(existing), task: taskJson(requireTaskRow(taskId)) };
+        }
+        if (taskRow.target_hash === null || taskRow.target_hash === undefined || taskRow.target_hash !== manifest) {
+          fail("APPROVAL_STALE", "integration manifestHash does not match task.target_hash", {
+            taskId,
+            manifestHash: manifest,
+            targetHash: taskRow.target_hash ?? null,
+          });
+        }
+        if (taskRow.status !== "INTEGRATING") {
+          fail("TASK_VERSION_CONFLICT", `task "${taskId}" is not INTEGRATING`, {
+            taskId,
+            status: taskRow.status,
+            currentVersion: Number(taskRow.version),
+            reason: "not-integrating",
+          });
+        }
+        const at = nowIso();
+        const id = generateId("INT");
+        stmt(
+          `INSERT INTO integrations (id, task_id, run_id, commit_sha, manifest_hash, actor, at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        ).run(id, taskId, runId, commitSha, manifest, actorValue, at);
+        const task = transitionTaskInTx(taskId, "AWAITING_ACCEPTANCE");
+        insertEvent(
+          makeEvent({
+            projectId: taskRow.project_id,
+            aggregateType: "task",
+            aggregateId: taskId,
+            type: "task.updated",
+            payload: {
+              taskId,
+              status: "AWAITING_ACCEPTANCE",
+              previousStatus: "INTEGRATING",
+              reason: "integration",
+              integrationId: id,
+              runId,
+              manifestHash: manifest,
+            },
+            now: at,
+          }),
+        );
+        return { integration: integrationJson(stmt("SELECT * FROM integrations WHERE id = ?").get(id)), task };
+      });
+    },
+
     decideApproval({ id, decision: rawDecision, actor, targetHash } = {}) {
       requireId(id, "approval.id");
       const decision = validateApprovalDecision(rawDecision);
@@ -2536,6 +2901,10 @@ export function openStore(options = {}) {
               status: decision,
               targetHash: receivedTargetHash,
               actor: reviewer,
+              principal: "HUMAN",
+              operation: "approval.decide",
+              targetVersion: task.version,
+              at,
             },
             now: at,
           }),

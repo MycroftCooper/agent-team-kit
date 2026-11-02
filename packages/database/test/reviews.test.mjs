@@ -14,6 +14,16 @@ function seedReviewable(store, { taskId = "TASK-1", agentId = "agent-dev" } = {}
   store.createTask(taskDto("proj-1", { id: taskId }));
   store.upsertAgent({ id: agentId, role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
   const run = store.createRun({ taskId, agentId, function: "WORKER", role: "DEV" });
+  // M6.1 F06: a review needs a COMPLETED producer Run for this Task.
+  store.enqueueDispatchCommand({
+    runId: run.id,
+    commandType: "RUN_TASK",
+    payload: {},
+    idempotencyKey: `review-seed-${taskId}`,
+  });
+  store.claimDispatchCommand({ ownerId: "seed-host", leaseMs: 60_000 });
+  store.updateRunStatus(run.id, { status: "RUNNING", generation: 1 });
+  store.updateRunStatus(run.id, { status: "COMPLETED", exitCode: 0, generation: 1 });
   advanceTask(store, taskId, "REVIEWING");
   return { task: store.getTask(taskId), run };
 }
@@ -70,7 +80,7 @@ test("createReview writes PENDING + review.requested and enforces one active rev
     const beforeFailures = fingerprint(store);
     assert.throws(
       () => store.createReview({ taskId: "TASK-READY", actor: "HUMAN" }),
-      (error) => error.code === "TASK_VERSION_CONFLICT" && error.details.reason === "not-reviewing",
+      (error) => error.code === "VALIDATION_ERROR" && error.details.reason === "no-completed-run",
       label,
     );
     assert.throws(

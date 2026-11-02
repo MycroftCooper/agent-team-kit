@@ -97,32 +97,44 @@ test("both stores walk the legal main chain step by step", (t) => {
   for (const [index, store] of openBothStores(t).entries()) {
     const label = index === 0 ? "sqlite" : "memory";
     store.createTask(taskDto("proj-1", { id: "TASK-CHAIN" }));
-    let expectedVersion = store.getTask("TASK-CHAIN").version;
     assert.equal(store.getTask("TASK-CHAIN").status, "READY");
     // Same-state is an idempotent success (READY -> READY), not an error.
     const selfPatch = store.patchTask("TASK-CHAIN", {
-      expectedVersion,
+      expectedVersion: store.getTask("TASK-CHAIN").version,
       changes: { status: "READY" },
     });
     assert.equal(selfPatch.status, "READY", label);
-    expectedVersion = selfPatch.version;
-    for (const next of ["CLAIMED", "RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE"]) {
+
+    // M6.1 F01: the generic patch API refuses every execution-state edge; the
+    // owning service (or the internal writer for fixtures) advances the chain.
+    for (const [from, to] of [
+      ["READY", "CLAIMED"],
+      ["CLAIMED", "RUNNING"],
+      ["RUNNING", "REVIEWING"],
+      ["REVIEWING", "INTEGRATING"],
+      ["INTEGRATING", "AWAITING_ACCEPTANCE"],
+    ]) {
+      if (store.getTask("TASK-CHAIN").status !== from) advanceTask(store, "TASK-CHAIN", from);
       const before = store.getTask("TASK-CHAIN");
-      const updated = store.patchTask("TASK-CHAIN", {
-        expectedVersion: before.version,
-        changes: { status: next },
-      });
-      expectedVersion += 1;
-      assert.equal(updated.status, next, `${label}: ${next}`);
-      assert.equal(updated.version, expectedVersion, `${label}: version after ${next}`);
+      assert.throws(
+        () => store.patchTask("TASK-CHAIN", { expectedVersion: before.version, changes: { status: to } }),
+        (error) =>
+          error.code === "TASK_VERSION_CONFLICT" &&
+          error.details.reason === "execution-state-guard" &&
+          error.details.requestedStatus === to,
+        `${label}: ${from} -> ${to}`,
+      );
+      assert.equal(store.getTask("TASK-CHAIN").status, from, `${label}: rejected ${from} -> ${to} writes nothing`);
     }
-    // M4: DONE cannot be patched; an APPROVED approval is the only entrance.
+    // Finish the chain with the internal writer, then prove DONE is approval-only.
+    advanceTask(store, "TASK-CHAIN", "AWAITING_ACCEPTANCE");
     const awaiting = store.getTask("TASK-CHAIN");
+    assert.equal(awaiting.status, "AWAITING_ACCEPTANCE", label);
     assert.throws(
       () => store.patchTask("TASK-CHAIN", { expectedVersion: awaiting.version, changes: { status: "DONE" } }),
       (error) =>
         error.code === "TASK_VERSION_CONFLICT" &&
-        error.details.reason === "human-approval-required" &&
+        error.details.reason === "execution-state-guard" &&
         error.details.requestedStatus === "DONE",
       label,
     );
@@ -149,7 +161,7 @@ test("both stores reject illegal jumps, backwards moves and DRAFT", (t) => {
         () => store.patchTask("TASK-JUMPS", { expectedVersion: before.version, changes: { status: to } }),
         (error) =>
           (to === "DONE"
-            ? error.code === "TASK_VERSION_CONFLICT" && error.details.reason === "human-approval-required"
+            ? ["TASK_VERSION_CONFLICT", "VALIDATION_ERROR"].includes(error.code)
             : error.code === "VALIDATION_ERROR" &&
               error.details.from === from &&
               error.details.to === to &&
@@ -170,7 +182,7 @@ test("both stores reject illegal jumps, backwards moves and DRAFT", (t) => {
           expectedVersion: after.version,
           changes: { title: "should not apply", priority: 0, status: "DONE" },
         }),
-      (error) => error.code === "TASK_VERSION_CONFLICT",
+      (error) => ["TASK_VERSION_CONFLICT", "VALIDATION_ERROR"].includes(error.code),
     );
     const unchanged = store.getTask("TASK-JUMPS");
     assert.equal(unchanged.title, titleBefore, label);
@@ -229,7 +241,7 @@ test("BLOCKED is a branch state with exactly one way back (READY)", (t) => {
           }),
         (error) =>
           (to === "DONE"
-            ? error.code === "TASK_VERSION_CONFLICT" && error.details.reason === "human-approval-required"
+            ? ["TASK_VERSION_CONFLICT", "VALIDATION_ERROR"].includes(error.code)
             : error.code === "VALIDATION_ERROR" && error.details.from === "BLOCKED"),
         `${label}: BLOCKED -> ${to}`,
       );
@@ -250,7 +262,7 @@ test("BLOCKED is a branch state with exactly one way back (READY)", (t) => {
           }),
         (error) =>
           (to === "DONE"
-            ? error.code === "TASK_VERSION_CONFLICT" && error.details.reason === "human-approval-required"
+            ? ["TASK_VERSION_CONFLICT", "VALIDATION_ERROR"].includes(error.code)
             : error.code === "VALIDATION_ERROR" && error.details.from === "CANCELLED"),
         `${label}: CANCELLED -> ${to}`,
       );

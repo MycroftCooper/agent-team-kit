@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createMemoryStore, openStore } from "@atk/database";
+import { INTERNAL } from "../src/internal.mjs";
 
 /**
  * Open a Store on a fresh temp database and guarantee the file is released
@@ -102,7 +103,13 @@ export function advanceTask(store, id, target) {
     else if (target === "BLOCKED" || target === "CANCELLED") next = target;
     else if (task.status === "BLOCKED" && targetIndex >= 0) next = "READY";
     else throw new Error(`advanceTask: cannot move ${task.status} -> ${target}`);
-    store.patchTask(id, { expectedVersion: task.version, changes: { status: next } });
+    // M6.1 F01: the public patch API refuses to advance execution states;
+    // fixtures use the internal writer (the same one migrations use).
+    if (["CLAIMED", "RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE"].includes(next)) {
+      store[INTERNAL].setTaskStatus(id, next);
+    } else {
+      store.patchTask(id, { expectedVersion: task.version, changes: { status: next } });
+    }
   }
   throw new Error(`advanceTask: transition guard exceeded for ${id} -> ${target}`);
 }

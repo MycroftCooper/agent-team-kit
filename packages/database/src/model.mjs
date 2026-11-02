@@ -15,6 +15,10 @@ import {
   RUN_STATUSES,
   TASK_STATUSES,
   createEvent,
+  eventDedupeKey,
+  normalizeRepoPath as contractsNormalizeRepoPath,
+  overlappingPaths,
+  pathsOverlap,
   validateApproval,
   validateProject,
   validateRequirement,
@@ -23,7 +27,7 @@ import {
 import { fail } from "./errors.mjs";
 
 /** Schema version written by the latest migration file. */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 export const DEFAULT_LIST_LIMIT = 100;
 export const MAX_LIST_LIMIT = 10000;
 export const MAX_EVENT_LIMIT = 10000;
@@ -418,16 +422,45 @@ export const TASK_PATCH_KEYS = Object.freeze([
   "targetHash",
 ]);
 
+export const EXECUTION_STATE_EDGES = Object.freeze([
+  Object.freeze(["READY", "CLAIMED"]),
+  Object.freeze(["CLAIMED", "RUNNING"]),
+  Object.freeze(["RUNNING", "REVIEWING"]),
+  Object.freeze(["REVIEWING", "INTEGRATING"]),
+  Object.freeze(["INTEGRATING", "AWAITING_ACCEPTANCE"]),
+  Object.freeze(["AWAITING_ACCEPTANCE", "DONE"]),
+]);
+
+const EXECUTION_STATE_EDGE_KEYS = new Set(EXECUTION_STATE_EDGES.map(([from, to]) => `${from}>${to}`));
+const TASK_STOP_STATUSES = new Set(["DONE", "CANCELLED"]);
+
+/** Targets the generic PATCH endpoint may legally request from `current`. */
+export function publicTaskTransitionsFrom(current) {
+  const targets = [];
+  if (!TASK_STOP_STATUSES.has(current)) {
+    if (["DRAFT", "REJECTED", "BLOCKED"].includes(current)) targets.push("READY");
+    targets.push("BLOCKED", "CANCELLED");
+  }
+  targets.push(current); // same-state no-op
+  return [...new Set(targets)];
+}
+
+export function isExecutionTaskEdge(from, to) {
+  return EXECUTION_STATE_EDGE_KEYS.has(`${from}>${to}`);
+}
+
 export function mergeTask(current, changes, { now } = {}) {
   ensurePlainObject(changes, "changes");
-  // Hard invariant (M4): human acceptance is the ONLY way into DONE. The store
-  // must enforce it too, not just the Backend route, so internal callers and
-  // future endpoints cannot bypass the approval gate.
-  if (changes.status === "DONE" && current.status !== "DONE") {
-    fail("TASK_VERSION_CONFLICT", "task DONE requires an APPROVED human approval", {
+  // Hard invariant (M6.1 F01): execution-state transitions belong to the
+  // dedicated service methods (claimTask / applyRuntimeEventBatch /
+  // createReview / submitReview / recordIntegration / decideApproval). The
+  // generic patch endpoint must never advance them — not even READY->CLAIMED.
+  if (changes.status !== undefined && isExecutionTaskEdge(current.status, changes.status)) {
+    fail("TASK_VERSION_CONFLICT", "task status must be advanced by the owning service", {
       taskId: current.id,
-      reason: "human-approval-required",
-      requestedStatus: "DONE",
+      requestedStatus: changes.status,
+      reason: "execution-state-guard",
+      allowedTransitions: publicTaskTransitionsFrom(current.status),
     });
   }
   for (const key of Object.keys(changes)) {
@@ -744,7 +777,20 @@ export function normalizeReview(dto, { now, attempt = 1, id } = {}) {
   ensurePlainObject(dto, "review");
   requireId(dto.taskId, "review.taskId");
   if (dto.runId !== undefined && dto.runId !== null) requireId(dto.runId, "review.runId");
-  const actor = validateActor(dto.actor, "review.actor");
+  const actor = dto.actor === undefined || dto.actor === null ? "HUMAN" : validateActor(dto.actor, "review.actor");
+  const assignedTo = dto.assignedTo ?? "HUMAN";
+  if (!["AGENT", "HUMAN"].includes(assignedTo)) {
+    fail("VALIDATION_ERROR", "review.assignedTo must be AGENT|HUMAN", { assignedTo });
+  }
+  const reviewerAgentId =
+    dto.reviewerAgentId === undefined || dto.reviewerAgentId === null
+      ? null
+      : canonicalAgentId(requireId(dto.reviewerAgentId, "review.reviewerAgentId"));
+  if (assignedTo === "AGENT" && !reviewerAgentId) {
+    fail("VALIDATION_ERROR", "review.reviewerAgentId is required when assignedTo=AGENT", {
+      field: "reviewerAgentId",
+    });
+  }
   const at = nowIso(now);
   const review = {
     id: id ?? generateId("REV"),
@@ -754,7 +800,12 @@ export function normalizeReview(dto, { now, attempt = 1, id } = {}) {
     version: 0,
     createdAt: at,
     updatedAt: at,
+    assignedTo,
   };
+  if (reviewerAgentId) review.reviewerAgentId = reviewerAgentId;
+  if (dto.createdByRole !== undefined && dto.createdByRole !== null) {
+    review.createdByRole = validateToken(dto.createdByRole, "review.createdByRole");
+  }
   if (dto.runId !== undefined && dto.runId !== null) review.runId = dto.runId;
   return { review, actor };
 }
@@ -844,7 +895,7 @@ export function validateApprovalDecision(decision) {
  * envelope) and let the store assign `seq`. Only the fields the contract names
  * exist here 鈥?no ad-hoc additions.
  */
-export function makeEvent({ projectId = null, aggregateType, aggregateId, type, payload, now } = {}) {
+export function makeEvent({ projectId = null, aggregateType, aggregateId, type, payload, eventId, sessionSeq, now } = {}) {
   if (projectId !== null && (typeof projectId !== "string" || projectId.trim() === "")) {
     fail("VALIDATION_ERROR", "event.projectId must be a non-empty string or null", { projectId });
   }
@@ -866,6 +917,8 @@ export function makeEvent({ projectId = null, aggregateType, aggregateId, type, 
       type,
       payload: payload ?? {},
       happenedAt: nowIso(now),
+      eventId: eventId ?? null,
+      sessionSeq: sessionSeq ?? null,
     });
   } catch (error) {
     fail("VALIDATION_ERROR", error.message, { type: type ?? null });
@@ -874,6 +927,102 @@ export function makeEvent({ projectId = null, aggregateType, aggregateId, type, 
 }
 
 export { EVENT_SCHEMA_VERSION };
+
+// ---------------------------------------------------------------------------
+// Persisted runtime-event batch (M6.1 F03/F08)
+// ---------------------------------------------------------------------------
+export const BATCH_EVENT_TYPES = Object.freeze(["run.updated", "run.log"]);
+
+/**
+ * Validate one batch of *already mapped* events before any write.
+ * route owns runtime semantics; the store receives `run.updated`
+ * (payload.status/exitCode?/endedAt?) and `run.log` (payload). A batch carries
+ * at most ONE run.updated; more is a VALIDATION_ERROR with details.index.
+ */
+export function planRuntimeEventBatch({ runId, events } = {}) {
+  if (!Array.isArray(events)) {
+    fail("VALIDATION_ERROR", "run.events must be an array", { events: events ?? null });
+  }
+  if (events.length > 1000) {
+    fail("VALIDATION_ERROR", "run.events accepts at most 1000 events per call", { length: events.length });
+  }
+  return events.map((raw, index) => {
+    if (!isPlainObject(raw)) {
+      fail("VALIDATION_ERROR", `run.events[${index}] must be an object`, { index, field: "events" });
+    }
+    if (!BATCH_EVENT_TYPES.includes(raw.type)) {
+      fail("VALIDATION_ERROR", `run.events[${index}].type must be run.updated|run.log`, {
+        index,
+        field: "type",
+        allowed: BATCH_EVENT_TYPES,
+      });
+    }
+    if (!isPlainObject(raw.payload)) {
+      fail("VALIDATION_ERROR", `run.events[${index}].payload must be an object`, { index, field: "payload" });
+    }
+    if (raw.eventId !== undefined && raw.eventId !== null) {
+      if (typeof raw.eventId !== "string" || raw.eventId.trim() === "") {
+        fail("VALIDATION_ERROR", `run.events[${index}].eventId must be a non-empty string`, {
+          index,
+          field: "eventId",
+        });
+      }
+    }
+    if (raw.sessionSeq !== undefined && raw.sessionSeq !== null) {
+      if (!Number.isInteger(raw.sessionSeq) || raw.sessionSeq < 0) {
+        fail("VALIDATION_ERROR", `run.events[${index}].sessionSeq must be a non-negative integer`, {
+          index,
+          field: "sessionSeq",
+        });
+      }
+    }
+    const entry = {
+      index,
+      dedupeKey: eventDedupeKey({
+        ...raw,
+        aggregateId: runId,
+        happenedAt: raw.at ?? raw.payload?.at,
+        payload: {
+          ...raw.payload,
+          runId,
+          ...(raw.payload.sessionId === undefined && raw.sessionId !== undefined
+            ? { sessionId: raw.sessionId }
+            : {}),
+        },
+      }),
+      eventId: raw.eventId ?? null,
+      sessionSeq: raw.sessionSeq ?? null,
+      type: raw.type,
+      payload: raw.payload,
+    };
+    if (raw.type === "run.updated") {
+      const { status, exitCode, endedAt } = raw.payload;
+      if (typeof status !== "string" || !RUN_STATUSES.includes(status)) {
+        fail("VALIDATION_ERROR", `run.events[${index}].payload.status must be a run status`, {
+          index,
+          field: "payload.status",
+          allowed: RUN_STATUSES,
+        });
+      }
+      if (exitCode !== undefined && exitCode !== null && !Number.isInteger(exitCode)) {
+        fail("VALIDATION_ERROR", `run.events[${index}].payload.exitCode must be an integer or null`, {
+          index,
+          field: "payload.exitCode",
+        });
+      }
+      if (endedAt !== undefined && endedAt !== null && (typeof endedAt !== "string" || Number.isNaN(Date.parse(endedAt)))) {
+        fail("VALIDATION_ERROR", `run.events[${index}].payload.endedAt must be an ISO timestamp`, {
+          index,
+          field: "payload.endedAt",
+        });
+      }
+      entry.status = status;
+      entry.exitCode = exitCode ?? undefined;
+      entry.endedAt = endedAt ?? undefined;
+    }
+    return entry;
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Run lifecycle state machine (m2-contracts 搂2)
@@ -1043,29 +1192,14 @@ export function normalizeRepoPath(value, label = "path") {
   if (slashed.includes("\0")) {
     fail("VALIDATION_ERROR", `${label} must not contain NUL bytes`, { entity: label });
   }
-  if (/^[A-Za-z]:/.test(slashed) || slashed.startsWith("/")) {
+  if (slashed.startsWith("/") || /^[A-Za-z]:\//.test(slashed)) {
     fail("VALIDATION_ERROR", `${label} must be a repo-relative path`, { entity: label, path: value });
   }
-  const segments = [];
-  for (const segment of slashed.split("/")) {
-    if (segment === "" || segment === ".") continue;
-    if (segment === "..") {
-      if (segments.length === 0) {
-        fail("VALIDATION_ERROR", `${label} must stay inside the repository`, { entity: label, path: value });
-      }
-      segments.pop();
-      continue;
-    }
-    segments.push(segment);
+  try {
+    return contractsNormalizeRepoPath(value);
+  } catch (error) {
+    fail("VALIDATION_ERROR", error.message, { entity: label, path: value });
   }
-  const normalised = segments.join("/");
-  if (normalised === "") {
-    fail("VALIDATION_ERROR", `${label} must point at a file inside the repository`, {
-      entity: label,
-      path: value,
-    });
-  }
-  return normalised;
 }
 
 /** `projects.policy_json` payload; NULL/missing 鈫?{}. */
@@ -1113,28 +1247,13 @@ export function validateSchedulingPolicies(policies) {
  * Returns the sorted union of the conflicting canonical paths from both sides.
  */
 export function filesIntersection(left, right) {
-  const normalize = (file) => {
-    try {
-      return normalizeRepoPath(file);
-    } catch {
-      return file;
-    }
-  };
-  const leftFiles = [...new Set(left.map(normalize))];
-  const rightFiles = [...new Set(right.map(normalize))];
-  const conflicts = new Set();
-  for (const leftFile of leftFiles) {
-    for (const rightFile of rightFiles) {
-      if (
-        leftFile === rightFile ||
-        leftFile.startsWith(`${rightFile}/`) ||
-        rightFile.startsWith(`${leftFile}/`)
-      ) {
-        conflicts.add(leftFile);
-        conflicts.add(rightFile);
-      }
-    }
-  }
+  // M6.1 F13: one shared rule set (@atk/contracts) for both write-scope copies.
+  const leftFiles = [...new Set(left.map((file) => normalizeRepoPath(file)))];
+  const rightFiles = [...new Set(right.map((file) => normalizeRepoPath(file)))];
+  const conflicts = new Set([
+    ...overlappingPaths(leftFiles, rightFiles),
+    ...overlappingPaths(rightFiles, leftFiles),
+  ]);
   return [...conflicts].sort((a, b) => a.localeCompare(b));
 }
 

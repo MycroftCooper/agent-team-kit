@@ -9,7 +9,7 @@
 // Writes validate before mutating: there is no window in which a rejected
 // operation leaves a half-applied change behind (the SQLite store gets the same
 // guarantee from BEGIN IMMEDIATE/ROLLBACK).
-import { EVENT_SCHEMA_VERSION } from "@atk/contracts";
+import { EVENT_SCHEMA_VERSION, ID_RE, eventDedupeKey } from "@atk/contracts";
 import { fail, notFound } from "./errors.mjs";
 import { INTERNAL } from "./internal.mjs";
 import {
@@ -23,6 +23,7 @@ import {
   SCHEMA_VERSION,
   applyReviewVerdict,
   assertEnumFilter,
+  assertRunTransition,
   assertTaskTransition,
   buildOverview,
   canTransition,
@@ -49,6 +50,7 @@ import {
   normalizeRun,
   normalizeTask,
   nowIso,
+  planRuntimeEventBatch,
   requireId,
   safeJson,
   validateActor,
@@ -82,6 +84,7 @@ export function createMemoryStore() {
   const reviews = new Map();
   const reviewAttempts = new Map();
   const approvals = new Map();
+  const integrations = new Map();
   const events = [];
   const projectMeta = new Map();
   const taskMeta = new Map();
@@ -94,7 +97,12 @@ export function createMemoryStore() {
   /** Insert one already-built event and return a defensive copy. */
   function appendEventEntry(event) {
     seq += 1;
-    const persisted = { ...event, seq, schemaVersion: EVENT_SCHEMA_VERSION };
+    const persisted = {
+      ...event,
+      seq,
+      schemaVersion: EVENT_SCHEMA_VERSION,
+      ...(event.eventId ? {} : { legacy: true }),
+    };
     events.push(persisted);
     return clone(persisted);
   }
@@ -152,13 +160,15 @@ export function createMemoryStore() {
    * Run's agent, else the Task's latest/active Run agent.
    */
   function latestProducerAgentId(taskId) {
-    const taskRuns = [...runs.values()].filter((run) => run.taskId === taskId);
-    const active = taskRuns
-      .filter((run) => ACTIVE_RUN_STATUSES.includes(run.status))
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
-    if (active.length > 0) return active[0].agentId;
-    const all = taskRuns.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
-    return all.length > 0 ? all[0].agentId : null;
+    const completed = [...runs.values()]
+      .filter((run) => run.taskId === taskId && run.status === "COMPLETED")
+      .sort(
+        (a, b) =>
+          b.updatedAt.localeCompare(a.updatedAt) ||
+          b.createdAt.localeCompare(a.createdAt) ||
+          b.id.localeCompare(a.id),
+      );
+    return completed.length > 0 ? completed[0].agentId : null;
   }
 
   /** Validate + apply a Task transition inside the caller's write path. */
@@ -827,11 +837,115 @@ export function createMemoryStore() {
       return built.map((event) => appendEventEntry(event));
     },
 
-    /**
-     * Reconcile facts for a restarted Host (see sqlite.mjs): a completed run's
-     * lease is reported as EXPIRED with its monotonic generation retained, not
-     * as null. sessions stays empty in M2.
-     */
+    applyRuntimeEventBatch({ runId, generation, events: inputEvents, now } = {}) {
+      requireId(runId, "run.id");
+      if (!Number.isInteger(generation) || generation < 1) {
+        fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
+      }
+      const plan = planRuntimeEventBatch({ runId, events: inputEvents });
+      return store[INTERNAL].transaction(() => {
+        const at = nowIso(now);
+        const lease = leaseOf(runId);
+        const stale = (details) => {
+          fail("STALE_GENERATION", `run "${runId}" event report is fenced out`, {
+            runId,
+            generation,
+            ...details,
+          });
+        };
+        if (!lease) stale({ currentGeneration: null, reason: "lease-missing" });
+        if (lease.generation !== generation) {
+          stale({ currentGeneration: lease.generation, reason: "generation-mismatch" });
+        }
+        if (lease.claimedUntil <= at) {
+          stale({
+            currentGeneration: lease.generation,
+            claimedUntil: lease.claimedUntil,
+            reason: "lease-expired",
+          });
+        }
+        const run = requireRunEntry(runId);
+        const task = requireTaskEntry(run.taskId);
+        const seen = new Set(events.filter((event) => event.aggregateId === runId).map((event) => eventDedupeKey(event)));
+        const batchSeen = new Set();
+        let skipped = 0;
+        let stateChanged = false;
+        const applied = [];
+        for (const entry of plan) {
+          const hasEventId = entry.eventId !== null && entry.eventId !== undefined;
+          if (seen.has(entry.dedupeKey) || (hasEventId && batchSeen.has(entry.dedupeKey))) {
+            skipped += 1;
+            continue;
+          }
+          if (hasEventId) batchSeen.add(entry.dedupeKey);
+          if (entry.status !== undefined) {
+            if (entry.status !== run.status) {
+              try {
+                assertRunTransition(run.status, entry.status);
+              } catch (error) {
+                if (error?.code === "VALIDATION_ERROR") {
+                  fail("VALIDATION_ERROR", `run.events[${entry.index}] has an illegal run transition`, {
+                    index: entry.index,
+                    field: "type",
+                    from: run.status,
+                    to: entry.status,
+                  });
+                }
+                throw error;
+              }
+              const merge = mergeRunStatus(run, {
+                status: entry.status,
+                exitCode: entry.exitCode,
+                endedAt: entry.endedAt,
+              }, { now: at });
+              if (merge.updated) {
+                Object.assign(run, merge.run);
+                stateChanged = true;
+              }
+            }
+            applied.push(
+              appendEventEntry(
+                makeEvent({
+                  projectId: task.projectId,
+                  aggregateType: "run",
+                  aggregateId: runId,
+                  type: "run.updated",
+                  payload: {
+                    runId,
+                    taskId: run.taskId,
+                    status: run.status,
+                    previousStatus: entry.previousStatus ?? undefined,
+                    version: run.version,
+                    ...(run.exitCode === undefined ? {} : { exitCode: run.exitCode }),
+                    ...(run.endedAt === undefined ? {} : { endedAt: run.endedAt }),
+                  },
+                  eventId: entry.eventId,
+                  sessionSeq: entry.sessionSeq,
+                  now: at,
+                }),
+              ),
+            );
+            continue;
+          }
+          applied.push(
+            appendEventEntry(
+              makeEvent({
+                projectId: task.projectId,
+                aggregateType: "run",
+                aggregateId: runId,
+                type: entry.type,
+                payload: entry.payload,
+                eventId: entry.eventId,
+                sessionSeq: entry.sessionSeq,
+                now: at,
+              }),
+            ),
+          );
+        }
+        return { ok: true, run: clone(run), applied, skipped, duplicate: skipped, stateChanged };
+      });
+    },
+
     reconcileRun({ runId } = {}) {
       requireId(runId, "run.id");
       const run = requireRunEntry(runId);
@@ -1196,9 +1310,53 @@ export function createMemoryStore() {
         .map(clone);
     },
 
+    /** M6.1 F11: filter -> sort -> keyset page (cursor base64url("<createdAt>|<id>")). */
+    listReviewsPage({ taskId, status, limit, cursor } = {}) {
+      let list = [...reviews.values()];
+      if (taskId !== undefined && taskId !== null) {
+        requireId(taskId, "review.taskId");
+        list = list.filter((review) => review.taskId === taskId);
+      }
+      if (status !== undefined && status !== null) {
+        assertEnumFilter("review", status);
+        list = list.filter((review) => review.status === status);
+      }
+      if (cursor !== undefined && cursor !== null && cursor !== "") {
+        let decoded;
+        try {
+          decoded = Buffer.from(String(cursor), "base64url").toString("utf8");
+        } catch {
+          decoded = "";
+        }
+        const split = decoded.lastIndexOf("|");
+        const createdAt = split > 0 ? decoded.slice(0, split) : "";
+        const id = split > 0 ? decoded.slice(split + 1) : "";
+        if (!createdAt || !ID_RE.test(id) || Number.isNaN(Date.parse(createdAt))) {
+          fail("VALIDATION_ERROR", "review.cursor is invalid", { field: "cursor", cursor });
+        }
+        list = list.filter(
+          (review) =>
+            review.createdAt < createdAt || (review.createdAt === createdAt && review.id < id),
+        );
+      }
+      list.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+      const capped = normalizeLimit(limit, { fallback: 50, max: 100 });
+      const page = list.slice(0, capped + 1);
+      const hasMore = page.length > capped;
+      const items = page.slice(0, capped).map(clone);
+      const last = items.at(-1);
+      return {
+        items,
+        hasMore,
+        ...(hasMore && last
+          ? { nextCursor: Buffer.from(`${last.createdAt}|${last.id}`, "utf8").toString("base64url") }
+          : {}),
+      };
+    },
+
     createReview(dto = {}) {
       ensurePlainObject(dto, "review");
-      validateActor(dto.actor, "review.actor");
+      if (dto.actor !== undefined && dto.actor !== null) validateActor(dto.actor, "review.actor");
       requireId(dto.taskId, "review.taskId");
       const task = getTaskEntry(dto.taskId);
       if (!task) {
@@ -1208,25 +1366,55 @@ export function createMemoryStore() {
           reason: "task-not-found",
         });
       }
-      if (task.status !== "REVIEWING") {
-        fail("TASK_VERSION_CONFLICT", `task "${dto.taskId}" is not REVIEWING`, {
-          taskId: dto.taskId,
-          status: task.status,
-          currentVersion: task.version,
-          reason: "not-reviewing",
-        });
+      const needsTransition = task.status !== "REVIEWING";
+      let producerAgentId = null;
+      if (needsTransition) {
+        let run = null;
+        if (dto.runId !== undefined && dto.runId !== null) {
+          run = getRunEntry(dto.runId);
+          if (!run || run.taskId !== task.id) {
+            fail("VALIDATION_ERROR", `run "${dto.runId}" does not belong to task "${task.id}"`, {
+              runId: dto.runId,
+              taskId: task.id,
+            });
+          }
+        } else {
+          run = [...runs.values()]
+            .filter((candidate) => candidate.taskId === task.id && candidate.status === "COMPLETED")
+            .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id))[0] ?? null;
+        }
+        if (!run || run.status !== "COMPLETED") {
+          fail("VALIDATION_ERROR", "task has no COMPLETED run to review", {
+            taskId: task.id,
+            reason: "no-completed-run",
+          });
+        }
+        if (!["RUNNING", "CLAIMED"].includes(task.status)) {
+          fail("TASK_VERSION_CONFLICT", `task "${dto.taskId}" is not reviewable`, {
+            taskId: dto.taskId,
+            status: task.status,
+            currentVersion: task.version,
+            reason: "not-reviewable",
+          });
+        }
+        producerAgentId = run.agentId;
+        if (dto.assignedTo === "AGENT" && dto.reviewerAgentId) {
+          if (canonicalAgentId(dto.reviewerAgentId) === canonicalAgentId(producerAgentId)) {
+            fail("SELF_REVIEW_FORBIDDEN", "a reviewer cannot review their own work", {
+              taskId: task.id,
+              assignedAgentId: producerAgentId,
+              presentedAgentId: dto.reviewerAgentId,
+            });
+          }
+        }
       }
       if (dto.runId !== undefined && dto.runId !== null) {
-        requireId(dto.runId, "review.runId");
         const run = getRunEntry(dto.runId);
-        if (!run) {
-          fail("VALIDATION_ERROR", `run "${dto.runId}" does not exist`, { entity: "run", id: dto.runId });
-        }
-        if (run.taskId !== task.id) {
+        if (!run || run.taskId !== task.id) {
           fail("VALIDATION_ERROR", `run "${dto.runId}" does not belong to task "${task.id}"`, {
             runId: dto.runId,
             taskId: task.id,
-            runTaskId: run.taskId,
+            runTaskId: run?.taskId ?? null,
           });
         }
       }
@@ -1245,9 +1433,30 @@ export function createMemoryStore() {
         [...reviews.values()].filter((review) => review.taskId === task.id).length + 1;
       const at = nowIso();
       const { review } = normalizeReview(
-        { taskId: dto.taskId, runId: dto.runId, actor: dto.actor },
+        {
+          taskId: dto.taskId,
+          runId: dto.runId,
+          actor: dto.actor,
+          reviewerAgentId: dto.reviewerAgentId,
+          assignedTo: dto.assignedTo,
+          createdByRole: dto.createdByRole,
+        },
         { now: at, attempt: nextAttempt },
       );
+      if (needsTransition) {
+        const previousStatus = task.status;
+        transitionTaskEntry(task.id, "REVIEWING");
+        appendEventEntry(
+          makeEvent({
+            projectId: task.projectId,
+            aggregateType: "task",
+            aggregateId: task.id,
+            type: "task.updated",
+            payload: { taskId: task.id, status: "REVIEWING", previousStatus, reviewId: review.id },
+            now: at,
+          }),
+        );
+      }
       reviews.set(review.id, clone(review));
       const attemptId = generateId("RVA");
       reviewAttempts.set(attemptId, {
@@ -1284,6 +1493,7 @@ export function createMemoryStore() {
       findings,
       evidence,
       actor,
+      reviewerAgentId,
       targetHash,
     } = {}) {
       requireId(id, "review.id");
@@ -1306,18 +1516,40 @@ export function createMemoryStore() {
           status: row.status,
         });
       }
+      if ((row.assignedTo ?? "HUMAN") === "AGENT") {
+        const assigned = row.reviewerAgentId ?? null;
+        const presented = typeof reviewerAgentId === "string" ? reviewerAgentId : null;
+        if (!presented || !assigned || canonicalAgentId(presented) !== canonicalAgentId(assigned)) {
+          fail("SELF_REVIEW_FORBIDDEN", "review must be submitted by its assigned reviewer", {
+            reviewId: id,
+            taskId: row.taskId,
+            assignedAgentId: assigned,
+            presentedAgentId: presented,
+          });
+        }
+      }
       const task = requireTaskEntry(row.taskId);
       // QA-005: canonical identity comparison (trim + casefold) before actor
       // shape validation, so whitespace/case variants of the author are 403.
       const rawActor = typeof actor === "string" ? actor : "";
       const canonicalActor = canonicalAgentId(rawActor);
       const authors = new Map();
+      // Author = the reviewed producer Run; legacy rows fall back to the latest
+      // COMPLETED producer, never to an active Run.
+      let producerAgentId = null;
       if (row.runId !== undefined && row.runId !== null) {
         const producer = getRunEntry(row.runId);
-        if (producer) authors.set(canonicalAgentId(producer.agentId), producer.agentId);
+        if (producer) producerAgentId = producer.agentId;
       }
-      const latestProducer = latestProducerAgentId(row.taskId);
-      if (latestProducer) authors.set(canonicalAgentId(latestProducer), latestProducer);
+      if (!producerAgentId) producerAgentId = latestProducerAgentId(row.taskId);
+      if (!producerAgentId) {
+        fail("VALIDATION_ERROR", "cannot resolve the reviewed producer Run", {
+          reviewId: id,
+          taskId: row.taskId,
+          reason: "review-run-unknown",
+        });
+      }
+      authors.set(canonicalAgentId(producerAgentId), producerAgentId);
       if (canonicalActor !== "" && authors.has(canonicalActor)) {
         fail("SELF_REVIEW_FORBIDDEN", "an actor cannot review their own work", {
           actor: rawActor,
@@ -1549,6 +1781,72 @@ export function createMemoryStore() {
       return clone(approvals.get(approval.id));
     },
 
+    recordIntegration({ taskId, runId, commitSha, manifestHash, actor } = {}) {
+      requireId(taskId, "integration.taskId");
+      requireId(runId, "integration.runId");
+      if (typeof commitSha !== "string" || !/^[0-9a-fA-F]{7,64}$/.test(commitSha)) {
+        fail("VALIDATION_ERROR", "integration.commitSha must be a git commit sha", { commitSha });
+      }
+      const manifest = validateTargetHash(manifestHash, "integration.manifestHash");
+      const actorValue = actor === undefined || actor === null ? null : validateActor(actor, "integration.actor");
+      const task = requireTaskEntry(taskId);
+      const run = getRunEntry(runId);
+      if (!run) notFound("run", runId);
+      if (run.taskId !== taskId) {
+        fail("VALIDATION_ERROR", `run "${runId}" does not belong to task "${taskId}"`, { runId, taskId });
+      }
+      const existing = [...integrations.values()].find(
+        (integration) => integration.taskId === taskId && integration.manifestHash === manifest,
+      );
+      if (existing) return { integration: clone(existing), task: clone(requireTaskEntry(taskId)) };
+      if (!task.targetHash || task.targetHash !== manifest) {
+        fail("APPROVAL_STALE", "integration manifestHash does not match task.target_hash", {
+          taskId,
+          manifestHash: manifest,
+          targetHash: task.targetHash ?? null,
+        });
+      }
+      if (task.status !== "INTEGRATING") {
+        fail("TASK_VERSION_CONFLICT", `task "${taskId}" is not INTEGRATING`, {
+          taskId,
+          status: task.status,
+          currentVersion: task.version,
+          reason: "not-integrating",
+        });
+      }
+      const at = nowIso();
+      const integration = {
+        id: generateId("INT"),
+        taskId,
+        runId,
+        commitSha,
+        manifestHash: manifest,
+        ...(actorValue === null ? {} : { actor: actorValue }),
+        at,
+      };
+      integrations.set(integration.id, integration);
+      const nextTask = transitionTaskEntry(taskId, "AWAITING_ACCEPTANCE");
+      appendEventEntry(
+        makeEvent({
+          projectId: task.projectId,
+          aggregateType: "task",
+          aggregateId: taskId,
+          type: "task.updated",
+          payload: {
+            taskId,
+            status: "AWAITING_ACCEPTANCE",
+            previousStatus: "INTEGRATING",
+            reason: "integration",
+            integrationId: integration.id,
+            runId,
+            manifestHash: manifest,
+          },
+          now: at,
+        }),
+      );
+      return { integration: clone(integration), task: clone(nextTask) };
+    },
+
     decideApproval({ id, decision: rawDecision, actor, targetHash } = {}) {
       requireId(id, "approval.id");
       const decision = validateApprovalDecision(rawDecision);
@@ -1635,6 +1933,10 @@ export function createMemoryStore() {
             status: decision,
             targetHash: receivedTargetHash,
             actor: reviewer,
+            principal: "HUMAN",
+            operation: "approval.decide",
+            targetVersion: updatedTask.version,
+            at,
           },
           now: at,
         }),
@@ -1706,6 +2008,7 @@ export function createMemoryStore() {
           reviews: new Map([...reviews].map(([key, value]) => [key, clone(value)])),
           reviewAttempts: new Map([...reviewAttempts].map(([key, value]) => [key, clone(value)])),
           approvals: new Map([...approvals].map(([key, value]) => [key, clone(value)])),
+          integrations: new Map([...integrations].map(([key, value]) => [key, clone(value)])),
           projectMeta: new Map([...projectMeta].map(([key, value]) => [key, clone(value)])),
           taskMeta: new Map([...taskMeta].map(([key, value]) => [key, clone(value)])),
           runs: new Map([...runs].map(([key, value]) => [key, clone(value)])),
@@ -1729,6 +2032,7 @@ export function createMemoryStore() {
           restore(reviews, snapshot.reviews);
           restore(reviewAttempts, snapshot.reviewAttempts);
           restore(approvals, snapshot.approvals);
+          restore(integrations, snapshot.integrations);
           restore(projectMeta, snapshot.projectMeta);
           restore(taskMeta, snapshot.taskMeta);
           restore(runs, snapshot.runs);
@@ -1750,6 +2054,7 @@ export function createMemoryStore() {
         reviews.clear();
         reviewAttempts.clear();
         approvals.clear();
+        integrations.clear();
         projectMeta.clear();
         taskMeta.clear();
         runs.clear();

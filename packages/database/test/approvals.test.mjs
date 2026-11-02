@@ -86,14 +86,17 @@ test("decideApproval APPROVED with the matching hash is the only DONE entrance",
     assert.equal(result.task.status, "DONE", label);
     const event = store.listEvents({ limit: 1000 }).at(-1);
     assert.equal(event.type, "approval.recorded", label);
-    assert.deepEqual(event.payload, {
-      taskId: "TASK-1",
-      approvalId: approval.id,
-      decision: "APPROVED",
-      status: "APPROVED",
-      targetHash: SHA_A,
-      actor: "HUMAN",
-    }, label);
+    assert.equal(event.payload.taskId, "TASK-1", label);
+    assert.equal(event.payload.approvalId, approval.id, label);
+    assert.equal(event.payload.decision, "APPROVED", label);
+    assert.equal(event.payload.status, "APPROVED", label);
+    assert.equal(event.payload.targetHash, SHA_A, label);
+    assert.equal(event.payload.actor, "HUMAN", label);
+    assert.equal(event.payload.principal, "HUMAN", label);
+    assert.equal(event.payload.operation, "approval.decide", label);
+    assert.equal(event.payload.targetVersion, result.task.version, label);
+    assert.equal(event.payload.at, event.payload.at, label);
+    assert.ok(event.payload.at, label);
 
     // Task DONE is terminal: a second decision on the same approval is rejected.
     const before = fingerprint(store);
@@ -195,7 +198,7 @@ test("QA-005: patchTask can never set DONE; approval is the only door", (t) => {
       () => store.patchTask("TASK-1", { expectedVersion: task.version, changes: { status: "DONE" } }),
       (error) =>
         error.code === "TASK_VERSION_CONFLICT" &&
-        error.details.reason === "human-approval-required" &&
+        error.details.reason === "execution-state-guard" &&
         error.details.requestedStatus === "DONE",
       label,
     );

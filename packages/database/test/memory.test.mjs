@@ -1,4 +1,4 @@
-﻿// In-memory Store: same contract, same behaviour as SQLite (contracts 搂1 says
+// In-memory Store: same contract, same behaviour as SQLite (contracts 搂1 says
 // backend/QA may use it without a database file).
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -14,7 +14,7 @@ test("memory store exposes the same API shape with no file", (t) => {
   assert.deepEqual(store.health(), {
     ok: true,
     file: null,
-    schemaVersion: 5,
+    schemaVersion: 6,
     counts: { projects: 0, tasks: 0, runs: 0, events: 0, agents: 0 },
   });
   assert.deepEqual(store.listProjects(), []);
