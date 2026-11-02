@@ -36,6 +36,7 @@ for (const required of [BACKEND_CLI, STATE]) {
 }
 
 const { openStore } = await load("packages/database/src/index.mjs");
+const { INTERNAL } = await load("packages/database/src/internal.mjs");
 const { planDispatch } = await load("packages/scheduler-core/src/index.mjs");
 const { createSchedulerClient } = await load("apps/scheduler/src/client.mjs");
 const { createScheduler } = await load("apps/scheduler/src/index.mjs");
@@ -115,7 +116,7 @@ function seedTask({ id, title, deps = [], priority = 2, status = "READY" }) {
     deps,
     acceptance: "smoke",
   });
-  if (status !== "READY") store.patchTask(task.id, { expectedVersion: task.version, changes: { status } });
+  if (status !== "READY") store[INTERNAL].setTaskStatus(task.id, status); // fixture seed (F01: no public direct transition)
   return store.getTask(task.id);
 }
 
@@ -317,11 +318,10 @@ try {
     await host.stop();
 
     // The scheduler does not auto-accept, and since M4 DONE is reachable only
-    // through a human approval. Walk the legal chain, then approve with the
-    // matching target hash.
-    for (const status of ["RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE"]) {
-      await patchTask("M3-A", { status });
-    }
+    // through a human approval. This gate is about scheduling, not about the
+    // review loop, so the candidate state is seeded through the internal writer
+    // (F01 forbids PATCHing execution states); the approval itself is real HTTP.
+    store[INTERNAL].setTaskStatus("M3-A", "AWAITING_ACCEPTANCE");
     const targetHash = "a".repeat(64); // contracts: a target hash is a sha256 hex digest
     // Since M4 an approval must bind to the task's real candidate hash, which a
     // PASS review normally writes. This gate is about scheduling, so it seeds the
