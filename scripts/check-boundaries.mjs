@@ -34,7 +34,7 @@ const ALLOWED = {
   "runtime-sdk": new Set(["contracts"]),
   workspace: new Set([]),
   scheduler: new Set(["scheduler-core", "contracts"]),
-  "scheduler-core": new Set([]),
+  "scheduler-core": new Set(["contracts"]),
   // The launcher orchestrates processes; it must not import the apps it starts.
   launcher: new Set(["contracts"]),
 };
