@@ -135,12 +135,9 @@ if (!hasSqlite) {
         const store = openStore({ file: sandbox.dbFile, migrate: true });
         try {
           const project = store.createProject({ id: `QA-P-${Date.now()}`, name: "qa", repoPath: REPO, defaultBranch: "m0/baseline-and-p0" });
-          for (let index = 0; index < 2; index += 1) store.upsertAgent({ id: `qa-agent-${index + 1}`, role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
-          // M6.2 F10: the scheduler only dispatches to agents with a live
-          // heartbeat and capacity. Fixture-only seed (guarded for old stores).
-          if (typeof store.recordHeartbeat === "function") {
-            store.recordHeartbeat({ hostId: "m5-qa-fixture", agentIds: ["qa-agent-1", "qa-agent-2"], capacity: 1 });
-          }
+          // M6.3: Runtime Hosts register their own agents and heartbeat them;
+          // seeding fake IDLE agents here would compete with the real workers
+          // and reintroduce the "IDLE == dispatchable" assumption.
           for (let index = 0; index < count; index += 1) {
             store.createTask({ id: `QA-T-${Date.now()}-${index}`, projectId: project.id, title: `qa ${index}`, description: "qa", functionRequired: "WORKER", roleRequired: "DEV", priority: 2, deps: [], acceptance: "qa" });
           }
@@ -596,4 +593,5 @@ if (!hasSqlite) {
     }
   });
 }
+
 

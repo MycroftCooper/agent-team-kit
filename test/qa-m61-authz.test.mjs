@@ -30,7 +30,7 @@ if (!hasSqlite) {
   const { normalizeRepoPath, pathsOverlap } = await load("packages/contracts/src/paths.mjs");
   const { filesIntersection } = await load("packages/database/src/model.mjs");
   const helpers = await load("apps/backend/test/helpers.mjs");
-  const { startServer, request, writeHeaders, internalHeaders, TEST_TOKEN, TEST_INTERNAL_TOKEN } = helpers;
+  const { startServer, request, writeHeaders, internalHeaders, TEST_TOKEN, TEST_INTERNAL_TOKEN, TEST_HOST_INTERNAL_TOKEN } = helpers;
 
   function tempDir(t) {
     const dir = mkdtempSync(path.join(os.tmpdir(), "atk-m61-authz-"));
@@ -100,42 +100,48 @@ if (!hasSqlite) {
 
   test("QA-03.2 the internal credential is runtime-host-only on review submit", async (t) => {
     const f = await fixture(t, { withReview: true });
-    const submit = (role) => request(f.ctx.base, {
+    const submit = (token, role) => request(f.ctx.base, {
       method: "POST",
       path: `/api/v1/reviews/${f.review.id}/submit`,
-      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, role), "content-type": "application/json" },
+      headers: { ...internalHeaders(token, role), "content-type": "application/json" },
       body: PASS_BODY(f.review),
     });
-    const missing = await submit("");
-    assert.equal(missing.status, 403);
-    assert.equal(missing.json.error.code, "NOT_AUTHORIZED");
-    assert.equal(missing.json.error.details.reason, "internal-role-required");
-    const scheduler = await submit("scheduler");
-    assert.equal(scheduler.status, 403);
+    // M6.3 P0-2: the token itself binds the role; the header is an assertion.
+    const scheduler = await submit(TEST_INTERNAL_TOKEN, "scheduler");
+    assert.equal(scheduler.status, 403, scheduler.text);
     assert.equal(scheduler.json.error.details.reason, "internal-role-forbidden");
-    const runtimeHost = await submit("runtime-host");
+    const wrongHeader = await submit(TEST_HOST_INTERNAL_TOKEN, "scheduler");
+    assert.equal(wrongHeader.status, 403);
+    assert.equal(wrongHeader.json.error.details.reason, "internal-role-forbidden");
+    const runtimeHostNoHeader = await submit(TEST_HOST_INTERNAL_TOKEN, "");
+    assert.equal(runtimeHostNoHeader.status, 403, "a HUMAN assignment cannot be submitted with the runtime-host credential");
+    assert.equal(runtimeHostNoHeader.json.error.details.reason, "review-assignment-required");
+    const runtimeHost = await submit(TEST_HOST_INTERNAL_TOKEN, "runtime-host");
     assert.equal(runtimeHost.status, 403, "a HUMAN assignment cannot be submitted with the runtime-host credential");
     assert.equal(runtimeHost.json.error.details.reason, "review-assignment-required");
   });
 
   test("QA-03.3 internal role matrix is deny-by-default and endpoint-scoped (real HTTP)", async (t) => {
     const f = await fixture(t, { status: "READY" });
-    const claim = (role) => request(f.ctx.base, {
+    const claim = (token, role) => request(f.ctx.base, {
       method: "POST",
       path: `/internal/v1/tasks/${f.task.id}/claim`,
-      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, role), "content-type": "application/json" },
-      body: { agentId: "agent-1", expectedTaskVersion: f.task.version, idempotencyKey: "qa-m61-role" },
+      headers: { ...internalHeaders(token, role), "content-type": "application/json" },
+      body: { agentId: "agent-1", expectedTaskVersion: f.task.version, idempotencyKey: `qa-m61-role-${role ?? "none"}` },
     });
-    const missing = await claim("");
-    assert.equal(missing.status, 403);
-    assert.equal(missing.json.error.details.reason, "internal-role-required");
-    const wrong = await claim("runtime-host");
-    assert.equal(wrong.status, 403);
-    assert.equal(wrong.json.error.details.reason, "internal-role-forbidden");
-    const unknown = await claim("root");
-    assert.equal(unknown.status, 403);
-    assert.equal(unknown.json.error.details.reason, "internal-role-forbidden");
-    const allowed = await claim("scheduler");
+    const hostToken = await claim(TEST_HOST_INTERNAL_TOKEN, "runtime-host");
+    assert.equal(hostToken.status, 403);
+    assert.equal(hostToken.json.error.details.reason, "internal-role-forbidden");
+    const hostAsScheduler = await claim(TEST_HOST_INTERNAL_TOKEN, "scheduler");
+    assert.equal(hostAsScheduler.status, 403);
+    assert.equal(hostAsScheduler.json.error.details.reason, "internal-role-forbidden");
+    const schedulerWrongHeader = await claim(TEST_INTERNAL_TOKEN, "runtime-host");
+    assert.equal(schedulerWrongHeader.status, 403);
+    assert.equal(schedulerWrongHeader.json.error.details.reason, "internal-role-forbidden");
+    // No header is not an elevation: the scheduler token still binds scheduler.
+    const schedulerNoHeader = await claim(TEST_INTERNAL_TOKEN, "");
+    assert.notEqual(schedulerNoHeader.status, 403, `scheduler token must pass the endpoint gate: ${schedulerNoHeader.text}`);
+    const allowed = await claim(TEST_INTERNAL_TOKEN, "scheduler");
     assert.notEqual(allowed.status, 403, `scheduler must pass the role gate: ${allowed.text}`);
   });
 
@@ -247,12 +253,12 @@ if (!hasSqlite) {
     f.store.updateRunStatus(run.id, { status: "RUNNING" });
     f.store.updateRunStatus(run.id, { status: "COMPLETED", exitCode: 0 });
     f.store[INTERNAL].setTaskStatus(f.task.id, "RUNNING");
-    const reviewerRun = f.store.createRun({ taskId: f.task.id, agentId: "agent-2", function: "WORKER", role: "DEV" });
+    const reviewerRun = f.store.createRun({ taskId: f.task.id, agentId: "agent-2", function: "REVIEWER", role: "QA" });
     const created = await request(f.ctx.base, {
       method: "POST",
       path: "/api/v1/reviews",
       headers: writeHeaders(f.ctx.base),
-      body: { taskId: f.task.id, runId: run.id, assignedTo: "AGENT", reviewerAgentId: "agent-2" },
+      body: { taskId: f.task.id, runId: run.id, assignedTo: "AGENT", reviewerAgentId: "agent-2", reviewerRunId: reviewerRun.id },
     });
     assert.equal(created.status, 201, created.text);
     assert.equal(created.json.assignedTo, "AGENT");
@@ -269,7 +275,7 @@ if (!hasSqlite) {
     const internal = await request(f.ctx.base, {
       method: "POST",
       path: `/api/v1/reviews/${review.id}/submit`,
-      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host"), "content-type": "application/json" },
+      headers: { ...internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"), "content-type": "application/json" },
       body: { ...PASS_BODY(review), actor: "agent-1", runId: reviewerRun.id },
     });
     assert.equal(internal.status, 200, internal.text);
@@ -286,6 +292,7 @@ if (!hasSqlite) {
     f.store.updateRunStatus(run.id, { status: "RUNNING" });
     f.store.updateRunStatus(run.id, { status: "COMPLETED", exitCode: 0 });
     f.store[INTERNAL].setTaskStatus(f.task.id, "RUNNING");
+    const reviewerRun = f.store.createRun({ taskId: f.task.id, agentId: "agent-author", function: "REVIEWER", role: "QA" });
     const before = new DatabaseSync(f.dbFile, { readOnly: true });
     let reviewsBefore;
     try { reviewsBefore = Number(before.prepare("SELECT COUNT(*) AS c FROM reviews").get().c); } finally { before.close(); }
@@ -293,7 +300,7 @@ if (!hasSqlite) {
       method: "POST",
       path: "/api/v1/reviews",
       headers: writeHeaders(f.ctx.base),
-      body: { taskId: f.task.id, runId: run.id, assignedTo: "AGENT", reviewerAgentId: "agent-author" },
+      body: { taskId: f.task.id, runId: run.id, assignedTo: "AGENT", reviewerAgentId: "agent-author", reviewerRunId: reviewerRun.id },
     });
     assert.ok(created.status === 403 || created.status === 409, created.text);
     assert.equal(created.json.error.code, "SELF_REVIEW_FORBIDDEN");
@@ -341,28 +348,28 @@ if (!hasSqlite) {
       raw.prepare("UPDATE tasks SET status = 'INTEGRATING', target_hash = ? WHERE id = ?").run(targetHash, f.task.id);
     } finally { raw.close(); }
     const body = { taskId: f.task.id, runId: run.id, commitSha: "a".repeat(40), manifestHash: targetHash };
-    const attempt = (role) => request(f.ctx.base, {
+    const attempt = (token, role) => request(f.ctx.base, {
       method: "POST",
       path: `/internal/v1/tasks/${f.task.id}/integration`,
-      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, role), "content-type": "application/json" },
+      headers: { ...internalHeaders(token, role), "content-type": "application/json" },
       body,
     });
-    const missing = await attempt("");
-    assert.equal(missing.status, 403);
-    assert.equal(missing.json.error.details.reason, "internal-role-required");
-    const wrong = await attempt("runtime-host");
+    const wrong = await attempt(TEST_HOST_INTERNAL_TOKEN, "runtime-host");
     assert.equal(wrong.status, 403);
     assert.equal(wrong.json.error.details.reason, "internal-role-forbidden");
-    // user-action is allowed; a wrong manifest is refused before any write.
+    const schedulerWrongHeader = await attempt(TEST_INTERNAL_TOKEN, "runtime-host");
+    assert.equal(schedulerWrongHeader.status, 403);
+    assert.equal(schedulerWrongHeader.json.error.details.reason, "internal-role-forbidden");
+    // user-action header cannot be asserted with a scheduler-bound token.
     const wrongBody = await request(f.ctx.base, {
       method: "POST",
       path: `/internal/v1/tasks/${f.task.id}/integration`,
-      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, "user-action"), "content-type": "application/json" },
+      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"), "content-type": "application/json" },
       body: { ...body, manifestHash: "f".repeat(64) },
     });
     assert.equal(wrongBody.status, 409, wrongBody.text);
     assert.equal(wrongBody.json.error.code, "APPROVAL_STALE");
-    const accepted = await attempt("user-action");
+    const accepted = await attempt(TEST_INTERNAL_TOKEN, "scheduler");
     assert.equal(accepted.status, 200, accepted.text);
     assert.equal(accepted.json.task.status, "AWAITING_ACCEPTANCE");
     const rawCheck = new DatabaseSync(f.dbFile, { readOnly: true });

@@ -29,7 +29,7 @@ if (!hasSqlite) {
   const { createMockRuntime } = await load("packages/runtime-sdk/src/mock.mjs");
   const { createScheduler } = await load("apps/scheduler/src/index.mjs");
   const core = await load("packages/scheduler-core/src/index.mjs");
-  const { startServer, request, writeHeaders, internalHeaders, TEST_INTERNAL_TOKEN } = await load("apps/backend/test/helpers.mjs");
+  const { startServer, request, writeHeaders, internalHeaders, TEST_INTERNAL_TOKEN, TEST_HOST_INTERNAL_TOKEN } = await load("apps/backend/test/helpers.mjs");
   const { ensureWorktree, listWorktrees, worktreeStatus } = await load("packages/workspace/src/index.mjs");
 
   const quiet = { info() {}, warn() {}, error() {} };
@@ -109,6 +109,9 @@ if (!hasSqlite) {
       client,
       runtime,
       ownerId: `qa-${name}`,
+      agents: [{ agentId: "agent-1", role: "DEV", function: "WORKER" }],
+      hostId: `qa-${name}`,
+      allowNoneWorkspace: true,
       pollMs: 1000,
       flushMs: 5,
       heartbeatMs: 1000,
@@ -169,7 +172,7 @@ if (!hasSqlite) {
     assert.equal(run.specHash, specHash);
     assert.equal(path.resolve(run.workspace.path).startsWith(path.resolve(worktreeRoot)), true);
     const { runtime, starts } = captureRuntime(t, { onStart: (input) => writeFileSync(path.join(input.cwd, "host-created.txt"), "host\\n", "utf8") });
-    const host = hostFor(t, { dir: tempDir(t, "atk-m62-host-"), client: createInternalClient({ baseUrl: f.ctx.base, token: TEST_INTERNAL_TOKEN }), runtime });
+    const host = hostFor(t, { dir: tempDir(t, "atk-m62-host-"), client: createInternalClient({ baseUrl: f.ctx.base, token: TEST_HOST_INTERNAL_TOKEN }), runtime });
     await host.tick();
     await waitFor(() => f.store.getRun(run.id).status === "COMPLETED" && f.store[INTERNAL].getDispatchCommand(command.id)?.status === "DONE" && host.outbox().length === 0, 10000, "host worktree completion");
     assert.equal(starts.length, 1, "the runtime must be started exactly once");
@@ -200,7 +203,7 @@ if (!hasSqlite) {
     assert.notEqual(runs[0].workspace.path, runs[1].workspace.path);
     const host = hostFor(t, {
       dir: tempDir(t, "atk-m62-host-"),
-      client: createInternalClient({ baseUrl: f.ctx.base, token: TEST_INTERNAL_TOKEN }),
+      client: createInternalClient({ baseUrl: f.ctx.base, token: TEST_HOST_INTERNAL_TOKEN }),
       runtime: captureRuntime(t, { onStart: (input) => writeFileSync(path.join(input.cwd, `${input.runId}.txt`), input.runId, "utf8") }).runtime,
     });
     await host.tick();
@@ -226,19 +229,19 @@ if (!hasSqlite) {
     const run = f.store.createRun({ taskId: task.id, agentId: "agent-1", function: "WORKER", role: "DEV" });
     f.store.updateRunStatus(run.id, { status: "RUNNING" });
     f.store.updateRunStatus(run.id, { status: "COMPLETED", exitCode: 0 });
-    const reviewerRun = f.store.createRun({ taskId: task.id, agentId: "agent-2", function: "WORKER", role: "QA" });
+    const reviewerRun = f.store.createRun({ taskId: task.id, agentId: "agent-2", function: "REVIEWER", role: "QA" });
     const created = await request(f.ctx.base, {
       method: "POST",
       path: "/api/v1/reviews",
       headers: writeHeaders(f.ctx.base),
-      body: { taskId: task.id, runId: run.id, assignedTo: "AGENT", reviewerAgentId: "agent-2" },
+      body: { taskId: task.id, runId: run.id, assignedTo: "AGENT", reviewerAgentId: "agent-2", reviewerRunId: reviewerRun.id },
     });
     assert.equal(created.status, 201, created.text);
     const manifestHash = "a".repeat(64);
     const submitted = await request(f.ctx.base, {
       method: "POST",
       path: `/api/v1/reviews/${created.json.id}/submit`,
-      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host"), "content-type": "application/json" },
+      headers: { ...internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"), "content-type": "application/json" },
       body: { expectedVersion: created.json.version, verdict: "PASS", manifestHash, evidence: { tests: { passed: 1, total: 1 } }, runId: reviewerRun.id },
     });
     assert.equal(submitted.status, 200, submitted.text);
@@ -246,7 +249,7 @@ if (!hasSqlite) {
     const integration = await request(f.ctx.base, {
       method: "POST",
       path: `/internal/v1/tasks/${task.id}/integration`,
-      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, "user-action"), "content-type": "application/json" },
+      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"), "content-type": "application/json" },
       body: { taskId: task.id, runId: run.id, commitSha: "b".repeat(40), manifestHash },
     });
     assert.equal(integration.status, 200, integration.text);
@@ -307,7 +310,7 @@ if (!hasSqlite) {
     const { runtime, starts } = captureRuntime(t, { scenario: "fail" });
     const host = hostFor(t, {
       dir: tempDir(t, "atk-m62-host-"),
-      client: createInternalClient({ baseUrl: f.ctx.base, token: TEST_INTERNAL_TOKEN }),
+      client: createInternalClient({ baseUrl: f.ctx.base, token: TEST_HOST_INTERNAL_TOKEN }),
       runtime,
     });
     await host.tick();
@@ -394,6 +397,10 @@ if (!hasSqlite) {
     assert.equal(mockClaim.json.run.workspace.kind, "none");
   });
 }
+
+
+
+
 
 
 

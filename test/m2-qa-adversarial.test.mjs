@@ -1,4 +1,4 @@
-// M2 independent QA: adversarial regression suite (QA-003).
+﻿// M2 independent QA: adversarial regression suite (QA-003).
 //
 // Scope: the M2 "execution layer" from the frozen commit `fed5ee8` and its
 // post-freeze fix `b8fc426`: internal API credential isolation, atomic dispatch
@@ -74,11 +74,15 @@ if (!hasSqlite) {
       internalToken: null,
       session: null,
       seed(label = "qa") {
-        const run = store.createRun({ taskId: task.id, agentId: "agent-dev-01", function: "WORKER", role: "DEV" });
+        // M6.3 F05: the Host refuses to start without a frozen TaskExecutionSpec.
+        // Freeze it as the real claim path would; the backend dispatch route
+        // attaches it to the claim response.
+        const frozen = typeof store.freezeTaskSpec === "function" ? store.freezeTaskSpec(task.id, { workspace: { kind: "none" } }) : null;
+        const run = store.createRun({ taskId: task.id, agentId: "agent-dev-01", function: "WORKER", role: "DEV", ...(frozen ? { specHash: frozen.specHash, workspace: frozen.spec.workspace } : {}) });
         const command = store.enqueueDispatchCommand({
           runId: run.id,
           commandType: "START_RUN",
-          payload: { prompt: label },
+          payload: { prompt: label, ...(frozen ? { specHash: frozen.specHash } : {}) },
           idempotencyKey: `${label}-${run.id}`,
         });
         return { run: store.getRun(run.id), command };
@@ -113,9 +117,12 @@ if (!hasSqlite) {
           await sleep(50);
         }
         assert.ok(healthy, `backend did not become healthy: ${output.slice(-500)}`);
-        const token = output.match(/internal token:\s*(\S+)/)?.[1];
-        assert.ok(token, `backend did not print an internal token: ${output.slice(-500)}`);
-        env.internalToken = token;
+        const tokenPair = output.match(/internal tokens:\s*scheduler=(\S+)\s+runtime-host=(\S+)/);
+        assert.ok(tokenPair, `backend did not print the two internal tokens: ${output.slice(-700)}`);
+        env.tokens = { scheduler: tokenPair[1], "runtime-host": tokenPair[2] };
+        // Backwards-compatible fixture alias: most existing probes use the
+        // scheduler credential; host-only calls use env.tokens["runtime-host"].
+        env.internalToken = env.tokens.scheduler;
         env.base = `http://127.0.0.1:${started}`;
         env.output = () => output;
         env.session = await (await fetch(`${env.base}/api/v1/session`)).json();
@@ -137,6 +144,7 @@ if (!hasSqlite) {
         };
         env.internal = async (method, route, body) => {
           const role = roleFor(method, route);
+          const token = env.tokens[role] ?? env.tokens.scheduler;
           const response = await fetch(`${env.base}${route}`, {
             method,
             headers: {
@@ -478,9 +486,11 @@ process.stdout.write(JSON.stringify({ owner, claimed: Boolean(claim), commandId:
     const { run } = env.seed("full-session");
     const runtime = createMockRuntime({ scenario: "complete", sessionIdFactory: () => "full-session" });
     const host = createHost({
-      client: createInternalClient({ baseUrl: env.base, token: env.internalToken }),
+      client: createInternalClient({ baseUrl: env.base, token: env.tokens["runtime-host"] }),
       runtime,
       ownerId: "qa-host",
+      agents: [{ agentId: "agent-dev-01", role: "DEV", function: "WORKER" }],
+      allowNoneWorkspace: true,
       leaseMs: 2000,
       pollMs: 20,
       flushMs: 10,
@@ -673,9 +683,11 @@ process.stdout.write(JSON.stringify({ owner, claimed: Boolean(claim), commandId:
     await sleep(1300); // the dead host's lease expires here
     const recoveryRuntime = createMockRuntime({ scenario: "complete", sessionIdFactory: () => "recovery" });
     const recoveryHost = createHost({
-      client: createInternalClient({ baseUrl: env.base, token: env.internalToken }),
+      client: createInternalClient({ baseUrl: env.base, token: env.tokens["runtime-host"] }),
       runtime: recoveryRuntime,
       ownerId: "recovery",
+      agents: [{ agentId: "agent-dev-01", role: "DEV", function: "WORKER" }],
+      allowNoneWorkspace: true,
       leaseMs: 2000,
       pollMs: 20,
       flushMs: 10,
@@ -839,3 +851,5 @@ process.stdout.write(JSON.stringify({ owner, claimed: Boolean(claim), commandId:
     });
   }
 }
+
+

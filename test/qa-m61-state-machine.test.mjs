@@ -293,7 +293,7 @@ if (!hasSqlite) {
     const integration = await request(f.ctx.base, {
       method: "POST",
       path: `/internal/v1/tasks/${f.task.id}/integration`,
-      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, "user-action"), "content-type": "application/json" },
+      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"), "content-type": "application/json" },
       body: { taskId: f.task.id, runId: run.id, commitSha: "b".repeat(40), manifestHash: MANIFEST },
     });
     assert.equal(integration.status, 200, integration.text);
@@ -320,7 +320,7 @@ if (!hasSqlite) {
     const integration = await request(f.ctx.base, {
       method: "POST",
       path: `/internal/v1/tasks/${f.task.id}/integration`,
-      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, "user-action"), "content-type": "application/json" },
+      headers: { ...internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"), "content-type": "application/json" },
       body: { taskId: f.task.id, runId: currentRun.id, commitSha: "d".repeat(40), manifestHash: MANIFEST },
     });
     assert.equal(integration.status, 200, integration.text);
@@ -358,6 +358,7 @@ if (!hasSqlite) {
     void manifestHash;
   });
 }
+
 
 
 

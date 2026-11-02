@@ -101,11 +101,12 @@ if (!hasSqlite) {
           await sleep(50);
         }
         assert.ok(healthy, `backend did not start: ${output.slice(-400)}`);
-        const token = output.match(/internal token:\s*(\S+)/)?.[1];
-        assert.ok(token, `backend did not print an internal token: ${output.slice(-400)}`);
+        const tokenPair = output.match(/internal tokens:\s*scheduler=(\S+)\s+runtime-host=(\S+)/);
+        assert.ok(tokenPair, `backend did not print the two internal tokens: ${output.slice(-600)}`);
+        env.tokens = { scheduler: tokenPair[1], "runtime-host": tokenPair[2] };
         env.base = base;
-        env.internalToken = token;
-        env.client = createSchedulerClient({ baseUrl: base, token });
+        env.internalToken = env.tokens.scheduler;
+        env.client = createSchedulerClient({ baseUrl: base, token: env.tokens.scheduler });
         return env;
       },
       async stopBackend() {
@@ -755,7 +756,7 @@ process.stdout.write(JSON.stringify(out));
     const acc1 = snapshot.tasks.find((entry) => entry.id === "ACC1");
     await env.client.claim("ACC1", { agentId: "agent-A", expectedTaskVersion: acc1.version, policies, idempotencyKey: "acc-1" });
     const { createInternalClient } = await import(pathToFileURL(path.join(REPO, "apps/runtime-host/src/client.mjs")).href);
-    const internal = createInternalClient({ baseUrl: env.base, token: env.internalToken });
+    const internal = createInternalClient({ baseUrl: env.base, token: env.tokens["runtime-host"] });
     const hostClaim = await internal.claim({ ownerId: "host-acc", leaseMs: 5000 });
     assert.ok(hostClaim, "the scheduler-created command must be claimable by a host");
     // Finish the Run through the real internal API: the Task must NOT move on its own.

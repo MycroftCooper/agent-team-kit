@@ -1,4 +1,4 @@
-// M6.1 independent QA-02: runtime fault injection.
+﻿// M6.1 independent QA-02: runtime fault injection.
 //
 // Landed: F02 Outbox/FINISHING, F03 store batch atomicity, F07 fencing, F09
 // atomic recovery, F08 eventId dedupe. The HTTP batch-recovery route is still
@@ -24,7 +24,7 @@ if (!hasSqlite) {
   const { INTERNAL } = await load("packages/database/src/internal.mjs");
   const { createHost } = await load("apps/runtime-host/src/host.mjs");
   const { createMockRuntime } = await load("packages/runtime-sdk/src/mock.mjs");
-  const { startServer, request, internalHeaders, TEST_INTERNAL_TOKEN } = await load("apps/backend/test/helpers.mjs");
+  const { startServer, request, internalHeaders, TEST_INTERNAL_TOKEN, TEST_HOST_INTERNAL_TOKEN } = await load("apps/backend/test/helpers.mjs");
   const { createInternalClient } = await load("apps/runtime-host/src/client.mjs");
 
   // M6.2 F05: a Host never starts without a valid frozen TaskExecutionSpec.
@@ -96,6 +96,7 @@ if (!hasSqlite) {
       client: options.client ?? fakeClient({ claims: [claimOf()] }),
       runtime: options.runtime ?? createMockRuntime({ scenario: "complete", sessionIdFactory: () => "session-1" }),
       ownerId: "host-a",
+      allowNoneWorkspace: true,
       pollMs: 1000,
       flushMs: 5,
       heartbeatMs: 1000,
@@ -103,6 +104,7 @@ if (!hasSqlite) {
       outboxFile,
       outboxRetryBaseMs: 5,
       outboxRetryMaxMs: 20,
+      idFactory: () => "00000000-0000-4000-8000-000000000000",
       logger,
       ...options.hostOptions,
     });
@@ -252,25 +254,27 @@ if (!hasSqlite) {
   });
 
   test("QA-02.5 F02: a transient result failure persists the fact and only counts completion after ack", async (t) => {
-    let failures = 2;
+    let allow = false;
     const client = fakeClient({
       claims: [claimOf()],
       onResult: () => {
-        if (failures > 0) { failures -= 1; return Promise.reject(new Error("ECONNRESET")); }
+        if (!allow) return Promise.reject(new Error("ECONNRESET"));
         return Promise.resolve({ persisted: true });
       },
     });
     const f = hostFixture(t, { client });
     await f.host.tick();
-    await waitFor(() => f.host.mode() === "FINISHING", 3000, "FINISHING");
+    await waitFor(() => f.host.mode() === "FINISHING" && f.host.outbox().length === 1, 3000, "FINISHING");
     assert.equal(f.host.stats.completed, 0, "an unacknowledged result is not a completed Run");
     const persisted = JSON.parse(readFileSync(f.outboxFile, "utf8"));
     assert.equal(persisted.entries.length, 1, "the terminal fact must be durable in the outbox");
     assert.ok(persisted.entries[0].idempotencyKey, "outbox needs a stable idempotency key");
     assert.ok(JSON.parse(readFileSync(f.stateFile, "utf8")).some((record) => record.runId === "run-1"), "the in-flight record must survive a failed ack");
+    allow = true;
+    await f.host.flushOutbox();
     await waitFor(() => f.host.outbox().length === 0, 4000, "outbox drained");
     assert.equal(f.host.stats.completed, 1);
-    assert.ok(client.calls.result.length >= 3);
+    assert.ok(client.calls.result.length >= 2, "one transient failure plus one acknowledged retry");
     assert.equal(new Set(client.calls.result.map((call) => call.idempotencyKey)).size, 1, "retries must reuse one idempotency key");
   });
 
@@ -279,12 +283,13 @@ if (!hasSqlite) {
     const client = fakeClient({
       claims: [claimOf()],
       onResult: () => { resultCalls += 1; return Promise.reject(new Error("socket hang up")); },
-      onReconcile: () => Promise.resolve({ run: { id: "run-1", status: "COMPLETED" }, command: { id: "CMD-1", status: "DONE" }, persisted: true }),
+      onReconcile: () => Promise.resolve({ run: { id: "run-1", status: "COMPLETED" }, command: { id: "CMD-1", status: "DONE", generation: 7, result: { eventId: "00000000-0000-4000-8000-000000000000" } }, persisted: true }),
     });
     const f = hostFixture(t, { client });
     await f.host.tick();
     await waitFor(() => client.calls.reconcile.length >= 1, 3000, "reconcile");
     await waitFor(() => f.host.outbox().length === 0, 3000, "reconciled outbox");
+    process.stderr.write(`QA02.6 diag calls=${JSON.stringify(client.calls)} stats=${JSON.stringify(f.host.stats)} outbox=${JSON.stringify(f.host.outbox())}\\n`);
     assert.equal(resultCalls, 1, "a reconcilable lost response must not be re-posted");
     assert.equal(f.host.stats.completed, 1);
     assert.deepEqual(JSON.parse(readFileSync(f.stateFile, "utf8")), []);
@@ -351,7 +356,7 @@ if (!hasSqlite) {
       summary: "done",
       eventId: "EVT-ACK",
     };
-    const headers = { ...internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host"), "content-type": "application/json" };
+    const headers = { ...internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"), "content-type": "application/json" };
     const first = await request(ctx.base, { method: "POST", path: `/internal/v1/dispatch/${claimed.command.id}/result`, headers, body });
     assert.equal(first.status, 200, first.text);
     assert.equal(first.json.persisted, true);
@@ -367,7 +372,7 @@ if (!hasSqlite) {
     const f = storeRunFixture(t);
     const ctx = await startServer({ store: f.store, logger });
     t.after(async () => { await ctx.server.close().catch(() => {}); });
-    const headers = { ...internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host"), "content-type": "application/json" };
+    const headers = { ...internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"), "content-type": "application/json" };
     const body = {
       generation: f.generation,
       events: [
@@ -445,7 +450,7 @@ if (!hasSqlite) {
       },
       onReconcile: async () => {
         reconciles += 1;
-        return { run: { id: "run-1", status: "COMPLETED" }, command: { id: "CMD-1", status: "DONE" }, persisted: true };
+        return { run: { id: "run-1", status: "COMPLETED" }, command: { id: "CMD-1", status: "DONE", generation: 7, result: { eventId: "00000000-0000-4000-8000-000000000000" } }, persisted: true };
       },
     }));
     t.after(() => { try { server.close(); } catch { /* closed */ } });
@@ -464,7 +469,7 @@ if (!hasSqlite) {
     const ctx = await startServer({ store: f.store, logger });
     t.after(async () => { await ctx.server.close().catch(() => {}); });
     const before = fingerprint(f.store, f.claim.run.id);
-    const headers = { ...internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host"), "content-type": "application/json" };
+    const headers = { ...internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"), "content-type": "application/json" };
     const rejected = await request(ctx.base, {
       method: "POST",
       path: `/internal/v1/runs/${f.claim.run.id}/events`,
@@ -475,4 +480,9 @@ if (!hasSqlite) {
     assert.deepEqual(fingerprint(f.store, f.claim.run.id), before, "a rejected batch must not change the Run or its events");
   });
 }
+
+
+
+
+
 
