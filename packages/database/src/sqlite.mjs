@@ -2156,6 +2156,15 @@ export function openStore(options = {}) {
           });
         }
         const at = nowIso();
+        // M6.2 F05: freeze BEFORE the CAS so the spec describes the Task as it
+        // was dispatched (taskVersion = expectedTaskVersion, i.e. claim-1).
+        const runId = generateId("RUN");
+        const projectRow = requireProject(task.projectId);
+        const workspaceValue = resolveClaimWorkspace(workspace, {
+          project: projectJson(projectRow),
+          runId,
+        });
+        const frozen = guarded.freezeTaskSpec(taskId, { workspace: workspaceValue, now: at });
         const update = stmt(
           "UPDATE tasks SET status = 'CLAIMED', version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND status = 'READY'",
         ).run(at, taskId, expectedTaskVersion);
@@ -2168,13 +2177,6 @@ export function openStore(options = {}) {
             reason: "cas-lost",
           });
         }
-        const runId = generateId("RUN");
-        const projectRow = requireProject(task.projectId);
-        const workspaceValue = resolveClaimWorkspace(workspace, {
-          project: projectJson(projectRow),
-          runId,
-        });
-        const frozen = guarded.freezeTaskSpec(taskId, { workspace: workspaceValue, now: at });
         const run = store.createRun({
           taskId,
           agentId,

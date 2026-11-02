@@ -1286,9 +1286,13 @@ export function buildFrozenExecutionSpec({ task, project, workspace, now, constr
   return { spec, specHash: hashExecutionSpec(spec), frozenAt };
 }
 
-/** Stable sha256 of a frozen execution spec (persisted alongside it). */
+/** Stable sha256 of a frozen execution spec (persisted alongside it).
+ * `frozenAt` is metadata, not content: excluding it keeps identical claim
+ * inputs hash-identical across SQLite and Memory (QA-M62-01). */
 export function hashExecutionSpec(spec) {
-  return createHash("sha256").update(JSON.stringify(spec)).digest("hex");
+  const { frozenAt, ...content } = spec ?? {};
+  void frozenAt;
+  return createHash("sha256").update(JSON.stringify(content)).digest("hex");
 }
 
 /* M6.2 F04: claim-time workspace binding. `runId` is known before the Run row

@@ -112,6 +112,40 @@ test("F05 freezeTaskSpec persists a frozen spec that later task edits cannot cha
   }
 });
 
+test("QA-M62-01 both stores freeze the same claim spec (version + hash)", (t) => {
+  const results = [];
+  for (const { label, store } of bothStores(t)) {
+    store.upsertAgent({ id: "agent-claim", role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
+    const task = store.getTask("TASK-SEED");
+    const claimed = store.claimTask({
+      taskId: "TASK-SEED",
+      agentId: "agent-claim",
+      expectedTaskVersion: task.version,
+      idempotencyKey: "qa-m62-claim",
+      workspace: { kind: "none" },
+    });
+    const normalized = { ...claimed.spec };
+    delete normalized.frozenAt;
+    results.push({
+      label,
+      taskVersion: claimed.spec.taskVersion,
+      specHash: claimed.specHash,
+      spec: normalized,
+      stored: (() => {
+        const storedSpec = { ...store.getRunSpec(claimed.run.id).spec };
+        delete storedSpec.frozenAt;
+        return storedSpec;
+      })(),
+    });
+  }
+  assert.equal(results[0].taskVersion, 0, "spec describes the pre-claim task version");
+  assert.equal(results[0].taskVersion, results[1].taskVersion);
+  assert.equal(results[0].specHash, results[1].specHash, "same claim -> same specHash");
+  assert.deepEqual(results[0].spec, results[1].spec);
+  assert.deepEqual(results[0].stored, results[0].spec);
+  assert.deepEqual(results[1].stored, results[1].spec);
+});
+
 test("F04 claimTask binds workspace, freezes a matching spec and replays idempotently", (t) => {
   for (const { label, store } of bothStores(t)) {
     store.upsertAgent({ id: "agent-claim", role: "DEV", capabilities: ["WORKER"], status: "IDLE" });

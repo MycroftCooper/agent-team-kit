@@ -2,6 +2,8 @@
 ALTER TABLE runs ADD COLUMN workspace_path TEXT;
 ALTER TABLE runs ADD COLUMN base_commit TEXT;
 ALTER TABLE runs ADD COLUMN target_branch TEXT;
+-- Internal metadata only: distinguishes an explicit {kind:"none"} claim from a
+-- legacy run that never had a workspace. Never exposed to clients.
 ALTER TABLE runs ADD COLUMN workspace_kind TEXT;
 
 CREATE TABLE IF NOT EXISTS run_specs (
