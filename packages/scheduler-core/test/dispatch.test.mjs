@@ -63,7 +63,7 @@ test("scoreAndSort output is independent of input order", () => {
 // ---------------------------------------------------------------------------
 
 test("matchAgents returns idle agents with the exact role and required capability", () => {
-  const result = matchAgents({ task: task("T-1"), agents: [agent("A-2"), agent("A-1")] });
+  const result = matchAgents({ task: task("T-1"), agents: [agent("A-2"), agent("A-1")], now: NOW });
   assert.deepEqual(result.candidates.map((entry) => entry.id), ["A-1", "A-2"]);
   assert.deepEqual(result.excluded, []);
 });
@@ -77,6 +77,7 @@ test("matchAgents excludes non-idle, wrong-role and missing-capability agents wi
       agent("A-FUNCTION", { capabilities: ["REVIEWER"] }),
       agent("A-OK"),
     ],
+    now: NOW,
   });
   assert.deepEqual(result.candidates.map((entry) => entry.id), ["A-OK"]);
   assert.deepEqual(result.excluded, [
@@ -86,9 +87,10 @@ test("matchAgents excludes non-idle, wrong-role and missing-capability agents wi
   ]);
 });
 
-test("matchAgents tolerates empty and malformed input", () => {
-  assert.deepEqual(matchAgents({ task: task("T-1"), agents: [] }), { candidates: [], excluded: [] });
-  assert.deepEqual(matchAgents({}).candidates, []);
+test("matchAgents tolerates empty input and requires the injected clock", () => {
+  // the injected clock is mandatory (m6.2 F10): no a-la-carte "no heartbeat check"
+  assert.throws(() => matchAgents({}), /now must be a valid/);
+  assert.deepEqual(matchAgents({ task: task("T-1"), agents: [], now: NOW }), { candidates: [], excluded: [] });
 });
 
 // ---------------------------------------------------------------------------

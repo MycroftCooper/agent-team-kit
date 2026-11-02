@@ -27,6 +27,10 @@ export function agent(id, overrides = {}) {
     capabilities: ["WORKER"],
     status: "IDLE",
     version: 1,
+    // m6.2 F10: an IDLE agent is only dispatchable while its heartbeat is fresh
+    // and its capacity is positive. Tests that prove the refusal override these.
+    lastHeartbeatAt: NOW,
+    capacity: 1,
     ...overrides,
   };
 }

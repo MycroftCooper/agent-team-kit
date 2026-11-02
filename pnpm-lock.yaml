@@ -73,7 +73,11 @@ importers:
         specifier: workspace:*
         version: link:../contracts
 
-  packages/scheduler-core: {}
+  packages/scheduler-core:
+    dependencies:
+      '@atk/contracts':
+        specifier: workspace:*
+        version: link:../contracts
 
   packages/workspace: {}
 

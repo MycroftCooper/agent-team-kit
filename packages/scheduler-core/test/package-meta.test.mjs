@@ -29,16 +29,21 @@ test("package metadata matches the M3 contract", () => {
   assert.deepEqual(manifest.engines, { node: ">=22.5.0" });
 });
 
-test("the package has zero dependencies", () => {
-  for (const field of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
-    assert.equal(manifest[field], undefined, `${field} must not exist (zero-dependency algorithm package)`);
+test("the package depends only on @atk/contracts (shared path rules, M6.2 F13)", () => {
+  // F13 replaced the local path normaliser with the shared repository rule. The
+  // package therefore has exactly one workspace dependency and stays free of
+  // external crates: no npm package may sneak in.
+  assert.deepEqual(manifest.dependencies, { "@atk/contracts": "workspace:*" });
+  for (const field of ["devDependencies", "peerDependencies", "optionalDependencies"]) {
+    assert.equal(manifest[field], undefined, `${field} must not exist (only the workspace contracts package)`);
   }
 });
 
-test("the source has no imports at all (not even node: builtins)", () => {
+test("the source imports exactly one module: @atk/contracts", () => {
   const files = readdirSync(SRC_DIR).filter((name) => name.endsWith(".mjs"));
   assert.deepEqual(files, ["index.mjs"]);
-  assert.equal(/\bimport\b/.test(source), false, "src must not import anything");
+  const importSpecifiers = [...source.matchAll(/^\s*(?:import|export)[^;]*?from\s+["']([^"']+)["']/gm)].map((match) => match[1]);
+  assert.deepEqual(importSpecifiers, ["@atk/contracts"]);
   assert.equal(/\brequire\s*\(/.test(source), false, "src must not use require()");
 });
 
@@ -78,6 +83,10 @@ test("the public surface exposes the documented functions and enums", async () =
     "resolveOwner",
     "normalizePath",
     "pathsOverlap",
+    "agentAvailability",
+    "AGENT_AVAILABILITY_REASONS",
+    "AGENT_EXCLUSION_VALUES",
+    "DEFAULT_HEARTBEAT_TTL_MS",
     "SKIP_REASONS",
     "SKIP_REASON_VALUES",
     "PRIORITY_WEIGHT",

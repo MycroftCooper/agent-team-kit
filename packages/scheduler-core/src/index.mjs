@@ -1,9 +1,11 @@
 // @atk/scheduler-core — pure scheduling algorithms for M3.
 //
 // Contract: docs/architecture/m3-contracts.md §1 and §0 invariants (ADR-003).
-// This module is deliberately pure: no imports, no clock, no network, no file
-// system, no process state. `now` is always injected so the same snapshot and
-// policy always produce byte-identical plans (spec §8.2).
+// This module is deliberately pure: no clock, no network, no file system, no
+// process state. Its only dependency is @atk/contracts, for the shared
+// repository path rules (M6.2 F13): one canonicaliser and one overlap rule for
+// the database, the scheduler and the backend. `now` is always injected so the
+// same snapshot and policy always produce byte-identical plans (spec §8.2).
 //
 // Hard rules encoded here:
 //   1. A task whose dependencies are incomplete is never a candidate.
@@ -11,6 +13,10 @@
 //      reported with reason "cycle" (never "skip the broken part and continue").
 //   3. Output order is a fixed weight + stable sort, independent of input order.
 //   4. Skipped reasons are machine-readable enum values, never free text.
+//   5. An IDLE agent is not automatically dispatchable: a fresh heartbeat and
+//      capacity are required too (m6.2 F10).
+
+import { normalizeRepoPath, overlappingPaths, pathsOverlap } from "@atk/contracts";
 
 /** Machine-readable skip reasons (m3-contracts §1). Never add free text here. */
 export const SKIP_REASONS = Object.freeze({
@@ -36,6 +42,23 @@ export const ACTIVE_RUN_STATUSES = Object.freeze(["QUEUED", "STARTING", "RUNNING
 
 /** Run statuses that no longer count as active. */
 export const TERMINAL_RUN_STATUSES = Object.freeze(["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"]);
+
+/**
+ * M6.2 F10: how long a host heartbeat keeps its agents dispatchable. A heartbeat
+ * is live while `lastHeartbeatAt + ttlMs >= now`; the default matches the 10s
+ * host heartbeat with room for three missed beats. Policies may override it
+ * (`policies.heartbeatTtlMs`), but there is no "disabled" value: IDLE alone is
+ * never enough to dispatch.
+ */
+export const DEFAULT_HEARTBEAT_TTL_MS = 30_000;
+
+/** Machine-readable availability reasons (mirrors the database store, F10). */
+export const AGENT_AVAILABILITY_REASONS = Object.freeze({
+  OK: "ok",
+  NO_HEARTBEAT: "no-heartbeat",
+  STALE_HEARTBEAT: "stale-heartbeat",
+  NO_CAPACITY: "no-capacity",
+});
 
 /** Task statuses eligible for scheduling. */
 export const READY_TASK_STATUS = "READY";
@@ -63,43 +86,45 @@ function compareIds(a, b) {
   return a < b ? -1 : 1;
 }
 
-/** Normalise a declared file/scope path for conflict comparison (pure). */
-export function normalizePath(value) {
-  if (typeof value !== "string") return "";
-  const posix = value.replace(/\\/g, "/").trim();
-  if (posix === "") return "";
-  const drive = /^([A-Za-z]:)(?:\/|$)/.exec(posix);
-  const prefix = drive ? `${drive[1]}/` : posix.startsWith("/") ? "/" : "";
-  let rest = posix;
-  if (drive) rest = posix.slice(drive[0].length);
-  else if (prefix === "/") rest = posix.slice(1);
-  const segments = [];
-  for (const segment of rest.split("/")) {
-    if (segment === "" || segment === ".") continue;
-    if (segment === "..") {
-      if (segments.length && segments.at(-1) !== "..") segments.pop();
-      else segments.push("..");
-      continue;
-    }
-    segments.push(segment);
+/**
+ * Canonical repository-relative path (M6.2 F13).
+ *
+ * This is the @atk/contracts function itself, re-exported under the historical
+ * name so existing callers keep working. It is intentionally NOT a wrapper: the
+ * database and the scheduler compare the exact same function, and Windows drive
+ * absolute paths (`C:\abs` / `C:/abs`), UNC paths and `..` escapes are rejected
+ * (they throw a TypeError, exactly like the database boundary).
+ */
+export const normalizePath = normalizeRepoPath;
+
+/**
+ * True when two canonical repo paths name the same file or a directory scope
+ * contains the other (M6.2 F13: the shared @atk/contracts rule).
+ */
+export { pathsOverlap };
+
+/** Canonical repo path, or null when the shared rule rejects the input. */
+function canonicalOrNull(value) {
+  if (typeof value !== "string") return null;
+  try {
+    return normalizeRepoPath(value);
+  } catch {
+    return null;
   }
-  if (segments.length === 0) return prefix || "";
-  return `${prefix}${segments.join("/")}`;
 }
 
-/** True when two normalised paths name the same file or a directory scope contains it. */
-export function pathsOverlap(a, b) {
-  if (!a || !b) return false;
-  if (a === b) return true;
-  return a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
-}
-
-/** Normalised, de-duplicated, sorted write-scope entries of a task/run. */
+/**
+ * Normalised, de-duplicated, sorted write-scope entries of a task/run.
+ *
+ * Entries the shared repository rule rejects (absolute, UNC, `..` escapes) are
+ * not repository scopes, so they cannot create an overlap. The database refuses
+ * them at write time (`validateFiles`); dropping them here keeps a malformed
+ * snapshot from crashing the planner without inventing a scope for it.
+ */
 function writeScopeOf(record) {
   const seen = new Set();
   for (const entry of asArray(record?.files)) {
-    if (typeof entry !== "string") continue;
-    const normalised = normalizePath(entry);
+    const normalised = canonicalOrNull(entry);
     if (normalised) seen.add(normalised);
   }
   return [...seen].sort(compareIds);
@@ -363,6 +388,51 @@ function toEpochMs(now) {
   return ms;
 }
 
+/** Validate the configured heartbeat TTL; `undefined` means the fixed default. */
+function heartbeatTtlOf(policies) {
+  const value = policies?.heartbeatTtlMs;
+  if (value === undefined || value === null) return DEFAULT_HEARTBEAT_TTL_MS;
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new TypeError("scheduler-core: heartbeatTtlMs must be a positive integer when provided");
+  }
+  return value;
+}
+
+/**
+ * Availability of one agent for scheduling (M6.2 F10).
+ *
+ * This is the pure mirror of the database store's `agentAvailability`: a fresh
+ * heartbeat (`lastHeartbeatAt + ttlMs >= now`) plus positive capacity are
+ * required, and `status === "IDLE"` is NOT consulted — an IDLE agent whose host
+ * stopped checking in is not dispatchable. An unparsable heartbeat is stale, and
+ * a missing one is `no-heartbeat`; neither is ever treated as available.
+ *
+ * @param {object} agent snapshot agent (`lastHeartbeatAt`, `capacity`)
+ * @param {{now: Date|number|string, ttlMs?: number}} options
+ * @returns {{available: boolean, reason: string}}
+ */
+export function agentAvailability(agent, { now, ttlMs = DEFAULT_HEARTBEAT_TTL_MS } = {}) {
+  if (!Number.isInteger(ttlMs) || ttlMs <= 0) {
+    throw new TypeError("scheduler-core: ttlMs must be a positive integer");
+  }
+  const nowMs = toEpochMs(now);
+  if (!isPlainObject(agent)) return { available: false, reason: AGENT_AVAILABILITY_REASONS.NO_HEARTBEAT };
+  const heartbeat = agent.lastHeartbeatAt;
+  if (heartbeat === undefined || heartbeat === null || (typeof heartbeat === "string" && heartbeat.trim() === "")) {
+    return { available: false, reason: AGENT_AVAILABILITY_REASONS.NO_HEARTBEAT };
+  }
+  const heartbeatMs = Date.parse(heartbeat);
+  // Mirror the database rule exactly: `last + ttl >= now` is fresh, an
+  // unparsable heartbeat can never satisfy it and therefore reads as stale.
+  if (!Number.isFinite(heartbeatMs) || heartbeatMs + ttlMs < nowMs) {
+    return { available: false, reason: AGENT_AVAILABILITY_REASONS.STALE_HEARTBEAT };
+  }
+  if (!(Number(agent.capacity ?? 0) > 0)) {
+    return { available: false, reason: AGENT_AVAILABILITY_REASONS.NO_CAPACITY };
+  }
+  return { available: true, reason: AGENT_AVAILABILITY_REASONS.OK };
+}
+
 /**
  * Stable scheduling order with the first-version fixed weights:
  *
@@ -396,20 +466,22 @@ export function scoreAndSort(tasks, { now } = {}) {
  * Map a file path to its ownership rule using the longest matching prefix.
  *
  * The rules shape is supplied by the caller (`{rules: [{prefix, role}]}`) so this
- * package never imports `lib/**` (M3 contract §1). Tie-breaks are deterministic:
- * longer prefix first, then prefix lexicographic, then role lexicographic.
+ * package never imports `lib/**` (M3 contract §1). Prefixes are canonicalised
+ * with the shared repository rule; a prefix the rule rejects can never match a
+ * repository path and is dropped. Tie-breaks are deterministic: longer prefix
+ * first, then prefix lexicographic, then role lexicographic.
  *
  * @param {{rules?: Array<{prefix?: string, role?: string}>} | null} ownership
  * @param {string} filePath
  * @returns {{role: string, prefix: string} | null}
  */
 export function resolveOwner(ownership, filePath) {
-  const file = normalizePath(filePath);
+  const file = canonicalOrNull(filePath);
   if (!file) return null;
   const rules = asArray(ownership?.rules)
     .filter((rule) => isPlainObject(rule) && isNonEmptyString(rule.prefix) && isNonEmptyString(rule.role))
-    .map((rule) => ({ role: rule.role, prefix: normalizePath(rule.prefix) }))
-    .filter((rule) => rule.prefix !== "")
+    .map((rule) => ({ role: rule.role, prefix: canonicalOrNull(rule.prefix) }))
+    .filter((rule) => rule.prefix !== null)
     .sort((a, b) => b.prefix.length - a.prefix.length || compareIds(a.prefix, b.prefix) || compareIds(a.role, b.role));
   for (const rule of rules) {
     if (pathsOverlap(file, rule.prefix)) return rule;
@@ -444,11 +516,15 @@ export function detectConflicts({ task, activeRuns, ownership } = {}) {
     .sort((a, b) => compareIds(a.id, b.id));
 
   for (const run of runs) {
+    // M6.2 F13: the shared @atk/contracts rule computes which candidate paths
+    // overlap this run; a plain string-prefix comparison would treat
+    // "src2/a.ts" as inside "src".
+    const overlapping = new Set(overlappingPaths(candidateFiles, run.files));
     for (const candidateFile of candidateFiles) {
       for (const runFile of run.files) {
         const owner = resolveOwner(ownership, candidateFile);
         const runOwner = resolveOwner(ownership, runFile);
-        const pathOverlap = pathsOverlap(candidateFile, runFile);
+        const pathOverlap = overlapping.has(candidateFile) && pathsOverlap(candidateFile, runFile);
         const sameRegion = Boolean(owner && runOwner && owner.prefix === runOwner.prefix);
         if (!pathOverlap && !sameRegion) continue;
         const reason = pathOverlap ? "path-overlap" : "ownership-region";
@@ -466,23 +542,31 @@ const AGENT_EXCLUSION = Object.freeze({
   NOT_IDLE: "not-idle",
   ROLE_MISMATCH: "role-mismatch",
   FUNCTION_MISSING: "function-missing",
+  // m6.2 F10: heartbeat/capacity refusals reuse the availability reason codes.
+  NO_HEARTBEAT: AGENT_AVAILABILITY_REASONS.NO_HEARTBEAT,
+  STALE_HEARTBEAT: AGENT_AVAILABILITY_REASONS.STALE_HEARTBEAT,
+  NO_CAPACITY: AGENT_AVAILABILITY_REASONS.NO_CAPACITY,
 });
 
 /** Agent exclusion reasons (machine-readable). */
 export const AGENT_EXCLUSION_VALUES = Object.freeze(Object.values(AGENT_EXCLUSION));
 
 /**
- * Agents that can execute a task: `status === "IDLE"`, the exact role and the
- * required Function present in `agent.capabilities`.
+ * Agents that can execute a task: `status === "IDLE"`, the exact role, the
+ * required Function present in `agent.capabilities`, and a live heartbeat with
+ * positive capacity (m6.2 F10).
  *
  * Returns the candidates plus a per-agent exclusion reason so the planner can
- * distinguish "no idle agent" from "idle agents, wrong capability".
+ * distinguish "no idle agent" from "idle agents, wrong capability" and from
+ * "IDLE but the host stopped checking in". The injected clock is mandatory: the
+ * availability rule has no hidden `Date.now()` fallback.
  *
- * @param {{task?: object, agents?: object[], policies?: object}} input
+ * @param {{task?: object, agents?: object[], policies?: object, now: Date|number|string}} input
  * @returns {{candidates: object[], excluded: Array<{agentId: string, reason: string}>}}
  */
-export function matchAgents({ task, agents, policies } = {}) {
-  void policies;
+export function matchAgents({ task, agents, policies, now } = {}) {
+  const ttlMs = heartbeatTtlOf(policies);
+  const nowMs = toEpochMs(now);
   const excluded = [];
   const candidates = [];
   const sorted = asArray(agents)
@@ -500,6 +584,11 @@ export function matchAgents({ task, agents, policies } = {}) {
     }
     if (!asArray(agent.capabilities).includes(task?.functionRequired)) {
       excluded.push({ agentId: agent.id, reason: AGENT_EXCLUSION.FUNCTION_MISSING });
+      continue;
+    }
+    const availability = agentAvailability(agent, { now: nowMs, ttlMs });
+    if (!availability.available) {
+      excluded.push({ agentId: agent.id, reason: availability.reason });
       continue;
     }
     candidates.push(agent);
@@ -532,8 +621,13 @@ function cloneWorkspacePolicy(value, label) {
  *   4. accepted tasks become proposals and immediately consume capacity and
  *      write scope, so one plan never proposes two conflicting tasks.
  *
+ * m6.2 F10: an IDLE agent also needs a live heartbeat and positive capacity. When
+ * any IDLE agent is refused for that reason the result additionally carries
+ * `unavailableAgents: [{agentId, reason}]` and `heartbeatTtlMs`; the field is
+ * absent when every IDLE agent is available (historical plan shape preserved).
+ *
  * @param {{snapshot?: object, policies?: object, now?: Date|number|string}} input
- * @returns {{proposals: object[], skipped: Array<{taskId: string, reason: string}>}}
+ * @returns {{proposals: object[], skipped: Array<{taskId: string, reason: string}>, unavailableAgents?: Array<{agentId: string, reason: string}>, heartbeatTtlMs?: number}}
  */
 export function planDispatch({ snapshot, policies = {}, now } = {}) {
   if (!isPlainObject(snapshot)) throw new TypeError("scheduler-core: snapshot must be an object");
@@ -562,6 +656,17 @@ export function planDispatch({ snapshot, policies = {}, now } = {}) {
       proposals: [],
       skipped: tasks.map((task) => ({ taskId: task.id, reason: SKIP_REASONS.CYCLE })).sort((a, b) => compareIds(a.taskId, b.taskId)),
     };
+  }
+
+  // M6.2 F10: compute the heartbeat/capacity refusals once per round. They are
+  // part of the scheduling result, not a silent filter: the CLI and smoke gates
+  // must be able to explain why an IDLE agent got no work.
+  const heartbeatTtlMs = heartbeatTtlOf(policies);
+  const unavailableAgents = [];
+  for (const agent of agents) {
+    if (agent.status !== "IDLE") continue;
+    const availability = agentAvailability(agent, { now, ttlMs: heartbeatTtlMs });
+    if (!availability.available) unavailableAgents.push({ agentId: agent.id, reason: availability.reason });
   }
 
   const activeRuns = runs.filter((run) => !TERMINAL_RUN_STATUSES.includes(run.status));
@@ -625,12 +730,16 @@ export function planDispatch({ snapshot, policies = {}, now } = {}) {
       continue;
     }
 
-    const match = matchAgents({ task, agents });
+    const match = matchAgents({ task, agents, policies, now });
     if (match.candidates.length === 0) {
-      const hasIdleAgent = agents.some((agent) => agent.status === "IDLE");
+      // "No idle agent" now means "no *available* idle agent": an IDLE agent
+      // whose heartbeat expired does not count (m6.2 F10).
+      const hasAvailableIdleAgent = agents.some(
+        (agent) => agent.status === "IDLE" && agentAvailability(agent, { now, ttlMs: heartbeatTtlMs }).available,
+      );
       skipped.push({
         taskId: task.id,
-        reason: hasIdleAgent ? SKIP_REASONS.CAPABILITY_MISMATCH : SKIP_REASONS.NO_IDLE_AGENT,
+        reason: hasAvailableIdleAgent ? SKIP_REASONS.CAPABILITY_MISMATCH : SKIP_REASONS.NO_IDLE_AGENT,
       });
       continue;
     }
@@ -670,7 +779,14 @@ export function planDispatch({ snapshot, policies = {}, now } = {}) {
   }
 
   skipped.sort((a, b) => compareIds(a.taskId, b.taskId));
-  return { proposals, skipped };
+  const result = { proposals, skipped };
+  if (unavailableAgents.length > 0) {
+    // Additive diagnostic (m6.2 F10): present only when some IDLE agent was
+    // refused, so an all-available plan keeps the historical shape.
+    result.unavailableAgents = unavailableAgents;
+    result.heartbeatTtlMs = heartbeatTtlMs;
+  }
+  return result;
 }
 
 /**

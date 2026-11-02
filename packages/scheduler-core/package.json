@@ -2,7 +2,7 @@
   "name": "@atk/scheduler-core",
   "version": "0.1.0",
   "private": true,
-  "description": "M3: pure deterministic scheduling algorithms (DAG cycles, stable ordering, agent matching, write-scope conflicts, dispatch planning). Zero dependencies, zero clock, zero I/O.",
+  "description": "M3: pure deterministic scheduling algorithms (DAG cycles, stable ordering, agent matching, write-scope conflicts, dispatch planning). One workspace dependency (@atk/contracts) for the shared path rules; no clock, no I/O.",
   "license": "MIT",
   "type": "module",
   "main": "./src/index.mjs",
@@ -12,6 +12,9 @@
   },
   "scripts": {
     "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@atk/contracts": "workspace:*"
   },
   "engines": {
     "node": ">=22.5.0"

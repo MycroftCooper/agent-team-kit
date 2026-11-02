@@ -73,7 +73,21 @@ export function createScheduler({ client, core, policies, ownerId, pollMs = 1000
         results.push({ taskId: proposal.taskId, claimed: false, code: error?.code });
       }
     }
-    return { ok: true, version: snapshot?.version ?? null, proposals: proposals.length, skipped: skipped.length, results };
+    return {
+      ok: true,
+      version: snapshot?.version ?? null,
+      proposals: proposals.length,
+      skipped: skipped.length,
+      results,
+      // m6.2 F10: surface heartbeat/capacity refusals in the round summary so an
+      // IDLE agent that is not dispatchable is explained, never silently idle.
+      ...(Array.isArray(plan?.unavailableAgents)
+        ? {
+            unavailableAgents: plan.unavailableAgents,
+            ...(plan.heartbeatTtlMs === undefined ? {} : { heartbeatTtlMs: plan.heartbeatTtlMs }),
+          }
+        : {}),
+    };
   }
 
   function schedule(fn, ms) {
