@@ -221,7 +221,7 @@ try {
     const happy = seedRun(seed, "happy");
     const runtime = createMockRuntime({ scenario: "complete", sessionIdFactory: () => "mock-happy" });
     const client = createInternalClient({ baseUrl: base, token: internalTokens.host });
-    const host = createHost({ client, runtime, ownerId: "host-happy", leaseMs: LEASE_MS, pollMs: 20, flushMs: 10, heartbeatMs: 500, logger: quietLogger });
+    const host = createHost({ client, runtime, ownerId: "host-happy", leaseMs: LEASE_MS, pollMs: 20, flushMs: 10, heartbeatMs: 500, allowNoneWorkspace: true, logger: quietLogger });
     await host.tick();
     await waitFor(async () => (await getRun(happy.run.id)).status === "COMPLETED", 15000, "run COMPLETED");
     await waitFor(async () => (await commandRow(happy.command.id))?.status === "DONE", 10000, "dispatch command DONE");
@@ -253,7 +253,7 @@ try {
     // ignoreStop:true is what makes the simulated crash faithful — a real dead
     // process cannot emit a polite cancelled event on its way out.
     const hangingRuntime = createMockRuntime({ scenario: "hang", ignoreStop: true, sessionIdFactory: () => "mock-crash" });
-    const deadHost = createHost({ client, runtime: hangingRuntime, ownerId: "host-dead", leaseMs: LEASE_MS, pollMs: 20, flushMs: 10, heartbeatMs: 500, logger: quietLogger });
+    const deadHost = createHost({ client, runtime: hangingRuntime, ownerId: "host-dead", leaseMs: LEASE_MS, pollMs: 20, flushMs: 10, heartbeatMs: 500, allowNoneWorkspace: true, logger: quietLogger });
     await deadHost.tick();
     expect(hangingRuntime._sessionCount === 1, `the dead host should have started exactly one session, got ${hangingRuntime._sessionCount}`);
     await deadHost.stop(); // simulates the process disappearing mid-run
@@ -262,7 +262,7 @@ try {
     await sleep(LEASE_MS + 600);
 
     const recoveryRuntime = createMockRuntime({ scenario: "complete", sessionIdFactory: () => "mock-recovery" });
-    const recoveryHost = createHost({ client, runtime: recoveryRuntime, ownerId: "host-recovery", leaseMs: LEASE_MS, pollMs: 20, flushMs: 10, heartbeatMs: 500, logger: quietLogger });
+    const recoveryHost = createHost({ client, runtime: recoveryRuntime, ownerId: "host-recovery", leaseMs: LEASE_MS, pollMs: 20, flushMs: 10, heartbeatMs: 500, allowNoneWorkspace: true, logger: quietLogger });
     await recoveryHost.tick();
     await waitFor(async () => (await getRun(crash.run.id)).status === "INTERRUPTED", 15000, "run INTERRUPTED");
     await waitFor(async () => (await commandRow(crash.command.id))?.status === "FAILED", 10000, "dispatch command FAILED");

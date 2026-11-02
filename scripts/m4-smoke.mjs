@@ -440,6 +440,31 @@ function seedReviewerRun(taskId, reviewerAgentId) {
   }
 }
 
+/**
+ * Fixture cleanup: earlier checks create dispatch commands (reviewer runs) that
+ * a spawned host would claim before the command this check is about. Close them
+ * through the same services a caller uses, so claim order stays deterministic.
+ */
+function drainPendingCommands(reason) {
+  const fresh = openStore({ file: dbFile, migrate: false });
+  try {
+    for (let guard = 0; guard < 50; guard += 1) {
+      const claimed = fresh.claimDispatchCommand({ ownerId: "m4-smoke-drain", leaseMs: 60_000 });
+      const commandId = claimed?.command?.id;
+      if (!commandId) return;
+      fresh.completeDispatchCommand({
+        id: commandId,
+        ownerId: "m4-smoke-drain",
+        generation: claimed.lease?.generation ?? claimed.command.generation,
+        status: "FAILED",
+        result: { summary: reason },
+      });
+    }
+  } finally {
+    fresh.close();
+  }
+}
+
 function dbTask(taskId) {
   return dbGet("SELECT status, version, target_hash AS targetHash FROM tasks WHERE id = ?", taskId);
 }
@@ -707,6 +732,8 @@ check("6. rework loop: REJECTED -> READY -> re-executed Run (attempt 2); over-li
   // immediately after one tick and cancel the session, so it could not prove
   // claim -> complete; this is still the real CLI binary, killed afterwards.
   if (!internalTokens.scheduler || !internalTokens.host) throw new SkipCheck("backend did not expose internal credentials, cannot drive Scheduler/Host");
+  // Drop fixture commands so the spawned host claims the rework command below.
+  drainPendingCommands("m4-smoke fixture command");
   const schedulerScript = path.join(ROOT, "apps", "scheduler", "cli.mjs");
   const schedulerRun = await runCliProcess(
     schedulerScript,
@@ -750,6 +777,8 @@ check("6. rework loop: REJECTED -> READY -> re-executed Run (attempt 2); over-li
     ATK_HOST_STATE_FILE: path.join(tmp, "runtime", "host-m4-smoke.json"),
     ATK_HOST_AGENTS: JSON.stringify([{ agentId: "agent-dev-1", role: "DEV", function: "WORKER" }]),
     ATK_HOST_CAPACITY: "2",
+    // M6.3 P1-9: the fixture has no git repository, so the mock run is explicitly allowed to skip a worktree.
+    ATK_ALLOW_NONE_WORKSPACE: "1",
   };
   const hostRun = await runCliProcess(hostScript, ["--owner", "m4-smoke-host", "--once"], hostEnv, { timeoutMs: 30_000 });
   expect(hostRun.code === 0, `real host CLI exited ${hostRun.code}: ${hostRun.stderr.slice(-800)}`);
@@ -765,7 +794,7 @@ check("6. rework loop: REJECTED -> READY -> re-executed Run (attempt 2); over-li
     newRun.id,
   );
   expect(command, "no dispatch command for the reworked Run");
-  expect(command.ownerId === "m4-smoke-host", `DB dispatch command owner expected m4-smoke-host, got ${command.ownerId}`);
+  expect(command.ownerId === "m4-smoke-host", `DB dispatch command owner expected m4-smoke-host, got ${command.ownerId}; hostReport=${JSON.stringify(hostReport)}; stderr=${String(hostRun.stderr).slice(-600)}`);
   // A `--once` host deliberately stops after one tick, so the Run may still be
   // STARTING (the tick is not a "run to completion" driver). The process-reality
   // facts the gate asserts are: the real scheduler CLI created Run attempt 2 and
