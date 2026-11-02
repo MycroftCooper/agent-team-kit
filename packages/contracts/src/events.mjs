@@ -60,11 +60,45 @@ export function validateEvent(value) {
   if (typeof value.happenedAt !== "string" || Number.isNaN(Date.parse(value.happenedAt))) {
     errors.push("event.happenedAt must be an ISO-8601 timestamp");
   }
+  // F08: a host-generated stable id makes retries idempotent. The legacy
+  // composite key (runId + sessionId + timestamp + type) can collide when a
+  // session emits several events inside the same millisecond.
+  if (value.eventId != null && (typeof value.eventId !== "string" || value.eventId === "")) {
+    errors.push("event.eventId must be a non-empty string when present");
+  }
+  if (value.sessionSeq != null && (!Number.isInteger(value.sessionSeq) || value.sessionSeq < 0)) {
+    errors.push("event.sessionSeq must be a non-negative integer when present");
+  }
   return { ok: errors.length === 0, errors };
 }
 
+/**
+ * Identity used for de-duplication (F08).
+ *
+ * Prefer the host-generated `eventId`; fall back to the legacy composite only for
+ * events produced before ids existed. Two different events must never share a
+ * key, so the legacy branch is deliberately explicit about the fields it uses.
+ */
+export function eventDedupeKey(event) {
+  if (event && typeof event.eventId === "string" && event.eventId !== "") return `id:${event.eventId}`;
+  const runId = event?.payload?.runId ?? event?.aggregateId ?? "";
+  const sessionId = event?.payload?.sessionId ?? "";
+  const at = event?.happenedAt ?? event?.at ?? "";
+  return `legacy:${runId}|${sessionId}|${at}|${event?.type ?? ""}`;
+}
+
 /** Build the persisted event shape. `seq: null` means "not assigned yet". */
-export function createEvent({ seq = null, projectId = null, aggregateType, aggregateId, type, payload = {}, happenedAt = new Date().toISOString() }) {
+export function createEvent({
+  seq = null,
+  projectId = null,
+  aggregateType,
+  aggregateId,
+  type,
+  payload = {},
+  happenedAt = new Date().toISOString(),
+  eventId = null,
+  sessionSeq = null,
+}) {
   if (!isEventType(type)) throw new Error(`contracts: unknown event type "${type}"`);
   return {
     schemaVersion: EVENT_SCHEMA_VERSION,
@@ -75,6 +109,10 @@ export function createEvent({ seq = null, projectId = null, aggregateType, aggre
     type,
     payload,
     happenedAt,
+    // Only present when a producer supplies them: the persisted row shape for
+    // legacy events must stay byte-compatible.
+    ...(eventId == null ? {} : { eventId }),
+    ...(sessionSeq == null ? {} : { sessionSeq }),
   };
 }
 

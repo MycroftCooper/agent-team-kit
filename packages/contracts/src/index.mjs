@@ -7,3 +7,4 @@ export * from "./enums.mjs";
 export * from "./errors.mjs";
 export * from "./dto.mjs";
 export * from "./events.mjs";
+export * from "./paths.mjs";
