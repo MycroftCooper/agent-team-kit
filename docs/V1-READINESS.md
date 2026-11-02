@@ -37,17 +37,23 @@ node apps/launcher/cli.mjs stop
 | 执行规格（M6.2）：派发携带冻结 spec（任务版本/验收/依赖/工作区），缺失即拒绝启动 | QA-05 8/8 |
 | 心跳门控（M6.2）：`IDLE` 不等于可派发，心跳过期停止派工并给出 reason | scheduler-core 84/84 · QA-04 |
 | Run 时间线（M6.2）：按 `aggregateId` 服务端分页、实时按 seq 去重、裁剪精确告警 | web 175/175 · QA-05 |
+| 真实 launcher 自举（M6.3）：Host 注册 Agent → 心跳 → Scheduler 自动派工，无手工注入 | QA-M63 8/8 |
+| 角色凭据隔离（M6.3）：scheduler / runtime-host 各自独立 token，token→role 服务端绑定；内部凭据不可审批 | m63-backend 5/5 · QA-03 |
+| 每个 Run 独立 worktree（M6.3）：`work_branch` 唯一，`targetBranch` 仅集成目标；失败不删未提交修改 | QA-M63 · QA-05 |
+| 完成回执绑定（M6.3）：只有 command 终态 + generation + result.eventId 匹配才清 Outbox；无 command 保守保留 | QA-02 · runtime-host 46/46 |
+| 评审可信凭据（M6.3）：`reviewer_run_id` + 强制 `function==="REVIEWER"`；WORKER Run 不可作审查凭据 | database 140/140 · QA-03 |
+| 工作区策略推导（M6.3）：git 仓库 → worktree + HEAD 作 baseCommit；非仓库 → none（Mock）；信息不足即拒绝 | scheduler 32/32 · m5 4/4 |
 
 Web 页面：概览 / 任务 / Runs（时间线 + 实时流）/ Agent / 审查与验收 / 设置，全部双语。
 
 ## 3. 门禁与测试（HEAD 实测）
 
 ```text
-node scripts/test.mjs             -> 528 / 528（0 fail / 0 skip）
-node scripts/test-workspace.mjs   -> 717 / 717
-node scripts/check-boundaries.mjs -> PASS（9 packages / 7 edges / 0 cycles）
+node scripts/test.mjs             -> 536 / 536（0 fail / 0 skip）
+node scripts/test-workspace.mjs   -> 768 / 768
+node scripts/check-boundaries.mjs -> PASS（10 packages / 10 edges / 0 cycles）
 m1 16/16 · m2 4/4 · m3 6/6 · m4 9/9 · m5 4/4 · m6 12/12
-独立 QA：QA-001..007 + QA-M6.1（34/34）+ QA-M6.2（14/14），每轮变异测试 ≥3 处
+独立 QA：QA-001..007 + QA-M6.1（34/34）+ QA-M6.2（14/14）+ QA-M6.3（8/8 真实 launcher），每轮变异测试 ≥3 处
 ```
 
 ## 4. 明确不可用的部分（这是"不可生产"的具体含义）
@@ -61,6 +67,9 @@ m1 16/16 · m2 4/4 · m3 6/6 · m4 9/9 · m5 4/4 · m6 12/12
 7. **真实任务需要 Scheduler 提供 `root` 与 40/64 hex `baseCommit`**：backend 不做 git 逻辑；`workspacePolicy` 信息不足会被拒绝（`workspace-policy-incomplete`），不会静默退化到 `kind:"none"`（那会让 Agent 写进主工作区）。
 8. `runtime-host` 尚未纳入依赖边界矩阵（当前用相对路径 import `@atk/contracts`/`@atk/workspace`）；`specHash` 不含 `frozenAt`（保证双 store 一致）；M6.2 的 Mock 场景 `workspace.kind="none"` 时 cwd 仍为进程目录。
 9. **真实 DSH 适配器仍未验证**：M7 准入要求"真实 DSH 控制接口可复现 PoC"，当前不满足，因此不得启动真实 DSH 集成。
+10. **多仓库未支持**（M6.3 边界）：Scheduler 以 `ATK_REPO_PATH` 或进程 cwd 推导 workspace policy；多项目/多仓库需要 snapshot 携带 `project.repoPath`。
+11. **worktree 不自动清理**：smoke/launcher 运行会在 `%LOCALAPPDATA%\AgentTeamKit\worktrees` 留下注册，需人工或后续 prune；`runs.target_branch` 不再由调度策略表达（应由 backend 从 `project.defaultBranch` 落库，尚未实现）。
+12. **Agent 子进程 env scrub 依赖 adapter 尊重 `input.env`**：真实 DSH adapter 必须配合，否则内部 token 可能随 process.env 泄漏（M7 前必须验证）。
 
 ## 5. 工程纪律（本项目沉淀的规则）
 
