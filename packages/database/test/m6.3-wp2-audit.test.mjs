@@ -35,6 +35,20 @@ test("M6.3 §12 createReviewerRun reuses producer workspace and enqueues a REVIE
     });
     assert.equal(replay.run.id, first.run.id, `${label}: same Run`);
     assert.equal(replay.specHash, first.specHash, `${label}: same specHash`);
+    assert.equal(first.command.ownerId, "reviewer-1", label);
+
+    // §12 optional idempotencyKey: same task version is idempotent.
+    const auto1 = store.createReviewerRun({ taskId: "TASK-SEED", reviewerAgentId: "reviewer-1" });
+    const auto2 = store.createReviewerRun({ taskId: "TASK-SEED", reviewerAgentId: "reviewer-1" });
+    assert.equal(auto2.run.id, auto1.run.id, `${label}: same version -> same Run`);
+    assert.equal(auto2.specHash, auto1.specHash, label);
+    // A Task version change means a new review round -> a new Run.
+    store.patchTask("TASK-SEED", {
+      expectedVersion: store.getTask("TASK-SEED").version,
+      changes: { title: "review round two" },
+    });
+    const auto3 = store.createReviewerRun({ taskId: "TASK-SEED", reviewerAgentId: "reviewer-1" });
+    assert.notEqual(auto3.run.id, auto1.run.id, `${label}: new version -> new Run`);
 
     // No completed producer -> completed-run-required.
     store.createTask(taskDto("proj-1", { id: "TASK-NO-PRODUCER" }));

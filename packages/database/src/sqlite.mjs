@@ -2436,24 +2436,30 @@ export function openStore(options = {}) {
     createReviewerRun({ taskId, reviewerAgentId, idempotencyKey } = {}) {
       requireId(taskId, "task.id");
       requireId(reviewerAgentId, "agent.id");
-      const key = validateIdempotencyKey(idempotencyKey);
+      const explicitKey =
+        idempotencyKey === undefined || idempotencyKey === null ? null : validateIdempotencyKey(idempotencyKey);
+      const replayOf = (lookupKey) => {
+        const existing = stmt("SELECT * FROM dispatch_commands WHERE idempotency_key = ?").get(lookupKey);
+        if (!existing) return null;
+        const run = runJson(requireRunRow(existing.run_id));
+        if (run.taskId !== taskId) {
+          fail("VALIDATION_ERROR", "idempotencyKey was already used for another task", { taskId, existingTaskId: run.taskId });
+        }
+        let spec = null;
+        let specHash = null;
+        try {
+          const loaded = store.getRunSpec(run.id);
+          spec = loaded.spec;
+          specHash = loaded.specHash;
+        } catch {
+          // Pre-0008 replay has no spec; return the command as recorded.
+        }
+        return { run, command: commandJson(existing), spec, specHash };
+      };
       return transaction(() => {
-        const existing = stmt("SELECT * FROM dispatch_commands WHERE idempotency_key = ?").get(key);
-        if (existing) {
-          const run = runJson(requireRunRow(existing.run_id));
-          if (run.taskId !== taskId) {
-            fail("VALIDATION_ERROR", "idempotencyKey was already used for another task", { taskId, existingTaskId: run.taskId });
-          }
-          let spec = null;
-          let specHash = null;
-          try {
-            const loaded = store.getRunSpec(run.id);
-            spec = loaded.spec;
-            specHash = loaded.specHash;
-          } catch {
-            // Pre-0008 replay has no spec; return the command as recorded.
-          }
-          return { run, command: commandJson(existing), spec, specHash };
+        if (explicitKey) {
+          const replay = replayOf(explicitKey);
+          if (replay) return replay;
         }
         const taskRow = requireTaskRow(taskId);
         if (taskRow.status !== "REVIEWING") {
@@ -2462,6 +2468,12 @@ export function openStore(options = {}) {
             status: taskRow.status,
             reason: "task-not-reviewing",
           });
+        }
+        const key =
+          explicitKey ?? `review-run:${taskId}:${reviewerAgentId}:${Number(taskRow.version)}`;
+        if (!explicitKey) {
+          const replay = replayOf(key);
+          if (replay) return replay;
         }
         const producerRow = stmt(
           "SELECT * FROM runs WHERE task_id = ? AND status = 'COMPLETED' ORDER BY updated_at DESC, id DESC LIMIT 1",

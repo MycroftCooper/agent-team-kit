@@ -1477,9 +1477,11 @@ export function createMemoryStore() {
     createReviewerRun({ taskId, reviewerAgentId, idempotencyKey } = {}) {
       requireId(taskId, "task.id");
       requireId(reviewerAgentId, "agent.id");
-      const key = validateIdempotencyKey(idempotencyKey);
-      const existingId = commandIdempotency.get(key);
-      if (existingId !== undefined) {
+      const explicitKey =
+        idempotencyKey === undefined || idempotencyKey === null ? null : validateIdempotencyKey(idempotencyKey);
+      const replayOf = (lookupKey) => {
+        const existingId = commandIdempotency.get(lookupKey);
+        if (existingId === undefined) return null;
         const command = dispatchCommands.get(existingId);
         const run = requireRunEntry(command.runId);
         if (run.taskId !== taskId) {
@@ -1492,6 +1494,10 @@ export function createMemoryStore() {
           spec: loaded ? clone(loaded.spec) : null,
           specHash: loaded ? loaded.specHash : null,
         };
+      };
+      if (explicitKey) {
+        const replay = replayOf(explicitKey);
+        if (replay) return replay;
       }
       const task = requireTaskEntry(taskId);
       if (task.status !== "REVIEWING") {
@@ -1500,6 +1506,12 @@ export function createMemoryStore() {
           status: task.status,
           reason: "task-not-reviewing",
         });
+      }
+      const key =
+        explicitKey ?? `review-run:${taskId}:${reviewerAgentId}:${Number(task.version)}`;
+      if (!explicitKey) {
+        const replay = replayOf(key);
+        if (replay) return replay;
       }
       const producer = [...runs.values()]
         .filter((run) => run.taskId === taskId && run.status === "COMPLETED")
