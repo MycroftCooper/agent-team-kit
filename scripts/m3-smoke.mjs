@@ -121,8 +121,16 @@ function seedTask({ id, title, deps = [], priority = 2, status = "READY" }) {
 }
 
 function seedAgents(count) {
+  const ids = [];
   for (let index = 0; index < count; index += 1) {
-    store.upsertAgent({ id: `agent-dev-${index + 1}`, role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
+    const id = `agent-dev-${index + 1}`;
+    ids.push(id);
+    store.upsertAgent({ id, role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
+  }
+  // M6.2 F10: IDLE alone is not dispatchable - the scheduler also requires a
+  // heartbeat inside the TTL, so the fixture registers one for its hosts.
+  if (typeof store.recordHeartbeat === "function") {
+    store.recordHeartbeat({ hostId: "m3-smoke", agentIds: ids, capacity: 1 });
   }
 }
 

@@ -167,6 +167,10 @@ const fixtures = { skippedSetup: [] };
 for (const index of [1, 2, 3]) {
   store.upsertAgent({ id: `agent-dev-${index}`, role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
 }
+// M6.2 F10: an IDLE agent without a live heartbeat is not dispatchable.
+if (typeof store.recordHeartbeat === "function") {
+  store.recordHeartbeat({ hostId: "m4-smoke", agentIds: ["agent-dev-1", "agent-dev-2", "agent-dev-3"], capacity: 1 });
+}
 
 // Check 5 only needs the base store: an AWAITING_ACCEPTANCE task.
 fixtures.directDone = createTask("M4-DIRECT-DONE", "AWAITING_ACCEPTANCE");

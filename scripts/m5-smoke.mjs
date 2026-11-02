@@ -116,6 +116,10 @@ function seedWork(count) {
     const project = store.createProject({ id: `M5-P-${Date.now()}`, name: "m5-smoke project", repoPath: ROOT, defaultBranch: "m0/baseline-and-p0" });
     for (let index = 0; index < 2; index += 1) {
       store.upsertAgent({ id: `m5-agent-${index + 1}`, role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
+    // M6.2 F10: seed a heartbeat so the scheduler may dispatch to this agent.
+    if (typeof store.recordHeartbeat === "function") {
+      store.recordHeartbeat({ hostId: "m5-smoke", agentIds: [`m5-agent-${index + 1}`], capacity: 1 });
+    }
     }
     const taskIds = [];
     for (let index = 0; index < count; index += 1) {

@@ -256,6 +256,10 @@ function seed(dbFile, { events = 105 } = {}) {
       acceptance: "smoke",
     });
     store.upsertAgent({ id: "m6-agent", role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
+    // M6.2 F10: a live heartbeat is required before dispatch.
+    if (typeof store.recordHeartbeat === "function") {
+      store.recordHeartbeat({ hostId: "m6-smoke", agentIds: ["m6-agent"], capacity: 1 });
+    }
     const run = store.createRun({ taskId: task.id, agentId: "m6-agent", function: "WORKER", role: "DEV" });
     for (let index = 0; index < events; index += 1) {
       store.appendEvent({ type: "task.updated", aggregateType: "task", aggregateId: task.id, payload: { index } });
