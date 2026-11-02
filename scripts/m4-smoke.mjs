@@ -421,6 +421,25 @@ function seedTaskStatus(taskId, status) {
   }
 }
 
+/**
+ * F06/M6.3: an AGENT-assigned review must name an existing REVIEWER run. The
+ * gate builds one through the store (the same service a real caller uses) so
+ * the HTTP review creation has a legitimate reviewer run to bind to.
+ */
+function seedReviewerRun(taskId, reviewerAgentId) {
+  const fresh = openStore({ file: dbFile, migrate: false });
+  try {
+    const task = fresh.getTask(taskId);
+    return fresh.createReviewerRun({
+      taskId,
+      reviewerAgentId,
+      idempotencyKey: `m4-smoke-review-${taskId}-${reviewerAgentId}-${task?.version ?? 0}`,
+    });
+  } finally {
+    fresh.close();
+  }
+}
+
 function dbTask(taskId) {
   return dbGet("SELECT status, version, target_hash AS targetHash FROM tasks WHERE id = ?", taskId);
 }
@@ -495,11 +514,13 @@ function runCliProcess(script, args, env, { timeoutMs = 30_000 } = {}) {
 
 check("1. self-review by the author agent is forbidden (403 SELF_REVIEW_FORBIDDEN, review stays PENDING)", async () => {
   requireM4(true);
-  // F06: the reviewer must be an assigned agent, and the agent that produced the
-  // Run may not review it. Assignment comes from the API, not from body.actor.
+  // F06/M6.3: the reviewer must be an assigned agent with its own REVIEWER run;
+  // the author's WORKER run may not be used as review evidence.
+  const reviewerRun = seedReviewerRun("M4-SELF", "agent-dev-2");
   const review = await createReview("M4-SELF", fixtures.self.run.id, "HUMAN", {
     assignedTo: "AGENT",
-    reviewerAgentId: "agent-dev-1", // the agent that produced the Run
+    reviewerAgentId: "agent-dev-2",
+    reviewerRunId: reviewerRun.run.id,
   });
   expect(reviewRow(review.id)?.status === "PENDING", `review should start PENDING, got ${reviewRow(review.id)?.status}`);
 
@@ -507,7 +528,7 @@ check("1. self-review by the author agent is forbidden (403 SELF_REVIEW_FORBIDDE
   const sessionAttempt = await api(
     "POST",
     `/api/v1/reviews/${encodeURIComponent(review.id)}/submit`,
-    { expectedVersion: review.version, verdict: "PASS", manifestHash: MANIFEST, reviewerAgentId: "agent-dev-1", evidence: { tests: { passed: 2, total: 2 } } },
+    { expectedVersion: review.version, verdict: "PASS", manifestHash: MANIFEST, reviewerAgentId: "agent-dev-2", evidence: { tests: { passed: 2, total: 2 } } },
     "agent-dev-1",
   );
   expect(sessionAttempt.status === 403, `session submit of an AGENT review expected 403, got ${sessionAttempt.status}: ${sessionAttempt.text.slice(0, 200)}`);
@@ -521,7 +542,9 @@ check("1. self-review by the author agent is forbidden (403 SELF_REVIEW_FORBIDDE
       expectedVersion: review.version,
       verdict: "PASS",
       manifestHash: MANIFEST,
-      reviewerAgentId: "agent-dev-1",
+      reviewerAgentId: "agent-dev-2",
+      // The author's own WORKER run is presented as review evidence: refused.
+      runId: fixtures.self.run.id,
       evidence: { tests: { passed: 2, total: 2 } },
     },
     "runtime-host",
@@ -690,7 +713,7 @@ check("6. rework loop: REJECTED -> READY -> re-executed Run (attempt 2); over-li
     ["--once"],
     {
       ATK_BACKEND_URL: base,
-      ATK_INTERNAL_TOKEN: internalToken,
+      ATK_INTERNAL_TOKEN: internalTokens.scheduler,
       SCHEDULER_OWNER: "m4-smoke-scheduler",
       MAX_CONCURRENT_PER_PROJECT: "4",
       MAX_PER_AGENT: "1",
@@ -721,10 +744,12 @@ check("6. rework loop: REJECTED -> READY -> re-executed Run (attempt 2); over-li
   mkdirSync(path.join(tmp, "runtime"), { recursive: true });
   const hostEnv = {
     ATK_BACKEND_URL: base,
-    ATK_INTERNAL_TOKEN: internalToken,
+    ATK_INTERNAL_TOKEN: internalTokens.host,
     AGENT_RUNTIME: "mock",
     ATK_HOST_OWNER: "m4-smoke-host",
     ATK_HOST_STATE_FILE: path.join(tmp, "runtime", "host-m4-smoke.json"),
+    ATK_HOST_AGENTS: JSON.stringify([{ agentId: "agent-dev-1", role: "DEV", function: "WORKER" }]),
+    ATK_HOST_CAPACITY: "2",
   };
   const hostRun = await runCliProcess(hostScript, ["--owner", "m4-smoke-host", "--once"], hostEnv, { timeoutMs: 30_000 });
   expect(hostRun.code === 0, `real host CLI exited ${hostRun.code}: ${hostRun.stderr.slice(-800)}`);

@@ -105,7 +105,19 @@ function taskOf(store) {
 
 function seedRun(store, label) {
   const task = taskOf(store);
-  const run = store.createRun({ taskId: task.id, agentId: "agent-dev-01", function: "WORKER", role: "DEV" });
+  // F05: a host refuses to start a run without a frozen execution spec, so the
+  // seed freezes one exactly like a real claim would.
+  const frozen = typeof store.freezeTaskSpec === "function"
+    ? store.freezeTaskSpec(task.id, { workspace: { kind: "none" } })
+    : null;
+  const run = store.createRun({
+    taskId: task.id,
+    agentId: "agent-dev-01",
+    function: "WORKER",
+    role: "DEV",
+    workspace: { kind: "none" },
+    ...(frozen ? { specHash: frozen.specHash } : {}),
+  });
   const command = store.enqueueDispatchCommand({
     runId: run.id,
     commandType: "START_RUN",
