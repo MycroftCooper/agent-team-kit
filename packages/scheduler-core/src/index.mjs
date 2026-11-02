@@ -770,6 +770,11 @@ export function planDispatch({ snapshot, policies = {}, now } = {}) {
       agentId: agent.id,
       expectedTaskVersion,
       workspacePolicy,
+      // m6.3 P1-8: a Run's execution identity comes from the Task. Carrying it
+      // explicitly means the claim creates a REVIEWER Run for reviewer tasks and
+      // a WORKER Run for work tasks; it never silently defaults to WORKER.
+      function: task.functionRequired,
+      role: task.roleRequired,
       reason: `priority=${row.priority}; waitingMs=${row.waitingMs}`,
       idempotencyKey: `claim-${task.id}-${expectedTaskVersion}`,
     });

@@ -60,6 +60,11 @@ export function createScheduler({ client, core, policies, ownerId, pollMs = 1000
           agentId: proposal.agentId,
           expectedTaskVersion: proposal.expectedTaskVersion,
           workspacePolicy: proposal.workspacePolicy,
+          // m6.3 P1-8: request the Run with the Task's execution identity. The
+          // backend still re-validates it against the Task; sending it explicitly
+          // is what turns a reviewer Task into a REVIEWER Run.
+          ...(proposal.function === undefined ? {} : { function: proposal.function }),
+          ...(proposal.role === undefined ? {} : { role: proposal.role }),
           // Capacity limits travel with the claim so the backend enforces the
           // same numbers the planner used (m3-contracts §2 step 5).
           policies,

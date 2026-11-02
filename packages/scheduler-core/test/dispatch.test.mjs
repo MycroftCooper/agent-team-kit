@@ -183,6 +183,8 @@ test("planDispatch proposes one deterministic dispatch for a ready task", () => 
         agentId: "A-1",
         expectedTaskVersion: 3,
         workspacePolicy: { kind: "none" },
+        function: "WORKER",
+        role: "DEV",
         reason: "priority=2; waitingMs=600000",
         idempotencyKey: "claim-T-1-3",
       },

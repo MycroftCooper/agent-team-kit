@@ -37,7 +37,17 @@ export function createSchedulerClient({ baseUrl, token, fetchImpl = globalThis.f
     const payload = text ? JSON.parse(text) : null;
     if (!response.ok) {
       const error = payload?.error ?? {};
-      throw new SchedulerApiError(response.status, error.code ?? "HTTP_ERROR", error.details, `${response.status} ${error.code ?? ""}`.trim());
+      // m6.3 P0-2: the server binds the token to a role; the header is only an
+      // assertion. Surface the `details.reason` (`internal-role-forbidden`,
+      // `internal-token-invalid`, ...) so an operator sees WHY a round failed
+      // instead of a bare `403 NOT_AUTHORIZED`.
+      const reason = typeof error.details?.reason === "string" && error.details.reason !== "" ? ` ${error.details.reason}` : "";
+      throw new SchedulerApiError(
+        response.status,
+        error.code ?? "HTTP_ERROR",
+        error.details,
+        `${response.status} ${error.code ?? ""}${reason}`.trim(),
+      );
     }
     return payload;
   }

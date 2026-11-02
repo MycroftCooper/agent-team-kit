@@ -18,7 +18,7 @@
 | `matchAgents({ task, agents, policies, now })` | `{ candidates, excluded: [{agentId, reason}] }`（`now` 必填；IDLE/Role/Function 之外还校验心跳与容量） |
 | `agentAvailability(agent, { now, ttlMs? })` | `{ available, reason }`；reason ∈ `ok` / `no-heartbeat` / `stale-heartbeat` / `no-capacity` |
 | `detectConflicts({ task, activeRuns, ownership })` | `{ ok, reasons: [{kind, detail}] }` |
-| `planDispatch({ snapshot, policies, now })` | `{ proposals, skipped }`；有不可用 IDLE agent 时附加 `unavailableAgents` + `heartbeatTtlMs` |
+| `planDispatch({ snapshot, policies, now })` | `{ proposals, skipped }`；每个 proposal 带 `function`/`role`（来自 Task，m6.3 P1-8）；有不可用 IDLE agent 时附加 `unavailableAgents` + `heartbeatTtlMs` |
 | `resolveOwner(ownership, path)` / `normalizePath` / `pathsOverlap` | 写域匹配辅助（`normalizePath`/`pathsOverlap` 就是 `@atk/contracts` 的同一实现） |
 | `assertDeterministic(a, b)` | 确定性断言（测试用） |
 | `SKIP_REASONS` / `SKIP_REASON_VALUES` / `PRIORITY_WEIGHT` / `DEFAULT_HEARTBEAT_TTL_MS` / `AGENT_AVAILABILITY_REASONS` | 机器可读枚举与常量 |
@@ -84,6 +84,9 @@ planDispatch({ snapshot, policies, now })
 5. `workspacePolicy` 优先级：项目 policy → `policies.workspacePolicy` → `{ kind: "none" }`。
 6. 若本轮有 IDLE agent 被心跳/容量拒绝，结果附加 `unavailableAgents: [{agentId, reason}]` 与
    `heartbeatTtlMs`（全部可用时不出现该字段，保持历史形状）。
+7. **执行身份（m6.3 P1-8）**：proposal 携带 `function`/`role`，值来自 Task 的 `functionRequired` /
+   `roleRequired`；`REVIEWER` 任务因此生成 `function:"REVIEWER"` 的 Run，Scheduler 不会默认成 `WORKER`，
+   也不会替调用方猜测身份。
 
 ## 测试
 

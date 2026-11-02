@@ -3,12 +3,17 @@
 // provable here. The backend is a real HTTP server in this process: a fake
 // `fetch` would not catch a missing header.
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import http from "node:http";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { createSchedulerClient, SchedulerApiError } from "../src/client.mjs";
 import { createScheduler } from "../src/index.mjs";
 
 const TOKEN = "internal-test";
+const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
 
 function listen(handler) {
   return new Promise((resolve, reject) => {
@@ -170,4 +175,123 @@ test("a real scheduler round passes a role-gated backend (m4-smoke item 6 shape)
   assert.equal(claims.length, 1);
   assert.equal(result.results[0].claimed, true);
   await scheduler.stop();
+});
+
+// ---------------------------------------------------------------------------
+// m6.3 P0-2: the Scheduler never mints or rewrites the credential. The Backend
+// binds a token to a role; the header is only an assertion on top, so a token
+// bound to another role must be refused and the refusal must be visible.
+// ---------------------------------------------------------------------------
+
+test("a token bound to another role is refused, with the server reason visible", async (t) => {
+  const { server, base } = await listen((req, res) => {
+    // Server-side token→role binding (m6.3 P0-2): the header cannot grant a role.
+    const boundRole = req.headers["x-atk-internal"] === "scheduler-token" ? "scheduler" : "runtime-host";
+    if (boundRole !== "scheduler") {
+      return json(res, 403, {
+        error: { code: "NOT_AUTHORIZED", details: { reason: "internal-role-forbidden", role: boundRole, expectedRole: "scheduler" } },
+      });
+    }
+    return json(res, 200, { version: 1, tasks: [], agents: [], runs: [], leases: [] });
+  });
+  t.after(() => server.close());
+
+  const client = createSchedulerClient({ baseUrl: base, token: "host-token" });
+  await assert.rejects(client.snapshot(), (error) => {
+    assert.equal(error.status, 403);
+    assert.equal(error.code, "NOT_AUTHORIZED");
+    assert.match(error.message, /internal-role-forbidden/, "the refusal reason must be visible in the error message");
+    return true;
+  });
+});
+
+test("a round using a host-bound token fails closed and records the reason", async (t) => {
+  const { server, base } = await listen((req, res) =>
+    json(res, 403, { error: { code: "NOT_AUTHORIZED", details: { reason: "internal-role-forbidden" } } }),
+  );
+  t.after(() => server.close());
+
+  const claims = [];
+  const client = createSchedulerClient({ baseUrl: base, token: "host-token" });
+  const scheduler = createScheduler({
+    client,
+    core: {
+      planDispatch: () => {
+        claims.push("called");
+        return { proposals: [{ taskId: "T-1", agentId: "A-1", expectedTaskVersion: 1 }], skipped: [] };
+      },
+    },
+    policies: {},
+    ownerId: "scheduler-1",
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const result = await scheduler.runOnce();
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "snapshot-failed");
+  assert.equal(claims.length, 0, "a refused credential must not lead to a claim");
+  assert.match(scheduler.failures()[0].error, /internal-role-forbidden/);
+  await scheduler.stop();
+});
+
+test("the real CLI sends the injected ATK_INTERNAL_TOKEN unchanged", async (t) => {
+  const seen = [];
+  const token = `scheduler-token-${randomUUID()}`;
+  const { server, base } = await listen((req, res) => {
+    seen.push({ token: req.headers["x-atk-internal"], role: req.headers["x-atk-internal-role"], path: req.url });
+    if (req.url === "/internal/v1/scheduling/snapshot") {
+      return json(res, 200, { version: 1, tasks: [], agents: [], runs: [], leases: [] });
+    }
+    return json(res, 404, { error: { code: "NOT_FOUND" } });
+  });
+  t.after(() => server.close());
+
+  const result = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CLI, "--once"], {
+      windowsHide: true,
+      env: { ...process.env, ATK_BACKEND_URL: base, ATK_INTERNAL_TOKEN: token, SCHEDULER_OWNER: "client-test" },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.on("error", reject);
+    child.on("exit", (code) => resolve({ code, stdout, stderr }));
+  });
+  assert.equal(result.code, 0, `CLI exited ${result.code}: ${result.stderr}`);
+  assert.ok(seen.length >= 1);
+  for (const entry of seen) {
+    assert.equal(entry.token, token, "the CLI must pass ATK_INTERNAL_TOKEN through verbatim");
+    assert.equal(entry.role, "scheduler");
+  }
+});
+
+test("the client surface stays on the scheduler plane (no result/approval calls)", async (t) => {
+  const seen = [];
+  const { server, base } = await listen((req, res) => {
+    seen.push(`${req.method} ${req.url}`);
+    if (req.url === "/internal/v1/scheduling/snapshot") {
+      return json(res, 200, { version: 1, tasks: [], agents: [], runs: [], leases: [] });
+    }
+    if (req.url.endsWith("/claim")) return json(res, 200, { run: { id: "run-1" } });
+    if (req.url === "/internal/v1/scheduler/heartbeat") return json(res, 200, { ok: true });
+    return json(res, 404, { error: { code: "NOT_FOUND" } });
+  });
+  t.after(() => server.close());
+
+  const client = createSchedulerClient({ baseUrl: base, token: TOKEN });
+  await client.snapshot();
+  await client.claim("T-1", { agentId: "A-1", expectedTaskVersion: 1 });
+  await client.heartbeat({ ownerId: "scheduler-1", status: "RUNNING" });
+
+  const allowed = [
+    /^GET \/internal\/v1\/scheduling\/snapshot$/,
+    /^POST \/internal\/v1\/tasks\/[^/]+\/claim$/,
+    /^POST \/internal\/v1\/scheduler\/heartbeat$/,
+  ];
+  for (const request of seen) {
+    assert.ok(allowed.some((pattern) => pattern.test(request)), `scheduler client must not call ${request}`);
+  }
+  for (const forbidden of [/\/result/, /\/approval/, /\/dispatch\//, /\/runs\//]) {
+    assert.ok(!seen.some((request) => forbidden.test(request)), `scheduler client must never call ${forbidden}`);
+  }
 });
