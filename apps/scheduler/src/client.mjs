@@ -22,6 +22,9 @@ export function createSchedulerClient({ baseUrl, token, fetchImpl = globalThis.f
         method,
         headers: {
           "x-atk-internal": token,
+          // m6.1-contracts §2: a role assertion, not a credential — the token above
+          // is still the credential itself; the Scheduler is always "scheduler".
+          "x-atk-internal-role": "scheduler",
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
