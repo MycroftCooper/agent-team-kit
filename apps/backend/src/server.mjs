@@ -204,6 +204,63 @@ export function createServer({
     return frozen;
   }
 
+  /**
+   * M6.2 F04 bridge: a Scheduler proposal carries a workspacePolicy, not the
+   * final workspace. Translate it to the claim.workspace shape. An incomplete
+   * real-task policy is refused (never silently degraded to "none", which would
+   * let the Agent write into the main worktree).
+   */
+  function workspaceFromPolicy(dto = {}) {
+    if (isPlainObject(dto.workspace)) return dto.workspace;
+    const policy = dto.workspacePolicy;
+    if (policy === undefined || policy === null) return undefined; // store default: none
+    if (!isPlainObject(policy)) {
+      throw new ApiError("VALIDATION_ERROR", "workspacePolicy must be an object", {
+        details: { field: "workspacePolicy", errors: ["workspacePolicy must be an object"] },
+      });
+    }
+    const kind = policy.kind ?? (policy.root !== undefined || policy.baseCommit !== undefined ? "worktree" : "none");
+    if (kind !== "worktree" && kind !== "none") {
+      throw new ApiError("VALIDATION_ERROR", "workspacePolicy.kind must be worktree|none", {
+        details: { field: "workspacePolicy.kind", errors: ["workspacePolicy.kind must be worktree|none"] },
+      });
+    }
+    if (kind === "none") return { kind: "none" };
+
+    const missing = [];
+    let root = typeof policy.root === "string" && policy.root.trim() !== "" ? policy.root : null;
+    if (root === null) {
+      // The project's parent directory is an acceptable explicit fallback, but
+      // only when we can resolve it to an absolute path.
+      let project = null;
+      try {
+        const task = store.getTask(dto.taskId);
+        project = (store.listProjects() ?? []).find((candidate) => candidate.id === task?.projectId) ?? null;
+      } catch {
+        project = null;
+      }
+      if (typeof project?.repoPath === "string" && path.isAbsolute(project.repoPath)) {
+        root = path.dirname(project.repoPath);
+      } else {
+        missing.push("root");
+      }
+    }
+    const baseCommit = typeof policy.baseCommit === "string" ? policy.baseCommit : null;
+    if (baseCommit === null || !/^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$/.test(baseCommit)) missing.push("baseCommit");
+    if (missing.length > 0) {
+      throw new ApiError("VALIDATION_ERROR", "workspacePolicy is not specific enough to dispatch a real task", {
+        details: { field: "workspacePolicy", reason: "workspace-policy-incomplete", missing, kind },
+      });
+    }
+    return {
+      kind: "worktree",
+      root,
+      baseCommit,
+      targetBranch: typeof policy.targetBranch === "string" && policy.targetBranch !== "" ? policy.targetBranch : null,
+      ...(typeof policy.path === "string" && policy.path !== "" ? { path: policy.path } : {}),
+    };
+  }
+
   const internalStore = Object.create(store);
   if (typeof store.claimTask === "function") {
     const enrichClaim = (result, frozen) => {
@@ -222,7 +279,8 @@ export function createServer({
     internalStore.claimTask = (dto = {}) => {
       // M6.2: claimTask freezes the spec + binds the workspace inside its own
       // transaction. Never re-freeze here - especially not on idempotent replay.
-      const result = store.claimTask(dto);
+      const workspace = workspaceFromPolicy(dto);
+      const result = store.claimTask({ ...dto, ...(workspace === undefined ? {} : { workspace }) });
       if (!isPlainObject(result)) return result;
       if (typeof store.getRunSpec !== "function") return result;
       let frozen = null;

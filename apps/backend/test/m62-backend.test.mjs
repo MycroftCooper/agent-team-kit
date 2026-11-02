@@ -214,3 +214,83 @@ test("F04: claim pins the workspace on the Run and in the frozen spec", async (t
   assert.equal(worktreeRun.specHash, worktreeCommand.specHash);
   assert.deepEqual(store.getRun(worktreeRun.id).workspace, worktreeRun.workspace);
 });
+
+test("QA-05.8: Scheduler workspacePolicy is translated into claim.workspace (and never silently degraded)", async (t) => {
+  const { store, task, ctx } = await openRealStore(t, "atk-m62-policy-");
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), "atk-m62-policy-root-"));
+  t.after(() => rmSync(workspaceRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+
+  // 1. Complete policy → worktree claim whose run.workspace == spec.workspace.
+  const complete = await request(ctx.base, {
+    method: "POST",
+    path: `/internal/v1/tasks/${task.id}/claim`,
+    headers: internalHeaders(undefined, "scheduler"),
+    body: {
+      ...claimBody(task),
+      workspacePolicy: { kind: "worktree", root: workspaceRoot, baseCommit: "a".repeat(40), targetBranch: "main" },
+    },
+  });
+  assert.equal(complete.status, 200, complete.text);
+  assert.equal(complete.json.run.workspace.kind, "worktree", complete.text);
+  assert.ok(path.resolve(complete.json.run.workspace.path).startsWith(path.resolve(workspaceRoot)));
+  assert.equal(complete.json.run.workspace.baseCommit, "a".repeat(40));
+  assert.equal(complete.json.run.workspace.targetBranch, "main");
+  assert.deepEqual(complete.json.run.workspace, complete.json.command.payload.spec.workspace);
+
+  // 2. Incomplete policy → explicit refusal with a visible reason, no Run/mutation.
+  const incompleteTask = store.createTask({
+    id: "T-INCOMPLETE-POLICY",
+    projectId: "P-1",
+    title: "incomplete policy",
+    description: "d",
+    functionRequired: "WORKER",
+    roleRequired: "DEV",
+    priority: 2,
+    deps: [],
+    acceptance: "x",
+  });
+  const incomplete = await request(ctx.base, {
+    method: "POST",
+    path: `/internal/v1/tasks/${incompleteTask.id}/claim`,
+    headers: internalHeaders(undefined, "scheduler"),
+    body: {
+      agentId: "agent-1",
+      expectedTaskVersion: incompleteTask.version,
+      idempotencyKey: "policy-incomplete",
+      workspacePolicy: { kind: "worktree", targetBranch: "main" },
+    },
+  });
+  assert.equal(incomplete.status, 400, incomplete.text);
+  assert.equal(incomplete.json.error.code, "VALIDATION_ERROR");
+  assert.equal(incomplete.json.error.details.reason, "workspace-policy-incomplete");
+  assert.deepEqual(incomplete.json.error.details.missing.sort(), ["baseCommit", "root"]);
+  assert.equal(store.getTask(incompleteTask.id).status, "READY", "a refused dispatch must not claim the Task");
+  assert.equal((store.listRuns({ taskId: incompleteTask.id }) ?? []).length, 0);
+
+  // 3. Mock / no repository policy → kind "none".
+  const mockTask = store.createTask({
+    id: "T-MOCK-POLICY",
+    projectId: "P-1",
+    title: "mock policy",
+    description: "d",
+    functionRequired: "WORKER",
+    roleRequired: "DEV",
+    priority: 2,
+    deps: [],
+    acceptance: "x",
+  });
+  const mock = await request(ctx.base, {
+    method: "POST",
+    path: `/internal/v1/tasks/${mockTask.id}/claim`,
+    headers: internalHeaders(undefined, "scheduler"),
+    body: {
+      agentId: "agent-1",
+      expectedTaskVersion: mockTask.version,
+      idempotencyKey: "policy-none",
+      workspacePolicy: { kind: "none" },
+    },
+  });
+  assert.equal(mock.status, 200, mock.text);
+  assert.equal(mock.json.run.workspace.kind, "none");
+  assert.deepEqual(mock.json.run.workspace, mock.json.command.payload.spec.workspace);
+});
