@@ -5,7 +5,7 @@
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { createMockRuntime } from "@atk/runtime-sdk/mock";
-import { createTaskExecutionSpec } from "../../../../packages/contracts/src/execution-spec.mjs";
+import { createTaskExecutionSpec } from "@atk/contracts";
 import { createHost } from "../../src/host.mjs";
 
 const [dir, repoPath, baseCommit, worktreePath] = process.argv.slice(2);

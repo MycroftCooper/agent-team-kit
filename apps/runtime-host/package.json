@@ -13,7 +13,9 @@
     "start": "node ./cli.mjs"
   },
   "dependencies": {
-    "@atk/runtime-sdk": "workspace:*"
+    "@atk/contracts": "workspace:*",
+    "@atk/runtime-sdk": "workspace:*",
+    "@atk/workspace": "workspace:*"
   },
   "engines": {
     "node": ">=22.5.0"

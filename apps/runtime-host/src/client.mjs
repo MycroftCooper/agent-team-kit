@@ -82,8 +82,11 @@ export function createInternalClient({ baseUrl, token, role = "runtime-host", fe
     events(runId, { generation, events }) {
       return call("POST", `/internal/v1/runs/${encodeURIComponent(runId)}/events`, { generation, events });
     },
-    heartbeat({ ownerId, status, capabilities, sessions }) {
-      return call("POST", "/internal/v1/runtime/heartbeat", { ownerId, status, capabilities, sessions });
+    register({ hostId, agents }) {
+      return call("POST", "/internal/v1/runtime/register", { hostId, agents });
+    },
+    heartbeat({ hostId, agentIds, capacity }) {
+      return call("POST", "/internal/v1/runtime/heartbeat", { hostId, agentIds, capacity });
     },
     reconcile(runId) {
       return call("GET", `/internal/v1/runs/${encodeURIComponent(runId)}/reconcile`);

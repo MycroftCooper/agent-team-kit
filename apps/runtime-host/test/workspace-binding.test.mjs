@@ -10,8 +10,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createMockRuntime } from "@atk/runtime-sdk/mock";
-import { createTaskExecutionSpec } from "../../../packages/contracts/src/execution-spec.mjs";
-import { removeWorktree, worktreeStatus } from "../../../packages/workspace/src/index.mjs";
+import { createTaskExecutionSpec } from "@atk/contracts";
+import { removeWorktree, worktreeStatus } from "@atk/workspace";
+// M6.3 P1-9: these fixtures explicitly opt into Mock none workspaces.
+process.env.ATK_ALLOW_NONE_WORKSPACE = "1";
 import { createHost } from "../src/host.mjs";
 
 function quietLogger() {
@@ -89,7 +91,10 @@ function fakeClient({ claims = [] } = {}) {
       calls.result.push({ commandId, ...body });
       return Promise.resolve({ persisted: true });
     },
-    heartbeat(body) {
+    register({ hostId, agents }) {
+      const returned = (Array.isArray(agents) ? agents : []).map((agent) => ({ agentId: agent.agentId, role: agent.role, function: agent.function, capacity: agent.capacity ?? null }));
+      return Promise.resolve({ hostId, agents: returned });
+    },    heartbeat(body) {
       calls.heartbeat.push(body);
       return Promise.resolve({ ok: true });
     },
@@ -333,7 +338,10 @@ test("F04: a restarted host reuses the recorded worktree and preserves its files
   await waitFor(() => firstClient.calls.result.length >= 1 && host1.outbox().length === 0, 5000, "first incarnation");
   await host1.stop();
 
-  const secondClient = fakeClient({ claims: [claimOf({ runId: "run-reuse", commandId: "CMD-R2", spec, workspace })] });
+  // M6.3: the same Run is never re-executed after a recorded lease; reuse is
+  // exercised by a new Run that attaches to the preserved worktree branch.
+  const secondSpec = makeSpec({ taskId: "TASK-REUSE-2", repoPath: repo, workspace });
+  const secondClient = fakeClient({ claims: [claimOf({ runId: "run-reuse-2", commandId: "CMD-R2", spec: secondSpec, workspace })] });
   let sawKept = false;
   const second = captureRuntime({
     onStart: (input) => {

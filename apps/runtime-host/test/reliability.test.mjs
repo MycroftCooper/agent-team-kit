@@ -15,8 +15,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createMockRuntime } from "@atk/runtime-sdk/mock";
-import { createTaskExecutionSpec } from "../../../packages/contracts/src/execution-spec.mjs";
+import { createTaskExecutionSpec } from "@atk/contracts";
 import { createInternalClient, InternalApiError } from "../src/client.mjs";
+// M6.3 P1-9: these fixtures explicitly opt into Mock none workspaces.
+process.env.ATK_ALLOW_NONE_WORKSPACE = "1";
 import { createHost } from "../src/host.mjs";
 
 function quietLogger() {
@@ -75,7 +77,10 @@ function fakeClient({ claims = [], onEvents, onResult, onRenew, onReconcile } = 
       calls.result.push({ commandId, ...body });
       return onResult ? onResult(commandId, body, calls) : Promise.resolve({ persisted: true });
     },
-    heartbeat(body) {
+    register({ hostId, agents }) {
+      const returned = (Array.isArray(agents) ? agents : []).map((agent) => ({ agentId: agent.agentId, role: agent.role, function: agent.function, capacity: agent.capacity ?? null }));
+      return Promise.resolve({ hostId, agents: returned });
+    },    heartbeat(body) {
       calls.heartbeat.push(body);
       return Promise.resolve({ ok: true });
     },
@@ -151,6 +156,7 @@ test("F02: a transient result failure persists a FINISHING outbox entry and retr
 test("F02: a lost response is reconciled, not blindly retried as a new completion", async () => {
   const { stateFile, outboxFile } = makeDirs();
   let resultCalls = 0;
+  let host;
   const client = fakeClient({
     claims: [claimOf()],
     onResult: () => {
@@ -158,9 +164,16 @@ test("F02: a lost response is reconciled, not blindly retried as a new completio
       // The backend committed the result, but the response never reached us.
       return Promise.reject(new Error("socket hang up"));
     },
-    onReconcile: () => Promise.resolve({ run: { id: "run-1", status: "COMPLETED" }, command: { id: "CMD-1", status: "DONE" }, persisted: true }),
+    onReconcile: () => {
+      const entry = host.outbox()[0];
+      return Promise.resolve({
+        run: { id: "run-1", status: "COMPLETED" },
+        command: { id: "CMD-1", status: "DONE", generation: entry.generation, result: { eventId: entry.eventId } },
+        persisted: true,
+      });
+    },
   });
-  const host = createHost({
+  host = createHost({
     client,
     runtime: createMockRuntime({ scenario: "complete", sessionIdFactory: () => "session-2" }),
     ownerId: "host-a",
@@ -487,6 +500,7 @@ test("F02 real HTTP: a dropped result response is reconciled and the outbox is c
   const { stateFile, outboxFile } = makeDirs();
   const resultBodies = [];
   let reconcileCalls = 0;
+  let host;
   const { server, base } = await listen(
     internalApiHandler({
       onResult: (body, req) => {
@@ -495,12 +509,17 @@ test("F02 real HTTP: a dropped result response is reconciled and the outbox is c
       },
       onReconcile: async () => {
         reconcileCalls += 1;
-        return { run: { id: "run-1", status: "COMPLETED" }, command: { id: "CMD-1", status: "DONE" }, persisted: true };
+        const entry = host.outbox()[0] ?? {};
+        return {
+          run: { id: "run-1", status: "COMPLETED" },
+          command: { id: "CMD-1", status: "DONE", generation: entry.generation, result: { eventId: entry.eventId } },
+          persisted: true,
+        };
       },
     }),
   );
   try {
-    const host = createHost({
+    host = createHost({
       client: createInternalClient({ baseUrl: base, token: "internal-test", timeoutMs: 2000 }),
       runtime: createMockRuntime({ scenario: "complete", sessionIdFactory: () => "session-http-1" }),
       ownerId: "host-a",

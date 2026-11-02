@@ -6,7 +6,9 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createMockRuntime } from "@atk/runtime-sdk/mock";
-import { createTaskExecutionSpec } from "../../../packages/contracts/src/execution-spec.mjs";
+import { createTaskExecutionSpec } from "@atk/contracts";
+// M6.3 P1-9: these fixtures explicitly opt into Mock none workspaces.
+process.env.ATK_ALLOW_NONE_WORKSPACE = "1";
 import { createHost } from "../src/host.mjs";
 import { InternalApiError } from "../src/client.mjs";
 
@@ -42,7 +44,10 @@ function fakeClient({ claims = [], staleOnEvents = false, staleOnRenew = false }
       // M6.1 F02 ack contract: only a persisted:true response confirms delivery.
       return Promise.resolve({ persisted: true, command: { id: commandId }, run: { id: "run-1" } });
     },
-    heartbeat(body) {
+    register({ hostId, agents }) {
+      const returned = (Array.isArray(agents) ? agents : []).map((agent) => ({ agentId: agent.agentId, role: agent.role, function: agent.function, capacity: agent.capacity ?? null }));
+      return Promise.resolve({ hostId, agents: returned });
+    },    heartbeat(body) {
       calls.heartbeat.push(body);
       return Promise.resolve({ ok: true });
     },
@@ -210,18 +215,19 @@ test("renewing the lease advances the generation used by the next upload", async
 test("heartbeat is sent with the owner and an idle/busy status", async () => {
   const client = fakeClient({ claims: [] });
   const runtime = createMockRuntime({ scenario: "complete" });
-  const host = createHost({ client, runtime, ownerId: "host-a", pollMs: 1000, flushMs: 1000, heartbeatMs: 5, logger: quietLogger() });
+  const host = createHost({ client, runtime, ownerId: "host-a", pollMs: 1000, flushMs: 1000, heartbeatMs: 5, agents: [{ agentId: "agent-a", role: "DEV", function: "WORKER" }], logger: quietLogger() });
   host.start();
   await waitFor(() => client.calls.heartbeat.length >= 1);
-  assert.equal(client.calls.heartbeat[0].ownerId, "host-a");
-  assert.ok(["IDLE", "BUSY"].includes(client.calls.heartbeat[0].status));
+  assert.equal(client.calls.heartbeat[0].hostId, "host-a");
+  assert.deepEqual(client.calls.heartbeat[0].agentIds, ["agent-a"]);
+  assert.equal(client.calls.heartbeat[0].capacity, 1);
   await host.stop();
 });
 
 test("stop() is idempotent and leaves no running timers", async () => {
   const client = fakeClient({ claims: [] });
   const runtime = createMockRuntime({ scenario: "complete" });
-  const host = createHost({ client, runtime, ownerId: "host-a", pollMs: 5, flushMs: 5, heartbeatMs: 5, logger: quietLogger() });
+  const host = createHost({ client, runtime, ownerId: "host-a", pollMs: 5, flushMs: 5, heartbeatMs: 5, agents: [{ agentId: "agent-a", role: "DEV", function: "WORKER" }], logger: quietLogger() });
   host.start();
   await new Promise((resolve) => setTimeout(resolve, 30));
   await host.stop();

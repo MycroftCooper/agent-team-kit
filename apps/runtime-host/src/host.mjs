@@ -21,16 +21,14 @@
 // A reclaimed command (attempts > 1) is never restarted (the previous host may
 // have started a session we cannot observe); it is reported INTERRUPTED.
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
-// M6.2 F04/F05: the Host consumes the frozen spec from @atk/contracts and uses
-// the shared worktree manager. These are imported by path because runtime-host
-// is not yet part of the package-boundary matrix; the modules are still the
-// single source of truth (do not duplicate their rules here).
-import { validateTaskExecutionSpec } from "../../../packages/contracts/src/execution-spec.mjs";
-import { ensureWorktree, listWorktrees } from "../../../packages/workspace/src/index.mjs";
+// M6.2 F04/F05 / M6.3 P2-10: package-name imports only.
+import { validateTaskExecutionSpec } from "@atk/contracts";
+import { ensureWorktree, listWorktrees } from "@atk/workspace";
 
 const TERMINAL_RUN_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"]);
+const TERMINAL_COMMAND_STATUSES = new Set(["DONE", "FAILED"]);
 
 function samePath(left, right) {
   const a = resolvePath(String(left ?? ""));
@@ -55,7 +53,7 @@ function buildExecutionPrompt(spec) {
  * Validate the dispatched spec and bind the cwd to the persisted run.workspace.
  * Returns a rejection descriptor instead of ever guessing a directory or prompt.
  */
-function prepareExecution(claim) {
+function prepareExecution(claim, { noneWorkspaceAllowed = false } = {}) {
   const spec = claim?.spec ?? claim?.command?.payload?.spec;
   if (spec === undefined || spec === null) {
     return { ok: false, code: "missing-execution-spec", message: "the dispatch command did not carry a TaskExecutionSpec" };
@@ -100,6 +98,14 @@ function prepareExecution(claim) {
   if (runWorkspace && runWorkspace.kind !== "none") {
     return { ok: false, code: "workspace-mismatch", message: `spec.workspace is none but run.workspace is ${runWorkspace.kind}` };
   }
+  // M6.3 P1-9: real execution may never fall back to the process directory.
+  if (!noneWorkspaceAllowed) {
+    return {
+      ok: false,
+      code: "WORKSPACE_REQUIRED",
+      message: "real execution requires workspace.kind=worktree; none is only allowed for an explicit Mock (ATK_ALLOW_NONE_WORKSPACE=1)",
+    };
+  }
   return {
     ok: true,
     spec,
@@ -139,10 +145,56 @@ export function createHost({
   outboxMaxAttempts = 8,
   runtimeStopTimeoutMs = 5000,
   idFactory = () => randomUUID(),
+  hostId = null,
+  agentIds = null,
+  agents = null,
+  capacity = null,
+  allowNoneWorkspace = undefined,
 } = {}) {
   if (!client) throw new Error("createHost: client is required");
   if (!runtime) throw new Error("createHost: runtime is required");
   if (!ownerId) throw new Error("createHost: ownerId is required");
+
+  const resolvedHostId = String(hostId ?? process.env.ATK_HOST_ID ?? ownerId);
+  const configuredAgents = (() => {
+    const raw = agents ?? process.env.ATK_HOST_AGENTS;
+    if (Array.isArray(raw)) return raw.filter((entry) => entry && typeof entry === "object");
+    if (typeof raw === "string" && raw.trim() !== "") {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) return parsed.filter((entry) => entry && typeof entry === "object");
+      } catch {
+        /* fall through to the legacy agentIds shape */
+      }
+    }
+    const legacy = agentIds ?? process.env.ATK_HOST_AGENT_IDS;
+    const list = Array.isArray(legacy) ? legacy : String(legacy ?? "").split(",");
+    return list
+      .map((value) => String(value).trim())
+      .filter(Boolean)
+      .map((agentId) => ({ agentId, role: "DEV", function: "WORKER" }));
+  })();
+  let resolvedAgentIds = configuredAgents.map((entry) => entry.agentId).filter((value) => typeof value === "string" && value);
+  let registered = false;
+  let bootStarted = false;
+  const resolvedCapacity = Number.isInteger(capacity)
+    ? capacity
+    : Number.isInteger(Number(process.env.ATK_HOST_CAPACITY))
+      ? Number(process.env.ATK_HOST_CAPACITY)
+      : 1;
+  const noneWorkspaceIsAllowed = () => {
+    const envAllowed = process.env.ATK_ALLOW_NONE_WORKSPACE === "1";
+    const explicit = allowNoneWorkspace === undefined ? envAllowed : allowNoneWorkspace === true;
+    return explicit && runtime.kind === "mock";
+  };
+
+  /** M6.3 P0-1: Agent sessions must never inherit internal credentials. */
+  function scrubbedRuntimeEnv() {
+    const blocked = /^(ATK_INTERNAL_TOKEN|ATK_INTERNAL_ROLE|ATK_ALLOW_NONE_WORKSPACE|ATK_HOST_.*)$/;
+    return Object.fromEntries(
+      Object.entries(process.env).filter(([key, value]) => !blocked.test(key) && typeof value === "string"),
+    );
+  }
 
   /** @type {Map<string, { command: object, lease: object, session: object|null, unsubscribe: Function|null, buffer: object[], timers: NodeJS.Timeout[] }>} */
   const sessions = new Map();
@@ -151,7 +203,9 @@ export function createHost({
   let stopped = false;
   let capabilities = null;
   let keepAlive = false;
-  let mode = "RUNNING"; // RUNNING | FINISHING | FENCING | FENCING_REQUIRED | RECOVERY_REQUIRED | MANUAL_REQUIRED | STOPPED
+  let mode = "RUNNING"; // RUNNING | FINISHING | FENCING | FENCING_REQUIRED | RECOVERY_REQUIRED | MANUAL_REQUIRED | HEARTBEAT_LOST | STOPPED
+  let heartbeatFailures = 0;
+  let heartbeatAvailable = true;
   const outboxEntries = [];
   const retryTimers = new Map(); // outbox entry -> timer
   const fencedRuns = new Set();
@@ -195,14 +249,12 @@ export function createHost({
     return new Date(now()).toISOString();
   }
 
-  /**
-   * Atomic JSON write: tmp file + fsync + rename, and the previous complete
-   * generation is preserved as `<file>.bak` before replacement (F09).
-   */
-  function atomicWriteJson(file, value) {
-    mkdirSync(dirname(file), { recursive: true });
+  function sleepSync(ms) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  }
+
+  function writeTempFile(file, body) {
     const tempFile = `${file}.tmp-${process.pid}-${randomUUID()}`;
-    const body = `${JSON.stringify(value, null, 2)}\n`;
     const fd = openSync(tempFile, "w", 0o600);
     try {
       writeSync(fd, body);
@@ -210,59 +262,95 @@ export function createHost({
     } finally {
       closeSync(fd);
     }
-    try {
-      if (existsSync(file)) {
-        try {
-          copyFileSync(file, `${file}.bak`);
-        } catch (error) {
-          logger.warn?.(`[host] could not keep ${file}.bak: ${error?.message ?? error}`);
-        }
-      }
+    return tempFile;
+  }
+
+  function renameWithRetry(from, to) {
+    let lastError;
+    for (const delay of [0, 10, 25, 50]) {
+      if (delay > 0) sleepSync(delay);
       try {
-        renameSync(tempFile, file);
+        renameSync(from, to);
+        return;
       } catch (error) {
-        // Windows can hold a transient handle on the target; fall back to a
-        // complete copy (the .bak still keeps the previous generation).
-        try {
-          copyFileSync(tempFile, file);
-          unlinkSync(tempFile);
-        } catch {
-          throw error;
-        }
+        lastError = error;
       }
-    } catch (error) {
+    }
+    throw lastError;
+  }
+
+  /**
+   * M6.3 P1-7 atomic write: tmp -> fsync -> rename (retry+backoff); when rename
+   * still fails a complete `<file>.next` is written instead. There is no
+   * copyFileSync fallback: a partial copy must never become the live file.
+   */
+  function atomicWriteJson(file, value) {
+    mkdirSync(dirname(file), { recursive: true });
+    const body = `${JSON.stringify(value, null, 2)}\n`;
+    // Keep the backup FIRST: the main file's mtime must be newer than .bak so
+    // startup selection never prefers the previous generation on a tie.
+    if (existsSync(file)) {
+      try {
+        const previous = readFileSync(file, "utf8");
+        const backupTemp = writeTempFile(`${file}.bak`, previous);
+        renameWithRetry(backupTemp, `${file}.bak`);
+      } catch (error) {
+        logger.warn?.(`[host] could not keep ${file}.bak: ${error?.message ?? error}`);
+      }
+    }
+    const tempFile = writeTempFile(file, body);
+    try {
+      try {
+        renameWithRetry(tempFile, file);
+        return;
+      } catch (error) {
+        logger.warn?.(`[host] rename ${file} failed (${error?.code ?? error?.message}); writing ${file}.next`);
+        const nextTemp = writeTempFile(`${file}.next`, body);
+        renameWithRetry(nextTemp, `${file}.next`);
+      }
+    } finally {
       try {
         unlinkSync(tempFile);
       } catch {
-        /* already gone */
+        /* already renamed/unlinked */
       }
-      throw error;
     }
+  }
+
+  /** Pick the newest valid generation among file, file.next and file.bak. */
+  function readValidGeneration(file, valid) {
+    const candidates = [file, `${file}.next`, `${file}.bak`];
+    const errors = [];
+    let best = null;
+    for (const candidate of candidates) {
+      if (!existsSync(candidate)) continue;
+      try {
+        const parsed = JSON.parse(readFileSync(candidate, "utf8"));
+        if (!valid(parsed)) throw new Error("file has an invalid shape");
+        const mtime = statSync(candidate).mtimeMs;
+        if (!best || mtime > best.mtime) best = { value: parsed, source: candidate, mtime };
+      } catch (error) {
+        errors.push(`${candidate}: ${error?.message ?? error}`);
+      }
+    }
+    if (best) return { ok: true, value: best.value, source: best.source };
+    if (errors.length === 0) return { ok: true, value: null, source: null };
+    return { ok: false, error: new Error(errors.join("; ")) };
   }
 
   // --- crash-recovery bookkeeping (ADR-010 decision 7, F09) ----------------
   function readRecordsStrict() {
     if (!stateFile) return { ok: true, records: [] };
-    try {
-      const parsed = JSON.parse(readFileSync(stateFile, "utf8"));
-      if (!Array.isArray(parsed)) throw new Error("recovery file must be a JSON array");
-      return { ok: true, records: parsed };
-    } catch (error) {
-      if (error?.code === "ENOENT") return { ok: true, records: [] };
-      return { ok: false, error };
-    }
+    const selected = readValidGeneration(stateFile, (parsed) => Array.isArray(parsed));
+    if (!selected.ok) return { ok: false, error: selected.error };
+    return { ok: true, records: selected.value ?? [], source: selected.source };
   }
 
   function readOutboxStrict() {
     if (!outboxFile) return { ok: true, entries: [] };
-    try {
-      const parsed = JSON.parse(readFileSync(outboxFile, "utf8"));
-      if (!parsed || !Array.isArray(parsed.entries)) throw new Error("outbox must be {version:1, entries:[...]}");
-      return { ok: true, entries: parsed.entries };
-    } catch (error) {
-      if (error?.code === "ENOENT") return { ok: true, entries: [] };
-      return { ok: false, error };
-    }
+    const selected = readValidGeneration(outboxFile, (parsed) => Boolean(parsed) && Array.isArray(parsed.entries));
+    if (!selected.ok) return { ok: false, error: selected.error };
+    return { ok: true, entries: selected.value?.entries ?? [], source: selected.source };
   }
 
   function loadInitialFiles() {
@@ -399,6 +487,45 @@ export function createHost({
     }
   }
 
+  /** M6.3 P0-1: register this Host's agents before any heartbeat or claim. */
+  async function registerOnce() {
+    if (configuredAgents.length === 0) {
+      throw new Error("no agents configured (ATK_HOST_AGENTS is empty)");
+    }
+    const response = await client.register({ hostId: resolvedHostId, agents: configuredAgents });
+    const returned = Array.isArray(response?.agents) ? response.agents : [];
+    const ids = returned.map((agent) => agent?.agentId ?? agent?.id).filter((value) => typeof value === "string" && value);
+    if (ids.length === 0) throw new Error("runtime registration returned no agents");
+    resolvedAgentIds = [...new Set(ids)];
+    registered = true;
+    logger.info?.(`[host] registered ${resolvedAgentIds.length} agent(s) as ${resolvedHostId}: ${resolvedAgentIds.join(",")}`);
+    return response;
+  }
+
+  /** M6.3 P0-1: heartbeat is the Scheduler's proof this Host's agents can work. */
+  async function heartbeatOnce() {
+    if (!registered) throw new Error("heartbeat before runtime registration");
+    try {
+      const response = await client.heartbeat({ hostId: resolvedHostId, agentIds: resolvedAgentIds, capacity: resolvedCapacity });
+      heartbeatFailures = 0;
+      // Transition compatibility: an older backend omits `agents`; when present
+      // it is authoritative for local dispatchability.
+      heartbeatAvailable = !Array.isArray(response?.agents) || response.agents.some((agent) => agent?.available === true);
+      if (mode === "HEARTBEAT_LOST") setMode("RUNNING");
+      return response;
+    } catch (error) {
+      heartbeatFailures += 1;
+      stats.errors += 1;
+      logger.error?.(`[host] heartbeat failed (${heartbeatFailures}/2): ${error?.message ?? error}`);
+      if (heartbeatFailures >= 2) {
+        heartbeatAvailable = false;
+        if (mode === "RUNNING" || mode === "FINISHING" || mode === "HEARTBEAT_LOST") setMode("HEARTBEAT_LOST");
+        logger.error?.("[host] HEARTBEAT_LOST: consecutive heartbeat failures; refusing new claims");
+      }
+      throw error;
+    }
+  }
+
   function clearSession(runId) {
     const entry = sessions.get(runId);
     if (!entry) return undefined;
@@ -494,14 +621,23 @@ export function createHost({
     return response;
   }
 
-  function reconcileSaysPersisted(state) {
+  function reconcileSaysPersisted(state, entry) {
+    // M6.3 P0-4: only a command-aware reconcile can clear the Outbox. Until the
+    // backend returns `command`, a terminal Run alone is NOT proof: the original
+    // result may still be missing (the command stays CLAIMED).
     if (!state) return false;
-    // Contract §3: persisted == no pending result, Run terminal, and the command
-    // is not still CLAIMED (otherwise wait for the backend sweep and retry).
     if (state.pendingResult !== undefined && state.pendingResult !== null) return false;
     if (!TERMINAL_RUN_STATUSES.has(state.run?.status)) return false;
-    if (state.command && state.command.status === "CLAIMED") return false;
-    return true;
+    const command = state.command;
+    if (!command || !TERMINAL_COMMAND_STATUSES.has(command.status)) return false;
+    if (command.generation !== entry.generation) return false;
+    const result = command.result ?? {};
+    const eventMatches =
+      typeof entry.eventId === "string" && (result.eventId === entry.eventId || command.eventId === entry.eventId);
+    const keyMatches =
+      typeof entry.idempotencyKey === "string" &&
+      (result.idempotencyKey === entry.idempotencyKey || command.idempotencyKey === entry.idempotencyKey);
+    return eventMatches || keyMatches;
   }
 
   async function attemptOutbox(entry) {
@@ -531,6 +667,7 @@ export function createHost({
         summary: entry.summary,
         ...(entry.error === undefined ? {} : { error: entry.error }),
         idempotencyKey: entry.idempotencyKey,
+        eventId: entry.eventId,
       });
       if (response?.persisted === true) return acknowledgeOutbox(entry, response);
       // A 2xx without persisted:true is not an acknowledgement; keep the fact
@@ -571,7 +708,7 @@ export function createHost({
           reconciled = undefined;
           logger.warn?.(`[host] reconcile after a lost result response failed: ${reconcileError?.message ?? reconcileError}`);
         }
-        if (reconcileSaysPersisted(reconciled)) {
+        if (reconcileSaysPersisted(reconciled, entry)) {
           return acknowledgeOutbox(entry, reconciled);
         }
       }
@@ -608,6 +745,7 @@ export function createHost({
       summary: endedEvent.summary ?? endedEvent.reason,
       ...(status === "FAILED" ? { error: endedEvent.error ?? endedEvent.reason } : {}),
       idempotencyKey: idFactory(),
+      eventId: idFactory(),
       createdAt: isoNow(),
       attempts: 0,
       reconciled: false,
@@ -625,10 +763,23 @@ export function createHost({
     await attemptOutbox(outboxEntry);
   }
 
+  function withEventIdentity(entry, event) {
+    const copy = { ...event };
+    if (typeof copy.eventId !== "string" || copy.eventId === "") copy.eventId = randomUUID();
+    if (!Number.isInteger(copy.sessionSeq)) copy.sessionSeq = entry.nextSeq;
+    if (Number.isInteger(copy.sessionSeq) && copy.sessionSeq >= entry.nextSeq) entry.nextSeq = copy.sessionSeq + 1;
+    else entry.nextSeq += 1;
+    return copy;
+  }
+
+  function pushEvent(entry, event) {
+    entry.buffer.push(withEventIdentity(entry, event));
+  }
+
   function bufferEvent(runId, event) {
     const entry = sessions.get(runId);
     if (!entry || entry.fenced) return;
-    entry.buffer.push(event);
+    pushEvent(entry, event);
     if (event.type === "session.ended" && !entry.ended) {
       entry.ended = true;
       void enqueueTerminal(runId, event);
@@ -639,7 +790,7 @@ export function createHost({
     const { command, run, lease } = claim;
     const runId = run.id;
     stats.claimed += 1;
-    const entry = { command, lease, session: null, unsubscribe: null, buffer: [], timers: [], spec: null, specHash: null };
+    const entry = { command, lease, session: null, unsubscribe: null, buffer: [], timers: [], spec: null, specHash: null, nextSeq: 0 };
     sessions.set(runId, entry);
     const recordAt = isoNow();
     const claimedUntil =
@@ -672,7 +823,7 @@ export function createHost({
     // a durable FAILED fact through the same Outbox as any other terminal fact.
     let prepared;
     try {
-      prepared = prepareExecution(claim);
+      prepared = prepareExecution(claim, { noneWorkspaceAllowed: noneWorkspaceIsAllowed() });
     } catch (error) {
       stats.specRejected += 1;
       await rejectRun(runId, error?.code ?? "workspace-error", String(error?.message ?? error));
@@ -715,12 +866,13 @@ export function createHost({
       taskId: prepared.spec.taskId,
       prompt: buildExecutionPrompt(prepared.spec),
       cwd: prepared.cwd,
+      env: scrubbedRuntimeEnv(),
       ...(typeof constraints.model === "string" ? { model: constraints.model } : {}),
       ...(Number.isInteger(constraints.timeoutMs) ? { timeoutMs: constraints.timeoutMs } : {}),
     };
     const session = await safe("start", () => runtime.start(startInput));
     if (!session) {
-      entry.buffer.push({
+      pushEvent(entry, {
         type: "log",
         sessionId: `failed-start-${command.id}`,
         level: "error",
@@ -738,7 +890,7 @@ export function createHost({
 
     // F05 traceability: the frozen task version and spec hash are part of the
     // run's own event stream, not just the process log.
-    entry.buffer.push({
+    pushEvent(entry, {
       type: "log",
       sessionId: session.sessionId,
       level: "info",
@@ -772,7 +924,7 @@ export function createHost({
     const entry = sessions.get(runId);
     if (!entry) return;
     const sessionId = `rejected-${entry.command.id}`;
-    entry.buffer.push({
+    pushEvent(entry, {
       type: "log",
       sessionId,
       level: "error",
@@ -1003,7 +1155,8 @@ export function createHost({
 
   async function tick() {
     if (stopped) return;
-    if (mode !== "RUNNING" || outboxEntries.length > 0) return;
+    if (bootStarted && !registered) return;
+    if (mode !== "RUNNING" || !heartbeatAvailable || outboxEntries.length > 0) return;
     try {
       const claim = await safe("claim", () => client.claim({ ownerId, leaseMs }));
       if (!claim) return;
@@ -1036,29 +1189,44 @@ export function createHost({
     flushOutbox,
     recover,
     fencedRuns: () => [...fencedRuns],
+    heartbeat: heartbeatOnce,
+    register: registerOnce,
+    heartbeatAvailable: () => heartbeatAvailable,
+    heartbeatFailures: () => heartbeatFailures,
+    hostId: resolvedHostId,
+    agentIds: resolvedAgentIds,
+    capacity: resolvedCapacity,
 
     /** One claim attempt; exposed so tests do not need timers. */
     tick,
 
     start(options = {}) {
       stopped = false;
+      bootStarted = true;
       if (mode === "STOPPED") setMode("RUNNING");
       keepAlive = options?.keepAlive === true;
       void safe("capabilities", async () => {
         capabilities = await runtime.capabilities();
         return capabilities;
       });
-      claimTimer = schedule(() => void tick(), pollMs);
-      heartbeatTimer = schedule(() => {
-        void safe("heartbeat", async () =>
-          client.heartbeat({
-            ownerId,
-            status: sessions.size > 0 ? "BUSY" : mode === "RUNNING" ? "IDLE" : "DEGRADED",
-            ...(capabilities ? { capabilities } : {}),
-            sessions: [...sessions.keys()],
-          }),
-        );
-      }, heartbeatMs);
+      // Registration -> heartbeat -> only then claim. A failed registration is
+      // RECOVERY_REQUIRED; never silently heartbeat/claim with empty agentIds.
+      void (async () => {
+        try {
+          await registerOnce();
+        } catch (error) {
+          setMode("RECOVERY_REQUIRED");
+          logger.error?.(`[host] runtime registration failed; RECOVERY_REQUIRED: ${error?.message ?? error}`);
+          return;
+        }
+        // A first-heartbeat failure is not a registration failure: keep the
+        // periodic heartbeat so two consecutive failures can set HEARTBEAT_LOST.
+        await heartbeatOnce().catch(() => {});
+        claimTimer = schedule(() => void tick(), pollMs);
+        heartbeatTimer = schedule(() => {
+          void heartbeatOnce().catch(() => {});
+        }, heartbeatMs);
+      })();
       return this;
     },
 
@@ -1067,17 +1235,33 @@ export function createHost({
       clearInterval(claimTimer);
       clearInterval(heartbeatTimer);
       for (const entry of outboxEntries) clearRetry(entry);
+      const result = { stopped: [], failed: [], fencingRequired: false };
       for (const runId of [...sessions.keys()]) {
         const entry = sessions.get(runId);
+        const sessionId = entry.session?.sessionId ?? null;
         // After a terminal runtime event the session is already over; calling
         // stop() then would emit a cancelled event and the backend would refuse
         // the illegal COMPLETED -> CANCELLED transition (QA-003 finding).
-        if (!entry.ended) {
-          await safe("stop-session", () => entry.session && runtime.stop(entry.session.sessionId));
+        if (!entry.ended && sessionId) {
+          try {
+            await withTimeout(runtime.stop(sessionId), runtimeStopTimeoutMs, "runtime.stop");
+            result.stopped.push(sessionId);
+            clearSession(runId);
+          } catch (error) {
+            const message = String(error?.message ?? error);
+            result.failed.push({ sessionId, error: message });
+            result.fencingRequired = true;
+            stats.errors += 1;
+            logger.error?.(`[host] stop failed for session ${sessionId}: ${message}; keeping FENCING_REQUIRED`);
+          }
+        } else {
+          if (sessionId) result.stopped.push(sessionId);
+          clearSession(runId);
         }
-        clearSession(runId);
       }
-      setMode("STOPPED");
+      if (result.fencingRequired) setMode("FENCING_REQUIRED");
+      else setMode("STOPPED");
+      return result;
     },
   };
 }

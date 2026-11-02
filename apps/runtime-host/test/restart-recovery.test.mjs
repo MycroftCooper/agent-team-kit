@@ -12,8 +12,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { createMockRuntime } from "@atk/runtime-sdk/mock";
-import { createTaskExecutionSpec } from "../../../packages/contracts/src/execution-spec.mjs";
-import { ensureWorktree, worktreeStatus } from "../../../packages/workspace/src/index.mjs";
+import { createTaskExecutionSpec } from "@atk/contracts";
+import { ensureWorktree, worktreeStatus } from "@atk/workspace";
 import { createHost } from "../src/host.mjs";
 
 const WORKER = fileURLToPath(new URL("./fixtures/restart-worker.mjs", import.meta.url));
