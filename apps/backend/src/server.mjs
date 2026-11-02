@@ -24,6 +24,7 @@ import {
   checkWriteOrigin,
   createSession,
   isLoopbackRemote,
+  isSessionExpired,
   parseHostHeader,
   persistSessionToken,
 } from "./auth.mjs";
@@ -154,7 +155,7 @@ export function createServer({
   }
 
   const startedAt = now();
-  const session = createSession({ now: startedAt, ttlMs: sessionTtlMs, token, csrf });
+  let session = createSession({ now: startedAt, ttlMs: sessionTtlMs, token, csrf });
 
   // ADR-008 §5: internal credential is a separate secret for `/internal/v1/*`.
   // It is minted per process, never persisted, never logged and never returned
@@ -219,6 +220,15 @@ export function createServer({
   }
 
   function sessionPayload() {
+    // A server process outlives its session TTL (8h by default). Without
+    // rotation, reloading the page would hand the browser the SAME expired
+    // token and every request would answer NOT_AUTHORIZED/token-expired until
+    // someone restarted the backend. Mint and persist a fresh session instead.
+    if (isSessionExpired(session, now())) {
+      session = createSession({ now: now(), ttlMs: sessionTtlMs, actor: session.actor });
+      if (shouldPersist && tokenFile) persistSessionToken(session.token, { tokenFile, logger });
+      logger?.info?.(`[atk] session expired; issued a new session (ttl ${sessionTtlMs}ms)`);
+    }
     // The cookie-free bootstrap: exactly the fields m1-contracts §2 publishes.
     return { token: session.token, csrf: session.csrf, actor: session.actor, expiresAt: session.expiresAt };
   }
