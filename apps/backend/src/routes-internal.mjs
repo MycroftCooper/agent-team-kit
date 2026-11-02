@@ -7,7 +7,7 @@
 // browser sees real business events instead of just keep-alives.
 import { ID_RE, ApiError, createEvent, isEnumValue } from "@atk/contracts";
 
-import { normalizeLease } from "./internal.mjs";
+import { normalizeLease, requiredInternalRoles, checkInternalRole, INTERNAL_ROLE_HEADER } from "./internal.mjs";
 import { isPlainObject, parseIntegerParam, queryString, requireJsonBody, sendJson } from "./http.mjs";
 
 /** m2-contracts §2 event mapping: session.ended reason -> terminal Run status. */
@@ -53,11 +53,36 @@ const ROUTES = [
   { name: "runs.reconcile", method: "GET", regex: /^\/internal\/v1\/runs\/([^/]+)\/reconcile$/, keys: ["id"] },
   { name: "scheduling.snapshot", method: "GET", regex: /^\/internal\/v1\/scheduling\/snapshot$/, keys: [] },
   { name: "tasks.claim", method: "POST", regex: /^\/internal\/v1\/tasks\/([^/]+)\/claim$/, keys: ["id"] },
+  { name: "tasks.integration", method: "POST", regex: /^\/internal\/v1\/tasks\/([^/]+)\/integration$/, keys: ["id"] },
   { name: "scheduler.heartbeat", method: "POST", regex: /^\/internal\/v1\/scheduler\/heartbeat$/, keys: [] },
 ];
 
 function validationError(message, errors) {
   return new ApiError("VALIDATION_ERROR", message, { details: { errors } });
+}
+
+/**
+ * Map a store-side batch validation failure (either thrown with details, or the
+ * `{ ok:false, problem }` shape) into a contract 400 naming index/field.
+ */
+function batchValidationError(source) {
+  const raw = source?.details && typeof source.details === "object" ? source.details : source ?? {};
+  const details = raw.problem && typeof raw.problem === "object" ? raw.problem : raw;
+  const message =
+    typeof source?.message === "string" && source.message !== ""
+      ? source.message
+      : typeof details.message === "string" && details.message !== ""
+        ? details.message
+        : "invalid runtime event batch";
+  const errors = Array.isArray(details.errors) ? details.errors : [message];
+  return new ApiError("VALIDATION_ERROR", message, {
+    details: {
+      ...(Number.isInteger(details.index) ? { index: details.index } : {}),
+      ...(typeof details.field === "string" ? { field: details.field } : {}),
+      ...(Array.isArray(details.allowed) ? { allowed: details.allowed } : {}),
+      errors,
+    },
+  });
 }
 
 /** m2-contracts §6.2: the only STALE_GENERATION reasons Backend may emit. */
@@ -116,6 +141,14 @@ function validateRuntimeEvent(event, index) {
     errors.push(`${label}.sessionId must be a non-empty string`);
   }
   if (!isIsoDate(event.at)) errors.push(`${label}.at must be an ISO-8601 timestamp`);
+  // F08: optional Host-generated identity. When present it must be usable;
+  // when absent the event takes the legacy compatibility path (marked later).
+  if (event.eventId !== undefined && (typeof event.eventId !== "string" || event.eventId === "")) {
+    errors.push(`${label}.eventId must be a non-empty string when present`);
+  }
+  if (event.sessionSeq !== undefined && (!Number.isInteger(event.sessionSeq) || event.sessionSeq < 0)) {
+    errors.push(`${label}.sessionSeq must be a non-negative integer when present`);
+  }
   if (event.type === "output") {
     if (!["stdout", "stderr"].includes(event.stream)) errors.push(`${label}.stream must be stdout|stderr`);
     if (typeof event.text !== "string") errors.push(`${label}.text must be a string`);
@@ -177,7 +210,12 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
   const seenEventKeys = new Map();
 
   function dedupeKey(runId, event) {
-    return `${runId}|${event.sessionId}|${event.at}|${event.type}`;
+    // F08: the Host-generated eventId is the identity. The legacy composite is
+    // only the fallback for events produced before ids existed: it collapses
+    // several events emitted inside one millisecond, so it must never be
+    // applied to events that do carry an eventId.
+    if (typeof event.eventId === "string" && event.eventId !== "") return `id:${event.eventId}`;
+    return `legacy:${runId}|${event.sessionId}|${event.at}|${event.type}`;
   }
 
   function rememberEvent(runId, event) {
@@ -230,11 +268,22 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
   }
 
   /**
-   * Translate RuntimeEvents into what the Backend asks the store to do:
-   * - status transitions (store `updateRunStatus` owns the single `run.updated`
-   *   event, always within the same transaction as the status change);
-   * - `run.log` events for output/log (store `appendRunEvent`, fenced batch).
-   *
+   * F08: identity carried onto the persisted event. A host-generated eventId is
+   * stable across retries; events without one are explicitly marked `legacy`
+   * (never silently dropped) and only get the old composite de-duplication.
+   */
+  function eventIdentity(event) {
+    const identity = {};
+    if (typeof event.eventId === "string" && event.eventId !== "") identity.eventId = event.eventId;
+    else identity.legacy = true;
+    if (Number.isInteger(event.sessionSeq)) identity.sessionSeq = event.sessionSeq;
+    return identity;
+  }
+
+  /**
+   * Translate RuntimeEvents into the already-mapped event list the store
+   * commits atomically (m6.1-contracts §4, option A). Runtime semantics stay in
+   * the route: at most one `run.updated` plus any number of `run.log` events.
    * Pure function: it pre-validates the Run state machine so an illegal
    * transition is rejected before any write.
    */
@@ -251,17 +300,27 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
         if (!allowed.includes(targetStatus)) {
           throw validationError("illegal run transition", [`run cannot transition ${status} -> ${targetStatus}`]);
         }
-        const update = { status: targetStatus };
-        if (event.type === "session.ended") {
-          update.exitCode = event.exitCode ?? null;
-          update.endedAt = event.at;
-        }
-        updates.push(update);
+        updates.push({
+          type: "run.updated",
+          at: event.at,
+          payload: {
+            runId,
+            sessionId: event.sessionId,
+            status: targetStatus,
+            ...(event.type === "session.ended" ? { exitCode: event.exitCode ?? null, endedAt: event.at } : {}),
+          },
+          ...eventIdentity(event),
+        });
         status = targetStatus;
         continue;
       }
       if (event.type === "output" || event.type === "log") {
-        logs.push({ type: "run.log", payload: runLogPayload(runId, event) });
+        logs.push({
+          type: "run.log",
+          at: event.at,
+          payload: runLogPayload(runId, event),
+          ...eventIdentity(event),
+        });
       }
       // `state` is observation metadata: no Run transition, no M2 business event.
     }
@@ -599,6 +658,21 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
     if (!route) throw new ApiError("NOT_FOUND", `no internal route for ${method} ${pathname}`);
     const { params } = route;
 
+    // m6.1-contracts §2: every internal endpoint declares the internal Role it
+    // accepts. Missing/wrong role is a 403 with a frozen reason code; an
+    // endpoint without a declaration is denied by default, never silently open.
+    const allowedRoles = requiredInternalRoles(method, pathname);
+    const roleCheck = checkInternalRole(req.headers[INTERNAL_ROLE_HEADER], allowedRoles ?? []);
+    if (!roleCheck.ok) {
+      throw new ApiError("NOT_AUTHORIZED", "internal role is not allowed for this endpoint", {
+        details: {
+          reason: roleCheck.reason,
+          ...(roleCheck.role ? { role: roleCheck.role } : {}),
+          allowed: Array.isArray(roleCheck.allowed) ? roleCheck.allowed : [],
+        },
+      });
+    }
+
     switch (route.name) {
       case "dispatch.claim": {
         // D3 backstop: derive terminal command states from terminal Runs first.
@@ -646,6 +720,14 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
           if (typeof body.error !== "string") throw validationError("invalid dispatch result", ["error must be a string"]);
           result.error = body.error;
         }
+        // F02: the Host echoes its Outbox eventId so a lost response can be
+        // reconciled without guessing which completion this 2xx acknowledged.
+        if (body.eventId !== undefined) {
+          if (typeof body.eventId !== "string" || body.eventId === "") {
+            throw validationError("invalid dispatch result", ["eventId must be a non-empty string when present"]);
+          }
+          result.eventId = body.eventId;
+        }
         let command;
         try {
           command = store.completeDispatchCommand({ id: params.id, ownerId, generation, status: body.status, result });
@@ -661,7 +743,16 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
         } catch {
           run = null;
         }
-        sendJson(res, 200, { command, run });
+        // F02: a 2xx says "the result is durably persisted" so the Host may drop
+        // its Outbox entry. A replay of the same generation is idempotent and
+        // answers the same shape; anything that is not a stale generation is a
+        // 5xx (see toApiError), which keeps the Outbox entry alive for a retry.
+        sendJson(res, 200, {
+          persisted: true,
+          run,
+          command,
+          ...(typeof body.eventId === "string" ? { eventId: body.eventId } : {}),
+        });
         return;
       }
 
@@ -696,68 +787,99 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
         for (const [index, event] of body.events.entries()) errors.push(...validateRuntimeEvent(event, index));
         if (errors.length > 0) throw validationError("invalid runtime events", errors);
 
-        // Dedupe retried batches before planning any write.
+        // Dedupe retried batches before planning any write. eventId is the
+        // identity (F08); the legacy composite is only for events without one,
+        // and only across retries - two legacy events in the same batch are
+        // kept, because the composite cannot tell them apart.
         const uniqueEvents = [];
         let skipped = 0;
+        const batchKeys = new Set();
         for (const event of body.events) {
-          if (seenEventKeys.has(dedupeKey(runId, event))) {
+          const key = dedupeKey(runId, event);
+          if (seenEventKeys.has(key)) {
             skipped += 1;
             continue;
+          }
+          if (key.startsWith("id:")) {
+            if (batchKeys.has(key)) {
+              skipped += 1;
+              continue;
+            }
+            batchKeys.add(key);
           }
           uniqueEvents.push(event);
         }
 
         const runBefore = store.getRun(runId);
 
-        // MINOR-1: an empty batch is still a generation fence. It must go through
-        // the store fence call so a stale pure fence answers 409.
-        if (body.events.length === 0) {
-          try {
-            store.appendRunEvent({ runId, generation, events: [] });
-          } catch (error) {
-            staleFrom(error, { runId, generation });
-          }
-          sendJson(res, 200, { run: runBefore, appended: [], skipped: 0 });
-          return;
-        }
-
+        // Runtime semantics -> already-mapped events (m6.1-contracts §4).
         const plan = planRunEvents(runBefore, runId, uniqueEvents);
+        const batchEvents = [...plan.updates, ...plan.logs];
 
-        // Status changes first: `updateRunStatus(..., { generation })` validates
-        // the lease and writes status + version + the single `run.updated` event
-        // in one store transaction. No read-then-act window.
-        let run = runBefore;
-        if (plan.updates.length > 0) {
-          try {
-            for (const update of plan.updates) {
-              run = store.updateRunStatus(runId, { ...update, generation });
-            }
-          } catch (error) {
-            staleFrom(error, { runId, generation });
-          }
+        if (typeof store.applyRuntimeEventBatch !== "function") {
+          logger?.error?.("[atk] store.applyRuntimeEventBatch is unavailable; refusing a non-atomic runtime event batch");
+          throw new ApiError("INTERNAL_ERROR", "atomic runtime event batch store method is unavailable");
         }
 
-        // Then the log events as one fenced batch (same generation).
-        let appended = [];
-        if (plan.logs.length > 0) {
-          try {
-            appended = store.appendRunEvent({ runId, generation, events: plan.logs });
-          } catch (error) {
-            staleFrom(error, { runId, generation });
+        // One store transaction: status transition, dedupe and event inserts are
+        // all-or-nothing. There is no multi-write fallback, so a batch can never
+        // be half-applied (F03).
+        let result;
+        try {
+          result = store.applyRuntimeEventBatch({
+            runId,
+            generation,
+            events: batchEvents,
+            now: new Date(now()).toISOString(),
+          });
+        } catch (error) {
+          if (error?.code === "STALE_GENERATION") throw normalizeStale(error, { runId, generation });
+          if (error?.code === "VALIDATION_ERROR") throw batchValidationError(error);
+          logger?.error?.(`[atk] runtime event batch failed: ${error?.message ?? error}`);
+          throw new ApiError("INTERNAL_ERROR", "runtime event batch failed");
+        }
+        if (!result || result.ok !== true) {
+          const problem = result?.problem ?? {};
+          if (problem.code === "STALE_GENERATION") {
+            throw staleError({
+              runId,
+              generation,
+              currentGeneration: Number.isInteger(problem.currentGeneration)
+                ? problem.currentGeneration
+                : resolveGenerationAfterFailure(runId, problem),
+              reason: problem.reason,
+            });
           }
+          if (problem.code === "VALIDATION_ERROR") {
+            throw batchValidationError({ message: problem.message, details: problem });
+          }
+          logger?.error?.("[atk] store.applyRuntimeEventBatch failed without a known problem code");
+          throw new ApiError("INTERNAL_ERROR", "runtime event batch failed");
         }
 
         // Remember only successful events, so a fenced-out retry can be retried.
         for (const event of uniqueEvents) rememberEvent(runId, event);
 
-        if (plan.updates.length > 0 || appended.length > 0) {
+        const applied = Array.isArray(result.applied) ? result.applied : [];
+        if (applied.length > 0 || result.stateChanged === true) {
           try {
             hub?.pump?.();
           } catch (error) {
             logger?.error?.(`[atk] SSE pump failed after internal events: ${error?.message ?? error}`);
           }
         }
-        sendJson(res, 200, { run, appended, skipped });
+        const storeSkipped = Number.isInteger(result.skipped) ? result.skipped : 0;
+        const totalSkipped = skipped + storeSkipped;
+        sendJson(res, 200, {
+          run: result.run ?? runBefore,
+          // m6.1-contracts §4 response shape. `appended` is kept as an alias for
+          // the M2 clients/tests that still read the old field name.
+          // TODO(M6.2): remove the `appended` alias once M2 consumers are gone.
+          applied,
+          appended: applied,
+          skipped: totalSkipped,
+          duplicate: Number.isInteger(result.duplicate) ? skipped + result.duplicate : totalSkipped,
+        });
         return;
       }
 
@@ -788,6 +910,10 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
           run: reconciled.run,
           lease: normalizeLease(reconciled.lease),
           sessions: Array.isArray(reconciled.sessions) ? reconciled.sessions : [],
+          // F02 §3: pass a pending result through when the store exposes one, so
+          // a restarted Host can tell "submitted but the response was lost" from
+          // "never submitted". The field stays optional (absent when unknown).
+          ...(reconciled.pendingResult === undefined ? {} : { pendingResult: reconciled.pendingResult }),
         });
         return;
       }
@@ -896,6 +1022,46 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
           logger?.error?.(`[atk] SSE pump failed after claim: ${error?.message ?? error}`);
         }
         sendJson(res, 200, result);
+        return;
+      }
+
+      case "tasks.integration": {
+        // m6.1-contracts §1: the only legal INTEGRATING -> AWAITING_ACCEPTANCE
+        // entry. Role is already enforced (scheduler | user-action) above.
+        const taskId = params.id;
+        const body = requireObject(await requireJsonBody(req), "integration record");
+        requireId(body.taskId, "taskId");
+        if (body.taskId !== taskId) {
+          throw validationError("invalid integration record", ["taskId must match the task id in the path"]);
+        }
+        const runId = requireId(body.runId, "runId");
+        if (typeof body.commitSha !== "string" || body.commitSha.trim() === "") {
+          throw validationError("invalid integration record", ["commitSha must be a non-empty string"]);
+        }
+        if (typeof body.manifestHash !== "string" || body.manifestHash.trim() === "") {
+          throw validationError("invalid integration record", ["manifestHash must be a non-empty string"]);
+        }
+        if (typeof store.recordIntegration !== "function") {
+          logger?.error?.("[atk] store.recordIntegration is unavailable; refusing to record an integration");
+          throw new ApiError("INTERNAL_ERROR", "recordIntegration store method is unavailable");
+        }
+        const recorded = store.recordIntegration({
+          taskId,
+          runId,
+          commitSha: body.commitSha,
+          manifestHash: body.manifestHash,
+          actor: roleCheck.role,
+        });
+        if (!isPlainObject(recorded) || !isPlainObject(recorded.integration) || !isPlainObject(recorded.task)) {
+          logger?.error?.("[atk] store.recordIntegration returned an incomplete result");
+          throw new ApiError("INTERNAL_ERROR", "integration record returned an incomplete result");
+        }
+        try {
+          hub?.pump?.();
+        } catch (error) {
+          logger?.error?.(`[atk] SSE pump failed after integration record: ${error?.message ?? error}`);
+        }
+        sendJson(res, 200, { integration: recorded.integration, task: recorded.task });
         return;
       }
 

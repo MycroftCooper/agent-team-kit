@@ -34,11 +34,12 @@ async function withServer(t, store = seededStore()) {
   return ctx;
 }
 
-function assertInvalid(res, fieldPattern) {
+function assertInvalid(res, fieldPattern, expectedField) {
   assert.equal(res.status, 400, res.text);
   assert.equal(validateErrorBody(res.json).ok, true);
   assert.equal(res.json.error.code, "VALIDATION_ERROR");
   assert.match(JSON.stringify(res.json.error.details), fieldPattern);
+  if (expectedField !== undefined) assert.equal(res.json.error.details.field, expectedField, res.text);
 }
 
 test("GET /events filters by aggregateId, aggregateType and type", async (t) => {
@@ -174,12 +175,12 @@ test("GET /events never loses a seq when the last page is short (QA-007)", async
 test("GET /events validates every filter with a field-naming 400", async (t) => {
   const ctx = await withServer(t);
   const read = readHeaders();
-  assertInvalid(await request(ctx.base, { path: "/api/v1/events?aggregateId=not%20an%20id", headers: read }), /aggregateId/);
-  assertInvalid(await request(ctx.base, { path: "/api/v1/events?aggregateType=", headers: read }), /aggregateType/);
-  assertInvalid(await request(ctx.base, { path: "/api/v1/events?type=NOPE", headers: read }), /type/);
-  assertInvalid(await request(ctx.base, { path: "/api/v1/events?limit=0", headers: read }), /limit/);
-  assertInvalid(await request(ctx.base, { path: "/api/v1/events?limit=1001", headers: read }), /limit/);
-  assertInvalid(await request(ctx.base, { path: "/api/v1/events?afterSeq=-1", headers: read }), /afterSeq/);
+  assertInvalid(await request(ctx.base, { path: "/api/v1/events?aggregateId=not%20an%20id", headers: read }), /aggregateId/, "aggregateId");
+  assertInvalid(await request(ctx.base, { path: "/api/v1/events?aggregateType=", headers: read }), /aggregateType/, "aggregateType");
+  assertInvalid(await request(ctx.base, { path: "/api/v1/events?type=NOPE", headers: read }), /type/, "type");
+  assertInvalid(await request(ctx.base, { path: "/api/v1/events?limit=0", headers: read }), /limit/, "limit");
+  assertInvalid(await request(ctx.base, { path: "/api/v1/events?limit=1001", headers: read }), /limit/, "limit");
+  assertInvalid(await request(ctx.base, { path: "/api/v1/events?afterSeq=-1", headers: read }), /afterSeq/, "afterSeq");
 });
 
 test("GET /system/health exposes switchReadiness and omits it for old stores", async (t) => {

@@ -10,6 +10,7 @@ import { createFakeStore } from "./fake-store.mjs";
 import {
   TEST_TOKEN,
   closeSse,
+  internalHeaders,
   openSse,
   readHeaders,
   request,
@@ -38,7 +39,7 @@ function baseTask(overrides = {}) {
   };
 }
 
-function createStore({ taskOverrides = {}, tasks = [], runs = [] } = {}) {
+function createStore({ taskOverrides = {}, tasks = [], runs = [], reviews = [] } = {}) {
   return createFakeStore({
     projects: [{ id: "P-1", name: "Demo", repoPath: "C:\\repo", defaultBranch: "main" }],
     tasks: [
@@ -49,6 +50,7 @@ function createStore({ taskOverrides = {}, tasks = [], runs = [] } = {}) {
       { id: "RUN-1", taskId: "TASK-1", agentId: "agent-1", function: "WORKER", status: "COMPLETED", attempt: 1 },
       ...runs,
     ],
+    reviews,
   });
 }
 
@@ -100,6 +102,16 @@ function submitReview(ctx, reviewId, body) {
   });
 }
 
+/** AGENT assignments are submitted with the runtime-host internal credential. */
+function submitInternal(ctx, reviewId, body) {
+  return request(ctx.base, {
+    method: "POST",
+    path: `/api/v1/reviews/${reviewId}/submit`,
+    headers: internalHeaders(undefined, "runtime-host"),
+    body,
+  });
+}
+
 test("POST /reviews creates a PENDING review, emits review.requested and lists with filters", async (t) => {
   const ctx = await withServer(t);
   const res = await createReview(ctx);
@@ -108,7 +120,7 @@ test("POST /reviews creates a PENDING review, emits review.requested and lists w
   assert.equal(res.json.verdict, null);
   assert.equal(res.json.taskId, "TASK-1");
   assert.equal(res.json.runId, "RUN-1");
-  assert.equal(res.json.actor, "agent-2");
+  assert.equal(res.json.actor, "HUMAN"); // body.actor is ignored (m6.1 F06)
   assert.equal(res.json.version, 0);
   assert.equal(res.json.attempt, 1);
 
@@ -118,7 +130,10 @@ test("POST /reviews creates a PENDING review, emits review.requested and lists w
   const byTask = await request(ctx.base, { path: "/api/v1/reviews?taskId=TASK-1", headers: readHeaders() });
   assert.equal(byTask.status, 200);
   assert.equal(byTask.json.items.length, 1);
-  assert.equal(byTask.json.total, 1);
+  assert.equal(byTask.json.hasMore, false);
+  assert.equal(byTask.json.total, undefined, "total is omitted unless withTotal=1");
+  const byTaskWithTotal = await request(ctx.base, { path: "/api/v1/reviews?taskId=TASK-1&withTotal=1", headers: readHeaders() });
+  assert.equal(byTaskWithTotal.json.total, 1);
   const byStatus = await request(ctx.base, { path: "/api/v1/reviews?status=PENDING", headers: readHeaders() });
   assert.equal(byStatus.json.items.length, 1);
   const limited = await request(ctx.base, { path: "/api/v1/reviews?limit=1", headers: readHeaders() });
@@ -127,7 +142,7 @@ test("POST /reviews creates a PENDING review, emits review.requested and lists w
   assertErrorEnvelope(await request(ctx.base, { path: "/api/v1/reviews?limit=0", headers: readHeaders() }), "VALIDATION_ERROR", 400);
 });
 
-test("POST /reviews contract-layer negatives: non-REVIEWING task, foreign run, duplicate active review, missing actor", async (t) => {
+test("POST /reviews contract-layer negatives: non-REVIEWING task, foreign run, duplicate active review", async (t) => {
   const readyCtx = await withServer(t, { taskOverrides: { status: "READY" } });
   const notReviewing = await createReview(readyCtx);
   assertErrorEnvelope(notReviewing, "TASK_VERSION_CONFLICT", 409);
@@ -147,9 +162,6 @@ test("POST /reviews contract-layer negatives: non-REVIEWING task, foreign run, d
   const duplicate = await createReview(ctx);
   assertErrorEnvelope(duplicate, "VERSION_CONFLICT", 409);
   assert.equal(duplicate.json.error.details.activeReviewId, first.json.id);
-
-  const missingActor = await createReview(ctx, { actor: undefined });
-  assertErrorEnvelope(missingActor, "VALIDATION_ERROR", 400);
 
   assertErrorEnvelope(
     await request(ctx.base, { method: "POST", path: "/api/v1/reviews", headers: write(ctx.base), body: { taskId: "TASK-NOPE", actor: "agent-2" } }),
@@ -183,63 +195,77 @@ test("submit PASS persists Review PASS + Task INTEGRATING and appends events", a
   assert.ok(types.includes("task.updated"));
 });
 
-test("self-review is 403 SELF_REVIEW_FORBIDDEN and leaves Review/Task unchanged", async (t) => {
-  // Variant 1: actor is the Run's agent.
-  const runCtx = await withServer(t);
-  const review = (await createReview(runCtx)).json;
-  const byRunAgent = await submitReview(runCtx, review.id, submitBody({ actor: "agent-1" }));
-  assertErrorEnvelope(byRunAgent, "SELF_REVIEW_FORBIDDEN", 403);
-  assert.deepEqual(byRunAgent.json.error.details, { actor: "agent-1", authorAgentId: "agent-1" });
-  const afterRun = await request(runCtx.base, { path: `/api/v1/reviews?taskId=TASK-1`, headers: readHeaders() });
-  assert.equal(afterRun.json.items[0].status, "PENDING");
-  assert.equal((await request(runCtx.base, { path: "/api/v1/tasks/TASK-1", headers: readHeaders() })).json.status, "REVIEWING");
-
-  // Variant 2: actor is the Task assignee (no matching Run agent).
-  const assigneeCtx = await withServer(t, {
-    taskOverrides: { assignee: "agent-3" },
-    runs: [{ id: "RUN-3", taskId: "TASK-1", agentId: "agent-9", function: "WORKER", status: "COMPLETED", attempt: 1 }],
+test("self-review is decided by the trusted review assignment, not body.actor", async (t) => {
+  const store = createStore({
+    reviews: [
+      {
+        id: "REV-SELF",
+        taskId: "TASK-1",
+        runId: "RUN-1",
+        status: "PENDING",
+        verdict: null,
+        version: 0,
+        attempt: 1,
+        findings: [],
+        assignedTo: "AGENT",
+        reviewerAgentId: "agent-1", // same as the reviewed Run's author
+      },
+    ],
   });
-  const review2 = (await createReview(assigneeCtx)).json;
-  const byAssignee = await submitReview(assigneeCtx, review2.id, submitBody({ actor: "agent-3" }));
-  assertErrorEnvelope(byAssignee, "SELF_REVIEW_FORBIDDEN", 403);
-  assert.equal(byAssignee.json.error.details.actor, "agent-3");
-  assert.equal(byAssignee.json.error.details.authorAgentId, "agent-3");
+  const ctx = await withServer(t, { store });
+  // body.actor is irrelevant; the assignment says the author is the reviewer.
+  const res = await submitInternal(ctx, "REV-SELF", submitBody({ actor: "agent-2", runId: "RUN-1" }));
+  assertErrorEnvelope(res, "SELF_REVIEW_FORBIDDEN", 403);
+  assert.equal(res.json.error.details.reviewerAgentId, "agent-1");
+  assert.equal(res.json.error.details.authorAgentId, "agent-1");
+  const after = await request(ctx.base, { path: "/api/v1/reviews?taskId=TASK-1", headers: readHeaders() });
+  assert.equal(after.json.items[0].status, "PENDING");
+  assert.equal((await request(ctx.base, { path: "/api/v1/tasks/TASK-1", headers: readHeaders() })).json.status, "REVIEWING");
 });
 
-test("self-review cannot be bypassed with whitespace/case actor variants", async (t) => {
-  const ctx = await withServer(t);
-  const review = (await createReview(ctx)).json;
-  const variants = [
-    ["canonical self", "agent-1", 403, "SELF_REVIEW_FORBIDDEN"],
-    ["leading space", " agent-1", 400, "VALIDATION_ERROR"],
-    ["trailing space", "agent-1 ", 400, "VALIDATION_ERROR"],
-    ["uppercase", "AGENT-1", 403, "SELF_REVIEW_FORBIDDEN"],
-    ["mixed case + spaces", " Agent-1 ", 400, "VALIDATION_ERROR"],
-  ];
-  for (const [label, actor, expectedStatus, expectedCode] of variants) {
-    const res = await submitReview(ctx, review.id, submitBody({ actor }));
-    assert.equal(res.status, expectedStatus, `${label}: ${res.text}`);
-    assert.equal(res.json.error.code, expectedCode, label);
-    if (expectedStatus === 400) {
-      assert.equal(res.json.error.details.reason, "actor-not-normalized", label);
-      assert.equal(res.json.error.details.actor, actor, label);
-    } else {
-      assert.equal(res.json.error.details.actor, actor, label);
-      assert.equal(res.json.error.details.authorAgentId, "agent-1", label);
-    }
+test("assignment comparison is canonical (case/space) and a legitimate reviewer passes", async (t) => {
+  for (const reviewerAgentId of ["AGENT-1", " agent-1", "agent-1 "]) {
+    const store = createStore({
+      reviews: [
+        {
+          id: "REV-SELF",
+          taskId: "TASK-1",
+          runId: "RUN-1",
+          status: "PENDING",
+          verdict: null,
+          version: 0,
+          attempt: 1,
+          findings: [],
+          assignedTo: "AGENT",
+          reviewerAgentId,
+        },
+      ],
+    });
+    const ctx = await withServer(t, { store });
+    const res = await submitInternal(ctx, "REV-SELF", submitBody({ runId: "RUN-1" }));
+    assertErrorEnvelope(res, "SELF_REVIEW_FORBIDDEN", 403);
+    assert.equal(res.json.error.details.reviewerAgentId, reviewerAgentId);
   }
 
-  // Zero writes from every rejected variant.
-  const reviews = await request(ctx.base, { path: "/api/v1/reviews?taskId=TASK-1", headers: readHeaders() });
-  assert.equal(reviews.json.items[0].status, "PENDING");
-  assert.equal(reviews.json.items[0].version, 0);
-  assert.equal((await request(ctx.base, { path: "/api/v1/tasks/TASK-1", headers: readHeaders() })).json.status, "REVIEWING");
-  const events = await request(ctx.base, { path: "/api/v1/events?afterSeq=0", headers: readHeaders() });
-  assert.equal(events.json.items.some((event) => event.type === "review.updated"), false);
-
-  // A differently-cased legitimate reviewer is still accepted (and canonicalized
-  // only for comparison; the stored actor is the declared value).
-  const legal = await submitReview(ctx, review.id, submitBody({ actor: "AGENT-2" }));
+  const store = createStore({
+    runs: [{ id: "RUN-2", taskId: "TASK-1", agentId: "agent-2", function: "REVIEWER", status: "RUNNING", attempt: 2 }],
+    reviews: [
+      {
+        id: "REV-OK",
+        taskId: "TASK-1",
+        runId: "RUN-1",
+        status: "PENDING",
+        verdict: null,
+        version: 0,
+        attempt: 1,
+        findings: [],
+        assignedTo: "AGENT",
+        reviewerAgentId: "agent-2",
+      },
+    ],
+  });
+  const ctx = await withServer(t, { store });
+  const legal = await submitInternal(ctx, "REV-OK", submitBody({ actor: "forged", runId: "RUN-2" }));
   assert.equal(legal.status, 200, legal.text);
   assert.equal(legal.json.review.status, "PASS");
   assert.equal(legal.json.task.status, "INTEGRATING");
@@ -533,7 +559,8 @@ test("decide APPROVED with the correct hash is the only DONE entrance", async (t
     body: { expectedVersion: 0, changes: { status: "DONE" } },
   });
   assertErrorEnvelope(direct, "TASK_VERSION_CONFLICT", 409);
-  assert.equal(direct.json.error.details.reason, "human-approval-required");
+  assert.equal(direct.json.error.details.reason, "execution-state-guard");
+  assert.equal(direct.json.error.details.requestedStatus, "DONE");
 });
 
 test("decide rejects stale Task target hash and REJECTED returns the Task to READY", async (t) => {

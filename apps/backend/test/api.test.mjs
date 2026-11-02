@@ -369,7 +369,7 @@ test("known store error codes pass through unchanged (409 TASK_DEPENDENCY_BLOCKE
     method: "PATCH",
     path: `/api/v1/tasks/${task.id}`,
     headers: write,
-    body: { expectedVersion: 0, changes: { status: "RUNNING" } },
+    body: { expectedVersion: 0, changes: { status: "BLOCKED" } },
   });
   assertErrorEnvelope(res, "TASK_DEPENDENCY_BLOCKED", 409);
   assert.deepEqual(res.json.error.details.blockedBy, ["TASK-1"]);

@@ -37,7 +37,13 @@ import {
   sendJson,
   toApiError,
 } from "./http.mjs";
-import { INTERNAL_TOKEN_HEADER, checkInternalToken, createInternalToken } from "./internal.mjs";
+import {
+  INTERNAL_ROLE_HEADER,
+  INTERNAL_TOKEN_HEADER,
+  checkInternalRole,
+  checkInternalToken,
+  createInternalToken,
+} from "./internal.mjs";
 import { createInternalRouter } from "./routes-internal.mjs";
 import { createSseHub } from "./sse.mjs";
 import { createStaticHandler } from "./static.mjs";
@@ -237,6 +243,11 @@ export function createServer({
     return new ApiError("VALIDATION_ERROR", message, { details: { errors } });
   }
 
+  /** Validation errors that name the offending field (m6.1 F12). */
+  function fieldValidationError(field, message) {
+    return new ApiError("VALIDATION_ERROR", message, { details: { field, errors: [message] } });
+  }
+
   function requireBodyObject(body, label) {
     if (!isPlainObject(body)) throw validationError(`${label} must be a JSON object`, [`${label} must be an object`]);
     return body;
@@ -244,6 +255,36 @@ export function createServer({
 
   function listPayload(items) {
     return { items: Array.isArray(items) ? items : [] };
+  }
+
+  // --- m6.1 F01: generic PATCH may only touch non-execution states ----------
+  const EXECUTION_TARGET_STATES = new Set(["CLAIMED", "RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE", "DONE"]);
+  const GENERIC_PATCH_TARGETS = ["READY", "BLOCKED", "CANCELLED"];
+
+  function executionStateGuardError(taskId, requestedStatus) {
+    return new ApiError("TASK_VERSION_CONFLICT", `status "${requestedStatus}" can only be reached through its dedicated service`, {
+      details: {
+        taskId,
+        requestedStatus,
+        reason: "execution-state-guard",
+        allowedTransitions: [...GENERIC_PATCH_TARGETS],
+      },
+    });
+  }
+
+  function assertGenericTaskStatusAllowed(task, requestedStatus) {
+    if (requestedStatus === undefined) return;
+    if (requestedStatus === task.status) return; // no-op (idempotent)
+    if (EXECUTION_TARGET_STATES.has(requestedStatus)) throw executionStateGuardError(task.id, requestedStatus);
+    if (requestedStatus === "READY") {
+      if (!["DRAFT", "REJECTED", "BLOCKED"].includes(task.status)) throw executionStateGuardError(task.id, requestedStatus);
+      return;
+    }
+    if (requestedStatus === "BLOCKED" || requestedStatus === "CANCELLED") {
+      if (["DONE", "CANCELLED"].includes(task.status)) throw executionStateGuardError(task.id, requestedStatus);
+      return;
+    }
+    throw executionStateGuardError(task.id, requestedStatus);
   }
 
   // --- M4 contract-layer helpers (never delegated to the store for codes) ---
@@ -380,22 +421,63 @@ export function createServer({
     }
   }
 
+  function encodeReviewCursor(review) {
+    return Buffer.from(`${review.createdAt ?? ""}|${review.id}`, "utf8").toString("base64url");
+  }
+
+  function decodeReviewCursor(cursor) {
+    if (typeof cursor !== "string" || cursor.trim() === "") return null;
+    let raw;
+    try {
+      raw = Buffer.from(cursor, "base64url").toString("utf8");
+    } catch {
+      return null;
+    }
+    const at = raw.indexOf("|");
+    if (at < 0) return null;
+    const createdAt = raw.slice(0, at);
+    const id = raw.slice(at + 1);
+    if (id === "" || Number.isNaN(Date.parse(createdAt))) return null;
+    return { createdAt, id };
+  }
+
+  function compareReviewsDesc(a, b) {
+    const at = String(a.createdAt ?? "");
+    const bt = String(b.createdAt ?? "");
+    if (at !== bt) return at < bt ? 1 : -1;
+    return String(a.id) < String(b.id) ? 1 : -1;
+  }
+
+  function isAfterReviewCursor(review, cursor) {
+    const createdAt = String(review.createdAt ?? "");
+    if (createdAt !== cursor.createdAt) return createdAt < cursor.createdAt;
+    return String(review.id) < cursor.id;
+  }
+
   function reviewFilterFrom(searchParams) {
     const filter = {};
     const taskId = queryString(searchParams, "taskId");
     if (taskId !== undefined) {
-      if (taskId.trim() === "" || !ID_RE.test(taskId)) throw validationError("invalid review filter", ["taskId must be an id string"]);
+      if (taskId.trim() === "" || !ID_RE.test(taskId)) {
+        throw fieldValidationError("taskId", "taskId must be an id string");
+      }
       filter.taskId = taskId;
     }
     const status = queryString(searchParams, "status");
     if (status !== undefined) {
-      if (!M4_REVIEW_STATUSES.has(status)) {
-        throw validationError("invalid review filter", ["status must be a known review status"]);
-      }
+      if (!M4_REVIEW_STATUSES.has(status)) throw fieldValidationError("status", "status must be a known review status");
       filter.status = status;
     }
-    const limit = parseIntegerParam(searchParams, "limit", { min: 1, max: 100 });
-    if (limit !== undefined) filter.limit = limit;
+    const limit = parseIntegerParam(searchParams, "limit", { min: 1, max: 100, fallback: 50 });
+    filter.limit = limit;
+    const cursor = queryString(searchParams, "cursor");
+    if (cursor !== undefined) {
+      const decoded = decodeReviewCursor(cursor);
+      if (decoded === null) throw fieldValidationError("cursor", "cursor is not a valid review cursor");
+      filter.cursor = cursor;
+      filter.cursorValue = decoded;
+    }
+    filter.withTotal = queryString(searchParams, "withTotal") === "1";
     return filter;
   }
 
@@ -528,11 +610,19 @@ export function createServer({
           : Object.fromEntries(Object.entries(body).filter(([key]) => key !== "expectedVersion"));
         const errors = validateTaskChanges(changes);
         if (errors.length > 0) throw validationError("invalid task changes", errors);
-        // §0.5: DONE has exactly one entrance — an APPROVED human acceptance.
-        if (changes.status === "DONE") {
-          throw new ApiError("TASK_VERSION_CONFLICT", "DONE can only be reached through human approval", {
-            details: { taskId: params.id, reason: "human-approval-required", requestedStatus: "DONE" },
-          });
+        const currentTask = store.getTask(params.id); // 404 NOT_FOUND
+        // m6.1 F01: generic PATCH cannot advance execution states; those have
+        // dedicated services (claim / runtime events / review / integration /
+        // approval). Same-status is an idempotent no-op.
+        assertGenericTaskStatusAllowed(currentTask, changes.status);
+        if (changes.status === currentTask.status && Object.keys(changes).length === 1) {
+          if (currentTask.version !== body.expectedVersion) {
+            throw new ApiError("VERSION_CONFLICT", `task "${currentTask.id}" version conflict`, {
+              details: { entity: "task", id: currentTask.id, currentVersion: currentTask.version, expectedVersion: body.expectedVersion },
+            });
+          }
+          sendJson(res, 200, currentTask);
+          return;
         }
         sendJson(res, 200, store.patchTask(params.id, { expectedVersion: body.expectedVersion, changes }));
         return;
@@ -560,36 +650,94 @@ export function createServer({
         return;
       }
       case "reviews.list": {
+        // m6.1 §6: filter FIRST, then keyset-paginate. The store owns the page
+        // when it exposes listReviewsPage; the fallback keeps the same shape for
+        // older stores/tests (never truncate before filtering).
         const filter = reviewFilterFrom(url.searchParams);
-        // Filter statuses in the Backend: M4 adds CHANGES_REQUESTED/BLOCKED while
-        // the store's enum filter only knows the M1 set.
-        const { status, limit, ...storeFilter } = filter;
-        storeFilter.limit = limit ?? 100;
-        let items = store.listReviews(storeFilter);
-        items = Array.isArray(items) ? items : [];
-        if (status !== undefined) items = items.filter((review) => review.status === status);
-        if (limit !== undefined) items = items.slice(0, limit);
-        sendJson(res, 200, { items, total: items.length });
+        let items;
+        let hasMore;
+        let nextCursor;
+        let total;
+        if (typeof store.listReviewsPage === "function") {
+          const page = store.listReviewsPage({
+            taskId: filter.taskId,
+            status: filter.status,
+            limit: filter.limit,
+            cursor: filter.cursor,
+          });
+          items = page && Array.isArray(page.items) ? page.items : [];
+          hasMore = Boolean(page?.hasMore);
+          nextCursor = typeof page?.nextCursor === "string" ? page.nextCursor : undefined;
+          if (Number.isInteger(page?.total)) total = page.total;
+          // Store pages do not carry a count; withTotal=1 walks the filter only
+          // when the caller explicitly accepts that cost.
+          if (filter.withTotal && !Number.isInteger(total)) {
+            let count = 0;
+            let scanCursor;
+            for (let guard = 0; guard < 10_000; guard += 1) {
+              const scanned = store.listReviewsPage({
+                taskId: filter.taskId,
+                status: filter.status,
+                limit: 100,
+                cursor: scanCursor,
+              });
+              const scannedItems = Array.isArray(scanned?.items) ? scanned.items : [];
+              count += scannedItems.length;
+              if (!scanned?.hasMore || typeof scanned.nextCursor !== "string" || scannedItems.length === 0) break;
+              scanCursor = scanned.nextCursor;
+            }
+            total = count;
+          }
+        } else {
+          let rows = store.listReviews(filter.taskId ? { taskId: filter.taskId } : {});
+          rows = Array.isArray(rows) ? rows : [];
+          if (filter.status !== undefined) rows = rows.filter((review) => review.status === filter.status);
+          rows.sort(compareReviewsDesc);
+          const filteredTotal = rows.length;
+          if (filter.cursorValue !== undefined) rows = rows.filter((review) => isAfterReviewCursor(review, filter.cursorValue));
+          hasMore = rows.length > filter.limit;
+          items = rows.slice(0, filter.limit);
+          if (hasMore && items.length > 0) nextCursor = encodeReviewCursor(items[items.length - 1]);
+          total = filteredTotal;
+        }
+        const body = { items, hasMore };
+        if (nextCursor !== undefined) body.nextCursor = nextCursor;
+        if (filter.withTotal && Number.isInteger(total)) body.total = total;
+        sendJson(res, 200, body);
         return;
       }
       case "reviews.create": {
         const body = requireBodyObject(await requireJsonBody(req), "review");
         if (typeof body.taskId !== "string" || !ID_RE.test(body.taskId)) {
-          throw validationError("invalid review", ["taskId must be an id string"]);
+          throw fieldValidationError("taskId", "taskId must be an id string");
         }
-        const actor = actorFrom(body, { required: true });
+        // m6.1 §2: body.actor is ignored. Reviewer identity is an explicit
+        // assignment created by a trusted human/scheduler action.
+        const assignedTo = body.assignedTo === undefined ? "HUMAN" : body.assignedTo;
+        if (assignedTo !== "AGENT" && assignedTo !== "HUMAN") {
+          throw fieldValidationError("assignedTo", 'assignedTo must be "AGENT" or "HUMAN"');
+        }
+        let reviewerAgentId = null;
+        if (body.reviewerAgentId !== undefined) {
+          if (typeof body.reviewerAgentId !== "string" || !ID_RE.test(body.reviewerAgentId)) {
+            throw fieldValidationError("reviewerAgentId", "reviewerAgentId must be an agent id string");
+          }
+          reviewerAgentId = body.reviewerAgentId;
+        }
+        if (assignedTo === "AGENT" && reviewerAgentId === null) {
+          throw fieldValidationError("reviewerAgentId", "an AGENT review requires reviewerAgentId");
+        }
         let runId = null;
         if (body.runId !== undefined) {
           if (typeof body.runId !== "string" || !ID_RE.test(body.runId)) {
-            throw validationError("invalid review", ["runId must be an id string when provided"]);
+            throw fieldValidationError("runId", "runId must be an id string when provided");
           }
           runId = body.runId;
         }
         const task = store.getTask(body.taskId); // 404 NOT_FOUND
-        if (task.status !== "REVIEWING") throw taskStateConflict(task, "not-reviewing");
         if (runId !== null) {
           const run = store.getRun(runId); // 404 NOT_FOUND
-          if (run.taskId !== task.id) throw validationError("invalid review", ["runId does not belong to the task"]);
+          if (run.taskId !== task.id) throw fieldValidationError("runId", "runId does not belong to the task");
         }
         // §1: one active Review per Task (contract-layer, not store-dependent).
         const active = (store.listReviews({ taskId: task.id }) ?? []).find(
@@ -600,7 +748,42 @@ export function createServer({
             details: { entity: "review", taskId: task.id, activeReviewId: active.id, currentVersion: active.version ?? 0 },
           });
         }
-        const review = store.createReview({ taskId: task.id, runId, actor });
+        // The M6.1 store method binds the assignment + COMPLETED-Run precondition
+        // + REVIEWING transition in one transaction. Older stores cannot do that:
+        // refuse a trusted assignment instead of silently creating an unbound one.
+        const trustedAssignments = typeof store.listReviewsPage === "function" || typeof store.createReviewWithTransition === "function";
+        let review;
+        if (trustedAssignments) {
+          const runs = Array.isArray(store.listRuns({ taskId: task.id })) ? store.listRuns({ taskId: task.id }) : [];
+          const completed = runId !== null
+            ? runs.some((run) => run.id === runId && run.status === "COMPLETED") || store.getRun(runId)?.status === "COMPLETED"
+            : runs.some((run) => run.status === "COMPLETED");
+          if (!completed) {
+            throw new ApiError("TASK_VERSION_CONFLICT", `task "${task.id}" has no COMPLETED Run to review`, {
+              details: { taskId: task.id, reason: "completed-run-required", runId },
+            });
+          }
+          const payload = {
+            taskId: task.id,
+            runId,
+            reviewerAgentId,
+            assignedTo,
+            createdByRole: "user-action",
+            actor: assignedTo === "AGENT" ? reviewerAgentId : "HUMAN",
+          };
+          review = typeof store.createReviewWithTransition === "function"
+            ? store.createReviewWithTransition(payload)
+            : store.createReview(payload);
+        } else {
+          // Legacy store: preserve the M4 contract (task already REVIEWING).
+          if (task.status !== "REVIEWING") throw taskStateConflict(task, "not-reviewing");
+          if (assignedTo === "AGENT" || reviewerAgentId !== null) {
+            throw new ApiError("INTERNAL_ERROR", "this store build cannot bind trusted review assignments yet", {
+              details: { reason: "review-assignment-unsupported" },
+            });
+          }
+          review = store.createReview({ taskId: task.id, runId, actor: "HUMAN" });
+        }
         pumpSse();
         sendJson(res, 201, review);
         return;
@@ -614,13 +797,80 @@ export function createServer({
         if (!M4_VERDICTS.has(body.verdict)) {
           throw validationError("invalid review submission", ["verdict must be PASS, CHANGES_REQUESTED or BLOCKED"]);
         }
-        const actor = actorFrom(body);
         const review = getReviewOrThrow(params.id); // 404 NOT_FOUND
         if (review.status !== "PENDING") throw reviewStateConflict(review, "not-pending");
         if (review.version !== expectedVersion) throw reviewCasConflict(review, expectedVersion);
         const task = store.getTask(review.taskId); // 404 NOT_FOUND
         if (task.status !== "REVIEWING") throw taskStateConflict(task, "not-reviewing");
-        assertNotSelfReview(review, task, actor);
+
+        // m6.1 §2 F06: the caller identity is trusted, the body.actor is NOT.
+        // - browser session → only HUMAN assignments (actor is server-filled);
+        // - internal credential → only runtime-host, only AGENT assignments;
+        // - reviewer identity comes from the review assignment, never the body.
+        const principal = req.atkPrincipal ?? { kind: "session", role: "user-action" };
+        const assignedTo = review.assignedTo === "AGENT" ? "AGENT" : "HUMAN";
+        const reviewerAgentId = typeof review.reviewerAgentId === "string" && review.reviewerAgentId !== "" ? review.reviewerAgentId : null;
+        let submitActor = "HUMAN";
+        if (assignedTo === "AGENT") {
+          if (principal.kind !== "internal") {
+            throw new ApiError("NOT_AUTHORIZED", "agent reviews must be submitted with the runtime-host internal credential", {
+              details: { reason: "review-requires-runtime-host", reviewId: review.id, assignedTo },
+            });
+          }
+          if (reviewerAgentId === null) {
+            throw new ApiError("NOT_AUTHORIZED", "review has no trusted reviewer assignment", {
+              details: { reason: "review-assignment-required", reviewId: review.id, taskId: review.taskId },
+            });
+          }
+          // The trusted execution subject proves itself with its own Run: the
+          // optional body.runId must belong to this Task AND be run by the
+          // assigned reviewer. A forged/missing Run is a self-review attempt.
+          const presentedRunId = typeof body.runId === "string" && ID_RE.test(body.runId) ? body.runId : null;
+          let reviewerRun = null;
+          if (presentedRunId !== null) {
+            try {
+              reviewerRun = store.getRun(presentedRunId);
+            } catch {
+              reviewerRun = null;
+            }
+          }
+          if (
+            reviewerRun === null ||
+            reviewerRun.taskId !== review.taskId ||
+            canonicalActor(reviewerRun.agentId) !== canonicalActor(reviewerAgentId)
+          ) {
+            throw new ApiError("SELF_REVIEW_FORBIDDEN", "the review submission is not backed by the assigned reviewer's Run", {
+              details: {
+                reviewerAgentId,
+                authorAgentId: reviewerRun?.agentId ?? null,
+                runId: presentedRunId,
+              },
+            });
+          }
+          let authorAgentId = null;
+          try {
+            if (review.runId) {
+              authorAgentId = store.getRun(review.runId)?.agentId ?? null;
+            } else {
+              const runs = Array.isArray(store.listRuns({ taskId: review.taskId })) ? store.listRuns({ taskId: review.taskId }) : [];
+              const completed = runs.filter((run) => run.status === "COMPLETED");
+              authorAgentId = completed[0]?.agentId ?? null;
+            }
+          } catch {
+            authorAgentId = null;
+          }
+          // The assignment must exist and must not be the author of the reviewed Run.
+          if (authorAgentId !== null && canonicalActor(authorAgentId) === canonicalActor(reviewerAgentId)) {
+            throw new ApiError("SELF_REVIEW_FORBIDDEN", "the author cannot review their own work", {
+              details: { reviewerAgentId, authorAgentId, reviewId: review.id, taskId: review.taskId },
+            });
+          }
+          submitActor = reviewerAgentId;
+        } else if (principal.kind === "internal") {
+          throw new ApiError("NOT_AUTHORIZED", "human review assignments cannot be submitted with the runtime-host credential", {
+            details: { reason: "review-assignment-required", reviewId: review.id, assignedTo },
+          });
+        }
 
         let findings;
         if (body.findings !== undefined) {
@@ -655,7 +905,8 @@ export function createServer({
           commitSha: body.commitSha ?? null,
           findings: storeFindings,
           evidence: body.evidence ?? null,
-          actor,
+          actor: submitActor,
+          ...(assignedTo === "AGENT" ? { reviewerAgentId } : {}),
         });
         if (!isPlainObject(result) || !result.review || !result.task) {
           throw new ApiError("INTERNAL_ERROR", "review submission returned an incomplete result");
@@ -823,18 +1074,18 @@ export function createServer({
         const filter = {};
         if (afterSeq !== undefined) filter.afterSeq = afterSeq;
         if (aggregateId !== undefined) {
-          if (!ID_RE.test(aggregateId)) throw validationError("invalid event filter", ["aggregateId must be an id string"]);
+          if (!ID_RE.test(aggregateId)) throw fieldValidationError("aggregateId", "aggregateId must be an id string");
           filter.aggregateId = aggregateId;
         }
         if (aggregateType !== undefined) {
           if (typeof aggregateType !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]*$/.test(aggregateType)) {
-            throw validationError("invalid event filter", ["aggregateType must be a non-empty identifier"]);
+            throw fieldValidationError("aggregateType", "aggregateType must be a non-empty identifier");
           }
           filter.aggregateType = aggregateType;
         }
         if (type !== undefined) {
           if (!EVENT_TYPES.includes(type)) {
-            throw validationError("invalid event filter", ["type must be one of the known event types"]);
+            throw fieldValidationError("type", "type must be one of the known event types");
           }
           filter.type = type;
         }
@@ -922,6 +1173,31 @@ export function createServer({
 
       if (!isApi) {
         await staticHandler.handle(req, res, pathname, method);
+        return;
+      }
+
+      // m6.1 §2: review submission is the one browser-route endpoint that also
+      // accepts the internal credential, but only as runtime-host.
+      const isReviewSubmit = method === "POST" && /^\/api\/v1\/reviews\/[^/]+\/submit$/.test(pathname);
+      if (isReviewSubmit && req.headers[INTERNAL_TOKEN_HEADER] !== undefined) {
+        const internalCheck = checkInternalToken(resolvedInternalToken, req.headers[INTERNAL_TOKEN_HEADER]);
+        if (!internalCheck.ok) {
+          throw new ApiError("NOT_AUTHORIZED", "missing or invalid internal credential", {
+            details: { reason: internalCheck.reason },
+          });
+        }
+        const roleCheck = checkInternalRole(req.headers[INTERNAL_ROLE_HEADER], ["runtime-host"]);
+        if (!roleCheck.ok) {
+          throw new ApiError("NOT_AUTHORIZED", "internal role is not allowed for review submission", {
+            details: {
+              reason: roleCheck.reason,
+              role: roleCheck.role ?? null,
+              allowedRoles: ["runtime-host"],
+            },
+          });
+        }
+        req.atkPrincipal = { kind: "internal", role: roleCheck.role };
+        await dispatch({ req, res, method, pathname, url });
         return;
       }
 

@@ -6,7 +6,27 @@
 // - sync methods, plain JSON-serialisable values
 // - CAS on patchTask with `details.currentVersion`
 // - `_dropEventsBefore(seq)` simulates a pruned event log for the resync test
-import { createEvent } from "@atk/contracts";
+import { createEvent, eventDedupeKey } from "@atk/contracts";
+
+const RUN_STATUSES = Object.freeze([
+  "QUEUED",
+  "STARTING",
+  "RUNNING",
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+  "INTERRUPTED",
+]);
+
+const RUN_TRANSITIONS = Object.freeze({
+  QUEUED: ["STARTING", "FAILED", "CANCELLED", "INTERRUPTED"],
+  STARTING: ["RUNNING", "FAILED", "INTERRUPTED"],
+  RUNNING: ["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"],
+  COMPLETED: [],
+  FAILED: [],
+  CANCELLED: [],
+  INTERRUPTED: [],
+});
 
 function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -28,13 +48,17 @@ export function createFakeStore(seed = {}) {
   const agents = new Map();
   const reviews = new Map();
   const approvals = new Map();
+  const integrations = new Map();
   const dispatchCommands = new Map();
   const leases = new Map();
   let events = [];
   let seq = 0;
   let counters = { task: 0, run: 0, requirement: 0, approval: 0, command: 0, review: 0 };
+  let integrationCounter = 0;
   let snapshotVersion = 1;
   let switchReadiness = { ok: true, blockers: [] };
+  /** Test-only fault injection for applyRuntimeEventBatch (writes before failing). */
+  let batchFaultAfter = null;
 
   for (const project of seed.projects ?? []) projects.set(project.id, { version: 0, createdAt: nowIso(), ...clone(project) });
   for (const requirement of seed.requirements ?? []) {
@@ -290,15 +314,7 @@ export function createFakeStore(seed = {}) {
           staleGeneration({ runId: id, generation, reason: "lease-expired", currentGeneration: lease.generation });
         }
       }
-      const allowed = {
-        QUEUED: ["STARTING", "FAILED", "CANCELLED", "INTERRUPTED"],
-        STARTING: ["RUNNING", "FAILED", "INTERRUPTED"],
-        RUNNING: ["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"],
-        COMPLETED: [],
-        FAILED: [],
-        CANCELLED: [],
-        INTERRUPTED: [],
-      };
+      const allowed = RUN_TRANSITIONS;
       if (run.status === status) return clone(run);
       const transitions = allowed[run.status] ?? [];
       if (!transitions.includes(status)) {
@@ -475,11 +491,201 @@ export function createFakeStore(seed = {}) {
           aggregateId: runId,
           type: mapped.type,
           payload: mapped.payload,
+          // F08: host identity is part of the persisted row when supplied; the
+          // legacy path is marked instead of silently dropping the distinction.
+          ...(typeof mapped.eventId === "string" && mapped.eventId !== "" ? { eventId: mapped.eventId } : {}),
+          ...(Number.isInteger(mapped.sessionSeq) ? { sessionSeq: mapped.sessionSeq } : {}),
         });
+        if (mapped.legacy === true) event.legacy = true;
         events.push(event);
         return clone(event);
       });
       return inserted;
+    },
+
+    // ---- M6.1 F03/F08: atomic runtime-event batch (m6.1-contracts §4) ------
+    applyRuntimeEventBatch({ runId, generation, events: batchEvents, now } = {}) {
+      requireRun(runId);
+      if (!Number.isInteger(generation) || generation < 1) {
+        fail("VALIDATION_ERROR", "generation must be a positive integer", { generation });
+      }
+      if (!Array.isArray(batchEvents)) {
+        fail("VALIDATION_ERROR", "run.events must be an array", { events: batchEvents ?? null });
+      }
+      if (batchEvents.length > 1000) {
+        fail("VALIDATION_ERROR", "run.events accepts at most 1000 events per call", { length: batchEvents.length });
+      }
+
+      // Validate the whole batch before any write (mirrors planRuntimeEventBatch).
+      const plan = batchEvents.map((raw, index) => {
+        if (!isPlainObject(raw)) fail("VALIDATION_ERROR", `run.events[${index}] must be an object`, { index, field: "events" });
+        if (raw.type !== "run.updated" && raw.type !== "run.log") {
+          fail("VALIDATION_ERROR", `run.events[${index}].type must be run.updated|run.log`, {
+            index,
+            field: "type",
+            allowed: ["run.updated", "run.log"],
+          });
+        }
+        if (!isPlainObject(raw.payload)) {
+          fail("VALIDATION_ERROR", `run.events[${index}].payload must be an object`, { index, field: "payload" });
+        }
+        if (raw.eventId !== undefined && raw.eventId !== null) {
+          if (typeof raw.eventId !== "string" || raw.eventId.trim() === "") {
+            fail("VALIDATION_ERROR", `run.events[${index}].eventId must be a non-empty string`, { index, field: "eventId" });
+          }
+        }
+        if (raw.sessionSeq !== undefined && raw.sessionSeq !== null) {
+          if (!Number.isInteger(raw.sessionSeq) || raw.sessionSeq < 0) {
+            fail("VALIDATION_ERROR", `run.events[${index}].sessionSeq must be a non-negative integer`, {
+              index,
+              field: "sessionSeq",
+            });
+          }
+        }
+        let status;
+        if (raw.type === "run.updated") {
+          status = raw.payload.status;
+          if (typeof status !== "string" || !RUN_STATUSES.includes(status)) {
+            fail("VALIDATION_ERROR", `run.events[${index}].payload.status must be a run status`, {
+              index,
+              field: "payload.status",
+              allowed: [...RUN_STATUSES],
+            });
+          }
+          const { exitCode } = raw.payload;
+          if (exitCode !== undefined && exitCode !== null && !Number.isInteger(exitCode)) {
+            fail("VALIDATION_ERROR", `run.events[${index}].payload.exitCode must be an integer or null`, {
+              index,
+              field: "payload.exitCode",
+            });
+          }
+        }
+        return {
+          index,
+          raw,
+          status,
+          dedupeKey: eventDedupeKey({
+            ...raw,
+            aggregateId: runId,
+            happenedAt: raw.at ?? raw.payload?.at,
+            payload: { ...raw.payload, runId },
+          }),
+        };
+      });
+
+      // Lease fence (same as appendRunEvent) before the transaction writes.
+      const lease = leases.get(runId);
+      if (!lease) staleGeneration({ runId, generation, reason: "lease-missing", currentGeneration: null });
+      if (lease.generation !== generation) {
+        staleGeneration({ runId, generation, reason: "generation-mismatch", currentGeneration: lease.generation });
+      }
+      if (Date.parse(lease.expiresAt) <= Date.now()) {
+        staleGeneration({ runId, generation, reason: "lease-expired", currentGeneration: lease.generation });
+      }
+
+      // Snapshot rollback: the fake store is synchronous, so restoring the
+      // captured run/event/sequence state is the "transaction rollback".
+      const run = runs.get(runId);
+      const snapshot = {
+        run: clone(run),
+        eventsLength: events.length,
+        seq,
+        lease: clone(lease),
+      };
+      const at = typeof now === "string" && !Number.isNaN(Date.parse(now)) ? now : nowIso();
+      const task = tasks.get(run.taskId);
+      const seen = new Set(
+        events
+          .filter((event) => event.aggregateId === runId)
+          .map((event) => eventDedupeKey(event)),
+      );
+      const applied = [];
+      let skipped = 0;
+      let stateChanged = false;
+      let written = 0;
+      try {
+        for (const entry of plan) {
+          if (seen.has(entry.dedupeKey)) {
+            skipped += 1;
+            continue;
+          }
+          seen.add(entry.dedupeKey);
+          if (entry.raw.type === "run.updated") {
+            if (entry.status === run.status) continue; // idempotent warm start / repeated end
+            const transitions = RUN_TRANSITIONS[run.status] ?? [];
+            if (!transitions.includes(entry.status)) {
+              fail("VALIDATION_ERROR", `run ${runId} cannot transition ${run.status} -> ${entry.status}`, {
+                index: entry.index,
+                field: "payload.status",
+              });
+            }
+            const previousStatus = run.status;
+            run.status = entry.status;
+            run.version += 1;
+            run.updatedAt = nowIso();
+            if (entry.raw.payload.exitCode !== undefined) run.exitCode = entry.raw.payload.exitCode;
+            if (entry.raw.payload.endedAt !== undefined) run.endedAt = entry.raw.payload.endedAt;
+            if (RUN_STATUSES.slice(3).includes(entry.status) && run.endedAt == null) run.endedAt = at;
+            stateChanged = true;
+            seq += 1;
+            const event = createEvent({
+              seq,
+              projectId: task?.projectId ?? null,
+              aggregateType: "run",
+              aggregateId: runId,
+              type: "run.updated",
+              payload: {
+                runId,
+                taskId: run.taskId,
+                status: run.status,
+                previousStatus,
+                version: run.version,
+                ...(run.exitCode === undefined ? {} : { exitCode: run.exitCode }),
+                ...(run.endedAt === undefined ? {} : { endedAt: run.endedAt }),
+              },
+              happenedAt: at,
+              eventId: entry.raw.eventId ?? null,
+              sessionSeq: entry.raw.sessionSeq ?? null,
+            });
+            if (entry.raw.legacy === true) event.legacy = true;
+            events.push(event);
+            applied.push(clone(event));
+            written += 1;
+          } else {
+            seq += 1;
+            const event = createEvent({
+              seq,
+              projectId: task?.projectId ?? null,
+              aggregateType: "run",
+              aggregateId: runId,
+              type: entry.raw.type,
+              payload: entry.raw.payload,
+              happenedAt: at,
+              eventId: entry.raw.eventId ?? null,
+              sessionSeq: entry.raw.sessionSeq ?? null,
+            });
+            if (entry.raw.legacy === true) event.legacy = true;
+            events.push(event);
+            applied.push(clone(event));
+            written += 1;
+          }
+          // Test-only fault injection: simulate a database failure after N
+          // writes to prove the batch rolls back instead of half-applying.
+          if (Number.isInteger(batchFaultAfter) && written >= batchFaultAfter) {
+            const error = new Error("simulated mid-batch store failure");
+            error.code = "DATABASE_ERROR";
+            throw error;
+          }
+        }
+      } catch (error) {
+        runs.set(runId, snapshot.run);
+        events = events.slice(0, snapshot.eventsLength);
+        seq = snapshot.seq;
+        if (snapshot.lease) leases.set(runId, snapshot.lease);
+        else leases.delete(runId);
+        throw error;
+      }
+      return { ok: true, run: clone(run), applied, skipped, duplicate: skipped, stateChanged };
     },
     sweepDispatchCommands({ now: at } = {}) {
       const terminalRuns = new Set(["COMPLETED", "FAILED", "INTERRUPTED", "CANCELLED"]);
@@ -901,6 +1107,72 @@ export function createFakeStore(seed = {}) {
       });
       return { review: clone(review), task: clone(task), attempt: review.attempt };
     },
+    // ---- M6.1: integration record (INTEGRATING -> AWAITING_ACCEPTANCE) ------
+    recordIntegration({ taskId, runId, commitSha, manifestHash, actor = "SYSTEM" } = {}) {
+      const task = requireTask(taskId);
+      const run = requireRun(runId);
+      if (run.taskId !== taskId) {
+        fail("VALIDATION_ERROR", `run ${runId} does not belong to task ${taskId}`, { errors: ["runId does not belong to task"] });
+      }
+      if (task.status !== "INTEGRATING") {
+        fail("TASK_VERSION_CONFLICT", `task ${taskId} is not INTEGRATING`, {
+          taskId,
+          status: task.status,
+          currentVersion: task.version,
+          reason: "not-integrating",
+        });
+      }
+      if (typeof task.targetHash !== "string" || task.targetHash === "" || task.targetHash !== manifestHash) {
+        fail("APPROVAL_STALE", `integration manifestHash does not match the task target hash`, {
+          taskId,
+          expectedTargetHash: task.targetHash ?? null,
+          receivedTargetHash: manifestHash ?? null,
+        });
+      }
+      integrationCounter += 1;
+      const now = nowIso();
+      const integration = {
+        id: `INT-${integrationCounter.toString(36).toUpperCase()}`,
+        taskId,
+        runId,
+        commitSha,
+        manifestHash,
+        actor,
+        at: now,
+        createdAt: now,
+      };
+      integrations.set(integration.id, integration);
+      const previousStatus = task.status;
+      task.status = "AWAITING_ACCEPTANCE";
+      task.version += 1;
+      task.updatedAt = now;
+      recordEvent({
+        projectId: task.projectId ?? null,
+        aggregateType: "task",
+        aggregateId: taskId,
+        type: "task.updated",
+        payload: {
+          taskId,
+          status: task.status,
+          previousStatus,
+          version: task.version,
+          reason: "integration",
+          integrationId: integration.id,
+          runId,
+          commitSha,
+          manifestHash,
+        },
+      });
+      recordEvent({
+        projectId: task.projectId ?? null,
+        aggregateType: "integration",
+        aggregateId: integration.id,
+        type: "integration.updated",
+        payload: { integrationId: integration.id, taskId, runId, commitSha, manifestHash, actor },
+      });
+      return { integration: clone(integration), task: clone(task) };
+    },
+
     listApprovals({ taskId, status, limit } = {}) {
       let items = [...approvals.values()];
       if (taskId) items = items.filter((approval) => approval.taskId === taskId);
@@ -1066,6 +1338,12 @@ export function createFakeStore(seed = {}) {
       task.version += 1;
       task.updatedAt = nowIso();
       return clone(task);
+    },
+    _setBatchFaultAfter(writes) {
+      batchFaultAfter = Number.isInteger(writes) ? writes : null;
+    },
+    _listIntegrations() {
+      return [...integrations.values()].map(clone);
     },
   };
 }

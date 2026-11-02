@@ -4,6 +4,7 @@ import http from "node:http";
 
 import { parseSseFrame } from "@atk/contracts";
 
+import { requiredInternalRoles } from "../src/internal.mjs";
 import { createServer } from "../src/server.mjs";
 import { createFakeStore } from "./fake-store.mjs";
 
@@ -51,9 +52,13 @@ export async function startServer(options = {}) {
   return { server, store, base: info.url, info, internalToken: server.internalToken };
 }
 
-/** Header set for `/internal/v1/*` calls (never the browser token). */
-export function internalHeaders(token = TEST_INTERNAL_TOKEN) {
-  return { "x-atk-internal": token };
+/** Header set for `/internal/v1/*` calls (never the browser token).
+ *  The role assertion is added per-endpoint by `request()` when omitted; pass an
+ *  explicit role to exercise missing/forbidden-role negatives. */
+export function internalHeaders(token = TEST_INTERNAL_TOKEN, role = undefined) {
+  const headers = { "x-atk-internal": token };
+  if (role !== undefined) headers["x-atk-internal-role"] = role;
+  return headers;
 }
 
 export function request(base, { method = "GET", path = "/", headers = {}, body } = {}) {
@@ -67,6 +72,12 @@ export function request(base, { method = "GET", path = "/", headers = {}, body }
         : { "content-type": "application/json", "content-length": Buffer.byteLength(payload) }),
       ...headers,
     };
+    // Default the internal role from the frozen endpoint matrix unless the test
+    // explicitly supplies one (so role-forbidden/missing negatives stay possible).
+    if (typeof requestHeaders["x-atk-internal"] === "string" && requestHeaders["x-atk-internal-role"] === undefined) {
+      const roles = requiredInternalRoles(method, url.pathname);
+      if (Array.isArray(roles) && roles.length > 0) requestHeaders["x-atk-internal-role"] = roles[0];
+    }
     const req = http.request(
       {
         host: url.hostname,

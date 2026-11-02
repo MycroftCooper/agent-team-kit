@@ -184,7 +184,7 @@ test("cli serve prints the internal token once and enforces it on /internal/v1",
 
   const authorized = await fetch(`${base}/internal/v1/runtime/heartbeat`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-atk-internal": token },
+    headers: { "content-type": "application/json", "x-atk-internal": token, "x-atk-internal-role": "runtime-host" },
     body: heartbeatBody,
   });
   assert.equal(authorized.status, 200);
