@@ -2,6 +2,8 @@
 // F04 run<->workspace columns/method; F05 frozen TaskExecutionSpec; F10
 // heartbeat-based agent availability. Product code is untouched in phase A.
 import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { advanceTask, bothStores, projectDto, taskDto, useStore } from "./helpers.mjs";
@@ -107,6 +109,66 @@ test("F05 freezeTaskSpec persists a frozen spec that later task edits cannot cha
     assert.equal(loaded.spec.title, "original title", label);
     assert.equal(loaded.spec.acceptance, "original acceptance", label);
     assert.equal(loaded.frozenAt, NOW, label);
+  }
+});
+
+test("F04 claimTask binds workspace, freezes a matching spec and replays idempotently", (t) => {
+  for (const { label, store } of bothStores(t)) {
+    store.upsertAgent({ id: "agent-claim", role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
+    const task = store.getTask("TASK-SEED");
+    const before = { runs: store.listRuns({ limit: 100 }).length, task: store.getTask("TASK-SEED") };
+    assert.throws(
+      () =>
+        store.claimTask({
+          taskId: "TASK-SEED",
+          agentId: "agent-claim",
+          expectedTaskVersion: task.version,
+          idempotencyKey: "claim-missing-root",
+          workspace: { kind: "worktree", baseCommit: "a".repeat(40) },
+        }),
+      (error) => error.code === "VALIDATION_ERROR" && error.details.field === "workspace.root",
+      label,
+    );
+    assert.equal(store.listRuns({ limit: 100 }).length, before.runs, label);
+    assert.equal(store.getTask("TASK-SEED").status, "READY", label);
+
+    const root = path.join(os.tmpdir(), `atk-m62-wt-${label}`);
+    const claimed = store.claimTask({
+      taskId: "TASK-SEED",
+      agentId: "agent-claim",
+      expectedTaskVersion: task.version,
+      idempotencyKey: "claim-worktree",
+      workspace: { kind: "worktree", root, baseCommit: "a".repeat(40), targetBranch: "atk/claim" },
+    });
+    assert.equal(claimed.run.workspace.kind, "worktree", label);
+    assert.ok(claimed.run.workspace.path.endsWith(claimed.run.id), `${label}: path ends with runId`);
+    assert.ok(path.isAbsolute(claimed.run.workspace.path), label);
+    assert.equal(claimed.spec.schemaVersion, 1, label);
+    assert.equal(claimed.specHash, store.getRunSpec(claimed.run.id).specHash, label);
+    assert.deepEqual(store.getRunSpec(claimed.run.id).spec.workspace, claimed.run.workspace, label);
+    assert.equal(store.getTask("TASK-SEED").status, "CLAIMED", label);
+    assert.equal(store.listRuns({ limit: 100 }).length, before.runs + 1, label);
+
+    const replay = store.claimTask({
+      taskId: "TASK-SEED",
+      agentId: "agent-claim",
+      expectedTaskVersion: task.version,
+      idempotencyKey: "claim-worktree",
+      workspace: { kind: "worktree", root, baseCommit: "a".repeat(40), targetBranch: "atk/claim" },
+    });
+    assert.equal(replay.run.id, claimed.run.id, `${label}: replay returns the same Run`);
+    assert.equal(replay.specHash, claimed.specHash, `${label}: replay returns the same specHash`);
+    assert.equal(store.listRuns({ limit: 100 }).length, before.runs + 1, label);
+
+    store.createTask(taskDto("proj-1", { id: "TASK-MOCK" }));
+    const mock = store.claimTask({
+      taskId: "TASK-MOCK",
+      agentId: "agent-claim",
+      expectedTaskVersion: store.getTask("TASK-MOCK").version,
+      idempotencyKey: "claim-none",
+    });
+    assert.equal(mock.spec.workspace.kind, "none", label);
+    assert.deepEqual(mock.run.workspace, { kind: "none", path: null, baseCommit: null, targetBranch: null }, label);
   }
 });
 

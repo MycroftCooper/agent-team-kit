@@ -54,6 +54,7 @@ import {
   nowIso,
   planRuntimeEventBatch,
   requireId,
+  resolveClaimWorkspace,
   safeJson,
   validateActor,
   validateApprovalDecision,
@@ -1096,7 +1097,7 @@ export function createMemoryStore() {
       };
     },
 
-    claimTask({ taskId, agentId, expectedTaskVersion, policies, idempotencyKey, workspacePolicy } = {}) {
+    claimTask({ taskId, agentId, expectedTaskVersion, policies, idempotencyKey, workspacePolicy, workspace } = {}) {
       requireId(taskId, "task.id");
       requireId(agentId, "agent.id");
       if (!Number.isInteger(expectedTaskVersion) || expectedTaskVersion < 0) {
@@ -1126,7 +1127,13 @@ export function createMemoryStore() {
             existingTaskId: run.taskId,
           });
         }
-        return { run: clone(run), command: clone(command), task: clone(requireTaskEntry(taskId)) };
+        const loaded = runSpecs.get(run.id);
+        return {
+          run: clone(run),
+          command: clone(command),
+          task: clone(requireTaskEntry(taskId)),
+          ...(loaded ? { spec: clone(loaded.spec), specHash: loaded.specHash } : {}),
+        };
       }
 
       // 1. Task exists, READY, expected version.
@@ -1288,17 +1295,20 @@ export function createMemoryStore() {
         });
       }
       const at = nowIso();
-      const attempt = [...runs.values()].filter((run) => run.taskId === taskId).length + 1;
-      const run = normalizeRun(
-        {
-          taskId,
-          agentId,
-          function: task.functionRequired,
-          role: task.roleRequired,
-          files: candidateFiles,
-        },
-        { now: at, attempt },
-      );
+      const runId = generateId("RUN");
+      const project = requireProject(task.projectId);
+      const workspaceValue = resolveClaimWorkspace(workspace, { project, runId });
+      const frozen = store.freezeTaskSpec(taskId, { workspace: workspaceValue, now: at });
+      const run = store.createRun({
+        taskId,
+        agentId,
+        function: task.functionRequired,
+        role: task.roleRequired,
+        files: candidateFiles,
+        id: runId,
+        workspace: workspaceValue,
+        specHash: frozen.specHash,
+      });
       const updatedTask = { ...task, status: "CLAIMED", version: task.version + 1, updatedAt: at };
       const command = {
         id: generateId("CMD"),
@@ -1312,6 +1322,8 @@ export function createMemoryStore() {
           roleRequired: task.roleRequired,
           workspacePolicy: workspacePolicyValue,
           files: candidateFiles,
+          specHash: frozen.specHash,
+          workspace: workspaceValue,
         }),
         status: "PENDING",
         idempotencyKey: key,
@@ -1323,29 +1335,8 @@ export function createMemoryStore() {
         updatedAt: at,
       };
       tasks.set(taskId, updatedTask);
-      runs.set(run.id, run);
       dispatchCommands.set(command.id, command);
       commandIdempotency.set(key, command.id);
-      appendEventEntry(
-        makeEvent({
-          projectId: task.projectId,
-          aggregateType: "run",
-          aggregateId: run.id,
-          type: "run.created",
-          payload: {
-            runId: run.id,
-            taskId,
-            agentId,
-            function: run.function,
-            role: run.role,
-            status: run.status,
-            attempt: run.attempt,
-            version: run.version,
-            ...(run.files === undefined ? {} : { files: run.files }),
-          },
-          now: at,
-        }),
-      );
       appendEventEntry(
         makeEvent({
           projectId: task.projectId,
@@ -1363,7 +1354,13 @@ export function createMemoryStore() {
           now: at,
         }),
       );
-      return { run: clone(run), command: clone(command), task: clone(updatedTask) };
+      return {
+        run: clone(run),
+        command: clone(command),
+        task: clone(updatedTask),
+        spec: clone(frozen.spec),
+        specHash: frozen.specHash,
+      };
     },
 
     listAgents() {

@@ -5,6 +5,7 @@
 // overview projection. The two stores only differ in persistence, so this is
 // how "memory must behave like SQLite" is kept true instead of hoped for.
 import { createHash } from "node:crypto";
+import path from "node:path";
 import {
   ACCEPTANCE_STATUSES,
   AGENT_STATUSES,
@@ -1288,6 +1289,74 @@ export function buildFrozenExecutionSpec({ task, project, workspace, now, constr
 /** Stable sha256 of a frozen execution spec (persisted alongside it). */
 export function hashExecutionSpec(spec) {
   return createHash("sha256").update(JSON.stringify(spec)).digest("hex");
+}
+
+/* M6.2 F04: claim-time workspace binding. `runId` is known before the Run row
+ * exists so the default worktree path can be derived deterministically. */
+export function resolveClaimWorkspace(workspace, { project, runId } = {}) {
+  if (workspace === undefined || workspace === null) {
+    return { kind: "none", path: null, baseCommit: null, targetBranch: null };
+  }
+  if (!isPlainObject(workspace)) {
+    fail("VALIDATION_ERROR", "workspace must be an object", { field: "workspace" });
+  }
+  const kind = workspace.kind ?? "none";
+  if (!["worktree", "none"].includes(kind)) {
+    fail("VALIDATION_ERROR", "workspace.kind must be worktree|none", { field: "workspace.kind" });
+  }
+  const normalise = (value) => (typeof value === "string" ? value.trim().replace(/\\/g, "/") : value);
+  const baseCommit = workspace.baseCommit ?? null;
+  if (baseCommit !== null) {
+    if (typeof baseCommit !== "string" || !/^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$/.test(baseCommit)) {
+      fail("VALIDATION_ERROR", "workspace.baseCommit must be a 40 or 64 character hex commit", {
+        field: "workspace.baseCommit",
+      });
+    }
+  }
+  const targetBranch = workspace.targetBranch ?? null;
+  if (targetBranch !== null && (typeof targetBranch !== "string" || targetBranch.trim() === "")) {
+    fail("VALIDATION_ERROR", "workspace.targetBranch must be a non-empty string", {
+      field: "workspace.targetBranch",
+    });
+  }
+  const suppliedPath = workspace.path === undefined || workspace.path === null ? null : normalise(workspace.path);
+  if (suppliedPath !== null && !path.isAbsolute(suppliedPath)) {
+    fail("VALIDATION_ERROR", "workspace.path must be absolute", { field: "workspace.path" });
+  }
+  const root = workspace.root === undefined || workspace.root === null ? null : normalise(workspace.root);
+  if (root !== null && !path.isAbsolute(root)) {
+    fail("VALIDATION_ERROR", "workspace.root must be absolute", { field: "workspace.root" });
+  }
+  let resolvedPath = suppliedPath;
+  if (kind === "worktree") {
+    if (!resolvedPath) {
+      if (!root) {
+        fail("VALIDATION_ERROR", "workspace.root is required when workspace.path is omitted", {
+          field: "workspace.root",
+        });
+      }
+      if (!project || !runId) {
+        fail("VALIDATION_ERROR", "workspace path needs the project and Run id", { field: "workspace.root" });
+      }
+      resolvedPath = `${root.replace(/\/+$/, "")}/${project.id}/${runId}`;
+    }
+    if (project) {
+      const repoRoot = path.resolve(project.repoPath ?? ".");
+      const candidate = path.resolve(resolvedPath);
+      if (candidate === repoRoot || candidate.startsWith(`${repoRoot}${path.sep}`)) {
+        fail("VALIDATION_ERROR", "workspace.path must be outside the repository", {
+          field: "workspace.path",
+          path: resolvedPath,
+        });
+      }
+    }
+  }
+  return {
+    kind,
+    path: kind === "worktree" ? resolvedPath : null,
+    baseCommit: kind === "worktree" ? baseCommit : null,
+    targetBranch: kind === "worktree" ? targetBranch : null,
+  };
 }
 
 /* M6.2 F04: workspace binding persisted on the Run (never client-supplied cwd). */

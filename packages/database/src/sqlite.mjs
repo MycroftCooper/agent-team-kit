@@ -53,6 +53,7 @@ import {
   parseJsonColumn,
   planRuntimeEventBatch,
   requireId,
+  resolveClaimWorkspace,
   safeJson,
   validateActor,
   validateApprovalDecision,
@@ -500,7 +501,14 @@ export function openStore(options = {}) {
       updatedAt: row.updated_at,
     };
     if (row.workspace_id !== null && row.workspace_id !== undefined) run.workspaceId = row.workspace_id;
-    if (row.workspace_path !== null && row.workspace_path !== undefined) {
+    if (row.workspace_kind !== null && row.workspace_kind !== undefined) {
+      run.workspace = {
+        kind: row.workspace_kind,
+        path: row.workspace_path ?? null,
+        baseCommit: row.base_commit ?? null,
+        targetBranch: row.target_branch ?? null,
+      };
+    } else if (row.workspace_path !== null && row.workspace_path !== undefined) {
       run.workspace = {
         kind: "worktree",
         path: row.workspace_path,
@@ -1222,8 +1230,8 @@ export function openStore(options = {}) {
           `INSERT INTO runs
              (id, task_id, agent_id, function, status, attempt, started_at, ended_at, error_json,
               version, role, workspace_id, exit_code, files_json, created_at, updated_at,
-              workspace_path, base_commit, target_branch)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              workspace_path, base_commit, target_branch, workspace_kind)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           run.id,
           run.taskId,
@@ -1244,6 +1252,7 @@ export function openStore(options = {}) {
           run.workspace?.path ?? null,
           run.workspace?.baseCommit ?? null,
           run.workspace?.targetBranch ?? null,
+          run.workspace?.kind ?? null,
         );
         // F05: bind the frozen spec from freezeTaskSpec to this Run. The copy is
         // immutable, so later Task edits cannot change what the Run executes.
@@ -1934,7 +1943,7 @@ export function openStore(options = {}) {
      * transaction: any failed check (or the CAS losing a race) rolls back to
      * byte-for-byte no change. Same idempotencyKey replays the original result.
      */
-    claimTask({ taskId, agentId, expectedTaskVersion, policies, idempotencyKey, workspacePolicy } = {}) {
+    claimTask({ taskId, agentId, expectedTaskVersion, policies, idempotencyKey, workspacePolicy, workspace } = {}) {
       requireId(taskId, "task.id");
       requireId(agentId, "agent.id");
       if (!Number.isInteger(expectedTaskVersion) || expectedTaskVersion < 0) {
@@ -1968,6 +1977,12 @@ export function openStore(options = {}) {
             run: existingRun,
             command: commandJson(existingCommand),
             task: taskJson(requireTaskRow(taskId)),
+            ...(stmt("SELECT * FROM run_specs WHERE run_id = ?").get(existingRun.id) === undefined
+              ? {}
+              : (() => {
+                  const loaded = store.getRunSpec(existingRun.id);
+                  return { spec: loaded.spec, specHash: loaded.specHash };
+                })()),
           };
         }
 
@@ -2153,12 +2168,22 @@ export function openStore(options = {}) {
             reason: "cas-lost",
           });
         }
+        const runId = generateId("RUN");
+        const projectRow = requireProject(task.projectId);
+        const workspaceValue = resolveClaimWorkspace(workspace, {
+          project: projectJson(projectRow),
+          runId,
+        });
+        const frozen = guarded.freezeTaskSpec(taskId, { workspace: workspaceValue, now: at });
         const run = store.createRun({
           taskId,
           agentId,
           function: task.functionRequired,
           role: task.roleRequired,
           files: candidateFiles,
+          id: runId,
+          workspace: workspaceValue,
+          specHash: frozen.specHash,
         });
         const command = store.enqueueDispatchCommand({
           runId: run.id,
@@ -2170,6 +2195,8 @@ export function openStore(options = {}) {
             roleRequired: task.roleRequired,
             workspacePolicy: workspacePolicyValue,
             files: candidateFiles,
+            specHash: frozen.specHash,
+            workspace: workspaceValue,
           },
           idempotencyKey: key,
         });
@@ -2190,7 +2217,7 @@ export function openStore(options = {}) {
             now: at,
           }),
         );
-        return { run, command, task: taskJson(requireTaskRow(taskId)) };
+        return { run, command, task: taskJson(requireTaskRow(taskId)), spec: frozen.spec, specHash: frozen.specHash };
       });
     },
 

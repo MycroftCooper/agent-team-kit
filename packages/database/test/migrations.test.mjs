@@ -94,6 +94,7 @@ test("v7 adds run workspace binding, run_specs and agent heartbeat columns", (t)
     const columns = (table) =>
       raw.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name);
     assert.ok(columns("runs").includes("workspace_path"));
+    assert.ok(columns("runs").includes("workspace_kind"));
     assert.ok(columns("runs").includes("base_commit"));
     assert.ok(columns("runs").includes("target_branch"));
     assert.ok(columns("agent_instances").includes("host_id"));
