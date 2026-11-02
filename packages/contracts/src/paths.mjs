@@ -21,6 +21,10 @@ export function normalizeRepoPath(value) {
   const raw = value.trim().replace(/\\/g, "/");
   if (raw === "") throw new TypeError("normalizeRepoPath: path must not be empty");
   if (raw.startsWith("/")) throw new TypeError(`normalizeRepoPath: "${value}" must be repository-relative`);
+  // A Windows drive letter is an absolute path even though it does not start with
+  // a slash: "C:/repo/src" normalises to a string that looks relative. The legacy
+  // importer already refused this shape; the shared rule must too (QA-M61-01).
+  if (/^[A-Za-z]:/.test(raw)) throw new TypeError(`normalizeRepoPath: "${value}" must be repository-relative`);
   const out = [];
   for (const segment of raw.split("/")) {
     if (segment === "" || segment === ".") continue;

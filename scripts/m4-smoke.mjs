@@ -121,6 +121,7 @@ if (migrate.status !== 0) {
 }
 
 const { openStore } = await load("packages/database/src/index.mjs");
+const { INTERNAL } = await load("packages/database/src/internal.mjs");
 const store = openStore({ file: dbFile, migrate: true });
 
 // Capability detection: a missing M4 write path is a SKIP, never a pass.
@@ -144,14 +145,13 @@ function createTask(id, status) {
     deps: [],
     acceptance: "m4-smoke",
   });
-  // Walk the legal status chain with the store's own state machine (no DB pokes).
-  const chain = ["CLAIMED", "RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE", "DONE"];
-  let current = task;
-  for (const next of chain) {
-    if (current.status === status) break;
-    current = store.patchTask(current.id, { expectedVersion: current.version, changes: { status: next } });
-    if (next === status) break;
-  }
+  // FIXTURE SEEDING ONLY. The checks below exercise the public paths, and those
+  // now refuse direct execution-state transitions (F01) - which is exactly what
+  // the gate proves. Seeding therefore uses the same internal writer that
+  // `import` uses for migrations, so a fixture can start from any state without
+  // weakening the guard under test.
+  if (status !== "READY") store[INTERNAL].setTaskStatus(task.id, status);
+  const current = store.getTask(task.id);
   if (current.status !== status) throw new Error(`could not move ${id} to ${status} (stuck at ${current.status})`);
   return current;
 }
@@ -208,12 +208,9 @@ if (storeM4Ready) {
       limitReview = store.getReview(review.id);
       if (attempt < 3) {
         // Put the fixture back into REVIEWING for the next attempt (fixture setup
-        // only; the production rework path is what check 6 exercises over HTTP).
-        let task = store.getTask("M4-REWORK-LIMIT");
-        for (const status of ["REJECTED", "READY", "CLAIMED", "RUNNING", "REVIEWING"]) {
-          if (task.status === status) continue;
-          task = store.patchTask(task.id, { expectedVersion: task.version, changes: { status } });
-        }
+        // only via the internal writer; the production rework path is what check 6
+        // exercises over HTTP).
+        store[INTERNAL].setTaskStatus("M4-REWORK-LIMIT", "REVIEWING");
       }
     }
     fixtures.limit.review = limitReview;
@@ -321,6 +318,46 @@ async function api(method, requestPath, body, actor) {
   return { status: response.status, payload, text, code: payload?.error?.code ?? null };
 }
 
+/** Internal API call (Scheduler/Host credential plane; never the browser session). */
+async function internalApi(method, requestPath, body, role = "scheduler") {
+  const headers = { "x-atk-internal": internalToken, "x-atk-internal-role": role, accept: "application/json" };
+  if (body !== undefined) headers["content-type"] = "application/json";
+  const response = await fetch(`${base}${requestPath}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = null;
+  }
+  if (verbose) process.stderr.write(`[internal] ${method} ${requestPath} -> ${response.status} ${text.slice(0, 300)}\n`);
+  return { status: response.status, payload, text, code: payload?.error?.code ?? null };
+}
+
+/**
+ * F01: AWAITING_ACCEPTANCE is reachable only through the integration service.
+ * The gate must drive that service, not patch the task status.
+ */
+async function recordIntegration(taskId, runId) {
+  const task = dbTask(taskId);
+  expect(task?.targetHash, `task ${taskId} has no target hash yet (a PASS review must run first)`);
+  const response = await internalApi("POST", `/internal/v1/tasks/${encodeURIComponent(taskId)}/integration`, {
+    taskId,
+    runId,
+    commitSha: "0".repeat(40),
+    manifestHash: task.targetHash,
+  });
+  expect(
+    response.status === 200,
+    `integration for ${taskId} expected 200, got ${response.status}: ${response.text.slice(0, 300)}`,
+  );
+  return response.payload;
+}
+
 async function startSse() {
   sseController = new AbortController();
   const response = await fetch(`${base}/api/v1/events/stream`, {
@@ -361,6 +398,21 @@ const HASH_NEW = "e".repeat(64);
 const HASH_STALE = "f".repeat(64);
 const PASS_EVIDENCE = { tests: { passed: 2, total: 2 } };
 
+/**
+ * Fixture-only status seed for a running gate. The main `store` is closed before
+ * the backend starts (it owns the file during the checks), so opening a short
+ * connection to the same internal writer is the supported way to build a state
+ * the public services cannot reach directly (F01).
+ */
+function seedTaskStatus(taskId, status) {
+  const fresh = openStore({ file: dbFile, migrate: false });
+  try {
+    fresh[INTERNAL].setTaskStatus(taskId, status);
+  } finally {
+    fresh.close();
+  }
+}
+
 function dbTask(taskId) {
   return dbGet("SELECT status, version, target_hash AS targetHash FROM tasks WHERE id = ?", taskId);
 }
@@ -371,8 +423,10 @@ function requireM4(what = "") {
   if (what) expect(!fixtures.skippedSetup.length, `M4 fixture setup failed: ${fixtures.skippedSetup.join("; ")}`);
 }
 
-async function createReview(taskId, runId, actor = "HUMAN") {
-  const response = await api("POST", "/api/v1/reviews", { taskId, runId, actor }, actor);
+async function createReview(taskId, runId, actor = "HUMAN", options = {}) {
+  // F06: an AGENT-assigned review names its reviewer; the reviewer identity is
+  // never taken from the request body later on.
+  const response = await api("POST", "/api/v1/reviews", { taskId, runId, actor, ...options }, actor);
   expect(response.status === 201, `POST /reviews expected 201, got ${response.status}: ${response.text.slice(0, 200)}`);
   const review = response.payload?.review ?? response.payload;
   expect(typeof review?.id === "string", `review id missing: ${response.text.slice(0, 200)}`);
@@ -433,19 +487,36 @@ function runCliProcess(script, args, env, { timeoutMs = 30_000 } = {}) {
 
 check("1. self-review by the author agent is forbidden (403 SELF_REVIEW_FORBIDDEN, review stays PENDING)", async () => {
   requireM4(true);
-  const review = await createReview("M4-SELF", fixtures.self.run.id, "HUMAN");
+  // F06: the reviewer must be an assigned agent, and the agent that produced the
+  // Run may not review it. Assignment comes from the API, not from body.actor.
+  const review = await createReview("M4-SELF", fixtures.self.run.id, "HUMAN", {
+    assignedTo: "AGENT",
+    reviewerAgentId: "agent-dev-1", // the agent that produced the Run
+  });
   expect(reviewRow(review.id)?.status === "PENDING", `review should start PENDING, got ${reviewRow(review.id)?.status}`);
 
-  const submit = await api(
+  // A browser session may not submit an AGENT-assigned review at all.
+  const sessionAttempt = await api(
+    "POST",
+    `/api/v1/reviews/${encodeURIComponent(review.id)}/submit`,
+    { expectedVersion: review.version, verdict: "PASS", manifestHash: MANIFEST, reviewerAgentId: "agent-dev-1", evidence: { tests: { passed: 2, total: 2 } } },
+    "agent-dev-1",
+  );
+  expect(sessionAttempt.status === 403, `session submit of an AGENT review expected 403, got ${sessionAttempt.status}: ${sessionAttempt.text.slice(0, 200)}`);
+
+  // The assigned reviewer submits through the runtime-host credential; the author
+  // reviewing its own Run is refused on the identity, not on a claimed name.
+  const submit = await internalApi(
     "POST",
     `/api/v1/reviews/${encodeURIComponent(review.id)}/submit`,
     {
       expectedVersion: review.version,
       verdict: "PASS",
       manifestHash: MANIFEST,
+      reviewerAgentId: "agent-dev-1",
       evidence: { tests: { passed: 2, total: 2 } },
     },
-    "agent-dev-1", // the agent that produced the Run
+    "runtime-host",
   );
   expect(submit.status === 403, `expected 403 for self-review, got ${submit.status}: ${submit.text.slice(0, 200)}`);
   expect(submit.code === "SELF_REVIEW_FORBIDDEN", `expected SELF_REVIEW_FORBIDDEN, got ${submit.code}`);
@@ -522,7 +593,7 @@ check("4. acceptance is bound to the hash written by PASS (wrong/missing hash ->
   );
 
   // 3. The wrong hash is refused at creation time (not just at decide time).
-  await patchTaskStatus("M4-APPROVAL", "AWAITING_ACCEPTANCE");
+  await recordIntegration("M4-APPROVAL", fixtures.approval.run.id);
   const wrong = await api("POST", "/api/v1/approvals", { taskId: "M4-APPROVAL", scope: "candidate", targetHash: HEX_A }, "HUMAN");
   expect(wrong.status === 409, `wrong-hash approval expected 409, got ${wrong.status}: ${wrong.text.slice(0, 200)}`);
   expect(wrong.code === "APPROVAL_STALE", `expected APPROVAL_STALE, got ${wrong.code}`);
@@ -707,7 +778,7 @@ check("8. human REJECTION re-queues the task to READY (not REJECTED/DONE); DB + 
   await submitPass("M4-APPROVAL-REJECT", fixtures.approvalReject.run.id, MANIFEST);
   const afterPass = dbTask("M4-APPROVAL-REJECT");
   expect(afterPass.targetHash === MANIFEST, `DB target_hash expected the PASS hash, got ${afterPass.targetHash}`);
-  await patchTaskStatus("M4-APPROVAL-REJECT", "AWAITING_ACCEPTANCE");
+  await recordIntegration("M4-APPROVAL-REJECT", fixtures.approvalReject.run.id);
 
   const created = await api("POST", "/api/v1/approvals", { taskId: "M4-APPROVAL-REJECT", scope: "candidate", targetHash: MANIFEST }, "HUMAN");
   expect(created.status === 201, `POST /approvals expected 201, got ${created.status}: ${created.text.slice(0, 200)}`);
@@ -751,7 +822,7 @@ check("9. a new PASS changes the candidate hash, so an old approval + old hash c
   await submitPass("M4-STALE", fixtures.stale.run.id, HASH_NEW);
   const afterFirst = dbTask("M4-STALE");
   expect(afterFirst.targetHash === HASH_NEW, `DB target_hash expected H1, got ${afterFirst.targetHash}`);
-  await patchTaskStatus("M4-STALE", "AWAITING_ACCEPTANCE");
+  await recordIntegration("M4-STALE", fixtures.stale.run.id);
   const created = await api("POST", "/api/v1/approvals", { taskId: "M4-STALE", scope: "candidate", targetHash: HASH_NEW }, "HUMAN");
   expect(created.status === 201, `binding approval expected 201, got ${created.status}: ${created.text.slice(0, 200)}`);
   const oldApproval = created.payload?.approval ?? created.payload;
@@ -759,10 +830,11 @@ check("9. a new PASS changes the candidate hash, so an old approval + old hash c
 
   // 2. The candidate changes: rework the task back to REVIEWING and PASS a new
   //    hash H2. This is the "new version" that must invalidate the old approval.
-  for (const status of ["REJECTED", "READY", "CLAIMED", "RUNNING", "REVIEWING"]) {
-    await patchTaskStatus("M4-STALE", status);
-  }
-  await submitPass("M4-STALE", undefined, HASH_STALE);
+  // Fixture rewind only: the task goes back to RUNNING so a second candidate can
+  // exist. createReview (a real service) moves it to REVIEWING and PASS produces
+  // H2 - no production transition is patched.
+  seedTaskStatus("M4-STALE", "RUNNING");
+  await submitPass("M4-STALE", fixtures.stale.run.id, HASH_STALE);
   const changed = dbTask("M4-STALE");
   expect(changed.status === "INTEGRATING", `DB task expected INTEGRATING after the new PASS, got ${changed.status}`);
   expect(changed.targetHash === HASH_STALE, `DB target_hash expected the new hash H2, got ${changed.targetHash}`);
