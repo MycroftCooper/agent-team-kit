@@ -8,3 +8,4 @@ export * from "./errors.mjs";
 export * from "./dto.mjs";
 export * from "./events.mjs";
 export * from "./paths.mjs";
+export * from "./execution-spec.mjs";
