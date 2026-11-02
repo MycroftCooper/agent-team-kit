@@ -24,6 +24,8 @@ export const ERROR_CODES = Object.freeze({
   REVIEW_INVALIDATED: { http: 409, retryable: true },
   // M4: an agent must never approve its own work (spec §6.3 / §9.4).
   SELF_REVIEW_FORBIDDEN: { http: 403, retryable: false },
+  REVIEW_RUN_NOT_REVIEWER: { http: 403, retryable: false },
+  WORKSPACE_REQUIRED: { http: 400, retryable: false },
   // M4: a PASS verdict without a manifest hash or with failing/missing test
   // evidence is not a review, it is an assertion.
   EVIDENCE_MISSING: { http: 400, retryable: false },
