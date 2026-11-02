@@ -8,10 +8,14 @@
 //   SCHEDULER_POLL_MS            default 1000
 //   MAX_CONCURRENT_PER_PROJECT   default 4
 //   MAX_PER_AGENT                default 1
+//   ATK_REPO_PATH                project repository for workspace policy (default cwd)
+//   ATK_WORKTREE_ROOT            worktree root (default %LOCALAPPDATA%/AgentTeamKit/worktrees)
+//   ATK_WORKSPACE_MODE           auto | worktree | none (default auto)
 import process from "node:process";
 import { planDispatch } from "@atk/scheduler-core";
 import { createSchedulerClient } from "./src/client.mjs";
 import { createScheduler } from "./src/index.mjs";
+import { deriveWorkspacePolicy, summarizeWorkspacePolicy } from "./src/workspace-policy.mjs";
 
 const USAGE = [
   "Usage: atk-scheduler [--once] [--owner <id>]",
@@ -23,6 +27,9 @@ const USAGE = [
   "  SCHEDULER_POLL_MS            poll interval (default 1000)",
   "  MAX_CONCURRENT_PER_PROJECT   concurrent runs per project (default 4)",
   "  MAX_PER_AGENT                concurrent runs per agent (default 1)",
+  "  ATK_REPO_PATH                project repository for workspace policy (default: cwd)",
+  "  ATK_WORKTREE_ROOT            root for Run worktrees (default: %LOCALAPPDATA%/AgentTeamKit/worktrees)",
+  "  ATK_WORKSPACE_MODE           auto (git -> worktree, else none) | worktree | none (default auto)",
   "",
   "Exit codes: 0 ok, 2 usage/config error.",
 ].join("\n");
@@ -52,9 +59,24 @@ if (!token) {
 }
 
 const ownerId = args.owner ?? process.env.SCHEDULER_OWNER ?? `scheduler-${process.pid}`;
+// m6.3: derive the workspace policy once at startup. A real git repository gets
+// worktrees with a pinned HEAD; everything else degrades to `none` so a
+// mock/demo setup is never refused by the backend for an incomplete policy.
+let workspace;
+try {
+  workspace = deriveWorkspacePolicy({
+    repoPath: process.env.ATK_REPO_PATH,
+    worktreeRoot: process.env.ATK_WORKTREE_ROOT,
+    mode: process.env.ATK_WORKSPACE_MODE,
+  });
+} catch (error) {
+  process.stderr.write(`atk-scheduler: ${error.message}\n`);
+  process.exit(2);
+}
 const policies = {
   maxConcurrentPerProject: Number(process.env.MAX_CONCURRENT_PER_PROJECT ?? 4),
   maxPerAgent: Number(process.env.MAX_PER_AGENT ?? 1),
+  workspacePolicy: workspace.policy,
 };
 
 const logger = console;
@@ -70,11 +92,28 @@ const scheduler = createScheduler({
 
 if (args.once) {
   const result = await scheduler.runOnce();
-  process.stdout.write(`${JSON.stringify({ result, stats: scheduler.stats })}\n`);
+  process.stdout.write(
+    `${JSON.stringify({
+      result,
+      stats: scheduler.stats,
+      workspace: {
+        kind: workspace.policy.kind,
+        root: workspace.policy.root ?? null,
+        baseCommit: workspace.policy.baseCommit ?? null,
+        reason: workspace.reason,
+        repoPath: workspace.repoPath,
+      },
+    })}\n`,
+  );
   await scheduler.stop();
 } else {
   scheduler.start({ keepAlive: true });
-  process.stdout.write(`[scheduler] ${ownerId} attached to ${baseUrl} (policies ${JSON.stringify(policies)})\n`);
+  process.stdout.write(
+    `[scheduler] ${ownerId} attached to ${baseUrl} (policies ${JSON.stringify({
+      maxConcurrentPerProject: policies.maxConcurrentPerProject,
+      maxPerAgent: policies.maxPerAgent,
+    })}; workspace=${summarizeWorkspacePolicy(workspace)})\n`,
+  );
 }
 
 for (const signal of ["SIGINT", "SIGTERM"]) {

@@ -44,3 +44,9 @@ test("cli.mjs --once reports a failed round instead of crashing when the backend
   assert.equal(payload.result.reason, "snapshot-failed");
   assert.ok(payload.result.backoffMs >= 1000);
 });
+
+test("cli.mjs exits 2 with a clear message on an invalid ATK_WORKSPACE_MODE", () => {
+  const result = run(["--once"], { ATK_INTERNAL_TOKEN: "test-token", ATK_WORKSPACE_MODE: "bogus" });
+  assert.equal(result.status, 2, `expected exit 2, got ${result.status}: ${result.stderr}`);
+  assert.match(result.stderr, /workspace mode must be auto\|worktree\|none/);
+});
