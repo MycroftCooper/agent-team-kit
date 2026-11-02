@@ -116,7 +116,13 @@ if (!hasSqlite) {
         }
       },
       makeAgent(id, overrides = {}) {
-        return store.upsertAgent({ id, role: "DEV", capabilities: ["WORKER"], status: "IDLE", ...overrides });
+        const agent = store.upsertAgent({ id, role: "DEV", capabilities: ["WORKER"], status: "IDLE", ...overrides });
+        // M6.2 F10: IDLE alone is not dispatchable; a fresh heartbeat + capacity is.
+        // Fixture-only seed, guarded so the suite also runs against an older store.
+        if (typeof store.recordHeartbeat === "function" && agent.status === "IDLE") {
+          store.recordHeartbeat({ hostId: `fixture-${id}`, agentIds: [id], capacity: 1 });
+        }
+        return agent;
       },
       makeTask(id, deps = [], overrides = {}) {
         env.nextId += 1;
@@ -217,7 +223,7 @@ if (!hasSqlite) {
     roleRequired: "DEV",
     ...overrides,
   });
-  const agentRow = (id, overrides = {}) => ({ id, role: "DEV", capabilities: ["WORKER"], status: "IDLE", ...overrides });
+  const agentRow = (id, overrides = {}) => ({ id, role: "DEV", capabilities: ["WORKER"], status: "IDLE", lastHeartbeatAt: NOW, capacity: 1, ...overrides });
   const policies = { maxConcurrentPerProject: 10, maxPerAgent: 5 };
   const plan = (tasks, agents = [agentRow("a1")], extra = {}) =>
     core.planDispatch({ snapshot: { version: 1, projects: [{ id: "p", policy: {} }], tasks, agents, runs: [], leases: [], ...extra }, policies, now: NOW });

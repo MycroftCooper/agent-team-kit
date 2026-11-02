@@ -20,18 +20,42 @@ try { await import("node:sqlite"); } catch { hasSqlite = false; }
 if (!hasSqlite) {
   test("qa-m61 runtime-fault suite (skipped: node:sqlite is unavailable)", { skip: "node:sqlite requires Node >= 22.5" }, () => {});
 } else {
-  const { openStore } = await load("packages/database/src/index.mjs");
+  const { openStore, createMemoryStore } = await load("packages/database/src/index.mjs");
   const { INTERNAL } = await load("packages/database/src/internal.mjs");
   const { createHost } = await load("apps/runtime-host/src/host.mjs");
   const { createMockRuntime } = await load("packages/runtime-sdk/src/mock.mjs");
   const { startServer, request, internalHeaders, TEST_INTERNAL_TOKEN } = await load("apps/backend/test/helpers.mjs");
   const { createInternalClient } = await load("apps/runtime-host/src/client.mjs");
 
-  const claimOf = ({ runId = "run-1", commandId = "CMD-1" } = {}) => ({
-    command: { id: commandId, runId, commandType: "START_RUN", attempts: 1, payload: { prompt: "do it" } },
-    run: { id: runId, taskId: `TASK-${runId}`, status: "STARTING" },
-    lease: { ownerId: "host-a", generation: 7, claimedUntil: new Date(Date.now() + 30000).toISOString() },
+  // M6.2 F05: a Host never starts without a valid frozen TaskExecutionSpec.
+  // These are Host-side fault-injection fixtures, so the spec is constructed
+  // explicitly (kind "none") instead of reaching into the database.
+  const specOf = (runId, taskId = `TASK-${runId}`) => ({
+    schemaVersion: 1,
+    taskId,
+    taskVersion: 2,
+    title: "QA runtime-fault task",
+    description: "exercise Outbox / fencing",
+    acceptance: "ack is durable",
+    files: [],
+    deps: [],
+    functionRequired: "WORKER",
+    roleRequired: "DEV",
+    project: { id: "P-QA", name: "qa", repoPath: ".", defaultBranch: "main" },
+    workspace: { kind: "none", path: null, baseCommit: null, targetBranch: null },
+    constraints: {},
+    frozenAt: "2026-11-02T00:00:00.000Z",
   });
+  const claimOf = ({ runId = "run-1", commandId = "CMD-1", spec } = {}) => {
+    const taskId = spec?.taskId ?? `TASK-${runId}`;
+    const value = spec ?? specOf(runId, taskId);
+    return {
+      command: { id: commandId, runId, commandType: "START_RUN", attempts: 1, payload: { prompt: "do it", spec: value } },
+      run: { id: runId, taskId, status: "STARTING", workspace: value.workspace },
+      lease: { ownerId: "host-a", generation: 7, claimedUntil: new Date(Date.now() + 30000).toISOString() },
+      spec: value,
+    };
+  };
   function fakeClient({ claims = [], onEvents, onResult, onReconcile } = {}) {
     const calls = { claim: 0, events: [], result: [], renew: [], heartbeat: [], reconcile: [] };
     const queue = [...claims];
@@ -189,6 +213,42 @@ if (!hasSqlite) {
     assert.equal(second, null, "a second host must not receive the same command");
     const run = f.store.getRun(f.claim.run.id);
     assert.equal(run.status, "RUNNING");
+  });
+
+  test("QA-02.4b the same batch/fence/dedupe contract holds on the Memory store", async (t) => {
+    const dir = tempDir(t);
+    const memory = createMemoryStore();
+    t.after(() => { try { memory.close(); } catch { /* closed */ } });
+    memory.createProject({ id: "P1", name: "p1", repoPath: ".", defaultBranch: "main" });
+    memory.upsertAgent({ id: "agent-1", role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
+    const task = memory.createTask({ id: "T-MEM", projectId: "P1", title: "m", description: "d", functionRequired: "WORKER", roleRequired: "DEV", priority: 2, deps: [], acceptance: "x" });
+    const claim = memory.claimTask({ taskId: task.id, agentId: "agent-1", expectedTaskVersion: task.version, idempotencyKey: "qa02-memory" });
+    const claimed = memory.claimDispatchCommand({ ownerId: "host-mem", leaseMs: 60000 });
+    const generation = claimed.lease.generation;
+    memory.updateRunStatus(claim.run.id, { status: "RUNNING", generation });
+    const batch = {
+      runId: claim.run.id,
+      generation,
+      events: [
+        { type: "run.log", payload: { line: "mem" }, eventId: "MEM-EVT-1", sessionSeq: 1 },
+        { type: "run.updated", payload: { status: "COMPLETED", exitCode: 0 }, eventId: "MEM-EVT-2", sessionSeq: 2 },
+      ],
+    };
+    const first = memory.applyRuntimeEventBatch(batch);
+    assert.equal(first.applied.length, 2);
+    const second = memory.applyRuntimeEventBatch(batch);
+    assert.equal(second.applied.length, 0);
+    assert.equal(second.skipped, 2);
+    const before = JSON.stringify({ run: memory.getRun(claim.run.id), events: memory.listEvents({ aggregateId: claim.run.id, limit: 100 }) });
+    await assert.rejects(
+      async () => memory.applyRuntimeEventBatch({ runId: claim.run.id, generation, events: [{ type: "run.log", payload: "bad", eventId: "MEM-BAD", sessionSeq: 3 }] }),
+      (error) => error.code === "VALIDATION_ERROR" || error.name === "StoreError",
+    );
+    assert.equal(JSON.stringify({ run: memory.getRun(claim.run.id), events: memory.listEvents({ aggregateId: claim.run.id, limit: 100 }) }), before);
+    assert.throws(
+      () => memory.renewRunLease({ runId: claim.run.id, ownerId: "other", generation, leaseMs: 60000 }),
+      (error) => error.code === "STALE_GENERATION",
+    );
   });
 
   test("QA-02.5 F02: a transient result failure persists the fact and only counts completion after ack", async (t) => {
