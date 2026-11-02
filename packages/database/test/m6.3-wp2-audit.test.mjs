@@ -6,6 +6,54 @@ import { DatabaseSync } from "node:sqlite";
 import { INTERNAL } from "../src/internal.mjs";
 import { bothStores, projectDto, taskDto, useStore } from "./helpers.mjs";
 
+test("M6.3 §12 createReviewerRun reuses producer workspace and enqueues a REVIEWER dispatch", (t) => {
+  for (const { label, store } of bothStores(t)) {
+    store.upsertAgent({ id: "author-1", role: "DEV", capabilities: ["WORKER"], status: "IDLE" });
+    store.upsertAgent({ id: "reviewer-1", role: "QA", capabilities: ["REVIEWER"], status: "IDLE" });
+    const producer = store.createRun({ taskId: "TASK-SEED", agentId: "author-1", function: "WORKER", role: "DEV" });
+    store.enqueueDispatchCommand({ runId: producer.id, commandType: "RUN_TASK", payload: {}, idempotencyKey: "m63-review-producer" });
+    store.claimDispatchCommand({ ownerId: "host-1", leaseMs: 60000 });
+    store.updateRunStatus(producer.id, { status: "RUNNING", generation: 1 });
+    store.updateRunStatus(producer.id, { status: "COMPLETED", exitCode: 0, generation: 1 });
+    store[INTERNAL].setTaskStatus("TASK-SEED", "REVIEWING");
+
+    const first = store.createReviewerRun({
+      taskId: "TASK-SEED",
+      reviewerAgentId: "reviewer-1",
+      idempotencyKey: "m63-review-run",
+    });
+    assert.equal(first.run.function, "REVIEWER", label);
+    assert.equal(first.run.agentId, "reviewer-1", label);
+    assert.equal(first.run.workBranch, `atk/run/${first.run.id}`, label);
+    assert.equal(first.command.payload.specHash, first.specHash, label);
+    assert.deepEqual(first.command.payload.spec, first.spec, label);
+    assert.equal(store.getRunSpec(first.run.id).specHash, first.specHash, label);
+    const replay = store.createReviewerRun({
+      taskId: "TASK-SEED",
+      reviewerAgentId: "reviewer-1",
+      idempotencyKey: "m63-review-run",
+    });
+    assert.equal(replay.run.id, first.run.id, `${label}: same Run`);
+    assert.equal(replay.specHash, first.specHash, `${label}: same specHash`);
+
+    // No completed producer -> completed-run-required.
+    store.createTask(taskDto("proj-1", { id: "TASK-NO-PRODUCER" }));
+    store[INTERNAL].setTaskStatus("TASK-NO-PRODUCER", "REVIEWING");
+    assert.throws(
+      () => store.createReviewerRun({ taskId: "TASK-NO-PRODUCER", reviewerAgentId: "reviewer-1", idempotencyKey: "no-producer" }),
+      (error) => error.code === "VALIDATION_ERROR" && error.details.reason === "completed-run-required",
+      label,
+    );
+    // Not REVIEWING -> task-not-reviewing.
+    store.createTask(taskDto("proj-1", { id: "TASK-READY-REVIEW" }));
+    assert.throws(
+      () => store.createReviewerRun({ taskId: "TASK-READY-REVIEW", reviewerAgentId: "reviewer-1", idempotencyKey: "not-reviewing" }),
+      (error) => error.code === "VALIDATION_ERROR" && error.details.reason === "task-not-reviewing",
+      label,
+    );
+  }
+});
+
 test("P0-3b duplicate workBranch is rejected per project and by the real unique index", (t) => {
   for (const { label, store } of bothStores(t)) {
     store.upsertAgent({ id: "agent-1", role: "DEV", capabilities: ["WORKER"], status: "IDLE" });

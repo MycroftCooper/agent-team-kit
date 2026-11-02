@@ -2428,6 +2428,101 @@ export function openStore(options = {}) {
       };
     },
 
+    /**
+     * M6.3 §12: create a REVIEWER Run on an existing REVIEWING task, reusing the
+     * producer workspace facts but its own unique work branch, and enqueue the
+     * dispatch command the Host executes through the normal claim path.
+     */
+    createReviewerRun({ taskId, reviewerAgentId, idempotencyKey } = {}) {
+      requireId(taskId, "task.id");
+      requireId(reviewerAgentId, "agent.id");
+      const key = validateIdempotencyKey(idempotencyKey);
+      return transaction(() => {
+        const existing = stmt("SELECT * FROM dispatch_commands WHERE idempotency_key = ?").get(key);
+        if (existing) {
+          const run = runJson(requireRunRow(existing.run_id));
+          if (run.taskId !== taskId) {
+            fail("VALIDATION_ERROR", "idempotencyKey was already used for another task", { taskId, existingTaskId: run.taskId });
+          }
+          let spec = null;
+          let specHash = null;
+          try {
+            const loaded = store.getRunSpec(run.id);
+            spec = loaded.spec;
+            specHash = loaded.specHash;
+          } catch {
+            // Pre-0008 replay has no spec; return the command as recorded.
+          }
+          return { run, command: commandJson(existing), spec, specHash };
+        }
+        const taskRow = requireTaskRow(taskId);
+        if (taskRow.status !== "REVIEWING") {
+          fail("VALIDATION_ERROR", "task is not REVIEWING", {
+            taskId,
+            status: taskRow.status,
+            reason: "task-not-reviewing",
+          });
+        }
+        const producerRow = stmt(
+          "SELECT * FROM runs WHERE task_id = ? AND status = 'COMPLETED' ORDER BY updated_at DESC, id DESC LIMIT 1",
+        ).get(taskId);
+        if (!producerRow) {
+          fail("VALIDATION_ERROR", "task has no COMPLETED producer Run", {
+            taskId,
+            reason: "completed-run-required",
+          });
+        }
+        const agentRow = stmt("SELECT * FROM agent_instances WHERE id = ?").get(reviewerAgentId);
+        if (!agentRow) {
+          fail("VALIDATION_ERROR", "reviewer agent does not exist", { field: "reviewerAgentId", reviewerAgentId });
+        }
+        const agent = agentJson(agentRow);
+        const producer = runJson(producerRow);
+        const workspace = producer.workspace ?? { kind: "none", path: null, baseCommit: null, targetBranch: null };
+        const at = nowIso();
+        const runId = generateId("RUN");
+        const frozen = guarded.freezeTaskSpec(taskId, {
+          workspace,
+          now: at,
+          constraints: { reviewer: true },
+        });
+        const run = store.createRun({
+          taskId,
+          agentId: reviewerAgentId,
+          function: "REVIEWER",
+          role: agent.role,
+          files: taskJson(taskRow).files,
+          id: runId,
+          workspace,
+          workBranch: `atk/run/${runId}`,
+          specHash: frozen.specHash,
+        });
+        const command = store.enqueueDispatchCommand({
+          runId,
+          commandType: "RUN_TASK",
+          payload: {
+            taskId,
+            agentId: reviewerAgentId,
+            functionRequired: "REVIEWER",
+            roleRequired: agent.role,
+            reviewerAgentId,
+            review: true,
+            specHash: frozen.specHash,
+            spec: frozen.spec,
+            workspace,
+          },
+          idempotencyKey: key,
+        });
+        stmt("UPDATE dispatch_commands SET owner_id = ? WHERE id = ?").run(reviewerAgentId, command.id);
+        return {
+          run,
+          command: commandJson(stmt("SELECT * FROM dispatch_commands WHERE id = ?").get(command.id)),
+          spec: frozen.spec,
+          specHash: frozen.specHash,
+        };
+      });
+    },
+
     createReview(dto = {}) {
       ensurePlainObject(dto, "review");
       requireId(dto.taskId, "review.taskId");

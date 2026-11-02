@@ -1474,6 +1474,82 @@ export function createMemoryStore() {
       };
     },
 
+    createReviewerRun({ taskId, reviewerAgentId, idempotencyKey } = {}) {
+      requireId(taskId, "task.id");
+      requireId(reviewerAgentId, "agent.id");
+      const key = validateIdempotencyKey(idempotencyKey);
+      const existingId = commandIdempotency.get(key);
+      if (existingId !== undefined) {
+        const command = dispatchCommands.get(existingId);
+        const run = requireRunEntry(command.runId);
+        if (run.taskId !== taskId) {
+          fail("VALIDATION_ERROR", "idempotencyKey was already used for another task", { taskId, existingTaskId: run.taskId });
+        }
+        const loaded = runSpecs.get(run.id);
+        return {
+          run: clone(run),
+          command: clone(command),
+          spec: loaded ? clone(loaded.spec) : null,
+          specHash: loaded ? loaded.specHash : null,
+        };
+      }
+      const task = requireTaskEntry(taskId);
+      if (task.status !== "REVIEWING") {
+        fail("VALIDATION_ERROR", "task is not REVIEWING", {
+          taskId,
+          status: task.status,
+          reason: "task-not-reviewing",
+        });
+      }
+      const producer = [...runs.values()]
+        .filter((run) => run.taskId === taskId && run.status === "COMPLETED")
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id))[0];
+      if (!producer) {
+        fail("VALIDATION_ERROR", "task has no COMPLETED producer Run", {
+          taskId,
+          reason: "completed-run-required",
+        });
+      }
+      const agent = agents.get(reviewerAgentId);
+      if (!agent) {
+        fail("VALIDATION_ERROR", "reviewer agent does not exist", { field: "reviewerAgentId", reviewerAgentId });
+      }
+      const workspace = producer.workspace ?? { kind: "none", path: null, baseCommit: null, targetBranch: null };
+      const at = nowIso();
+      const runId = generateId("RUN");
+      const frozen = store.freezeTaskSpec(taskId, { workspace, now: at, constraints: { reviewer: true } });
+      const run = store.createRun({
+        taskId,
+        agentId: reviewerAgentId,
+        function: "REVIEWER",
+        role: agent.role,
+        files: task.files,
+        id: runId,
+        workspace,
+        workBranch: `atk/run/${runId}`,
+        specHash: frozen.specHash,
+      });
+      const command = store.enqueueDispatchCommand({
+        runId,
+        commandType: "RUN_TASK",
+        payload: {
+          taskId,
+          agentId: reviewerAgentId,
+          functionRequired: "REVIEWER",
+          roleRequired: agent.role,
+          reviewerAgentId,
+          review: true,
+          specHash: frozen.specHash,
+          spec: frozen.spec,
+          workspace,
+        },
+        idempotencyKey: key,
+      });
+      const ownedCommand = { ...command, ownerId: reviewerAgentId };
+      dispatchCommands.set(ownedCommand.id, ownedCommand);
+      return { run: clone(run), command: clone(ownedCommand), spec: clone(frozen.spec), specHash: frozen.specHash };
+    },
+
     createReview(dto = {}) {
       ensurePlainObject(dto, "review");
       if (dto.actor !== undefined && dto.actor !== null) validateActor(dto.actor, "review.actor");
