@@ -82,6 +82,92 @@ export function worktreePathOf({ projectId, runId, root }) {
   return path.join(root ?? defaultRoot(), assertSegment("projectId", projectId), assertSegment("runId", runId));
 }
 
+function samePath(left, right) {
+  const a = path.resolve(String(left ?? ""));
+  const b = path.resolve(String(right ?? ""));
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/**
+ * Create the worktree recorded on a Run, or reuse it after a restart (M6.2 F04).
+ *
+ * Unlike createWorktree, the target path is taken from the persisted
+ * run.workspace record rather than derived from a (projectId, runId) pair. Reuse
+ * never resets, checks out or cleans the directory: an Agent's uncommitted work
+ * must survive a host restart. A reused directory must be a registered worktree
+ * of the same repository and, when it has a branch, the recorded target branch.
+ *
+ * @returns {{id:string|null, projectId:string|null, runId:string, path:string, branch:string|null, baseCommit:string, reused:boolean}}
+ */
+export function ensureWorktree({ repoPath, projectId, runId, worktreePath, baseCommit = null, targetBranch = null, root } = {}) {
+  if (!repoPath) throw new WorkspaceError("VALIDATION_ERROR", "repoPath is required");
+  const repo = path.resolve(String(repoPath));
+  if (!existsSync(repo) || !statSync(repo).isDirectory()) {
+    throw new WorkspaceError("VALIDATION_ERROR", `repository path does not exist: ${repo}`);
+  }
+  if (!isGitRepository(repo)) throw new WorkspaceError("NOT_A_GIT_REPOSITORY", `${repo} is not a git repository`);
+  const project = projectId === undefined || projectId === null ? null : assertSegment("projectId", projectId);
+  const run = assertSegment("runId", runId);
+  const target = worktreePath
+    ? path.resolve(String(worktreePath))
+    : worktreePathOf({ projectId: project ?? "run", runId: run, root });
+  const relativeToRepo = path.relative(repo, target);
+  if (relativeToRepo === "" || (relativeToRepo && !relativeToRepo.startsWith("..") && !path.isAbsolute(relativeToRepo))) {
+    throw new WorkspaceError("WORKSPACE_INSIDE_REPO", `worktree path ${target} is inside ${repo}`);
+  }
+  const branch = targetBranch ? String(targetBranch) : branchNameOf(run);
+  const branchCheck = git(["check-ref-format", "--branch", branch], repo);
+  if (branchCheck.code !== 0) {
+    throw new WorkspaceError("VALIDATION_ERROR", `targetBranch ${JSON.stringify(branch)} is not a valid git branch`, { branch });
+  }
+
+  if (existsSync(target)) {
+    if (!statSync(target).isDirectory() || !isGitRepository(target)) {
+      throw new WorkspaceError("WORKSPACE_INVALID", `existing path is not a git worktree: ${target}`);
+    }
+    const entry = listWorktrees({ repoPath: repo }).find((candidate) => samePath(candidate.path, target));
+    if (!entry) {
+      throw new WorkspaceError("WORKSPACE_INVALID", `existing path is not a registered worktree of ${repo}: ${target}`);
+    }
+    if (entry.branch && entry.branch !== branch) {
+      throw new WorkspaceError("WORKSPACE_MISMATCH", `worktree ${target} is on ${entry.branch}, expected ${branch}`, {
+        path: target,
+        branch: entry.branch,
+        expectedBranch: branch,
+      });
+    }
+    return {
+      id: project ? `${project}/${run}` : null,
+      projectId: project,
+      runId: run,
+      path: target,
+      branch: entry.branch ?? null,
+      baseCommit: baseCommit ? resolveCommit(repo, baseCommit) : resolveCommit(target),
+      reused: true,
+    };
+  }
+
+  const resolvedBase = resolveCommit(repo, baseCommit ?? "HEAD");
+  const existingBranch = git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], repo);
+  mkdirSync(path.dirname(target), { recursive: true });
+  if (existingBranch.code === 0) {
+    // The branch survived a crash but the worktree directory did not: reattach it
+    // to the same branch instead of failing or silently creating a new one.
+    mustGit(["worktree", "add", target, branch], repo, "git worktree add (existing branch)");
+  } else {
+    mustGit(["worktree", "add", "-b", branch, target, resolvedBase], repo, "git worktree add");
+  }
+  return {
+    id: project ? `${project}/${run}` : null,
+    projectId: project,
+    runId: run,
+    path: target,
+    branch,
+    baseCommit: resolvedBase,
+    reused: false,
+  };
+}
+
 /**
  * Create an exclusive worktree for one Run.
  *

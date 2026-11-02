@@ -15,6 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createMockRuntime } from "@atk/runtime-sdk/mock";
+import { createTaskExecutionSpec } from "../../../packages/contracts/src/execution-spec.mjs";
 import { createInternalClient, InternalApiError } from "../src/client.mjs";
 import { createHost } from "../src/host.mjs";
 
@@ -24,9 +25,25 @@ function quietLogger() {
 }
 
 function claimOf({ runId = "run-1", commandId = "CMD-1", attempts = 1 } = {}) {
+  const spec = createTaskExecutionSpec({
+    task: {
+      id: `TASK-${runId}`,
+      version: 1,
+      title: "Reliability task",
+      description: "A frozen task for the reliability tests.",
+      acceptance: "green",
+      files: [],
+      deps: [],
+      functionRequired: "DEV",
+      roleRequired: "DEVELOPER",
+    },
+    project: { id: "proj-1", name: "Demo", repoPath: "C:/repo", defaultBranch: "main" },
+    workspace: { kind: "none", path: null, baseCommit: null, targetBranch: null },
+    frozenAt: "2026-01-01T00:00:00.000Z",
+  });
   return {
-    command: { id: commandId, runId, commandType: "START_RUN", attempts, payload: { prompt: "do it" } },
-    run: { id: runId, taskId: `TASK-${runId}`, status: "STARTING" },
+    command: { id: commandId, runId, commandType: "START_RUN", attempts, payload: { prompt: "do it", spec } },
+    run: { id: runId, taskId: `TASK-${runId}`, status: "STARTING", workspace: { kind: "none", path: null, baseCommit: null, targetBranch: null } },
     lease: { ownerId: "host-a", generation: 7, claimedUntil: new Date(Date.now() + 30000).toISOString() },
   };
 }

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createMockRuntime } from "@atk/runtime-sdk/mock";
+import { createTaskExecutionSpec } from "../../../packages/contracts/src/execution-spec.mjs";
 import { createHost } from "../src/host.mjs";
 import { InternalApiError } from "../src/client.mjs";
 
@@ -53,10 +54,29 @@ function fakeClient({ claims = [], staleOnEvents = false, staleOnRenew = false }
 
 function claimOf({ attempts = 1 } = {}) {
   return {
-    command: { id: "CMD-1", runId: "run-1", commandType: "START_RUN", attempts, payload: { prompt: "do it" } },
-    run: { id: "run-1", taskId: "TASK-1", status: "STARTING" },
+    command: { id: "CMD-1", runId: "run-1", commandType: "START_RUN", attempts, payload: { prompt: "do it", spec: noneSpec() } },
+    run: { id: "run-1", taskId: "TASK-1", status: "STARTING", workspace: { kind: "none", path: null, baseCommit: null, targetBranch: null } },
     lease: { ownerId: "host-a", generation: 1, claimedUntil: new Date(Date.now() + 30000).toISOString() },
   };
+}
+
+function noneSpec(taskId = "TASK-1") {
+  return createTaskExecutionSpec({
+    task: {
+      id: taskId,
+      version: 1,
+      title: "Test task",
+      description: "A frozen test task.",
+      acceptance: "green",
+      files: [],
+      deps: [],
+      functionRequired: "DEV",
+      roleRequired: "DEVELOPER",
+    },
+    project: { id: "proj-1", name: "Demo", repoPath: "C:/repo", defaultBranch: "main" },
+    workspace: { kind: "none", path: null, baseCommit: null, targetBranch: null },
+    frozenAt: "2026-01-01T00:00:00.000Z",
+  });
 }
 
 test("recover() reconciles persisted runs and never guesses (ADR-010 decision 7)", async () => {

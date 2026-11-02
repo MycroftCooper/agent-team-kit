@@ -20,11 +20,95 @@
 //
 // A reclaimed command (attempts > 1) is never restarted (the previous host may
 // have started a session we cannot observe); it is reported INTERRUPTED.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve as resolvePath } from "node:path";
+// M6.2 F04/F05: the Host consumes the frozen spec from @atk/contracts and uses
+// the shared worktree manager. These are imported by path because runtime-host
+// is not yet part of the package-boundary matrix; the modules are still the
+// single source of truth (do not duplicate their rules here).
+import { validateTaskExecutionSpec } from "../../../packages/contracts/src/execution-spec.mjs";
+import { ensureWorktree } from "../../../packages/workspace/src/index.mjs";
 
 const TERMINAL_RUN_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"]);
+
+function samePath(left, right) {
+  const a = resolvePath(String(left ?? ""));
+  const b = resolvePath(String(right ?? ""));
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function canonicalSpecHash(spec) {
+  // Matches database `hashExecutionSpec`: sha256(JSON.stringify(spec)).
+  return createHash("sha256").update(JSON.stringify(spec)).digest("hex");
+}
+
+function buildExecutionPrompt(spec) {
+  const sections = [spec.title, spec.description];
+  if (spec.acceptance) sections.push(`Acceptance:\n${spec.acceptance}`);
+  if (spec.files.length > 0) sections.push(`Files:\n${spec.files.map((file) => `- ${file}`).join("\n")}`);
+  if (spec.deps.length > 0) sections.push(`Dependencies:\n${spec.deps.map((dep) => `- ${dep}`).join("\n")}`);
+  return sections.filter(Boolean).join("\n\n");
+}
+
+/**
+ * Validate the dispatched spec and bind the cwd to the persisted run.workspace.
+ * Returns a rejection descriptor instead of ever guessing a directory or prompt.
+ */
+function prepareExecution(claim) {
+  const spec = claim?.spec ?? claim?.command?.payload?.spec;
+  if (spec === undefined || spec === null) {
+    return { ok: false, code: "missing-execution-spec", message: "the dispatch command did not carry a TaskExecutionSpec" };
+  }
+  const validation = validateTaskExecutionSpec(spec);
+  if (!validation.ok) {
+    return { ok: false, code: "invalid-execution-spec", message: `invalid execution spec: ${validation.errors.join("; ")}` };
+  }
+  const suppliedHash = claim.specHash ?? claim.command?.payload?.specHash;
+  const specHash = typeof suppliedHash === "string" && suppliedHash.trim() !== "" ? suppliedHash : canonicalSpecHash(spec);
+  const runWorkspace = claim.run?.workspace;
+  if (spec.workspace.kind === "worktree") {
+    if (
+      !runWorkspace ||
+      runWorkspace.kind !== "worktree" ||
+      typeof runWorkspace.path !== "string" ||
+      typeof runWorkspace.baseCommit !== "string"
+    ) {
+      return { ok: false, code: "workspace-mismatch", message: "spec.workspace is a worktree but run.workspace is not a worktree record" };
+    }
+    if (
+      !samePath(spec.workspace.path, runWorkspace.path) ||
+      spec.workspace.baseCommit !== runWorkspace.baseCommit ||
+      (spec.workspace.targetBranch && runWorkspace.targetBranch && spec.workspace.targetBranch !== runWorkspace.targetBranch)
+    ) {
+      return {
+        ok: false,
+        code: "workspace-mismatch",
+        message: `spec.workspace ${spec.workspace.path}@${spec.workspace.baseCommit} does not match run.workspace ${runWorkspace.path}@${runWorkspace.baseCommit}`,
+      };
+    }
+    const ensured = ensureWorktree({
+      repoPath: spec.project.repoPath,
+      projectId: spec.project.id,
+      runId: claim.run.id,
+      worktreePath: runWorkspace.path,
+      baseCommit: runWorkspace.baseCommit,
+      targetBranch: runWorkspace.targetBranch,
+    });
+    return { ok: true, spec, specHash, cwd: runWorkspace.path, workspace: runWorkspace, reused: ensured.reused === true };
+  }
+  if (runWorkspace && runWorkspace.kind !== "none") {
+    return { ok: false, code: "workspace-mismatch", message: `spec.workspace is none but run.workspace is ${runWorkspace.kind}` };
+  }
+  return {
+    ok: true,
+    spec,
+    specHash,
+    cwd: runWorkspace?.path ?? process.cwd(),
+    workspace: runWorkspace ?? { kind: "none", path: null, baseCommit: null, targetBranch: null },
+    reused: false,
+  };
+}
 
 /**
  * @param {object} options
@@ -84,6 +168,9 @@ export function createHost({
     outboxAcknowledged: 0,
     outboxExhausted: 0,
     permanentFailures: 0,
+    specRejected: 0,
+    workspaceCreated: 0,
+    workspaceReused: 0,
   };
 
   function setMode(next) {
@@ -518,8 +605,8 @@ export function createHost({
       generation: current.lease.generation,
       status,
       exitCode: endedEvent.exitCode ?? null,
-      summary: endedEvent.reason,
-      ...(status === "FAILED" ? { error: endedEvent.reason } : {}),
+      summary: endedEvent.summary ?? endedEvent.reason,
+      ...(status === "FAILED" ? { error: endedEvent.error ?? endedEvent.reason } : {}),
       idempotencyKey: idFactory(),
       createdAt: isoNow(),
       attempts: 0,
@@ -552,7 +639,7 @@ export function createHost({
     const { command, run, lease } = claim;
     const runId = run.id;
     stats.claimed += 1;
-    const entry = { command, lease, session: null, unsubscribe: null, buffer: [], timers: [] };
+    const entry = { command, lease, session: null, unsubscribe: null, buffer: [], timers: [], spec: null, specHash: null };
     sessions.set(runId, entry);
     // Persist BEFORE starting the session: if we die here, recover() must know
     // that this run may have been touched.
@@ -563,17 +650,41 @@ export function createHost({
       throw error;
     }
 
-    const session = await safe("start", () =>
-      runtime.start({
-        runId,
-        taskId: run.taskId,
-        prompt: command.payload?.prompt ?? `Execute task ${run.taskId}`,
-        cwd: command.payload?.cwd ?? process.cwd(),
-        model: command.payload?.model,
-        timeoutMs: command.payload?.timeoutMs,
-      }),
-    );
+    // F05: a Run without a valid frozen spec is never started. The rejection is
+    // a durable FAILED fact through the same Outbox as any other terminal fact.
+    let prepared;
+    try {
+      prepared = prepareExecution(claim);
+    } catch (error) {
+      stats.specRejected += 1;
+      await rejectRun(runId, error?.code ?? "workspace-error", String(error?.message ?? error));
+      return;
+    }
+    if (!prepared.ok) {
+      stats.specRejected += 1;
+      await rejectRun(runId, prepared.code, prepared.message);
+      return;
+    }
+    entry.spec = prepared.spec;
+    entry.specHash = prepared.specHash;
+    const constraints = prepared.spec.constraints ?? {};
+    const startInput = {
+      runId,
+      taskId: prepared.spec.taskId,
+      prompt: buildExecutionPrompt(prepared.spec),
+      cwd: prepared.cwd,
+      ...(typeof constraints.model === "string" ? { model: constraints.model } : {}),
+      ...(Number.isInteger(constraints.timeoutMs) ? { timeoutMs: constraints.timeoutMs } : {}),
+    };
+    const session = await safe("start", () => runtime.start(startInput));
     if (!session) {
+      entry.buffer.push({
+        type: "log",
+        sessionId: `failed-start-${command.id}`,
+        level: "error",
+        message: `execution-spec taskVersion=${prepared.spec.taskVersion} specHash=${prepared.specHash} workspace=${prepared.workspace.kind}; runtime start failed`,
+        at: isoNow(),
+      });
       // Start failure still becomes a durable terminal fact through the outbox.
       await enqueueTerminal(runId, { type: "session.ended", sessionId: `failed-start-${command.id}`, reason: "failed", exitCode: null });
       return;
@@ -582,6 +693,18 @@ export function createHost({
     stats.started += 1;
     const unsubscribe = await runtime.subscribe(session.sessionId, (event) => bufferEvent(runId, event));
     entry.unsubscribe = typeof unsubscribe === "function" ? unsubscribe : null;
+
+    // F05 traceability: the frozen task version and spec hash are part of the
+    // run's own event stream, not just the process log.
+    entry.buffer.push({
+      type: "log",
+      sessionId: session.sessionId,
+      level: "info",
+      message: `execution-spec taskVersion=${prepared.spec.taskVersion} specHash=${prepared.specHash} workspace=${prepared.workspace.kind}`,
+      at: isoNow(),
+    });
+    if (prepared.reused) stats.workspaceReused += 1;
+    else if (prepared.workspace.kind === "worktree") stats.workspaceCreated += 1;
 
     entry.timers.push(schedule(() => void flush(runId), flushMs));
     entry.timers.push(
@@ -600,6 +723,22 @@ export function createHost({
         }
       }, Math.max(1000, Math.floor(leaseMs / 3))),
     );
+  }
+
+  /** Reject a claimed Run without starting a runtime session (F05/F04). */
+  async function rejectRun(runId, code, message) {
+    const entry = sessions.get(runId);
+    if (!entry) return;
+    const sessionId = `rejected-${entry.command.id}`;
+    entry.buffer.push({
+      type: "log",
+      sessionId,
+      level: "error",
+      message: `execution rejected (${code}): ${message}`,
+      at: isoNow(),
+    });
+    logger.error?.(`[host] run ${runId} rejected before start (${code}): ${message}`);
+    await enqueueTerminal(runId, { type: "session.ended", sessionId, reason: "failed", exitCode: null, summary: code, error: message });
   }
 
   /**
