@@ -28,7 +28,7 @@ import { dirname, resolve as resolvePath } from "node:path";
 // is not yet part of the package-boundary matrix; the modules are still the
 // single source of truth (do not duplicate their rules here).
 import { validateTaskExecutionSpec } from "../../../packages/contracts/src/execution-spec.mjs";
-import { ensureWorktree } from "../../../packages/workspace/src/index.mjs";
+import { ensureWorktree, listWorktrees } from "../../../packages/workspace/src/index.mjs";
 
 const TERMINAL_RUN_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED"]);
 
@@ -641,10 +641,28 @@ export function createHost({
     stats.claimed += 1;
     const entry = { command, lease, session: null, unsubscribe: null, buffer: [], timers: [], spec: null, specHash: null };
     sessions.set(runId, entry);
-    // Persist BEFORE starting the session: if we die here, recover() must know
-    // that this run may have been touched.
+    const recordAt = isoNow();
+    const claimedUntil =
+      typeof lease.claimedUntil === "string" && Number.isFinite(Date.parse(lease.claimedUntil))
+        ? lease.claimedUntil
+        : new Date(now() + leaseMs).toISOString();
+    const baseRecord = {
+      runId,
+      commandId: command.id,
+      ownerId,
+      generation: lease.generation,
+      at: recordAt,
+      claimedUntil,
+      taskId: run.taskId,
+      commandType: command.commandType ?? null,
+      // The persisted run.workspace is the only cwd authority. Record it before
+      // the runtime starts so a crash cannot lose where the Run worked.
+      workspace: claim.run?.workspace ?? null,
+    };
+    // Persist BEFORE preparing/starting the session: if we die here, recover()
+    // must know that this run may have been touched.
     try {
-      recordRun({ runId, commandId: command.id, ownerId, generation: lease.generation, at: isoNow() });
+      recordRun(baseRecord);
     } catch (error) {
       sessions.delete(runId);
       throw error;
@@ -667,6 +685,30 @@ export function createHost({
     }
     entry.spec = prepared.spec;
     entry.specHash = prepared.specHash;
+    const persistedWorkspace =
+      prepared.workspace.kind === "worktree"
+        ? {
+            kind: "worktree",
+            path: prepared.workspace.path,
+            baseCommit: prepared.workspace.baseCommit,
+            targetBranch: prepared.workspace.targetBranch ?? null,
+            repoPath: prepared.spec.project.repoPath,
+            projectId: prepared.spec.project.id,
+          }
+        : { kind: "none", path: null, baseCommit: null, targetBranch: null };
+    try {
+      recordRun({
+        ...baseRecord,
+        workspace: persistedWorkspace,
+        specHash: prepared.specHash,
+        specTaskVersion: prepared.spec.taskVersion,
+        specTaskId: prepared.spec.taskId,
+      });
+    } catch (error) {
+      logger.error?.(`[host] could not persist the worktree binding: ${error?.message ?? error}`);
+      await rejectRun(runId, "recovery-state-write-failed", String(error?.message ?? error));
+      return;
+    }
     const constraints = prepared.spec.constraints ?? {};
     const startInput = {
       runId,
@@ -741,43 +783,177 @@ export function createHost({
     await enqueueTerminal(runId, { type: "session.ended", sessionId, reason: "failed", exitCode: null, summary: code, error: message });
   }
 
+  function recordLeaseDeadline(record) {
+    const claimed = Date.parse(record?.claimedUntil ?? "");
+    if (Number.isFinite(claimed)) return claimed;
+    const at = Date.parse(record?.at ?? "");
+    // Older M6.1 records had no claimedUntil: reconstruct the deadline from the
+    // claim time and the configured lease instead of guessing "not expired".
+    if (Number.isFinite(at)) return at + leaseMs;
+    return null;
+  }
+
+  function recordLeaseExpired(record) {
+    const deadline = recordLeaseDeadline(record);
+    return deadline !== null && deadline <= now();
+  }
+
+  /** Verify (never recreate) the worktree a recovered record points at. */
+  function inspectRecoveredWorktree(record) {
+    const workspace = record?.workspace;
+    if (!workspace || workspace.kind === "none") return { ok: true, kind: "none" };
+    if (workspace.kind !== "worktree") {
+      return { ok: false, code: "workspace-invalid", message: `recorded workspace.kind ${workspace.kind} is not worktree|none` };
+    }
+    if (typeof workspace.path !== "string" || workspace.path.trim() === "") {
+      return { ok: false, code: "workspace-invalid", message: "recorded worktree has no path" };
+    }
+    if (!existsSync(workspace.path)) {
+      return {
+        ok: false,
+        code: "workspace-missing",
+        message: `worktree ${workspace.path} is missing; RECOVERY_REQUIRED (it will not be recreated at a guessed path)`,
+      };
+    }
+    if (typeof workspace.repoPath !== "string" || workspace.repoPath.trim() === "") {
+      return { ok: false, code: "workspace-repo-unknown", message: `recorded worktree ${workspace.path} has no repoPath to verify it against` };
+    }
+    try {
+      const entry = listWorktrees({ repoPath: workspace.repoPath }).find((candidate) => samePath(candidate.path, workspace.path));
+      if (!entry) {
+        return { ok: false, code: "workspace-not-registered", message: `worktree ${workspace.path} is not registered in ${workspace.repoPath}` };
+      }
+      if (workspace.targetBranch && entry.branch && entry.branch !== workspace.targetBranch) {
+        return {
+          ok: false,
+          code: "workspace-branch-mismatch",
+          message: `worktree ${workspace.path} is on ${entry.branch}, recorded targetBranch is ${workspace.targetBranch}`,
+        };
+      }
+      return { ok: true, kind: "worktree", path: workspace.path, branch: entry.branch ?? workspace.targetBranch ?? null };
+    } catch (error) {
+      return { ok: false, code: error?.code ?? "workspace-error", message: String(error?.message ?? error) };
+    }
+  }
+
   /**
    * Called before taking new work. A corrupt recovery file is RECOVERY_REQUIRED:
    * it must never be interpreted as "no runs". Pending outbox facts are retried
    * first, then records are reconciled with the backend.
+   *
+   * A recovered record whose lease already expired is NOT resumed locally: the
+   * previous process may still have had a session we cannot observe. It is
+   * reported as INTERRUPTED/manual and the backend sweep closes the command.
+   * Missing worktrees are RECOVERY_REQUIRED and are never recreated here.
    */
   async function recover() {
-    const recordsRead = readRecordsStrict();
-    const summary = { total: 0, terminal: [], lost: [], unknown: [], corrupt: false };
-    if (!recordsRead.ok) {
+    const summary = {
+      total: 0,
+      terminal: [],
+      lost: [],
+      unknown: [],
+      interrupted: [],
+      worktrees: [],
+      worktreeMissing: [],
+      worktreeErrors: [],
+      recoveryRequired: false,
+      corrupt: false,
+    };
+    const initialRead = readRecordsStrict();
+    if (!initialRead.ok) {
       summary.corrupt = true;
+      summary.recoveryRequired = true;
       setMode("RECOVERY_REQUIRED");
       logger.error?.(`[host] refusing recovery: ${stateFile} is corrupt; reconcile manually before claiming work`);
       return summary;
     }
     await flushOutbox();
+    const recordsRead = readRecordsStrict();
+    if (!recordsRead.ok) {
+      summary.corrupt = true;
+      summary.recoveryRequired = true;
+      setMode("RECOVERY_REQUIRED");
+      logger.error?.(`[host] recovery file became corrupt during recovery: ${recordsRead.error?.message ?? recordsRead.error}`);
+      return summary;
+    }
     const records = recordsRead.records;
     summary.total = records.length;
     for (const record of records) {
+      const worktree = inspectRecoveredWorktree(record);
+      if (!worktree.ok) {
+        summary.recoveryRequired = true;
+        const entry = {
+          runId: record.runId,
+          path: record.workspace?.path ?? null,
+          reason: worktree.code,
+          message: worktree.message,
+        };
+        if (worktree.code === "workspace-missing") summary.worktreeMissing.push(entry);
+        else summary.worktreeErrors.push(entry);
+        logger.error?.(`[host] run ${record.runId} needs RECOVERY_REQUIRED: ${worktree.message}`);
+        try {
+          recordRun({ ...record, recoveryStatus: "RECOVERY_REQUIRED", recoveryError: { code: worktree.code, message: worktree.message }, recoveredAt: isoNow() });
+        } catch (error) {
+          logger.error?.(`[host] could not persist RECOVERY_REQUIRED evidence: ${error?.message ?? error}`);
+        }
+        continue;
+      }
+      if (worktree.kind === "worktree") summary.worktrees.push({ runId: record.runId, path: worktree.path, branch: worktree.branch });
+
+      const expired = recordLeaseExpired(record);
       const state = await safe("reconcile", () => client.reconcile(record.runId));
       if (state === undefined) {
-        summary.unknown.push(record.runId);
+        if (expired) {
+          summary.interrupted.push({
+            runId: record.runId,
+            commandId: record.commandId ?? null,
+            ownerId: record.ownerId ?? null,
+            generation: record.generation ?? null,
+            claimedUntil: record.claimedUntil ?? null,
+            reason: "lease-expired",
+            action: "backend-sweep",
+            reconcile: "unknown",
+          });
+          logger.warn?.(`[host] run ${record.runId} lease expired and reconcile failed; reporting INTERRUPTED/manual, not restarting`);
+        } else {
+          summary.unknown.push(record.runId);
+        }
         continue;
       }
       const status = state?.run?.status;
       if (TERMINAL_RUN_STATUSES.has(status)) {
         summary.terminal.push({ runId: record.runId, status });
         forgetRun(record.runId);
-      } else {
-        summary.lost.push({ runId: record.runId, status });
+        continue;
       }
+      if (expired) {
+        summary.interrupted.push({
+          runId: record.runId,
+          commandId: record.commandId ?? null,
+          ownerId: record.ownerId ?? null,
+          generation: record.generation ?? null,
+          claimedUntil: record.claimedUntil ?? null,
+          reason: "lease-expired",
+          action: "backend-sweep",
+          backendStatus: status ?? null,
+        });
+        logger.warn?.(`[host] run ${record.runId} (lease expired ${record.claimedUntil ?? record.at}) is INTERRUPTED/manual; backend sweep owns the command`);
+        try {
+          recordRun({ ...record, recoveryStatus: "INTERRUPTED", recoveryReason: "lease-expired", recoveredAt: isoNow() });
+        } catch (error) {
+          logger.error?.(`[host] could not persist INTERRUPTED evidence: ${error?.message ?? error}`);
+        }
+        continue;
+      }
+      summary.lost.push({ runId: record.runId, status });
     }
     if (summary.total > 0) {
       logger.warn?.(
-        `[host] recovered ${summary.total} record(s): ${summary.terminal.length} terminal, ${summary.lost.length} lost, ${summary.unknown.length} unknown`,
+        `[host] recovered ${summary.total} record(s): ${summary.terminal.length} terminal, ${summary.interrupted.length} interrupted, ${summary.lost.length} lost, ${summary.unknown.length} unknown, ${summary.worktrees.length} worktree(s), ${summary.worktreeMissing.length} missing`,
       );
     }
-    if (mode === "FINISHING" && outboxEntries.length === 0) setMode("RUNNING");
+    if (summary.recoveryRequired) setMode("RECOVERY_REQUIRED");
+    else if (mode === "FINISHING" && outboxEntries.length === 0) setMode("RUNNING");
     return summary;
   }
 
@@ -831,6 +1007,15 @@ export function createHost({
     try {
       const claim = await safe("claim", () => client.claim({ ownerId, leaseMs }));
       if (!claim) return;
+      // A Run that still has a recovery record must never be started by this
+      // process: the previous process may have had a session we cannot observe.
+      // This covers both a raced attempts=1 claim and an expired lease.
+      const recorded = readRecordsStrict();
+      if (recorded.ok && recorded.records.some((record) => record.runId === claim.run?.id)) {
+        logger.warn?.(`[host] claim for already-recorded run ${claim.run?.id} is reported interrupted, never restarted`);
+        await markInterrupted(claim);
+        return;
+      }
       if (Number(claim.command?.attempts ?? 1) > 1) {
         await markInterrupted(claim);
         return;

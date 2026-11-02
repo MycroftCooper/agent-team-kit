@@ -84,6 +84,25 @@ async function main() {
   if (recovered.total > 0) {
     logger.warn?.(`[host] reconciled ${recovered.total} in-flight run(s) from ${stateFile}`);
   }
+  if (Array.isArray(recovered.interrupted) && recovered.interrupted.length > 0) {
+    logger.warn?.(
+      `[host] ${recovered.interrupted.length} run(s) reported INTERRUPTED (expired lease); backend sweep owns the command: ${recovered.interrupted
+        .map((entry) => entry.runId)
+        .join(", ")}`,
+    );
+  }
+  if (Array.isArray(recovered.worktrees) && recovered.worktrees.length > 0) {
+    logger.info?.(
+      `[host] preserved worktree(s): ${recovered.worktrees.map((entry) => `${entry.runId}=${entry.path}@${entry.branch ?? "detached"}`).join(", ")}`,
+    );
+  }
+  if (Array.isArray(recovered.worktreeMissing) && recovered.worktreeMissing.length > 0) {
+    logger.error?.(
+      `[host] ${recovered.worktreeMissing.length} worktree(s) are missing; RECOVERY_REQUIRED (not recreated): ${recovered.worktreeMissing
+        .map((entry) => `${entry.runId}:${entry.message ?? entry.path}`)
+        .join(" | ")}`,
+    );
+  }
   if (recovered.corrupt) {
     logger.error?.(
       `[host] state RECOVERY_REQUIRED: ${stateFile} is corrupt; refusing to claim new work until it is reconciled manually`,

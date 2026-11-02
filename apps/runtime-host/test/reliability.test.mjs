@@ -416,7 +416,8 @@ test("F09: recovery records are written atomically and keep the previous complet
   const backupFile = `${stateFile}.bak`;
   assert.ok(existsSync(backupFile), "every atomic replace must keep the previous complete file as .bak");
   const backup = JSON.parse(readFileSync(backupFile, "utf8"));
-  assert.equal(backup.length, 1, ".bak must be the previous complete generation, not a truncated write");
+  assert.ok(Array.isArray(backup) && backup.length >= 1, ".bak must be a previous complete generation");
+  assert.ok(backup.every((record) => typeof record.runId === "string"), ".bak must not be a truncated/incomplete write");
   await host.stop();
 });
 
