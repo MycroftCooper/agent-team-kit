@@ -21,6 +21,8 @@ import process from "node:process";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { INTERNAL } from "../packages/database/src/internal.mjs";
+
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = path.join(REPO, "apps", "backend", "cli.mjs");
 const STATE = path.join(REPO, ".agent-flow", "state.json");
@@ -765,10 +767,9 @@ process.stdout.write(JSON.stringify(out));
     // approval, so the chain stops at AWAITING_ACCEPTANCE and the test goes
     // through a real PASS review plus an APPROVED approval (Lead updated this
     // file after QA-005 changed the invariant; QA was informed).
-    for (const status of ["RUNNING", "REVIEWING"]) {
-      const current = env.store.getTask("ACC1");
-      env.store.patchTask("ACC1", { expectedVersion: current.version, changes: { status } });
-    }
+    // M6.1 F01: execution-state edges are service-only; this test seeds the
+    // state through the internal store hatch (fixture, not an assertion).
+    env.store[INTERNAL].setTaskStatus("ACC1", "REVIEWING");
     const manifestHash = "a".repeat(64);
     const review = env.store.createReview({ taskId: "ACC1", actor: "agent-QA-01" });
     env.store.submitReview({
@@ -779,8 +780,7 @@ process.stdout.write(JSON.stringify(out));
       evidence: { tests: { passed: 1, total: 1 } },
       actor: "agent-QA-01",
     });
-    const integrating = env.store.getTask("ACC1");
-    env.store.patchTask("ACC1", { expectedVersion: integrating.version, changes: { status: "AWAITING_ACCEPTANCE" } });
+    env.store[INTERNAL].setTaskStatus("ACC1", "AWAITING_ACCEPTANCE");
     const approval = env.store.createApproval({ taskId: "ACC1", scope: "candidate", targetHash: manifestHash, actor: "HUMAN" });
     env.store.decideApproval({ id: approval.id, decision: "APPROVED", actor: "HUMAN", targetHash: manifestHash });
     assert.equal(env.store.getTask("ACC1").status, "DONE", "the approved task must reach DONE");

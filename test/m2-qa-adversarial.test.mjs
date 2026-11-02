@@ -119,10 +119,31 @@ if (!hasSqlite) {
         env.base = `http://127.0.0.1:${started}`;
         env.output = () => output;
         env.session = await (await fetch(`${env.base}/api/v1/session`)).json();
+        // M6.1: /internal/v1/* is role-scoped. This is the fixture-side mirror
+        // of the frozen endpoint matrix (no import of backend internals).
+        const roleFor = (method, route) => {
+          const pathname = route.split("?")[0];
+          if (method === "GET" && pathname === "/internal/v1/dispatch/claim") return "runtime-host";
+          if (method === "POST" && /^\/internal\/v1\/dispatch\/[^/]+\/result$/.test(pathname)) return "runtime-host";
+          if (/^\/internal\/v1\/runs\/[^/]+\/(renew|events)$/.test(pathname)) return "runtime-host";
+          if (method === "GET" && /^\/internal\/v1\/runs\/[^/]+\/reconcile$/.test(pathname)) return "runtime-host";
+          if (pathname === "/internal/v1/runtime/heartbeat") return "runtime-host";
+          if (method === "POST" && /^\/internal\/v1\/tasks\/[^/]+\/claim$/.test(pathname)) return "scheduler";
+          if (pathname === "/internal/v1/scheduling/snapshot") return "scheduler";
+          if (pathname === "/internal/v1/scheduler/heartbeat") return "scheduler";
+          if (pathname === "/internal/v1/dispatch/sweep") return "scheduler";
+          if (method === "POST" && /^\/internal\/v1\/tasks\/[^/]+\/integration$/.test(pathname)) return "scheduler";
+          return null;
+        };
         env.internal = async (method, route, body) => {
+          const role = roleFor(method, route);
           const response = await fetch(`${env.base}${route}`, {
             method,
-            headers: { "x-atk-internal": token, "content-type": "application/json" },
+            headers: {
+              "x-atk-internal": token,
+              ...(role ? { "x-atk-internal-role": role } : {}),
+              "content-type": "application/json",
+            },
             body: body === undefined ? undefined : JSON.stringify(body),
           });
           return { status: response.status, body: await response.json().catch(() => null) };

@@ -1,11 +1,11 @@
-// M6 independent QA: switch safety, event filters/pagination and upgrade behavior (QA-007).
+﻿// M6 independent QA: switch safety, event filters/pagination and upgrade behavior (QA-007).
 //
 // Reviewed object: frozen commit 0abdee1 (M6), not the later Phase C commit.
 // Tests use temp databases and random loopback ports; the developer instance on
 // 1421 is never touched. Node < 22.5 (no node:sqlite) skips the whole file.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -27,6 +27,8 @@ if (!hasSqlite) {
   test("m6 adversarial suite (skipped: node:sqlite is unavailable)", { skip: "node:sqlite requires Node >= 22.5; this file is skipped, not passed" }, () => {});
 } else {
   const { DatabaseSync } = await import("node:sqlite");
+  const { INTERNAL } = await import(pathToFileURL(path.join(REPO, "packages/database/src/internal.mjs")).href);
+  const LATEST_SCHEMA = Math.max(...readdirSync(path.join(REPO, "packages", "database", "migrations")).map((name) => Number(name.slice(0, 4))).filter(Number.isInteger));
   const database = await import(pathToFileURL(path.join(REPO, "packages/database/src/index.mjs")).href);
   const { openStore, importStateJson, exportStateJson, verifySwitchReadiness, createMemoryStore } = database;
 
@@ -167,7 +169,7 @@ if (!hasSqlite) {
     assert.throws(() => openStore({ file, migrate: false }).getTask("NEW-1"), (error) => error.code === "NOT_FOUND");
     const reopened = openStore({ file, migrate: true });
     try {
-      assert.equal(reopened.health().schemaVersion, 5);
+      assert.equal(reopened.health().schemaVersion, LATEST_SCHEMA);
       assert.equal(reopened.listTasks({}).length, 1);
       assert.equal(reopened.listEvents({}).length, 1);
     } finally {
@@ -185,8 +187,7 @@ if (!hasSqlite) {
     const target = path.join(dir, "target", "atk.db");
     const store = openStore({ file: source, migrate: true });
     seedBase(store);
-    const task = store.getTask("T-KEEP");
-    store.patchTask("T-KEEP", { expectedVersion: task.version, changes: { status: "CLAIMED" } });
+    store[INTERNAL].setTaskStatus("T-KEEP", "CLAIMED");
     store.close();
     assert.equal(cli(["export", "--data", source, "--to", exportFile, "--json"]).status, 0);
     assert.equal(cli(["import", "--from", exportFile, "--data", target, "--mode", "replace", "--force", "--json"]).status, 0);
@@ -380,7 +381,7 @@ if (!hasSqlite) {
       const file = makeLegacyDb(t, version);
       const store = openStore({ file, migrate: true });
       try {
-        assert.equal(store.health().schemaVersion, 5);
+        assert.equal(store.health().schemaVersion, LATEST_SCHEMA);
         assert.deepEqual(store.listProjects().map((project) => project.id), ["V-P"]);
         assert.deepEqual(store.listTasks({}).map((task) => task.id), ["V-T"]);
         assert.deepEqual(store.listEvents({ aggregateId: "V-T" }).map((event) => event.type), ["task.updated"]);
@@ -391,7 +392,7 @@ if (!hasSqlite) {
       const raw = new DatabaseSync(file, { readOnly: true });
       try {
         assert.equal(raw.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_events_type_seq'").all().length, 1);
-        assert.deepEqual(raw.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version), [1, 2, 3, 4, 5]);
+        assert.deepEqual(raw.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version), Array.from({ length: LATEST_SCHEMA }, (_, index) => index + 1));
       } finally {
         raw.close();
       }
@@ -404,18 +405,18 @@ if (!hasSqlite) {
     const store = openStore({ file, migrate: true });
     store.close();
     const raw = new DatabaseSync(file);
-    raw.prepare("DELETE FROM schema_migrations WHERE version = 5").run();
+    raw.prepare("DELETE FROM schema_migrations WHERE version = ?").run(LATEST_SCHEMA);
     raw.close();
     const reopened = openStore({ file, migrate: true });
     try {
-      assert.equal(reopened.health().schemaVersion, 5);
+      assert.equal(reopened.health().schemaVersion, LATEST_SCHEMA);
       assert.equal(reopened.listEvents({}).length, 0);
     } finally {
       reopened.close();
     }
     const check = new DatabaseSync(file, { readOnly: true });
     try {
-      assert.equal(check.prepare("SELECT version FROM schema_migrations WHERE version = 5").all().length, 1);
+      assert.equal(check.prepare("SELECT version FROM schema_migrations WHERE version = ?").all(LATEST_SCHEMA).length, 1);
       assert.equal(check.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_events_type_seq'").all().length, 1);
     } finally {
       check.close();
@@ -660,3 +661,4 @@ if (!hasSqlite) {
     assert.equal(small.body.hasMore, true);
   });
 }
+

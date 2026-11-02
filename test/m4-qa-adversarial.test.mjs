@@ -18,6 +18,8 @@ import process from "node:process";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { INTERNAL } from "../packages/database/src/internal.mjs";
+
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = path.join(REPO, "apps", "backend", "cli.mjs");
 const STATE = path.join(REPO, ".agent-flow", "state.json");
@@ -72,15 +74,16 @@ if (!hasSqlite) {
         return store.upsertAgent({ id, role: "DEV", capabilities: ["WORKER"], status: "IDLE", ...overrides });
       },
       makeTask(id) {
-        let task = store.createTask({ id, projectId: project.id, title: id, description: `qa ${id}`, functionRequired: "WORKER", roleRequired: "DEV", priority: 2, deps: [], acceptance: "qa" });
-        for (const status of ["CLAIMED", "RUNNING", "REVIEWING"]) task = store.patchTask(id, { expectedVersion: task.version, changes: { status } });
-        return task;
+        const task = store.createTask({ id, projectId: project.id, title: id, description: `qa ${id}`, functionRequired: "WORKER", roleRequired: "DEV", priority: 2, deps: [], acceptance: "qa" });
+        // M6.1 F01: patchTask refuses execution-state edges; fixture-only seed
+        // uses the internal hatch so the test still exercises the service path.
+        store[INTERNAL].setTaskStatus(id, "REVIEWING");
+        return store.getTask(id);
       },
       toAwaiting(id) {
         env.makeTask(id);
-        let task = store.getTask(id);
-        for (const status of ["INTEGRATING", "AWAITING_ACCEPTANCE"]) task = store.patchTask(id, { expectedVersion: task.version, changes: { status } });
-        return task;
+        store[INTERNAL].setTaskStatus(id, "AWAITING_ACCEPTANCE");
+        return store.getTask(id);
       },
       makeRun(taskId, agentId = "agent-dev-1") {
         const run = store.createRun({ taskId, agentId, function: "WORKER", role: "DEV" });
@@ -185,7 +188,7 @@ if (!hasSqlite) {
   // -------------------------------------------------------------------------
   // A. self-review gate
   // -------------------------------------------------------------------------
-  test("A1 the exact author agent cannot submit a review (403, zero writes)", async (t) => {
+  test("A1 body.actor cannot turn a HUMAN review into an agent self-review (M6.1 F06)", async (t) => {
     const env = await makeEnv(t);
     env.makeAgent("agent-dev-1");
     env.makeAgent("agent-dev-2");
@@ -193,17 +196,16 @@ if (!hasSqlite) {
     const run = env.makeRun("SELF-EXACT", "agent-dev-1");
     const review = env.createReview("SELF-EXACT", run.id);
     await env.startBackend();
-    const eventsBefore = Number(dbRow(env, "SELECT COUNT(*) AS c FROM events").c);
     const response = await env.api("POST", `/api/v1/reviews/${review.id}/submit`, { expectedVersion: review.version, verdict: "PASS", manifestHash: MANIFEST, evidence: PASS_EVIDENCE, actor: "agent-dev-1" });
-    assert.equal(response.status, 403);
-    assert.equal(response.code, "SELF_REVIEW_FORBIDDEN");
-    assert.equal(reviewRow(env, review.id).status, "PENDING");
-    assert.equal(reviewRow(env, review.id).reviewer, null);
-    assert.equal(taskRow(env, "SELF-EXACT").status, "REVIEWING");
-    assert.equal(Number(dbRow(env, "SELECT COUNT(*) AS c FROM events").c), eventsBefore, "a refused self-review must not write events");
+    // M6.1 F06: a browser session is always HUMAN. body.actor is not a
+    // principal, so it must not become the reviewer or trigger an AGENT path.
+    assert.equal(response.status, 200, "a HUMAN assignment submits normally");
+    assert.equal(reviewRow(env, review.id).reviewer, "HUMAN");
+    assert.equal(dbRow(env, "SELECT reviewer_agent_id AS reviewerAgentId FROM reviews WHERE id = ?", review.id).reviewerAgentId, null);
+    assert.equal(taskRow(env, "SELF-EXACT").status, "INTEGRATING");
   });
 
-  test("A2 without runId the latest Run's agent is still recognised as the author", async (t) => {
+  test("A2 without runId body.actor is still not the reviewer (M6.1 F06)", async (t) => {
     const env = await makeEnv(t);
     env.makeAgent("agent-dev-1");
     env.makeAgent("agent-dev-2");
@@ -212,13 +214,12 @@ if (!hasSqlite) {
     const review = env.createReview("SELF-NORUN", null);
     await env.startBackend();
     const response = await env.api("POST", `/api/v1/reviews/${review.id}/submit`, { expectedVersion: review.version, verdict: "PASS", manifestHash: MANIFEST, evidence: PASS_EVIDENCE, actor: "agent-dev-1" });
-    assert.equal(response.status, 403, "the proxy author detection (latest Run agent) must fire");
-    assert.equal(response.code, "SELF_REVIEW_FORBIDDEN");
-    assert.equal(reviewRow(env, review.id).status, "PENDING");
-    assert.equal(taskRow(env, "SELF-NORUN").status, "REVIEWING");
+    assert.equal(response.status, 200);
+    assert.equal(reviewRow(env, review.id).reviewer, "HUMAN", "the browser principal wins; no proxy-author inference");
+    assert.equal(taskRow(env, "SELF-NORUN").status, "INTEGRATING");
   });
 
-  test("A3 whitespace and case variants of the author id must still be refused", async (t) => {
+  test("A3 whitespace and case variants of the author id cannot spoof the reviewer", async (t) => {
     const env = await makeEnv(t);
     env.makeAgent("agent-dev-1");
     env.makeAgent("agent-dev-2");
@@ -234,9 +235,10 @@ if (!hasSqlite) {
       const run = env.makeRun(taskId, "agent-dev-1");
       const review = env.createReview(taskId, run.id);
       const response = await env.api("POST", `/api/v1/reviews/${review.id}/submit`, { expectedVersion: review.version, verdict: "PASS", manifestHash: MANIFEST, evidence: PASS_EVIDENCE, actor });
-      assert.notEqual(response.status, 200, `${name}: actor ${JSON.stringify(actor)} of the author must be refused, got 200`);
-      assert.equal(reviewRow(env, review.id).status, "PENDING", `${name}: review must stay PENDING`);
-      assert.equal(taskRow(env, taskId).status, "REVIEWING", `${name}: task must stay REVIEWING`);
+      assert.equal(response.status, 200, `${name}: a HUMAN review submits`);
+      assert.equal(reviewRow(env, review.id).reviewer, "HUMAN", `${name}: body.actor must not become the reviewer`);
+      assert.equal(dbRow(env, "SELECT reviewer_agent_id AS reviewerAgentId FROM reviews WHERE id = ?", review.id).reviewerAgentId, null, `${name}: no agent id may be persisted`);
+      assert.equal(taskRow(env, taskId).status, "INTEGRATING");
     }
   });
 
@@ -338,7 +340,7 @@ if (!hasSqlite) {
     const staleReview = env.createReview("ACCEPT-STALE", staleRun.id);
     env.store.submitReview({ id: staleReview.id, expectedVersion: staleReview.version, verdict: "PASS", manifestHash: MANIFEST, evidence: PASS_EVIDENCE, actor: "agent-dev-2" });
     let staleTask = env.store.getTask("ACCEPT-STALE");
-    staleTask = env.store.patchTask("ACCEPT-STALE", { expectedVersion: staleTask.version, changes: { status: "AWAITING_ACCEPTANCE" } });
+    env.store[INTERNAL].setTaskStatus("ACCEPT-STALE", "AWAITING_ACCEPTANCE");
     const targetHash = taskRow(env, "ACCEPT-STALE").targetHash || HEX_A;
     const otherHash = targetHash === HEX_A ? HEX_B : HEX_A;
     await env.startBackend();
@@ -363,7 +365,7 @@ if (!hasSqlite) {
     const review = env.createReview("ACCEPT-TARGET", run.id);
     env.store.submitReview({ id: review.id, expectedVersion: review.version, verdict: "PASS", manifestHash: MANIFEST, evidence: PASS_EVIDENCE, actor: "agent-dev-2" });
     let task = env.store.getTask("ACCEPT-TARGET");
-    task = env.store.patchTask("ACCEPT-TARGET", { expectedVersion: task.version, changes: { status: "AWAITING_ACCEPTANCE" } });
+    env.store[INTERNAL].setTaskStatus("ACCEPT-TARGET", "AWAITING_ACCEPTANCE");
     const row = taskRow(env, "ACCEPT-TARGET");
     assert.equal(row.status, "AWAITING_ACCEPTANCE");
     assert.ok(typeof row.targetHash === "string" && row.targetHash.length > 0, "m4-contracts §0.3 requires the approval hash to match the target's current hash; the frozen tree never writes tasks.target_hash, so acceptance degenerates to an echo of the caller's own hash");
@@ -472,7 +474,7 @@ if (!hasSqlite) {
     env.store.submitReview({ id: first.id, expectedVersion: first.version, verdict: "CHANGES_REQUESTED", findings: [{ code: "F1", message: "fix" }], actor: "agent-dev-2" });
     env.store.reworkTask({ taskId: "REWORK-ATTEMPTS", reviewId: first.id, reason: "fix", actor: "HUMAN" });
     let task = env.store.getTask("REWORK-ATTEMPTS");
-    for (const status of ["CLAIMED", "RUNNING", "REVIEWING"]) task = env.store.patchTask("REWORK-ATTEMPTS", { expectedVersion: task.version, changes: { status } });
+    env.store[INTERNAL].setTaskStatus("REWORK-ATTEMPTS", "REVIEWING");
     env.makeRun("REWORK-ATTEMPTS", "agent-dev-1");
     const second = env.createReview("REWORK-ATTEMPTS", null);
     const rows = dbRows(
@@ -512,7 +514,7 @@ if (!hasSqlite) {
       const outcome = env.store.reworkTask({ taskId: "REWORK-MAX-3", reviewId: review.id, reason: `fix ${round}`, actor: "HUMAN" });
       assert.equal(outcome.task.status, "READY");
       let task = env.store.getTask("REWORK-MAX-3");
-      for (const status of ["CLAIMED", "RUNNING", "REVIEWING"]) task = env.store.patchTask("REWORK-MAX-3", { expectedVersion: task.version, changes: { status } });
+      env.store[INTERNAL].setTaskStatus("REWORK-MAX-3", "REVIEWING");
       env.makeRun("REWORK-MAX-3", "agent-dev-1");
       review = env.createReview("REWORK-MAX-3", null);
       env.store.submitReview({ id: review.id, expectedVersion: review.version, verdict: "CHANGES_REQUESTED", findings: [{ code: `F${round}`, message: "f" }], actor: "agent-dev-2" });
@@ -593,7 +595,7 @@ process.stdout.write(JSON.stringify(out));
     const run = env.makeRun("AUDIT-CHAIN", "agent-dev-1");
     const review = env.createReview("AUDIT-CHAIN", run.id);
     env.store.submitReview({ id: review.id, expectedVersion: review.version, verdict: "PASS", manifestHash: MANIFEST, evidence: PASS_EVIDENCE, actor: "agent-dev-2" });
-    env.store.patchTask("AUDIT-CHAIN", { expectedVersion: env.store.getTask("AUDIT-CHAIN").version, changes: { status: "AWAITING_ACCEPTANCE" } });
+    env.store[INTERNAL].setTaskStatus("AUDIT-CHAIN", "AWAITING_ACCEPTANCE");
     const targetHash = taskRow(env, "AUDIT-CHAIN").targetHash || MANIFEST;
     const approval = env.store.createApproval({ taskId: "AUDIT-CHAIN", scope: "candidate", targetHash, actor: "HUMAN" });
     env.store.decideApproval({ id: approval.id, decision: "APPROVED", actor: "HUMAN", targetHash });
