@@ -575,10 +575,12 @@ async function serve(flags) {
       : "session token: in-memory only\n",
   );
   process.stdout.write(`security: bind 127.0.0.1, Host allow-list, write Origin+CSRF, x-atk-token (health/session exempt)\n`);
-  // M2: the internal credential is printed exactly once, is NOT persisted and is
-  // NOT logged. Child processes (future runtime-host) receive it via the env.
-  process.stdout.write(`internal token: ${server.internalToken}\n`);
-  process.env.ATK_INTERNAL_TOKEN = server.internalToken;
+  // M6.3 P0-2: two independent internal credentials, printed exactly once.
+  // They are NOT persisted and NOT logged; the launcher captures this line and
+  // injects each token only into its own child process.
+  process.stdout.write(
+    `internal tokens: scheduler=${server.internalTokens.scheduler} runtime-host=${server.internalTokens["runtime-host"]}\n`,
+  );
   process.stdout.write("internal API: /internal/v1/* requires x-atk-internal (browser token is not accepted there)\n");
   process.stdout.write("press Ctrl+C to stop\n");
 

@@ -10,7 +10,6 @@ import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { EVENT_TYPES, ID_RE, ApiError, isEnumValue, validateProject, validateTask, validateTaskExecutionSpec } from "@atk/contracts";
@@ -40,10 +39,14 @@ import {
 } from "./http.mjs";
 import {
   INTERNAL_ROLE_HEADER,
+  INTERNAL_ROLE_RUNTIME_HOST,
+  INTERNAL_ROLE_SCHEDULER,
   INTERNAL_TOKEN_HEADER,
   checkInternalRole,
-  checkInternalToken,
-  createInternalToken,
+  checkInternalRoleHeader,
+  createInternalTokens,
+  normalizeInternalTokens,
+  resolveInternalIdentity,
 } from "./internal.mjs";
 import { createInternalRouter } from "./routes-internal.mjs";
 import { createSseHub } from "./sse.mjs";
@@ -136,8 +139,10 @@ const ROUTES = [
  * @param {string} [options.tokenFile]      override the on-disk token path
  * @param {boolean} [options.persistToken]  force/disable token persistence
  * @param {string[]} [options.allowedOrigins] extra write origins (default: none)
- * @param {string} [options.internalToken] fixed internal credential (tests / tooling)
- * @returns {{ listen: Function, close: Function, stats: Function, url: string|null, session: object, internalToken: string }}
+ * @param {string} [options.internalToken] legacy single credential (tests only; maps both roles)
+ * @param {{scheduler:string, "runtime-host"?:string, host?:string}} [options.internalTokens]
+ *        independent per-role credentials (M6.3 P0-2; default: freshly generated)
+ * @returns {{ listen: Function, close: Function, stats: Function, url: string|null, session: object, internalToken: string, internalTokens: object }}
  */
 export function createServer({
   store,
@@ -153,6 +158,7 @@ export function createServer({
   sseHeartbeatMs = 25_000,
   ssePollMs = 300,
   internalToken,
+  internalTokens,
 } = {}) {
   if (!store || typeof store !== "object") {
     throw new TypeError(
@@ -164,12 +170,21 @@ export function createServer({
   const startedAt = now();
   let session = createSession({ now: startedAt, ttlMs: sessionTtlMs, token, csrf });
 
-  // ADR-008 §5: internal credential is a separate secret for `/internal/v1/*`.
-  // It is minted per process, never persisted, never logged and never returned
-  // by an HTTP response. Tests/CLI may inject a deterministic one.
-  const resolvedInternalToken = internalToken ?? createInternalToken();
-  if (typeof resolvedInternalToken !== "string" || resolvedInternalToken === "") {
-    throw new TypeError("@atk/backend: internalToken must be a non-empty string when provided");
+  // ADR-008 §5 / M6.3 P0-2: two independent internal credentials, one per role.
+  // They are minted per process, never persisted, never logged and never
+  // returned by an HTTP response.
+  const resolvedInternalTokens = normalizeInternalTokens(internalTokens)
+    ?? normalizeInternalTokens(
+      internalToken === undefined
+        ? null
+        : { scheduler: internalToken, "runtime-host": internalToken },
+    )
+    ?? createInternalTokens();
+  if (
+    typeof resolvedInternalTokens[INTERNAL_ROLE_SCHEDULER] !== "string" ||
+    typeof resolvedInternalTokens[INTERNAL_ROLE_RUNTIME_HOST] !== "string"
+  ) {
+    throw new TypeError("@atk/backend: internalTokens must contain non-empty scheduler and runtime-host tokens");
   }
 
   // A caller-provided token is deterministic tooling input; only a server-minted
@@ -891,6 +906,18 @@ export function createServer({
           }
           runId = body.runId;
         }
+        // M6.3 P1-8: an AGENT assignment must name the reviewer's own Run; the
+        // store proves it is a REVIEWER Run for this Task.
+        let reviewerRunId = null;
+        if (body.reviewerRunId !== undefined) {
+          if (typeof body.reviewerRunId !== "string" || !ID_RE.test(body.reviewerRunId)) {
+            throw fieldValidationError("reviewerRunId", "reviewerRunId must be a run id string");
+          }
+          reviewerRunId = body.reviewerRunId;
+        }
+        if (assignedTo === "AGENT" && reviewerRunId === null) {
+          throw fieldValidationError("reviewerRunId", "an AGENT review requires reviewerRunId");
+        }
         const task = store.getTask(body.taskId); // 404 NOT_FOUND
         if (runId !== null) {
           const run = store.getRun(runId); // 404 NOT_FOUND
@@ -924,6 +951,7 @@ export function createServer({
             taskId: task.id,
             runId,
             reviewerAgentId,
+            reviewerRunId,
             assignedTo,
             createdByRole: "user-action",
             actor: assignedTo === "AGENT" ? reviewerAgentId : "HUMAN",
@@ -1335,73 +1363,72 @@ export function createServer({
       // above never accepts `x-atk-internal`.
       const isInternal = pathname === "/internal" || pathname.startsWith("/internal/");
       if (isInternal) {
-        const internalCheck = checkInternalToken(resolvedInternalToken, req.headers[INTERNAL_TOKEN_HEADER]);
-        if (!internalCheck.ok) {
+        // M6.3 P0-2: the token→role binding is the ONLY authority. The optional
+        // client role header is an additional assertion and must agree with it.
+        const identity = resolveInternalIdentity(resolvedInternalTokens, req.headers[INTERNAL_TOKEN_HEADER]);
+        if (!identity.ok) {
           throw new ApiError("NOT_AUTHORIZED", "missing or invalid internal credential", {
-            details: { reason: internalCheck.reason },
+            details: { reason: identity.reason },
           });
         }
-        // --- M6.2 F10: host-level heartbeat (new shape) ----------------------
-        // The legacy M2 heartbeat shape is still served by the internal router
-        // (replayed below); the host-level shape is handled here so the WP6
-        // route owner can migrate without a second overlapping implementation.
-        if (method === "POST" && pathname === "/internal/v1/runtime/heartbeat") {
-          const body = await requireJsonBody(req);
-          const isHostHeartbeat = isPlainObject(body)
-            && (body.hostId !== undefined || body.agentIds !== undefined || body.capacity !== undefined);
-          if (isHostHeartbeat) {
-            const roleCheck = checkInternalRole(req.headers[INTERNAL_ROLE_HEADER], ["runtime-host"]);
-            if (!roleCheck.ok) {
-              throw new ApiError("NOT_AUTHORIZED", "internal role is not allowed for runtime heartbeat", {
-                details: { reason: roleCheck.reason, role: roleCheck.role ?? null, allowedRoles: ["runtime-host"] },
-              });
-            }
-            const invalid = (field, message) => new ApiError("VALIDATION_ERROR", message, { details: { field } });
-            if (typeof body.hostId !== "string" || body.hostId.trim() === "") {
-              throw invalid("hostId", "heartbeat.hostId must be a non-empty string");
-            }
-            if (!Array.isArray(body.agentIds) || body.agentIds.length === 0 || body.agentIds.some((id) => typeof id !== "string" || !ID_RE.test(id))) {
-              throw invalid("agentIds", "heartbeat.agentIds must be a non-empty array of agent ids");
-            }
-            if (!Number.isInteger(body.capacity) || body.capacity < 0) {
-              throw invalid("capacity", "heartbeat.capacity must be a non-negative integer");
-            }
-            if (typeof store.recordHeartbeat !== "function") {
-              throw new ApiError("INTERNAL_ERROR", "this store cannot record runtime heartbeats", {
-                details: { reason: "heartbeat-unsupported" },
-              });
-            }
-            const atIso = new Date(now()).toISOString();
-            const recorded = store.recordHeartbeat({
-              hostId: body.hostId,
-              agentIds: [...body.agentIds],
-              capacity: body.capacity,
-              now: atIso,
-            });
-            const at = typeof recorded?.at === "string" ? recorded.at : atIso;
-            const agents = body.agentIds.map((agentId) => {
-              let availability = { available: false, reason: "no-heartbeat" };
-              try {
-                availability = store.agentAvailability({ agentId, now: at });
-              } catch {
-                // A store without the availability view still gets a truthful 200.
-              }
-              return { agentId, available: Boolean(availability?.available), reason: availability?.reason ?? null };
-            });
-            sendJson(res, 200, { at, agents, hostId: body.hostId, capacity: body.capacity });
-            return;
-          }
-          // Legacy M2 heartbeat: replay the consumed body into the router.
-          const replay = Object.assign(Readable.from([Buffer.from(JSON.stringify(body))]), {
-            headers: req.headers,
-            method: req.method,
-            url: req.url,
-            socket: req.socket,
+        const roleHeader = checkInternalRoleHeader(identity.role, req.headers[INTERNAL_ROLE_HEADER]);
+        if (!roleHeader.ok) {
+          throw new ApiError("NOT_AUTHORIZED", "the declared internal role does not match the credential", {
+            details: { reason: roleHeader.reason, role: roleHeader.role, expectedRole: roleHeader.expectedRole },
           });
-          await internalRouter.handle({ req: replay, res, method, pathname, url });
+        }
+        // Routes/matrix consume the identity-bound role. The original header is
+        // left untouched so the route can still perform the assertion check.
+        // M6.3 P0-1: host registration before the first heartbeat.
+        if (method === "POST" && pathname === "/internal/v1/runtime/register") {
+          if (identity.role !== INTERNAL_ROLE_RUNTIME_HOST) {
+            throw new ApiError("NOT_AUTHORIZED", "internal role is not allowed for runtime registration", {
+              details: { reason: "internal-role-forbidden", role: identity.role, allowedRoles: ["runtime-host"] },
+            });
+          }
+          const body = await requireJsonBody(req);
+          const invalid = (field, message) => new ApiError("VALIDATION_ERROR", message, { details: { field } });
+          if (!isPlainObject(body) || typeof body.hostId !== "string" || body.hostId.trim() === "") {
+            throw invalid("hostId", "register.hostId must be a non-empty string");
+          }
+          if (!Array.isArray(body.agents) || body.agents.length === 0) {
+            throw invalid("agents", "register.agents must be a non-empty array");
+          }
+          if (typeof store.upsertAgent !== "function") {
+            throw new ApiError("INTERNAL_ERROR", "this store cannot register runtime agents");
+          }
+          const agents = [];
+          for (const [index, entry] of body.agents.entries()) {
+            if (!isPlainObject(entry)) throw invalid(`agents[${index}]`, "each agent must be an object");
+            if (typeof entry.agentId !== "string" || !ID_RE.test(entry.agentId)) {
+              throw invalid(`agents[${index}].agentId`, "agentId must be an id string");
+            }
+            if (typeof entry.role !== "string" || !/^[A-Z][A-Z0-9_]*$/.test(entry.role)) {
+              throw invalid(`agents[${index}].role`, "role must be an upper-case role identifier");
+            }
+            if (!isEnumValue("functions", entry.function)) {
+              throw invalid(`agents[${index}].function`, "function must be one of the functions enum values");
+            }
+            if (entry.capacity !== undefined && (!Number.isInteger(entry.capacity) || entry.capacity < 0)) {
+              throw invalid(`agents[${index}].capacity`, "capacity must be a non-negative integer");
+            }
+            store.upsertAgent({
+              id: entry.agentId,
+              role: entry.role,
+              capabilities: [entry.function],
+              status: "IDLE",
+            });
+            agents.push({
+              agentId: entry.agentId,
+              role: entry.role,
+              function: entry.function,
+              capacity: entry.capacity ?? null,
+            });
+          }
+          sendJson(res, 200, { hostId: body.hostId, agents });
           return;
         }
-        await internalRouter.handle({ req, res, method, pathname, url });
+        await internalRouter.handle({ req, res, method, pathname, url, identity });
         return;
       }
 
@@ -1412,27 +1439,35 @@ export function createServer({
         return;
       }
 
-      // m6.1 §2: review submission is the one browser-route endpoint that also
-      // accepts the internal credential, but only as runtime-host.
+      // m6.1 §2 / M6.3 P0-2: review submission accepts the internal plane, but
+      // only the runtime-host token. Human approvals never accept an internal
+      // credential: they are browser session + CSRF only.
+      const isApprovalDecide = method === "POST" && /^\/api\/v1\/approvals\/[^/]+\/decide$/.test(pathname);
+      if (isApprovalDecide && req.headers[INTERNAL_TOKEN_HEADER] !== undefined) {
+        throw new ApiError("NOT_AUTHORIZED", "human approval requires a browser session", {
+          details: { reason: "human-approval-requires-session" },
+        });
+      }
       const isReviewSubmit = method === "POST" && /^\/api\/v1\/reviews\/[^/]+\/submit$/.test(pathname);
       if (isReviewSubmit && req.headers[INTERNAL_TOKEN_HEADER] !== undefined) {
-        const internalCheck = checkInternalToken(resolvedInternalToken, req.headers[INTERNAL_TOKEN_HEADER]);
-        if (!internalCheck.ok) {
+        const identity = resolveInternalIdentity(resolvedInternalTokens, req.headers[INTERNAL_TOKEN_HEADER]);
+        if (!identity.ok) {
           throw new ApiError("NOT_AUTHORIZED", "missing or invalid internal credential", {
-            details: { reason: internalCheck.reason },
+            details: { reason: identity.reason },
           });
         }
-        const roleCheck = checkInternalRole(req.headers[INTERNAL_ROLE_HEADER], ["runtime-host"]);
-        if (!roleCheck.ok) {
+        const roleHeader = checkInternalRoleHeader(identity.role, req.headers[INTERNAL_ROLE_HEADER]);
+        if (!roleHeader.ok) {
+          throw new ApiError("NOT_AUTHORIZED", "the declared internal role does not match the credential", {
+            details: { reason: roleHeader.reason, role: roleHeader.role, expectedRole: roleHeader.expectedRole },
+          });
+        }
+        if (identity.role !== INTERNAL_ROLE_RUNTIME_HOST) {
           throw new ApiError("NOT_AUTHORIZED", "internal role is not allowed for review submission", {
-            details: {
-              reason: roleCheck.reason,
-              role: roleCheck.role ?? null,
-              allowedRoles: ["runtime-host"],
-            },
+            details: { reason: "internal-role-forbidden", role: identity.role, allowedRoles: ["runtime-host"] },
           });
         }
-        req.atkPrincipal = { kind: "internal", role: roleCheck.role };
+        req.atkPrincipal = { kind: "internal", role: identity.role };
         await dispatch({ req, res, method, pathname, url });
         return;
       }
@@ -1595,9 +1630,11 @@ export function createServer({
     tokenPersisted: tokenPersistence.persisted,
     tokenWarning: tokenPersistence.warning,
     /** Internal credential for in-process callers (CLI prints it once; never in HTTP). */
+    /** @deprecated single-token compatibility view (scheduler role). */
     get internalToken() {
-      return resolvedInternalToken;
+      return resolvedInternalTokens[INTERNAL_ROLE_SCHEDULER];
     },
+    internalTokens: Object.freeze({ ...resolvedInternalTokens }),
     httpServer,
   };
 }

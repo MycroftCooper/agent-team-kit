@@ -7,7 +7,7 @@
 // browser sees real business events instead of just keep-alives.
 import { ID_RE, ApiError, createEvent, isEnumValue, validateTaskExecutionSpec } from "@atk/contracts";
 
-import { normalizeLease, requiredInternalRoles, checkInternalRole, INTERNAL_ROLE_HEADER } from "./internal.mjs";
+import { normalizeLease, requiredInternalRoles, checkInternalRoleHeader, INTERNAL_ROLE_HEADER } from "./internal.mjs";
 import { isPlainObject, parseIntegerParam, queryString, requireJsonBody, sendJson } from "./http.mjs";
 
 /** m2-contracts §2 event mapping: session.ended reason -> terminal Run status. */
@@ -55,6 +55,7 @@ const ROUTES = [
   { name: "runs.spec", method: "GET", regex: /^\/internal\/v1\/runs\/([^/]+)\/spec$/, keys: ["id"] },
   { name: "scheduling.snapshot", method: "GET", regex: /^\/internal\/v1\/scheduling\/snapshot$/, keys: [] },
   { name: "tasks.claim", method: "POST", regex: /^\/internal\/v1\/tasks\/([^/]+)\/claim$/, keys: ["id"] },
+  { name: "tasks.review-runs", method: "POST", regex: /^\/internal\/v1\/tasks\/([^/]+)\/review-runs$/, keys: ["id"] },
   { name: "tasks.integration", method: "POST", regex: /^\/internal\/v1\/tasks\/([^/]+)\/integration$/, keys: ["id"] },
   { name: "scheduler.heartbeat", method: "POST", regex: /^\/internal\/v1\/scheduler\/heartbeat$/, keys: [] },
 ];
@@ -437,7 +438,7 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
         raw = store.schedulingSnapshot();
       } catch (error) {
         // Defensive: the Scheduler must keep working even if the store snapshot
-        // query is unavailable/buggy — compose the same contract shape from the
+        // query is unavailable/buggy; compose the same contract shape from the
         // M1/M2 read methods and record the degradation.
         logger?.error?.(`[atk] store.schedulingSnapshot() failed; using composed snapshot: ${error?.message ?? error}`);
         raw = null;
@@ -714,23 +715,55 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
   }
 
 
-  async function handle({ req, res, method, pathname, url }) {
+  /**
+   * M6.3 P0-2: endpoint authorization comes from the token→role binding the
+   * server already resolved (`identity`). The client `x-atk-internal-role`
+   * header is only an optional assertion: when present it must agree with the
+   * token-bound role, otherwise 403 `internal-role-forbidden`. Undeclared
+   * endpoints stay deny-by-default.
+   */
+  function authorizeInternal({ identity: resolvedIdentity, roleHeader, allowedRoles }) {
+    const allowed = Array.isArray(allowedRoles) ? allowedRoles : [];
+    if (!isPlainObject(resolvedIdentity) || resolvedIdentity.ok !== true || typeof resolvedIdentity.role !== "string") {
+      return { ok: false, details: { reason: "internal-identity-required", allowed: [...allowed] } };
+    }
+    const headerCheck = checkInternalRoleHeader(resolvedIdentity.role, roleHeader);
+    if (!headerCheck.ok) {
+      return {
+        ok: false,
+        details: {
+          reason: headerCheck.reason,
+          role: headerCheck.role,
+          expectedRole: headerCheck.expectedRole,
+          allowed: [...allowed],
+        },
+      };
+    }
+    if (!allowed.includes(resolvedIdentity.role)) {
+      return {
+        ok: false,
+        details: { reason: "internal-role-forbidden", role: resolvedIdentity.role, allowed: [...allowed] },
+      };
+    }
+    return { ok: true, role: resolvedIdentity.role };
+  }
+
+  async function handle({ req, res, method, pathname, url, identity }) {
     const route = matchRoute(pathname, method);
     if (!route) throw new ApiError("NOT_FOUND", `no internal route for ${method} ${pathname}`);
     const { params } = route;
 
-    // m6.1-contracts §2: every internal endpoint declares the internal Role it
-    // accepts. Missing/wrong role is a 403 with a frozen reason code; an
-    // endpoint without a declaration is denied by default, never silently open.
-    const allowedRoles = requiredInternalRoles(method, pathname);
-    const roleCheck = checkInternalRole(req.headers[INTERNAL_ROLE_HEADER], allowedRoles ?? []);
-    if (!roleCheck.ok) {
+    // m6.1-contracts §2 / M6.3 P0-2: every internal endpoint declares the
+    // internal Role it accepts. The role is authoritative from the token
+    // binding; a client-declared header is only an assertion.
+    const principal = authorizeInternal({
+      identity,
+      roleHeader: req.headers[INTERNAL_ROLE_HEADER],
+      allowedRoles: requiredInternalRoles(method, pathname),
+    });
+    if (!principal.ok) {
       throw new ApiError("NOT_AUTHORIZED", "internal role is not allowed for this endpoint", {
-        details: {
-          reason: roleCheck.reason,
-          ...(roleCheck.role ? { role: roleCheck.role } : {}),
-          allowed: Array.isArray(roleCheck.allowed) ? roleCheck.allowed : [],
-        },
+        details: principal.details,
       });
     }
 
@@ -945,35 +978,80 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
       }
 
       case "runtime.heartbeat": {
+        // M6.3 P0-1: one heartbeat shape only. The M2 shape
+        // {ownerId,status,capabilities,sessions} used to be accepted here (and
+        // answered 200 without recording anything); it is removed now, because a
+        // fake ack meant the Host believed its liveness was reported while the
+        // Scheduler still saw no heartbeat.
         const body = requireObject(await requireJsonBody(req), "runtime heartbeat");
-        const ownerId = requireId(body.ownerId, "ownerId");
-        if (body.status !== "IDLE" && body.status !== "BUSY") {
-          throw validationError("invalid runtime heartbeat", ['status must be "IDLE" or "BUSY"']);
+        if (body.ownerId !== undefined || body.status !== undefined || body.capabilities !== undefined || body.sessions !== undefined) {
+          throw fieldValidationError(
+            "the legacy heartbeat shape {ownerId,status,capabilities,sessions} has been removed; send {hostId,agentIds,capacity}",
+            "ownerId",
+          );
         }
-        if (!isPlainObject(body.capabilities)) {
-          throw validationError("invalid runtime heartbeat", ["capabilities must be an object"]);
+        if (typeof body.hostId !== "string" || body.hostId.trim() === "") {
+          throw fieldValidationError("heartbeat.hostId must be a non-empty string", "hostId");
         }
-        if (!Array.isArray(body.sessions) || body.sessions.some((session) => typeof session !== "string")) {
-          throw validationError("invalid runtime heartbeat", ["sessions must be an array of session ids"]);
+        if (
+          !Array.isArray(body.agentIds) ||
+          body.agentIds.length === 0 ||
+          body.agentIds.some((agentId) => typeof agentId !== "string" || !ID_RE.test(agentId))
+        ) {
+          throw fieldValidationError("heartbeat.agentIds must be a non-empty array of agent ids", "agentIds");
         }
-        sendJson(res, 200, {
-          ok: true,
-          ownerId,
-          status: body.status,
-          receivedAt: new Date(now()).toISOString(),
+        if (!Number.isInteger(body.capacity) || body.capacity < 0) {
+          throw fieldValidationError("heartbeat.capacity must be a non-negative integer", "capacity");
+        }
+        if (typeof store.recordHeartbeat !== "function") {
+          throw new ApiError("INTERNAL_ERROR", "this store cannot record runtime heartbeats", {
+            details: { reason: "heartbeat-unsupported" },
+          });
+        }
+        const atIso = new Date(now()).toISOString();
+        const recorded = store.recordHeartbeat({
+          hostId: body.hostId,
+          agentIds: [...body.agentIds],
+          capacity: body.capacity,
+          now: atIso,
         });
+        const at = typeof recorded?.at === "string" ? recorded.at : atIso;
+        const agents = body.agentIds.map((agentId) => {
+          let availability = { available: false, reason: "no-heartbeat" };
+          try {
+            availability = store.agentAvailability({ agentId, now: at });
+          } catch {
+            // A store without the availability view still gets a truthful 200.
+          }
+          return { agentId, available: Boolean(availability?.available), reason: availability?.reason ?? null };
+        });
+        sendJson(res, 200, { at, hostId: body.hostId, capacity: body.capacity, agents });
         return;
       }
 
       case "runs.reconcile": {
         const reconciled = store.reconcileRun({ runId: params.id });
+        // M6.3 P0-4: the Host must be able to bind its Outbox entry to backend
+        // facts, so reconcile carries the Run's latest Dispatch Command. The
+        // frozen shape is {id,generation,status,result,idempotencyKey,eventId}
+        // with `eventId` equal to the result event id recorded on completion.
+        const command = isPlainObject(reconciled.command) ? reconciled.command : null;
         sendJson(res, 200, {
           run: reconciled.run,
           lease: normalizeLease(reconciled.lease),
           sessions: Array.isArray(reconciled.sessions) ? reconciled.sessions : [],
-          // F02 §3: pass a pending result through when the store exposes one, so
-          // a restarted Host can tell "submitted but the response was lost" from
-          // "never submitted". The field stays optional (absent when unknown).
+          command: command === null
+            ? null
+            : {
+                id: command.id,
+                generation: command.generation ?? 0,
+                status: command.status,
+                result: command.result ?? null,
+                idempotencyKey: command.idempotencyKey ?? null,
+                eventId: command.eventId ?? command.result?.eventId ?? null,
+              },
+          // F02 §3 / M6.3 §4: optional shape {commandId,generation,status,result}
+          // for a Host that submitted but lost the response.
           ...(reconciled.pendingResult === undefined ? {} : { pendingResult: reconciled.pendingResult }),
         });
         return;
@@ -1163,7 +1241,7 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
           runId,
           commitSha: body.commitSha,
           manifestHash: body.manifestHash,
-          actor: roleCheck.role,
+          actor: principal.role,
         });
         if (!isPlainObject(recorded) || !isPlainObject(recorded.integration) || !isPlainObject(recorded.task)) {
           logger?.error?.("[atk] store.recordIntegration returned an incomplete result");
@@ -1175,6 +1253,58 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
           logger?.error?.(`[atk] SSE pump failed after integration record: ${error?.message ?? error}`);
         }
         sendJson(res, 200, { integration: recorded.integration, task: recorded.task });
+        return;
+      }
+
+      case "tasks.review-runs": {
+        // M6.3 §12: the only trusted entry point that creates a REVIEWER Run for
+        // an existing REVIEWING task. The store enforces task/producer/agent rules
+        // and idempotency; the route only validates the request shape.
+        const taskId = params.id;
+        const body = requireObject(await requireJsonBody(req), "reviewer run request");
+        if (typeof body.reviewerAgentId !== "string" || !ID_RE.test(body.reviewerAgentId)) {
+          throw fieldValidationError("reviewerAgentId must be an agent id", "reviewerAgentId");
+        }
+        let idempotencyKey;
+        if (body.idempotencyKey !== undefined) {
+          if (
+            typeof body.idempotencyKey !== "string" ||
+            body.idempotencyKey.trim() === "" ||
+            body.idempotencyKey.length > 200
+          ) {
+            throw fieldValidationError(
+              "idempotencyKey must be a non-empty string of at most 200 characters",
+              "idempotencyKey",
+            );
+          }
+          idempotencyKey = body.idempotencyKey;
+        }
+        if (typeof store.createReviewerRun !== "function") {
+          logger?.error?.("[atk] store.createReviewerRun is unavailable; refusing to create a reviewer Run");
+          throw new ApiError("INTERNAL_ERROR", "createReviewerRun store method is unavailable", {
+            details: { reason: "reviewer-run-unsupported" },
+          });
+        }
+        const created = store.createReviewerRun({
+          taskId,
+          reviewerAgentId: body.reviewerAgentId,
+          ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+        });
+        if (!isPlainObject(created) || !isPlainObject(created.run) || !isPlainObject(created.command)) {
+          logger?.error?.("[atk] store.createReviewerRun returned an incomplete result");
+          throw new ApiError("INTERNAL_ERROR", "reviewer run creation returned an incomplete result");
+        }
+        try {
+          hub?.pump?.();
+        } catch (error) {
+          logger?.error?.(`[atk] SSE pump failed after reviewer run creation: ${error?.message ?? error}`);
+        }
+        sendJson(res, 200, {
+          run: created.run,
+          command: created.command,
+          spec: created.spec ?? null,
+          specHash: created.specHash ?? null,
+        });
         return;
       }
 

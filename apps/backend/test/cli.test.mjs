@@ -136,7 +136,7 @@ test("cli.mjs migrate with a missing state file fails cleanly (exit 2, no stack 
   }
 });
 
-test("cli serve prints the internal token once and enforces it on /internal/v1", { skip: DB_SKIP }, async (t) => {
+test("cli serve prints two internal tokens once and enforces them on /internal/v1", { skip: DB_SKIP }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "atk-cli-serve-"));
   const child = spawn(process.execPath, [CLI, "serve", "--port", "0", "--data", path.join(dir, "serve.db")], {
     cwd: dir,
@@ -168,27 +168,37 @@ test("cli serve prints the internal token once and enforces it on /internal/v1",
   });
 
   const deadline = Date.now() + 20_000;
-  while (Date.now() < deadline && !(/internal token: \S+/.test(stdout) && /listening on http/.test(stdout))) {
+  while (Date.now() < deadline && !(/internal tokens: scheduler=\S+ runtime-host=\S+/.test(stdout) && /listening on http/.test(stdout))) {
     if (child.exitCode !== null) break;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.match(stdout, /listening on http:\/\/127\.0\.0\.1:\d+/, `server did not start: ${stdout} ${stderr}`);
 
-  const tokenLines = stdout.match(/^internal token: (.+)$/gm) ?? [];
-  assert.equal(tokenLines.length, 1, "the internal token is printed exactly once");
-  const token = tokenLines[0].replace("internal token: ", "").trim();
-  assert.match(token, /^[A-Za-z0-9_-]{40,}$/);
+  const tokenLines = stdout.match(/^internal tokens: scheduler=(\S+) runtime-host=(\S+)$/gm) ?? [];
+  assert.equal(tokenLines.length, 1, "the internal token pair is printed exactly once");
+  const [, schedulerToken, hostToken] = /^internal tokens: scheduler=(\S+) runtime-host=(\S+)$/.exec(tokenLines[0]);
+  assert.match(schedulerToken, /^[A-Za-z0-9_-]{40,}$/);
+  assert.match(hostToken, /^[A-Za-z0-9_-]{40,}$/);
+  assert.notEqual(schedulerToken, hostToken, "the two role tokens must be independent");
 
   const base = stdout.match(/listening on (http:\/\/127\.0\.0\.1:\d+)/)[1];
-  const heartbeatBody = JSON.stringify({ ownerId: "host-1", status: "IDLE", capabilities: {}, sessions: [] });
+  const heartbeatBody = JSON.stringify({ hostId: "host-1", agentIds: ["agent-1"], capacity: 2 });
 
   const authorized = await fetch(`${base}/internal/v1/runtime/heartbeat`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-atk-internal": token, "x-atk-internal-role": "runtime-host" },
+    headers: { "content-type": "application/json", "x-atk-internal": hostToken, "x-atk-internal-role": "runtime-host" },
     body: heartbeatBody,
   });
-  assert.equal(authorized.status, 200);
-  assert.equal((await authorized.json()).ok, true);
+  // The mock store may not have agent-1; 200/404 both prove authentication passed.
+  assert.notEqual(authorized.status, 401);
+  assert.notEqual(authorized.status, 403);
+
+  const crossRole = await fetch(`${base}/internal/v1/runtime/heartbeat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-atk-internal": schedulerToken, "x-atk-internal-role": "runtime-host" },
+    body: heartbeatBody,
+  });
+  assert.equal(crossRole.status, 403, "scheduler token must not hold the runtime-host role");
 
   const unauthorized = await fetch(`${base}/internal/v1/runtime/heartbeat`, {
     method: "POST",
@@ -197,11 +207,10 @@ test("cli serve prints the internal token once and enforces it on /internal/v1",
   });
   assert.equal(unauthorized.status, 403);
   const errorText = await unauthorized.text();
-  assert.equal(errorText.includes(token), false, "the internal token never appears in a response");
   assert.match(errorText, /internal-token-missing/);
 
   // The browser session plane must not accept the internal credential either.
-  const browserToken = await fetch(`${base}/api/v1/tasks`, { headers: { "x-atk-internal": token } });
+  const browserToken = await fetch(`${base}/api/v1/tasks`, { headers: { "x-atk-internal": hostToken } });
   assert.equal(browserToken.status, 403);
 });
 

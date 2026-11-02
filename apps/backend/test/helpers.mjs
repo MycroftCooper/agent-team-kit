@@ -10,7 +10,10 @@ import { createFakeStore } from "./fake-store.mjs";
 
 export const TEST_TOKEN = "test-session-token";
 export const TEST_CSRF = "test-csrf-token";
-export const TEST_INTERNAL_TOKEN = "test-internal-token";
+/** M6.3: one independent credential per internal role. */
+export const TEST_INTERNAL_TOKEN = "test-scheduler-internal-token";
+export const TEST_HOST_INTERNAL_TOKEN = "test-runtime-host-internal-token";
+const AUTO_INTERNAL_TOKEN = "__atk_auto_internal_token__";
 
 export const SILENT_LOGGER = Object.freeze({
   info() {},
@@ -40,7 +43,10 @@ export async function startServer(options = {}) {
   const server = createServer({
     token: TEST_TOKEN,
     csrf: TEST_CSRF,
-    internalToken: TEST_INTERNAL_TOKEN,
+    internalTokens: {
+      scheduler: TEST_INTERNAL_TOKEN,
+      "runtime-host": TEST_HOST_INTERNAL_TOKEN,
+    },
     logger: SILENT_LOGGER,
     persistToken: false,
     ssePollMs: 25,
@@ -49,13 +55,13 @@ export async function startServer(options = {}) {
     store,
   });
   const info = await server.listen({ port: 0 });
-  return { server, store, base: info.url, info, internalToken: server.internalToken };
+  return { server, store, base: info.url, info, internalToken: server.internalToken, internalTokens: server.internalTokens };
 }
 
 /** Header set for `/internal/v1/*` calls (never the browser token).
- *  The role assertion is added per-endpoint by `request()` when omitted; pass an
- *  explicit role to exercise missing/forbidden-role negatives. */
-export function internalHeaders(token = TEST_INTERNAL_TOKEN, role = undefined) {
+ *  The matching role token + role assertion are added per-endpoint by `request()`
+ *  when omitted; pass an explicit token/role to exercise negatives. */
+export function internalHeaders(token = AUTO_INTERNAL_TOKEN, role = undefined) {
   const headers = { "x-atk-internal": token };
   if (role !== undefined) headers["x-atk-internal-role"] = role;
   return headers;
@@ -72,10 +78,15 @@ export function request(base, { method = "GET", path = "/", headers = {}, body }
         : { "content-type": "application/json", "content-length": Buffer.byteLength(payload) }),
       ...headers,
     };
-    // Default the internal role from the frozen endpoint matrix unless the test
-    // explicitly supplies one (so role-forbidden/missing negatives stay possible).
-    if (typeof requestHeaders["x-atk-internal"] === "string" && requestHeaders["x-atk-internal-role"] === undefined) {
-      const roles = requiredInternalRoles(method, url.pathname);
+    // Default the internal role/token from the frozen endpoint matrix unless the
+    // test explicitly supplies them (so negative cases stay possible).
+    const roles = requiredInternalRoles(method, url.pathname);
+    if (requestHeaders["x-atk-internal"] === AUTO_INTERNAL_TOKEN) {
+      const role = requestHeaders["x-atk-internal-role"]
+        ?? (Array.isArray(roles) && roles.length > 0 ? roles[0] : "scheduler");
+      requestHeaders["x-atk-internal"] = role === "runtime-host" ? TEST_HOST_INTERNAL_TOKEN : TEST_INTERNAL_TOKEN;
+      if (requestHeaders["x-atk-internal-role"] === undefined) requestHeaders["x-atk-internal-role"] = role;
+    } else if (typeof requestHeaders["x-atk-internal"] === "string" && requestHeaders["x-atk-internal-role"] === undefined) {
       if (Array.isArray(roles) && roles.length > 0) requestHeaders["x-atk-internal-role"] = roles[0];
     }
     const req = http.request(

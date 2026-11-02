@@ -38,7 +38,9 @@ export const INTERNAL_ROLE_MATRIX = Object.freeze([
   { method: "GET", pattern: /^\/internal\/v1\/runs\/[^/]+\/reconcile$/, roles: ["runtime-host"] },
   { method: "GET", pattern: /^\/internal\/v1\/runs\/[^/]+\/spec$/, roles: ["scheduler", "runtime-host"] },
   { method: "GET", pattern: /^\/internal\/v1\/runtime\/availability$/, roles: ["scheduler"] },
+  { method: "POST", pattern: /^\/internal\/v1\/runtime\/register$/, roles: ["runtime-host"] },
   { method: "POST", pattern: /^\/internal\/v1\/runtime\/heartbeat$/, roles: ["runtime-host"] },
+  { method: "POST", pattern: /^\/internal\/v1\/tasks\/[^/]+\/review-runs$/, roles: ["scheduler", "user-action"] },
 ]);
 
 /** Roles allowed for a request, or null when the route is not declared. */
@@ -72,6 +74,62 @@ export const INTERNAL_TOKEN_ENV = "ATK_INTERNAL_TOKEN";
 /** 32 random bytes, base64url — same strength as the browser session token. */
 export function createInternalToken() {
   return crypto.randomBytes(32).toString("base64url");
+}
+
+/** The two independent internal token roles (M6.3 P0-2). */
+export const INTERNAL_ROLE_SCHEDULER = "scheduler";
+export const INTERNAL_ROLE_RUNTIME_HOST = "runtime-host";
+
+/** Two independent, non-equal credentials. */
+export function createInternalTokens() {
+  const scheduler = createInternalToken();
+  let runtimeHost = createInternalToken();
+  while (runtimeHost === scheduler) runtimeHost = createInternalToken();
+  return { [INTERNAL_ROLE_SCHEDULER]: scheduler, [INTERNAL_ROLE_RUNTIME_HOST]: runtimeHost };
+}
+
+/** Normalise the supported token-map spellings (`host` is an accepted alias). */
+export function normalizeInternalTokens(value) {
+  if (!value || typeof value !== "object") return null;
+  const scheduler = value[INTERNAL_ROLE_SCHEDULER];
+  const runtimeHost = value[INTERNAL_ROLE_RUNTIME_HOST] ?? value.host;
+  if (typeof scheduler !== "string" || scheduler === "") return null;
+  if (typeof runtimeHost !== "string" || runtimeHost === "") return null;
+  return { [INTERNAL_ROLE_SCHEDULER]: scheduler, [INTERNAL_ROLE_RUNTIME_HOST]: runtimeHost };
+}
+
+/**
+ * M6.3 P0-2: the single token→role binding entry point. Endpoint authorization
+ * must be based on this result, never on a client-declared role header.
+ */
+export function resolveInternalIdentity(tokens, presented) {
+  if (typeof presented !== "string" || presented === "") {
+    return { ok: false, reason: "internal-token-missing" };
+  }
+  const normalized = normalizeInternalTokens(tokens);
+  if (normalized === null) return { ok: false, reason: "internal-token-unavailable" };
+  if (safeEqual(presented, normalized[INTERNAL_ROLE_SCHEDULER])) {
+    return { ok: true, role: INTERNAL_ROLE_SCHEDULER };
+  }
+  if (safeEqual(presented, normalized[INTERNAL_ROLE_RUNTIME_HOST])) {
+    return { ok: true, role: INTERNAL_ROLE_RUNTIME_HOST };
+  }
+  return { ok: false, reason: "internal-token-invalid" };
+}
+
+/**
+ * Optional `x-atk-internal-role` is only an additional assertion: when present
+ * it must equal the role bound to the token.
+ */
+export function checkInternalRoleHeader(boundRole, presented) {
+  if (presented === undefined || presented === null || presented === "") return { ok: true, role: boundRole };
+  if (presented === boundRole) return { ok: true, role: boundRole };
+  return {
+    ok: false,
+    reason: "internal-role-forbidden",
+    role: presented,
+    expectedRole: boundRole,
+  };
 }
 
 /**

@@ -21,9 +21,15 @@ importers:
 
   apps/runtime-host:
     dependencies:
+      '@atk/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@atk/runtime-sdk':
         specifier: workspace:*
         version: link:../../packages/runtime-sdk
+      '@atk/workspace':
+        specifier: workspace:*
+        version: link:../../packages/workspace
 
   apps/scheduler:
     dependencies:

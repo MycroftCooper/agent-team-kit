@@ -25,7 +25,8 @@ export const BACKEND_ROLE = "backend";
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("../../", import.meta.url)));
 const DEFAULT_SLEEP = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const TOKEN_LINE = /^internal token:\s*(\S+)\s*$/;
+const TOKEN_LINE = /^internal tokens:\s*scheduler=(\S+)\s+runtime-host=(\S+)\s*$/;
+const LEGACY_TOKEN_LINE = /^internal token:\s*(\S+)\s*$/;
 
 export class LauncherError extends Error {
   constructor(message, { code = 1, details = {} } = {}) {
@@ -117,7 +118,11 @@ export function createLauncher(options = {}) {
 
   /** name -> {name, role, pid, child, exited, exitCode, signalCode} */
   const children = new Map();
-  const tokenState = { value: null, waiters: [] };
+  const tokenState = { scheduler: null, runtimeHost: null, waiters: [] };
+
+  function tokensReady() {
+    return typeof tokenState.scheduler === "string" && typeof tokenState.runtimeHost === "string";
+  }
 
   function ensureDirs() {
     for (const directory of [dataDir, path.join(dataDir, "data"), runtimeDir, logsDir]) {
@@ -130,9 +135,11 @@ export function createLauncher(options = {}) {
   }
 
   function redact(text) {
-    const value = String(text ?? "");
-    if (!tokenState.value) return value;
-    return value.split(tokenState.value).join("[REDACTED]");
+    let value = String(text ?? "");
+    for (const token of [tokenState.scheduler, tokenState.runtimeHost]) {
+      if (typeof token === "string" && token !== "") value = value.split(token).join("[REDACTED]");
+    }
+    return value;
   }
 
   function appendLog(name, line) {
@@ -157,18 +164,18 @@ export function createLauncher(options = {}) {
     for (const waiter of tokenState.waiters.splice(0)) {
       clearTimeout(waiter.timer);
       if (error) waiter.reject(error);
-      else waiter.resolve(tokenState.value);
+      else waiter.resolve({ scheduler: tokenState.scheduler, runtimeHost: tokenState.runtimeHost });
     }
   }
 
-  function waitForToken(timeoutMs = tokenTimeoutMs) {
-    if (tokenState.value) return Promise.resolve(tokenState.value);
+  function waitForTokens(timeoutMs = tokenTimeoutMs) {
+    if (tokensReady()) return Promise.resolve({ scheduler: tokenState.scheduler, runtimeHost: tokenState.runtimeHost });
     return new Promise((resolve, reject) => {
       const waiter = { resolve, reject, timer: null };
       waiter.timer = setTimeout(() => {
         const index = tokenState.waiters.indexOf(waiter);
         if (index !== -1) tokenState.waiters.splice(index, 1);
-        reject(new LauncherError(`backend did not print an internal token within ${timeoutMs}ms`, { code: 1 }));
+        reject(new LauncherError(`backend did not print both internal tokens within ${timeoutMs}ms`, { code: 1 }));
       }, timeoutMs);
       waiter.timer.unref?.();
       tokenState.waiters.push(waiter);
@@ -179,10 +186,20 @@ export function createLauncher(options = {}) {
     if (name === BACKEND_ROLE) {
       const match = TOKEN_LINE.exec(line.trim());
       if (match) {
-        // Never persist the value: the log records that the credential arrived,
-        // not what it was. This is the only line the launcher special-cases.
-        tokenState.value = match[1];
-        appendLog(name, "internal credential received (value held in memory; passed to children via env)");
+        // Never persist the values: the log only records that they arrived.
+        tokenState.scheduler = match[1];
+        tokenState.runtimeHost = match[2];
+        appendLog(name, "internal credentials received (values held in memory; injected per role)");
+        resolveTokenWaiters();
+        return;
+      }
+      const legacy = LEGACY_TOKEN_LINE.exec(line.trim());
+      if (legacy) {
+        // Compatibility with older backends: one credential for both roles, but
+        // only during migration; the M6.3 backend prints two.
+        tokenState.scheduler = legacy[1];
+        tokenState.runtimeHost = legacy[1];
+        appendLog(name, "legacy single internal credential received (value held in memory)");
         resolveTokenWaiters();
         return;
       }
@@ -190,7 +207,7 @@ export function createLauncher(options = {}) {
     // Any line that names the credential channel (raw token banner or the
     // `x-atk-internal` security banner) is never written verbatim: handing the
     // backend's stdout to a file must not turn a printed secret into a stored one.
-    if (/internal token:|x-atk-internal/i.test(line)) {
+    if (/internal tokens?:|x-atk-internal/i.test(line)) {
       appendLog(name, "[redacted] internal credential line filtered");
       return;
     }
@@ -202,8 +219,8 @@ export function createLauncher(options = {}) {
     entry.exitCode = code;
     entry.signalCode = signal;
     appendLog(entry.name, `exited code=${code ?? "null"} signal=${signal ?? "null"}`);
-    if (entry.name === BACKEND_ROLE && !tokenState.value) {
-      resolveTokenWaiters(new LauncherError(`backend exited before printing an internal token (code ${code ?? "null"})`, { code: 1 }));
+    if (entry.name === BACKEND_ROLE && !tokensReady()) {
+      resolveTokenWaiters(new LauncherError(`backend exited before printing an internal token (scheduler/runtime-host; code ${code ?? "null"})`, { code: 1 }));
     }
   }
 
@@ -394,7 +411,7 @@ export function createLauncher(options = {}) {
 
     try {
       spawnChild(BACKEND_ROLE, BACKEND_ROLE, args);
-      const token = await waitForToken();
+      const tokens = await waitForTokens();
       await waitForHealth({
         baseUrl,
         timeoutMs: healthTimeoutMs,
@@ -406,15 +423,20 @@ export function createLauncher(options = {}) {
 
       spawnChild(SCHEDULER_ROLE, SCHEDULER_ROLE, [path.join(repoRoot, "apps", "scheduler", "cli.mjs")], {
         ATK_BACKEND_URL: baseUrl,
-        ATK_INTERNAL_TOKEN: token,
+        ATK_INTERNAL_TOKEN: tokens.scheduler,
         SCHEDULER_OWNER: "launcher-scheduler",
       });
 
       for (let index = 1; index <= hosts; index += 1) {
         const name = `host-${index}`;
+        const hostAgents = process.env.ATK_HOST_AGENTS
+          ?? JSON.stringify([{ agentId: `${name}-agent`, role: "DEV", function: "WORKER" }]);
+        const hostCapacity = process.env.ATK_HOST_CAPACITY ?? "1";
         spawnChild(name, HOST_ROLE, [path.join(repoRoot, "apps", "runtime-host", "cli.mjs"), "--owner", name], {
           ATK_BACKEND_URL: baseUrl,
-          ATK_INTERNAL_TOKEN: token,
+          ATK_INTERNAL_TOKEN: tokens.runtimeHost,
+          ATK_HOST_AGENTS: hostAgents,
+          ATK_HOST_CAPACITY: hostCapacity,
           AGENT_RUNTIME: runtime,
           ATK_HOST_OWNER: name,
           // ADR-010 decision 7: the Host records its in-flight runs here, so a

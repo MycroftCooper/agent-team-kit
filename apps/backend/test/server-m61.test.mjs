@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 
 import { checkInternalRole, requiredInternalRoles } from "../src/internal.mjs";
 import { createFakeStore } from "./fake-store.mjs";
-import { internalHeaders, readHeaders, request, startServer, writeHeaders } from "./helpers.mjs";
+import { TEST_INTERNAL_TOKEN, internalHeaders, readHeaders, request, startServer, writeHeaders } from "./helpers.mjs";
 
 const MANIFEST = "a".repeat(64);
 
@@ -119,22 +119,23 @@ test("F06: body.actor is ignored; reviewer identity comes from the trusted assig
     assert.equal(review.json.items[0].status, "PENDING");
   }
 
-  // 2. Internal credential + missing role → required; wrong role → forbidden.
+  // 2. M6.3 P0-2: a scheduler token cannot submit reviews (runtime-host only),
+  // and a role header that contradicts the token binding is refused.
   {
     const ctx = await withStore(t, makeStore({ assignedTo: "AGENT", reviewerAgentId: "agent-3" }));
-    const missingRole = await request(ctx.base, {
+    const wrongToken = await request(ctx.base, {
       method: "POST",
       path: "/api/v1/reviews/REV-ASSIGN/submit",
-      headers: { "x-atk-internal": internalHeaders()["x-atk-internal"] },
+      headers: { "x-atk-internal": TEST_INTERNAL_TOKEN },
       body: submitBody("ignored"),
     });
-    assert.equal(missingRole.status, 403, missingRole.text);
-    assert.equal(missingRole.json.error.details.reason, "internal-role-required");
+    assert.equal(wrongToken.status, 403, wrongToken.text);
+    assert.equal(wrongToken.json.error.details.reason, "internal-role-forbidden");
 
     const wrongRole = await request(ctx.base, {
       method: "POST",
       path: "/api/v1/reviews/REV-ASSIGN/submit",
-      headers: internalHeaders(undefined, "scheduler"),
+      headers: internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host"),
       body: submitBody("ignored"),
     });
     assert.equal(wrongRole.status, 403, wrongRole.text);
@@ -424,7 +425,7 @@ test("F06 real SQLite: assignment-bound review, session refused, runtime-host ac
   const raw = new DatabaseSync(path.join(dir, "atk.db"));
   raw.prepare("UPDATE tasks SET status = 'RUNNING', version = version + 1 WHERE id = ?").run(task.id);
   raw.close();
-  const reviewerRun = store.createRun({ id: "RUN-REVIEWER", taskId: task.id, agentId: "reviewer-1", function: "WORKER", role: "REVIEWER", status: "RUNNING" });
+  const reviewerRun = store.createRun({ id: "RUN-REVIEWER", taskId: task.id, agentId: "reviewer-1", function: "REVIEWER", role: "REVIEWER", status: "RUNNING" });
 
   const ctx = await startServer({ store });
   t.after(async () => {
@@ -437,7 +438,7 @@ test("F06 real SQLite: assignment-bound review, session refused, runtime-host ac
     method: "POST",
     path: "/api/v1/reviews",
     headers: writeHeaders(ctx.base),
-    body: { taskId: task.id, runId: claim.run.id, reviewerAgentId: "reviewer-1", assignedTo: "AGENT", actor: "forged" },
+    body: { taskId: task.id, runId: claim.run.id, reviewerAgentId: "reviewer-1", reviewerRunId: reviewerRun.id, assignedTo: "AGENT", actor: "forged" },
   });
   assert.equal(created.status, 201, created.text);
   assert.equal(created.json.reviewerAgentId, "reviewer-1");
@@ -482,11 +483,11 @@ test("F06 real SQLite: producer is review.runId, self-review 403 and unknown pro
   store.createProject({ id: "P1", name: "p1", repoPath: ".", defaultBranch: "main" });
   store.createTask({ id: "T-SELF", projectId: "P1", title: "self", description: "d", functionRequired: "WORKER", roleRequired: "DEV", priority: 2, deps: [], acceptance: "x" });
   store.createTask({ id: "T-NOPROD", projectId: "P1", title: "noprod", description: "d", functionRequired: "WORKER", roleRequired: "DEV", priority: 2, deps: [], acceptance: "x" });
-  const producer = store.createRun({ id: "RUN-SELF", taskId: "T-SELF", agentId: "agent-1", function: "WORKER", role: "DEV", status: "RUNNING" });
+  const producer = store.createRun({ id: "RUN-SELF", taskId: "T-SELF", agentId: "agent-1", function: "REVIEWER", role: "REVIEWER", status: "RUNNING" });
   store.updateRunStatus(producer.id, { status: "RUNNING" });
   store.updateRunStatus(producer.id, { status: "COMPLETED" });
   // The reviewer's own Run proves who is submitting, but must NOT become the producer.
-  const reviewerRun = store.createRun({ id: "RUN-REVIEWER2", taskId: "T-NOPROD", agentId: "reviewer-1", function: "WORKER", role: "REVIEWER", status: "RUNNING" });
+  const reviewerRun = store.createRun({ id: "RUN-REVIEWER2", taskId: "T-NOPROD", agentId: "reviewer-1", function: "REVIEWER", role: "REVIEWER", status: "RUNNING" });
   const at = "2026-01-01T00:00:00.000Z";
   const { DatabaseSync } = await import("node:sqlite");
   const raw = new DatabaseSync(file);
@@ -494,11 +495,12 @@ test("F06 real SQLite: producer is review.runId, self-review 403 and unknown pro
   const insert = raw.prepare(
     `INSERT INTO reviews
        (id, task_id, run_id, status, verdict, manifest_hash, commit_sha, findings_json, attempt,
-        version, reviewer, evidence_json, submitted_at, created_at, updated_at, reviewer_agent_id, assigned_to)
-     VALUES (?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, 1, 0, NULL, NULL, NULL, ?, ?, ?, 'AGENT')`,
+        version, reviewer, evidence_json, submitted_at, created_at, updated_at, reviewer_agent_id, assigned_to,
+        reviewer_run_id)
+     VALUES (?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, 1, 0, NULL, NULL, NULL, ?, ?, ?, 'AGENT', ?)`,
   );
-  insert.run("REV-SELF", "T-SELF", "RUN-SELF", at, at, "agent-1");
-  insert.run("REV-NOPROD", "T-NOPROD", null, at, at, "reviewer-1");
+  insert.run("REV-SELF", "T-SELF", "RUN-SELF", at, at, "agent-1", "RUN-SELF");
+  insert.run("REV-NOPROD", "T-NOPROD", null, at, at, "reviewer-1", "RUN-REVIEWER2");
   raw.close();
 
   const ctx = await startServer({ store });

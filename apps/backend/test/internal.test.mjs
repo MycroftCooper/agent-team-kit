@@ -1,4 +1,4 @@
-// M2 internal API tests (m2-contracts 搂2): separate internal credential,
+// M2 internal API tests (m2-contracts 閹?): separate internal credential,
 // dispatch claim/result, lease renewal with generation fencing, RuntimeEvent
 // mapping to Run state + business events, reconcile shape and the SSE producer.
 import assert from "node:assert/strict";
@@ -10,8 +10,10 @@ import test from "node:test";
 import { validateErrorBody, validateTaskExecutionSpec } from "@atk/contracts";
 
 import { createServer } from "../src/server.mjs";
+import { requiredInternalRoles } from "../src/internal.mjs";
 import { createFakeStore } from "./fake-store.mjs";
 import {
+  TEST_HOST_INTERNAL_TOKEN,
   TEST_INTERNAL_TOKEN,
   TEST_TOKEN,
   closeSse,
@@ -113,7 +115,7 @@ test("internal routes require x-atk-internal and reject the browser token", asyn
   assertErrorEnvelope(wrong, "NOT_AUTHORIZED", 403);
   assert.equal(wrong.json.error.details.reason, "internal-token-invalid");
 
-  // ADR-008 搂5: the browser session token must never unlock the internal plane.
+  // ADR-008 閹?: the browser session token must never unlock the internal plane.
   const browserToken = await request(base, {
     method: "POST",
     path: "/internal/v1/runtime/heartbeat",
@@ -554,43 +556,36 @@ test("retried event batches are deduped by (runId, sessionId, at, type)", async 
   assert.equal(replay.json.run.status, "RUNNING");
 });
 
-test("runtime heartbeat validates its payload and acknowledges", async (t) => {
+test("runtime heartbeat validates the new host-level payload", async (t) => {
   const { store } = createScenario();
   const { server, base } = await startServer({ store });
   t.after(() => server.close());
 
-  const ok = await request(base, { method: "POST", path: "/internal/v1/runtime/heartbeat", headers: internalHeaders(), body: heartbeatBody() });
+  const ok = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runtime/heartbeat",
+    headers: internalHeaders(undefined, "runtime-host"),
+    body: { hostId: "host-1", agentIds: ["agent-1"], capacity: 2 },
+  });
   assert.equal(ok.status, 200, ok.text);
-  assert.equal(ok.json.ok, true);
-  assert.equal(ok.json.ownerId, "host-1");
-  assert.equal(ok.json.status, "BUSY");
-  assert.equal(Number.isNaN(Date.parse(ok.json.receivedAt)), false);
+  assert.equal(ok.json.hostId, "host-1");
+  assert.equal(ok.json.capacity, 2);
+  assert.deepEqual(ok.json.agents, [{ agentId: "agent-1", available: true, reason: "ok" }]);
 
-  assertErrorEnvelope(
-    await request(base, { method: "POST", path: "/internal/v1/runtime/heartbeat", headers: internalHeaders(), body: { ownerId: "host-1" } }),
-    "VALIDATION_ERROR",
-    400,
-  );
-  assertErrorEnvelope(
-    await request(base, {
+  for (const [body, field] of [
+    [{ agentIds: ["agent-1"], capacity: 1 }, "hostId"],
+    [{ hostId: "host-1", agentIds: [], capacity: 1 }, "agentIds"],
+    [{ hostId: "host-1", agentIds: ["agent-1"], capacity: -1 }, "capacity"],
+  ]) {
+    const res = await request(base, {
       method: "POST",
       path: "/internal/v1/runtime/heartbeat",
-      headers: internalHeaders(),
-      body: { ownerId: "host-1", status: "SLEEPY", capabilities: {}, sessions: [] },
-    }),
-    "VALIDATION_ERROR",
-    400,
-  );
-  assertErrorEnvelope(
-    await request(base, {
-      method: "POST",
-      path: "/internal/v1/runtime/heartbeat",
-      headers: internalHeaders(),
-      body: { ownerId: "host-1", status: "IDLE", capabilities: {}, sessions: [1] },
-    }),
-    "VALIDATION_ERROR",
-    400,
-  );
+      headers: internalHeaders(undefined, "runtime-host"),
+      body,
+    });
+    assertErrorEnvelope(res, "VALIDATION_ERROR", 400);
+    assert.equal(res.json.error.details.field, field);
+  }
 });
 
 test("reconcile returns the authoritative run, lease and known sessions", async (t) => {
@@ -1017,7 +1012,7 @@ test("F03 real store: sequential transitions, rollback and retry dedupe over HTT
     store.close();
     await fs.promises.rm(dir, { recursive: true, force: true });
   });
-  const headers = internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host");
+  const headers = internalHeaders(undefined, "runtime-host");
   const postEvents = (runId, generation, events) =>
     request(base, { method: "POST", path: `/internal/v1/runs/${runId}/events`, headers, body: { generation, events } });
 
@@ -1229,40 +1224,41 @@ test("F08: submitting the same 100-event batch three times stores exactly one co
   assert.equal(store.listEvents({ aggregateId: "RUN-1", type: "run.log" }).length, 100);
 });
 
-test("internal endpoints enforce the frozen role matrix (missing / forbidden / accepted)", async (t) => {
+test("internal endpoints enforce the frozen role matrix (header assertion / forbidden / accepted)", async (t) => {
   const { base } = await claimedScenario(t);
 
-  // An empty explicit role stays empty (helpers.request only defaults when the
-  // header is absent), so this exercises the real "role missing" path.
-  const missing = await request(base, {
+  // M6.3 P0-2: the role isn't "missing" any more — it is bound to the token.
+  // An explicit empty role header is treated as absent and the token role wins.
+  const emptyHeader = await request(base, {
     path: "/internal/v1/runs/RUN-1/reconcile",
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, ""),
+    headers: internalHeaders(TEST_HOST_INTERNAL_TOKEN, ""),
   });
-  assertErrorEnvelope(missing, "NOT_AUTHORIZED", 403);
-  assert.equal(missing.json.error.details.reason, "internal-role-required");
-  assert.deepEqual(missing.json.error.details.allowed, ["runtime-host"]);
+  assert.equal(emptyHeader.status, 200, emptyHeader.text);
 
-  const wrong = await request(base, {
+  const wrongHeader = await request(base, {
     path: "/internal/v1/runs/RUN-1/reconcile",
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    headers: internalHeaders(TEST_HOST_INTERNAL_TOKEN, "scheduler"),
   });
-  assertErrorEnvelope(wrong, "NOT_AUTHORIZED", 403);
-  assert.equal(wrong.json.error.details.reason, "internal-role-forbidden");
-  assert.equal(wrong.json.error.details.role, "scheduler");
+  assertErrorEnvelope(wrongHeader, "NOT_AUTHORIZED", 403);
+  assert.equal(wrongHeader.json.error.details.reason, "internal-role-forbidden");
+  assert.equal(wrongHeader.json.error.details.role, "scheduler");
+  assert.equal(wrongHeader.json.error.details.expectedRole, "runtime-host");
 
-  const unknown = await request(base, {
+  const unknownHeader = await request(base, {
     path: "/internal/v1/runs/RUN-1/reconcile",
     headers: internalHeaders(TEST_INTERNAL_TOKEN, "admin"),
   });
-  assertErrorEnvelope(unknown, "NOT_AUTHORIZED", 403);
-  assert.equal(unknown.json.error.details.reason, "internal-role-forbidden");
+  assertErrorEnvelope(unknownHeader, "NOT_AUTHORIZED", 403);
+  assert.equal(unknownHeader.json.error.details.reason, "internal-role-forbidden");
 
   const accepted = await request(base, {
     path: "/internal/v1/runs/RUN-1/reconcile",
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host"),
+    headers: internalHeaders(undefined, "runtime-host"),
   });
   assert.equal(accepted.status, 200, accepted.text);
 
+  // Right token, wrong endpoint: identity says scheduler, the matrix wants
+  // runtime-host, so the header is consistent but the role is forbidden.
   const schedulerOnly = await request(base, {
     path: "/internal/v1/dispatch/claim?owner=host-2&leaseMs=5000",
     headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
@@ -1309,24 +1305,34 @@ test("integration endpoint records INTEGRATING -> AWAITING_ACCEPTANCE with role 
     request(base, {
       method: "POST",
       path: integrationPath,
-      headers: internalHeaders(TEST_INTERNAL_TOKEN, role),
+      headers: internalHeaders(undefined, role),
       body: payload,
     });
 
-  const missing = await request(base, {
+  const headerMismatch = await request(base, {
     method: "POST",
     path: integrationPath,
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, ""),
+    headers: internalHeaders(TEST_HOST_INTERNAL_TOKEN, "scheduler"),
     body,
   });
-  assertErrorEnvelope(missing, "NOT_AUTHORIZED", 403);
-  assert.equal(missing.json.error.details.reason, "internal-role-required");
+  assertErrorEnvelope(headerMismatch, "NOT_AUTHORIZED", 403);
+  assert.equal(headerMismatch.json.error.details.reason, "internal-role-forbidden");
+  assert.equal(headerMismatch.json.error.details.role, "scheduler");
+  assert.equal(headerMismatch.json.error.details.expectedRole, "runtime-host");
 
-  const forbidden = await integrationRequest("runtime-host");
+  // Identity-bound role the matrix does not allow on this endpoint.
+  const forbidden = await request(base, {
+    method: "POST",
+    path: integrationPath,
+    headers: internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"),
+    body,
+  });
   assertErrorEnvelope(forbidden, "NOT_AUTHORIZED", 403);
   assert.equal(forbidden.json.error.details.reason, "internal-role-forbidden");
+  assert.equal(forbidden.json.error.details.role, "runtime-host");
+  assert.deepEqual(forbidden.json.error.details.allowed, ["scheduler", "user-action"]);
 
-  const stale = await integrationRequest("user-action", { ...body, manifestHash: "C".repeat(64) });
+  const stale = await integrationRequest("scheduler", { ...body, manifestHash: "C".repeat(64) });
   assertErrorEnvelope(stale, "APPROVAL_STALE", 409);
   assert.equal(scenario.store.getTask("TASK-1").status, "INTEGRATING", "a stale hash must not move the task");
   assert.deepEqual(scenario.store._listIntegrations(), []);
@@ -1367,14 +1373,15 @@ test("F12: /events pagination rejects malformed afterSeq/limit by field; interna
     assert.equal(res.json.error.details.field, field, `${pathname} must name ${field} in details.field`);
   }
 
-  // m2-contracts 搂2: reconcile returns `{ run, lease, sessions }` and has no
-  // pagination parameter. Passing afterSeq/limit must not turn it into one.
+  // m6.3 搂4: reconcile returns `{ run, lease, sessions, command }` (command is
+  // null when the Run never had one) and has no pagination parameter. Passing
+  // afterSeq/limit must not turn it into one.
   const reconciled = await request(base, {
     path: "/internal/v1/runs/RUN-1/reconcile?afterSeq=0&limit=1",
     headers: internalHeaders(),
   });
   assert.equal(reconciled.status, 200, reconciled.text);
-  assert.deepEqual(Object.keys(reconciled.json).sort(), ["lease", "run", "sessions"]);
+  assert.deepEqual(Object.keys(reconciled.json).sort(), ["command", "lease", "run", "sessions"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -1410,7 +1417,7 @@ async function startClaimable(t) {
     request(base, {
       method: "POST",
       path: "/internal/v1/tasks/TASK-1/claim",
-      headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+      headers: internalHeaders(undefined, "scheduler"),
       body: { agentId: "agent-1", expectedTaskVersion: 0, idempotencyKey },
     });
   return { store, base, claim };
@@ -1441,7 +1448,7 @@ test("F05: task claim carries a validated frozen spec and replays the same specH
   const delayed = await request(restarted.base, {
     method: "POST",
     path: "/internal/v1/tasks/TASK-1/claim",
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    headers: internalHeaders(undefined, "scheduler"),
     body: { agentId: "agent-1", expectedTaskVersion: 0, idempotencyKey: "m62-claim-1" },
   });
   assert.equal(delayed.status, 200, delayed.text);
@@ -1458,7 +1465,7 @@ test("F05: a claim that cannot freeze a valid spec is a 500 and sends no partial
   const res = await request(base, {
     method: "POST",
     path: "/internal/v1/tasks/TASK-1/claim",
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    headers: internalHeaders(undefined, "scheduler"),
     body: { agentId: "agent-1", expectedTaskVersion: 0, idempotencyKey: "m62-no-spec" },
   });
 
@@ -1475,7 +1482,7 @@ test("F05: GET /runs/:id/spec serves the frozen spec and 404s with spec-not-froz
 
   const spec = await request(base, {
     path: `/internal/v1/runs/${runId}/spec`,
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    headers: internalHeaders(undefined, "scheduler"),
   });
   assert.equal(spec.status, 200, spec.text);
   assert.deepEqual(Object.keys(spec.json).sort(), ["frozenAt", "spec", "specHash", "taskId", "taskVersion"]);
@@ -1483,20 +1490,20 @@ test("F05: GET /runs/:id/spec serves the frozen spec and 404s with spec-not-froz
 
   const runtime = await request(base, {
     path: `/internal/v1/runs/${runId}/spec`,
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host"),
+    headers: internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"),
   });
   assert.equal(runtime.status, 200, runtime.text);
 
   const forbidden = await request(base, {
     path: `/internal/v1/runs/${runId}/spec`,
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "user-action"),
+    headers: internalHeaders(undefined, "user-action"),
   });
   assertErrorEnvelope(forbidden, "NOT_AUTHORIZED", 403);
   assert.equal(forbidden.json.error.details.reason, "internal-role-forbidden");
 
   const missing = await request(base, {
     path: "/internal/v1/runs/RUN-NOPE/spec",
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    headers: internalHeaders(undefined, "scheduler"),
   });
   assertErrorEnvelope(missing, "NOT_FOUND", 404);
   assert.equal(missing.json.error.details.reason, "spec-not-frozen");
@@ -1514,7 +1521,7 @@ test("F05: claim forwards the workspace and freezes it into the Run-bound spec",
   const res = await request(base, {
     method: "POST",
     path: "/internal/v1/tasks/TASK-1/claim",
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    headers: internalHeaders(undefined, "scheduler"),
     body: { agentId: "agent-1", expectedTaskVersion: 0, idempotencyKey: "m62-workspace-1", workspace },
   });
 
@@ -1531,7 +1538,7 @@ test("F05: claim forwards the workspace and freezes it into the Run-bound spec",
 
   const specRes = await request(base, {
     path: `/internal/v1/runs/${runId}/spec`,
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    headers: internalHeaders(undefined, "scheduler"),
   });
   assert.equal(specRes.status, 200, specRes.text);
   assert.equal(specRes.json.specHash, res.json.command.specHash);
@@ -1545,7 +1552,7 @@ test("F05: workspace shape errors are 400 naming the field (store validates work
     request(base, {
       method: "POST",
       path: "/internal/v1/tasks/TASK-1/claim",
-      headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+      headers: internalHeaders(undefined, "scheduler"),
       body: { agentId: "agent-1", expectedTaskVersion: 0, idempotencyKey: "m62-workspace-bad", workspace },
     });
 
@@ -1569,7 +1576,7 @@ test("F10: runtime heartbeat records host/agents/capacity and rejects malformed 
     request(base, {
       method: "POST",
       path: "/internal/v1/runtime/heartbeat",
-      headers: internalHeaders(TEST_INTERNAL_TOKEN, role),
+      headers: internalHeaders(undefined, role),
       body,
     });
 
@@ -1587,7 +1594,7 @@ test("F10: runtime heartbeat records host/agents/capacity and rejects malformed 
   assert.equal(Number.isNaN(Date.parse(agent.lastHeartbeatAt)), false);
   const availabilityView = await request(base, {
     path: "/internal/v1/runtime/availability?agentId=agent-1",
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    headers: internalHeaders(undefined, "scheduler"),
   });
   assert.equal(availabilityView.status, 200, availabilityView.text);
   assert.deepEqual(availabilityView.json, { agentId: "agent-1", available: true, reason: "ok" });
@@ -1614,7 +1621,7 @@ test("F10: runtime availability comes from heartbeats, not from status IDLE", as
   const availability = (agentId, role = "scheduler") =>
     request(base, {
       path: `/internal/v1/runtime/availability?agentId=${encodeURIComponent(agentId)}`,
-      headers: internalHeaders(TEST_INTERNAL_TOKEN, role),
+      headers: internalHeaders(undefined, role),
     });
 
   const before = await availability("agent-1");
@@ -1624,7 +1631,7 @@ test("F10: runtime availability comes from heartbeats, not from status IDLE", as
   const heartbeat = await request(base, {
     method: "POST",
     path: "/internal/v1/runtime/heartbeat",
-    headers: internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host"),
+    headers: internalHeaders(undefined, "runtime-host"),
     body: { hostId: "host-1", agentIds: ["agent-1"], capacity: 2 },
   });
   assert.equal(heartbeat.status, 200, heartbeat.text);
@@ -1641,4 +1648,487 @@ test("F10: runtime availability comes from heartbeats, not from status IDLE", as
   assertErrorEnvelope(forbidden, "NOT_AUTHORIZED", 403);
   assert.equal(forbidden.json.error.details.reason, "internal-role-forbidden");
 });
+
+// ---------------------------------------------------------------------------
+// M6.3 (phase B reproducers): heartbeat unification, reconcile command,
+// Reviewer-Run function mapping.
+// ---------------------------------------------------------------------------
+
+test("M6.3 P0-1: legacy heartbeat {ownerId,...} is rejected with 400 naming ownerId", async (t) => {
+  const { base } = await startClaimable(t);
+  const res = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runtime/heartbeat",
+    headers: internalHeaders(undefined, "runtime-host"),
+    body: { ownerId: "host-legacy", status: "BUSY", capabilities: { WORKER: true }, sessions: [] },
+  });
+
+  assertErrorEnvelope(res, "VALIDATION_ERROR", 400);
+  assert.equal(res.json.error.details.field, "ownerId");
+  assert.match(res.json.error.message, /(legacy|deprecated|removed)/i);
+
+  // The old body must never be acknowledged as a heartbeat write.
+  const availability = await request(base, {
+    path: "/internal/v1/runtime/availability?agentId=agent-1",
+    headers: internalHeaders(undefined, "scheduler"),
+  });
+  assert.deepEqual(availability.json, { agentId: "agent-1", available: false, reason: "no-heartbeat" });
+});
+
+test("M6.3 P0-1: new heartbeat shape is recorded and reflected in availability", async (t) => {
+  const { store, base } = await startClaimable(t);
+  const res = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runtime/heartbeat",
+    headers: internalHeaders(undefined, "runtime-host"),
+    body: { hostId: "host-m63", agentIds: ["agent-1"], capacity: 3 },
+  });
+
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.json.hostId, "host-m63");
+  assert.equal(res.json.capacity, 3);
+  assert.equal(Number.isNaN(Date.parse(res.json.at)), false);
+  assert.deepEqual(res.json.agents, [{ agentId: "agent-1", available: true, reason: "ok" }]);
+  const agent = store.listAgents().find((entry) => entry.id === "agent-1");
+  assert.equal(agent.hostId, "host-m63");
+  assert.equal(agent.capacity, 3);
+  assert.equal(Number.isNaN(Date.parse(agent.lastHeartbeatAt)), false);
+
+  const availability = await request(base, {
+    path: "/internal/v1/runtime/availability?agentId=agent-1",
+    headers: internalHeaders(undefined, "scheduler"),
+  });
+  assert.deepEqual(availability.json, { agentId: "agent-1", available: true, reason: "ok" });
+});
+
+test("M6.3 P0-1: heartbeat on a store without recordHeartbeat is a fail-closed 500", async (t) => {
+  const store = claimableScenario();
+  delete store.recordHeartbeat;
+  const { server, base } = await startServer({ store });
+  t.after(() => server.close());
+
+  const res = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runtime/heartbeat",
+    headers: internalHeaders(undefined, "runtime-host"),
+    body: { hostId: "host-m63", agentIds: ["agent-1"], capacity: 1 },
+  });
+  assertErrorEnvelope(res, "INTERNAL_ERROR", 500);
+  assert.equal(res.json.error.details.reason, "heartbeat-unsupported");
+});
+
+test("M6.3 P0-4: reconcile returns the latest dispatch command and pending result", async (t) => {
+  const { base, claim } = await startClaimable(t);
+  const claimedTask = await claim();
+  assert.equal(claimedTask.status, 200, claimedTask.text);
+  const runId = claimedTask.json.run.id;
+  const commandId = claimedTask.json.command.id;
+
+  const claimed = await request(base, {
+    path: "/internal/v1/dispatch/claim?owner=host-reconcile&leaseMs=5000",
+    headers: internalHeaders(undefined, "runtime-host"),
+  });
+  assert.equal(claimed.status, 200, claimed.text);
+  assert.equal(claimed.json.command.id, commandId);
+  const generation = claimed.json.lease.generation;
+
+  const before = await request(base, {
+    path: `/internal/v1/runs/${runId}/reconcile`,
+    headers: internalHeaders(undefined, "runtime-host"),
+  });
+  assert.equal(before.status, 200, before.text);
+  assert.deepEqual(Object.keys(before.json.command).sort(), [
+    "eventId",
+    "generation",
+    "id",
+    "idempotencyKey",
+    "result",
+    "status",
+  ]);
+  assert.equal(before.json.command.id, commandId);
+  assert.equal(before.json.command.generation, generation);
+  assert.equal(before.json.command.status, "CLAIMED");
+  assert.equal(before.json.command.result, null);
+  assert.equal(before.json.command.idempotencyKey, "m62-claim-1");
+  assert.equal(before.json.command.eventId, null);
+
+  const result = await request(base, {
+    method: "POST",
+    path: `/internal/v1/dispatch/${commandId}/result`,
+    headers: internalHeaders(undefined, "runtime-host"),
+    body: { ownerId: "host-reconcile", generation, status: "DONE", exitCode: 0, eventId: "evt-m63-1" },
+  });
+  assert.equal(result.status, 200, result.text);
+
+  const after = await request(base, {
+    path: `/internal/v1/runs/${runId}/reconcile`,
+    headers: internalHeaders(undefined, "runtime-host"),
+  });
+  assert.equal(after.status, 200, after.text);
+  assert.equal(after.json.command.id, commandId);
+  assert.equal(after.json.command.generation, generation);
+  assert.equal(after.json.command.status, "DONE");
+  assert.deepEqual(after.json.command.result, { exitCode: 0, eventId: "evt-m63-1" });
+  assert.equal(after.json.command.eventId, "evt-m63-1");
+  // Frozen 鎼?: a TERMINAL command means the result is persisted, so the
+  // crash-window `pendingResult` hint is absent.
+  assert.equal(Object.hasOwn(after.json, "pendingResult"), false);
+  assert.equal(after.json.command.status, "DONE");
+});
+
+test("M6.3 P0-4: reconcile reports a non-terminal command with a recorded result as pendingResult", async (t) => {
+  const { store, base, claim } = await startClaimable(t);
+  const claimedTask = await claim();
+  const runId = claimedTask.json.run.id;
+  const commandId = claimedTask.json.command.id;
+
+  const claimed = await request(base, {
+    path: "/internal/v1/dispatch/claim?owner=host-reconcile&leaseMs=5000",
+    headers: internalHeaders(undefined, "runtime-host"),
+  });
+  assert.equal(claimed.status, 200, claimed.text);
+  const generation = claimed.json.lease.generation;
+
+  // Crash window: the Host recorded the result, the command never flipped to a
+  // terminal status. reconcile must expose it as `pendingResult` (frozen 鎼?).
+  store._setCommandResult(commandId, { exitCode: 3, eventId: "evt-pending-1" });
+  const pending = await request(base, {
+    path: `/internal/v1/runs/${runId}/reconcile`,
+    headers: internalHeaders(undefined, "runtime-host"),
+  });
+  assert.equal(pending.status, 200, pending.text);
+  assert.equal(pending.json.command.status, "CLAIMED");
+  assert.deepEqual(pending.json.command.result, { exitCode: 3, eventId: "evt-pending-1" });
+  assert.equal(pending.json.command.eventId, "evt-pending-1");
+  assert.deepEqual(pending.json.pendingResult, {
+    commandId,
+    generation,
+    status: "CLAIMED",
+    result: { exitCode: 3, eventId: "evt-pending-1" },
+  });
+});
+
+test("M6.3 P1-8: REVIEW_RUN_NOT_REVIEWER from the store maps to HTTP 403", async (t) => {
+  const store = createFakeStore({
+    projects: [{ id: "P-1", name: "Demo", repoPath: "C:\\repo", defaultBranch: "main" }],
+    tasks: [
+      {
+        id: "TASK-1",
+        projectId: "P-1",
+        title: "Review me",
+        description: "d",
+        functionRequired: "WORKER",
+        roleRequired: "BE",
+        priority: 2,
+        deps: [],
+        status: "REVIEWING",
+        version: 0,
+      },
+    ],
+    runs: [
+      { id: "RUN-AUTHOR", taskId: "TASK-1", agentId: "agent-1", function: "WORKER", status: "COMPLETED", attempt: 1 },
+      { id: "RUN-REVIEWER", taskId: "TASK-1", agentId: "agent-2", function: "WORKER", status: "RUNNING", attempt: 2 },
+    ],
+    reviews: [
+      {
+        id: "REV-1",
+        taskId: "TASK-1",
+        runId: "RUN-AUTHOR",
+        status: "PENDING",
+        verdict: null,
+        version: 0,
+        attempt: 1,
+        findings: [],
+        assignedTo: "AGENT",
+        reviewerAgentId: "agent-2",
+      },
+    ],
+  });
+  let submitCalls = 0;
+  store.submitReview = () => {
+    submitCalls += 1;
+    const error = new Error("reviewer Run function is not REVIEWER");
+    error.code = "REVIEW_RUN_NOT_REVIEWER";
+    error.details = { reviewId: "REV-1", runId: "RUN-REVIEWER", function: "WORKER" };
+    throw error;
+  };
+  const { server, base } = await startServer({ store });
+  t.after(() => server.close());
+
+  const res = await request(base, {
+    method: "POST",
+    path: "/api/v1/reviews/REV-1/submit",
+    headers: internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"),
+    body: {
+      expectedVersion: 0,
+      verdict: "PASS",
+      manifestHash: "a".repeat(64),
+      commitSha: "abc1234",
+      evidence: { tests: { passed: 1, total: 1 } },
+      runId: "RUN-REVIEWER",
+    },
+  });
+
+  assertErrorEnvelope(res, "REVIEW_RUN_NOT_REVIEWER", 403);
+  assert.equal(submitCalls, 1, "the route must delegate the Reviewer-Run rule to the store");
+  assert.equal(res.json.error.details.runId, "RUN-REVIEWER");
+});
+
+// ---------------------------------------------------------------------------
+// M6.3 §12 (phase B): Host agent registration + Reviewer Run creation.
+// ---------------------------------------------------------------------------
+
+function reviewTaskScenario({
+  taskStatus = "REVIEWING",
+  producerStatus = "COMPLETED",
+  reviewerAgent = { id: "agent-2", role: "BE", capabilities: ["WORKER"], status: "IDLE" },
+} = {}) {
+  return createFakeStore({
+    projects: [{ id: "P-1", name: "Demo", repoPath: "C:\\repo", defaultBranch: "main" }],
+    tasks: [
+      {
+        id: "TASK-1",
+        projectId: "P-1",
+        title: "Review me",
+        description: "d",
+        functionRequired: "WORKER",
+        roleRequired: "BE",
+        priority: 2,
+        deps: [],
+        status: taskStatus,
+        version: 0,
+      },
+    ],
+    agents: [
+      { id: "agent-1", role: "BE", capabilities: ["WORKER"], status: "IDLE" },
+      ...(reviewerAgent === null ? [] : [reviewerAgent]),
+    ],
+    runs: [
+      { id: "RUN-PROD", taskId: "TASK-1", agentId: "agent-1", function: "WORKER", status: producerStatus, attempt: 1 },
+    ],
+  });
+}
+
+test("M6.3 §12: runtime registration upserts Host agents and unblocks heartbeats", async (t) => {
+  const store = claimableScenario();
+  const { server, base } = await startServer({ store });
+  t.after(() => server.close());
+
+  const res = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runtime/register",
+    headers: internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"),
+    body: {
+      hostId: "host-reg",
+      agents: [{ agentId: "agent-reg", role: "DEV", function: "WORKER", capacity: 2 }],
+    },
+  });
+  assert.equal(res.status, 200, res.text);
+  assert.deepEqual(res.json, {
+    hostId: "host-reg",
+    agents: [{ agentId: "agent-reg", role: "DEV", function: "WORKER", capacity: 2 }],
+  });
+  const registered = store.listAgents().find((agent) => agent.id === "agent-reg");
+  assert.equal(registered.role, "DEV");
+  assert.deepEqual(registered.capabilities, ["WORKER"]);
+  assert.equal(registered.status, "IDLE");
+
+  // A registered agent can now send heartbeats and becomes dispatchable.
+  const heartbeat = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runtime/heartbeat",
+    headers: internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"),
+    body: { hostId: "host-reg", agentIds: ["agent-reg"], capacity: 2 },
+  });
+  assert.equal(heartbeat.status, 200, heartbeat.text);
+  const availability = await request(base, {
+    path: "/internal/v1/runtime/availability?agentId=agent-reg",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+  });
+  assert.deepEqual(availability.json, { agentId: "agent-reg", available: true, reason: "ok" });
+
+  for (const [body, field] of [
+    [{ agents: [{ agentId: "agent-reg", role: "DEV", function: "WORKER", capacity: 1 }] }, "hostId"],
+    [{ hostId: "host-reg", agents: [] }, "agents"],
+    [{ hostId: "host-reg", agents: [{ agentId: "bad id!", role: "DEV", function: "WORKER", capacity: 1 }] }, "agents[0].agentId"],
+    [{ hostId: "host-reg", agents: [{ agentId: "agent-reg", role: "DEV", function: "NOPE", capacity: 1 }] }, "agents[0].function"],
+    [{ hostId: "host-reg", agents: [{ agentId: "agent-reg", role: "DEV", function: "WORKER", capacity: -1 }] }, "agents[0].capacity"],
+  ]) {
+    const bad = await request(base, {
+      method: "POST",
+      path: "/internal/v1/runtime/register",
+      headers: internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"),
+      body,
+    });
+    assertErrorEnvelope(bad, "VALIDATION_ERROR", 400);
+    assert.equal(bad.json.error.details.field, field, JSON.stringify(body));
+  }
+
+  const wrongRole = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runtime/register",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    body: { hostId: "h", agents: [{ agentId: "agent-reg", role: "DEV", function: "WORKER", capacity: 1 }] },
+  });
+  assertErrorEnvelope(wrongRole, "NOT_AUTHORIZED", 403);
+  assert.equal(wrongRole.json.error.details.reason, "internal-role-forbidden");
+});
+
+test("M6.3 §12: review-runs creates a REVIEWER Run idempotently and maps store errors", async (t) => {
+  const store = reviewTaskScenario();
+  const { server, base } = await startServer({ store });
+  t.after(() => server.close());
+  const createReviewRun = (body, token = TEST_INTERNAL_TOKEN, role = "scheduler") =>
+    request(base, {
+      method: "POST",
+      path: "/internal/v1/tasks/TASK-1/review-runs",
+      headers: internalHeaders(token, role),
+      body,
+    });
+
+  const res = await createReviewRun({ reviewerAgentId: "agent-2", idempotencyKey: "review-run-1" });
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.json.run.function, "REVIEWER");
+  assert.equal(res.json.run.agentId, "agent-2");
+  assert.equal(res.json.run.taskId, "TASK-1");
+  assert.equal(res.json.command.runId, res.json.run.id);
+  assert.equal(res.json.command.status, "PENDING");
+  assert.equal(res.json.command.idempotencyKey, "review-run-1");
+  assert.equal(res.json.command.payload.reviewerAgentId, "agent-2");
+  assert.equal(res.json.spec.taskId, "TASK-1");
+  assert.equal(res.json.spec.constraints.reviewer, true);
+  assert.match(res.json.specHash, /^[0-9a-f]{64}$/);
+
+  const replay = await createReviewRun({ reviewerAgentId: "agent-2", idempotencyKey: "review-run-1" });
+  assert.equal(replay.status, 200, replay.text);
+  assert.equal(replay.json.run.id, res.json.run.id);
+  assert.equal(replay.json.command.id, res.json.command.id);
+  assert.equal(replay.json.specHash, res.json.specHash);
+
+  const notReviewing = await startServer({ store: reviewTaskScenario({ taskStatus: "READY" }) });
+  t.after(() => notReviewing.server.close());
+  const notReviewingRes = await request(notReviewing.base, {
+    method: "POST",
+    path: "/internal/v1/tasks/TASK-1/review-runs",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    body: { reviewerAgentId: "agent-2" },
+  });
+  assertErrorEnvelope(notReviewingRes, "VALIDATION_ERROR", 400);
+  assert.equal(notReviewingRes.json.error.details.reason, "task-not-reviewing");
+
+  const noProducer = await startServer({ store: reviewTaskScenario({ producerStatus: "FAILED" }) });
+  t.after(() => noProducer.server.close());
+  const noProducerRes = await request(noProducer.base, {
+    method: "POST",
+    path: "/internal/v1/tasks/TASK-1/review-runs",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    body: { reviewerAgentId: "agent-2" },
+  });
+  assertErrorEnvelope(noProducerRes, "VALIDATION_ERROR", 400);
+  assert.equal(noProducerRes.json.error.details.reason, "completed-run-required");
+
+  const unknownAgent = await createReviewRun({ reviewerAgentId: "agent-ghost" });
+  assertErrorEnvelope(unknownAgent, "VALIDATION_ERROR", 400);
+  assert.equal(unknownAgent.json.error.details.field, "reviewerAgentId");
+
+  const wrongRole = await createReviewRun({ reviewerAgentId: "agent-2" }, TEST_HOST_INTERNAL_TOKEN, "runtime-host");
+  assertErrorEnvelope(wrongRole, "NOT_AUTHORIZED", 403);
+  assert.equal(wrongRole.json.error.details.reason, "internal-role-forbidden");
+});
+
+test("M6.3 §12 real store: registration then heartbeat works without seeded agents", { skip: REAL_DB_SKIP }, async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "atk-m63-register-"));
+  const store = realDatabase.openStore({ file: path.join(dir, "register.db"), migrate: true });
+  t.after(async () => {
+    store.close();
+    await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  const { server, base } = await startServer({ store });
+  t.after(() => server.close());
+
+  const registered = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runtime/register",
+    headers: internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"),
+    body: { hostId: "host-real", agents: [{ agentId: "agent-real", role: "DEV", function: "WORKER", capacity: 2 }] },
+  });
+  assert.equal(registered.status, 200, registered.text);
+  const agentRow = store.listAgents().find((agent) => agent.id === "agent-real");
+  assert.equal(agentRow.role, "DEV");
+  assert.deepEqual(agentRow.capabilities, ["WORKER"]);
+
+  const heartbeat = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runtime/heartbeat",
+    headers: internalHeaders(TEST_HOST_INTERNAL_TOKEN, "runtime-host"),
+    body: { hostId: "host-real", agentIds: ["agent-real"], capacity: 2 },
+  });
+  assert.equal(heartbeat.status, 200, heartbeat.text);
+  assert.deepEqual(heartbeat.json.agents, [{ agentId: "agent-real", available: true, reason: "ok" }]);
+});
+
+test("M6.3 §12 real store: review-runs creates a REVIEWER Run over HTTP", { skip: REAL_DB_SKIP }, async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "atk-m63-reviewrun-"));
+  const store = realDatabase.openStore({ file: path.join(dir, "reviewrun.db"), migrate: true });
+  t.after(async () => {
+    store.close();
+    await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  store.createProject({ id: "P-1", name: "M6.3", repoPath: "C:\\repo", defaultBranch: "main" });
+  store.createTask({
+    id: "TASK-1",
+    projectId: "P-1",
+    title: "Review me",
+    description: "d",
+    functionRequired: "WORKER",
+    roleRequired: "BE",
+    priority: 2,
+    deps: [],
+  });
+  store.upsertAgent({ id: "agent-1", role: "BE", capabilities: ["WORKER"], status: "IDLE" });
+  store.upsertAgent({ id: "agent-2", role: "BE", capabilities: ["WORKER"], status: "IDLE" });
+
+  // FIXTURE SEEDING ONLY (same internal writer m4-smoke uses): a REVIEWING task
+  // with a COMPLETED producer Run is the precondition createReviewerRun checks.
+  const producer = store.createRun({ taskId: "TASK-1", agentId: "agent-1", function: "WORKER", role: "BE", attempt: 1 });
+  store.updateRunStatus(producer.id, { status: "RUNNING" });
+  store.updateRunStatus(producer.id, { status: "COMPLETED", exitCode: 0, endedAt: "2026-11-03T01:00:00.000Z" });
+  store[Symbol.for("@atk/database.internal")].setTaskStatus("TASK-1", "REVIEWING");
+  assert.equal(store.getTask("TASK-1").status, "REVIEWING");
+
+  const { server, base } = await startServer({ store });
+  t.after(() => server.close());
+
+  const res = await request(base, {
+    method: "POST",
+    path: "/internal/v1/tasks/TASK-1/review-runs",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    body: { reviewerAgentId: "agent-2", idempotencyKey: "m63-real-reviewer" },
+  });
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.json.run.function, "REVIEWER");
+  assert.equal(res.json.run.agentId, "agent-2");
+  assert.equal(res.json.command.runId, res.json.run.id);
+  assert.equal(res.json.command.payload.reviewerAgentId, "agent-2");
+  assert.equal(res.json.specHash, store.getRunSpec(res.json.run.id).specHash);
+
+  const replay = await request(base, {
+    method: "POST",
+    path: "/internal/v1/tasks/TASK-1/review-runs",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    body: { reviewerAgentId: "agent-2", idempotencyKey: "m63-real-reviewer" },
+  });
+  assert.equal(replay.status, 200, replay.text);
+  assert.equal(replay.json.run.id, res.json.run.id);
+  assert.equal(replay.json.command.id, res.json.command.id);
+});
+
+test("M6.3 §12: the frozen role matrix declares register, review-runs and scheduler heartbeat", () => {
+  assert.deepEqual(requiredInternalRoles("POST", "/internal/v1/runtime/register"), ["runtime-host"]);
+  assert.deepEqual(requiredInternalRoles("POST", "/internal/v1/tasks/T-1/review-runs"), ["scheduler", "user-action"]);
+  assert.deepEqual(requiredInternalRoles("POST", "/internal/v1/scheduler/heartbeat"), ["scheduler"]);
+  // Cross-checks: each endpoint stays DENY-by-default for the other plane.
+  assert.equal(requiredInternalRoles("POST", "/internal/v1/runtime/register").includes("scheduler"), false);
+});
+
 

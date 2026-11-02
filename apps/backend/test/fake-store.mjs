@@ -719,8 +719,43 @@ export function createFakeStore(seed = {}) {
     },
     reconcileRun({ runId } = {}) {
       const run = requireRun(runId);
+      // M6.3 P0-4: reconcile carries the Run's latest Dispatch Command so the
+      // Host can bind its Outbox entry to backend facts. Shape frozen by the
+      // contract: {id,generation,status,result,idempotencyKey,eventId}.
+      const latest = [...dispatchCommands.values()].filter((entry) => entry.runId === runId).at(-1) ?? null;
+      const command = latest === null
+        ? null
+        : {
+            id: latest.id,
+            generation: latest.generation ?? 0,
+            status: latest.status,
+            result: latest.result ?? null,
+            idempotencyKey: latest.idempotencyKey ?? null,
+            eventId: latest.eventId ?? latest.result?.eventId ?? null,
+          };
+      // M6.3 §4 (frozen): pendingResult only when the command exists, is NOT
+      // terminal, and has a recorded result; otherwise the field is omitted.
+      const pendingResult =
+        latest !== null &&
+        latest.status !== "DONE" &&
+        latest.status !== "FAILED" &&
+        latest.result !== undefined &&
+        latest.result !== null
+          ? {
+              commandId: latest.id,
+              generation: latest.generation ?? 0,
+              status: latest.status,
+              result: clone(latest.result),
+            }
+          : undefined;
       // M2 contract: sessions are an empty array until M4 records them.
-      return { run: clone(run), lease: clone(leases.get(runId) ?? null), sessions: [] };
+      return {
+        run: clone(run),
+        lease: clone(leases.get(runId) ?? null),
+        sessions: [],
+        command,
+        ...(pendingResult === undefined ? {} : { pendingResult }),
+      };
     },
 
     // ---- M6.2 F05: frozen Task Execution Spec ------------------------------
@@ -1040,6 +1075,101 @@ export function createFakeStore(seed = {}) {
       );
       snapshotVersion += 1;
       return { run: clone(run), command: clone(command), task: clone(task) };
+    },
+
+    // ---- M6.3 §12: trusted Reviewer Run creation ---------------------------
+    createReviewerRun({ taskId, reviewerAgentId, idempotencyKey } = {}) {
+      const key = typeof idempotencyKey === "string" && idempotencyKey.trim() !== "" ? idempotencyKey : null;
+      if (key) {
+        const existing = [...dispatchCommands.values()].find((entry) => entry.idempotencyKey === key);
+        if (existing) {
+          const run = requireRun(existing.runId);
+          const bound = runSpecs.get(existing.runId) ?? null;
+          return {
+            run: clone(run),
+            command: clone(existing),
+            spec: bound === null ? null : clone(bound.spec),
+            specHash: bound === null ? null : bound.specHash,
+          };
+        }
+      }
+      const task = requireTask(taskId);
+      if (task.status !== "REVIEWING") {
+        fail("VALIDATION_ERROR", "task is not REVIEWING", {
+          taskId,
+          status: task.status,
+          reason: "task-not-reviewing",
+        });
+      }
+      const producer = [...runs.values()].filter((entry) => entry.taskId === taskId && entry.status === "COMPLETED").at(-1) ?? null;
+      if (producer === null) {
+        fail("VALIDATION_ERROR", "task has no COMPLETED producer Run", {
+          taskId,
+          reason: "completed-run-required",
+        });
+      }
+      const reviewer = agents.get(reviewerAgentId) ?? null;
+      if (reviewer === null) {
+        fail("VALIDATION_ERROR", "reviewer agent does not exist", { field: "reviewerAgentId", reviewerAgentId });
+      }
+      const project = projects.get(task.projectId);
+      if (!project) fail("NOT_FOUND", `project ${task.projectId} not found`, { entity: "project", id: task.projectId });
+      const workspace = producer.workspace ?? { kind: "none", path: null, baseCommit: null, targetBranch: null };
+      const at = nowIso();
+      const spec = createTaskExecutionSpec({
+        task: clone(task),
+        project: clone(project),
+        workspace,
+        constraints: { reviewer: true },
+        frozenAt: at,
+      });
+      const specHash = createHash("sha256").update(JSON.stringify(spec)).digest("hex");
+      pendingSpecs.set(taskId, { taskId, taskVersion: task.version, spec, specHash, frozenAt: at });
+      const runId = `RUN-${(counters.run + 1).toString(36).toUpperCase()}`;
+      const run = this.createRun({
+        id: runId,
+        taskId,
+        agentId: reviewerAgentId,
+        function: "REVIEWER",
+        role: reviewer.role,
+        attempt: 1,
+        workspace,
+        workBranch: `atk/run/${runId}`,
+      });
+      counters.command += 1;
+      const command = {
+        id: `CMD-${counters.command.toString(36).toUpperCase()}`,
+        runId: run.id,
+        taskId,
+        commandType: "RUN_TASK",
+        payload: {
+          taskId,
+          agentId: reviewerAgentId,
+          functionRequired: "REVIEWER",
+          roleRequired: reviewer.role,
+          reviewerAgentId,
+          review: true,
+          specHash,
+          spec: clone(spec),
+          workspace: clone(workspace),
+        },
+        idempotencyKey: key,
+        status: "PENDING",
+        ownerId: reviewerAgentId,
+        generation: 0,
+        claimedUntil: null,
+        attempts: 0,
+        createdAt: at,
+        updatedAt: at,
+      };
+      dispatchCommands.set(command.id, command);
+      snapshotVersion += 1;
+      return {
+        run: clone(run),
+        command: clone(command),
+        spec: clone(spec),
+        specHash,
+      };
     },
 
     listAgents() {
@@ -1463,6 +1593,13 @@ export function createFakeStore(seed = {}) {
     },
     _getDispatchCommand(id) {
       return clone(dispatchCommands.get(id) ?? null);
+    },
+    /** Simulates "result recorded but status not flipped yet" (crash window). */
+    _setCommandResult(id, result) {
+      const command = dispatchCommands.get(id);
+      if (!command) return null;
+      command.result = clone(result);
+      return clone(command);
     },
     _updateTask(id, changes) {
       const task = tasks.get(id);
