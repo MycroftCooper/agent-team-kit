@@ -26,6 +26,13 @@ if (!existsSync(BACKEND)) {
 
 const { openStore, verifySwitchReadiness, exportStateJson, importStateJson } = await load("packages/database/src/index.mjs");
 
+// The expected schema version is derived from the migrations directory so an
+// additive migration (0006 for M6.1 event identities) cannot make this gate
+// report a regression - the same rule the M1 smoke and the QA suites follow.
+const MIGRATIONS_DIR = path.join(ROOT, "packages", "database", "migrations");
+const EXPECTED_SCHEMA_VERSION = readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith(".sql")).length;
+const EXPECTED_LEDGER = Array.from({ length: EXPECTED_SCHEMA_VERSION }, (_, index) => index + 1);
+
 const checks = [];
 const results = [];
 function check(name, fn) {
@@ -153,8 +160,6 @@ async function collectEventSeqs({ base, token, aggregateId, limit, expected, pag
   expect(JSON.stringify(seqs) === JSON.stringify(expected), `paged seq mismatch: got ${JSON.stringify(seqs)} expected ${JSON.stringify(expected)}`);
   return `${pageSizes.join("/")} -> seq ${expected[0]}..${expected[expected.length - 1]} exactly once`;
 }
-
-const MIGRATIONS_DIR = path.join(ROOT, "packages", "database", "migrations");
 
 function migrationFiles() {
   return readdirSync(MIGRATIONS_DIR)
@@ -432,7 +437,7 @@ try {
     const store = openStore({ file: freshFile, migrate: true });
     try {
       const health = store.health();
-      expect(health.schemaVersion === 5, `expected schemaVersion 5 after replace, got ${health.schemaVersion}`);
+      expect(health.schemaVersion === EXPECTED_SCHEMA_VERSION, `expected schemaVersion ${EXPECTED_SCHEMA_VERSION} after replace, got ${health.schemaVersion}`);
       const warnings = store.migrationWarnings?.() ?? [];
       expect(warnings.length === 0, `replace must not force a migration replay: ${JSON.stringify(warnings)}`);
       return `schemaVersion ${health.schemaVersion}, no migration replay`;
@@ -465,7 +470,7 @@ try {
     return `tampered refused without creating a target; restored ${after.tasks} task(s), ${after.events} event(s) exactly`;
   });
 
-  check("a v1 database upgrades in place to v5", async () => {
+  check(`a v1 database upgrades in place to v${EXPECTED_SCHEMA_VERSION}`, async () => {
     const v1File = path.join(tmp, "v1", "atk.db");
     const { DatabaseSync } = await import("node:sqlite");
     const { mkdirSync } = await import("node:fs");
@@ -481,7 +486,7 @@ try {
     const store = openStore({ file: v1File, migrate: true });
     try {
       const health = store.health();
-      expect(health.schemaVersion === 5, `expected v1 -> v5, got ${health.schemaVersion}`);
+      expect(health.schemaVersion === EXPECTED_SCHEMA_VERSION, `expected v1 -> v${EXPECTED_SCHEMA_VERSION}, got ${health.schemaVersion}`);
       expect(store.listProjects().length === 1, "the v1 project row must survive the upgrade");
       return `v1 migrated in place to v${health.schemaVersion}, rows preserved`;
     } finally {
@@ -599,16 +604,16 @@ try {
     );
     const reopened = openStore({ file: targetFile, migrate: false });
     try {
-      expect(reopened.health().schemaVersion === 5, `reopened schemaVersion expected 5, got ${reopened.health().schemaVersion}`);
+      expect(reopened.health().schemaVersion === EXPECTED_SCHEMA_VERSION, `reopened schemaVersion expected ${EXPECTED_SCHEMA_VERSION}, got ${reopened.health().schemaVersion}`);
       const warnings = typeof reopened.migrationWarnings === "function" ? reopened.migrationWarnings() : [];
       expect(Array.isArray(warnings) && warnings.length === 0, `reopened migrationWarnings expected [], got ${JSON.stringify(warnings)}`);
     } finally {
       reopened.close();
     }
-    return `SKIPPED after ${createTaskCalls} createTask calls (IMPORT_WRITE_FAILED); ${before.tables.length} table counts + ledger ${JSON.stringify(before.versions)} deep-equal; reopen v5, migrationWarnings []`;
+    return `SKIPPED after ${createTaskCalls} createTask calls (IMPORT_WRITE_FAILED); ${before.tables.length} table counts + ledger ${JSON.stringify(before.versions)} deep-equal; reopen v${EXPECTED_SCHEMA_VERSION}, migrationWarnings []`;
   });
 
-  check("v1 and v4 databases upgrade to v5 with old tasks, events and indexes intact", async () => {
+  check(`v1 and v4 databases upgrade to v${EXPECTED_SCHEMA_VERSION} with old tasks, events and indexes intact`, async () => {
     const evidence = [];
     for (const version of [1, 4]) {
       const file = path.join(tmp, `upgrade-v${version}`, "atk.db");
@@ -616,7 +621,7 @@ try {
       const store = openStore({ file, migrate: true });
       try {
         const health = store.health();
-        expect(health.schemaVersion === 5, `v${version} -> expected v5, got ${health.schemaVersion}`);
+        expect(health.schemaVersion === EXPECTED_SCHEMA_VERSION, `v${version} -> expected v${EXPECTED_SCHEMA_VERSION}, got ${health.schemaVersion}`);
         const tasks = store.listTasks({ limit: 100 });
         const task = tasks.find((entry) => entry.id === "V-T");
         expect(task, `v${version} upgrade lost task V-T (tasks: ${tasks.map((entry) => entry.id).join(",")})`);
@@ -631,8 +636,8 @@ try {
       }
       expect(hasSqliteIndex(file, "idx_events_type_seq"), `v${version} upgrade did not create idx_events_type_seq`);
       const fingerprint = schemaFingerprint(file);
-      expect(JSON.stringify(fingerprint.versions) === JSON.stringify([1, 2, 3, 4, 5]), `v${version} ledger versions expected [1,2,3,4,5], got ${JSON.stringify(fingerprint.versions)}`);
-      evidence.push(`v${version}: v5, task V-T + its event kept, idx_events_type_seq present, ledger [1,2,3,4,5]`);
+      expect(JSON.stringify(fingerprint.versions) === JSON.stringify(EXPECTED_LEDGER), `v${version} ledger versions expected ${JSON.stringify(EXPECTED_LEDGER)}, got ${JSON.stringify(fingerprint.versions)}`);
+      evidence.push(`v${version}: v${EXPECTED_SCHEMA_VERSION}, task V-T + its event kept, idx_events_type_seq present, ledger ${JSON.stringify(EXPECTED_LEDGER)}`);
     }
     return evidence.join("; ");
   });
