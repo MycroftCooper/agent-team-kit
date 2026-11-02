@@ -527,6 +527,18 @@ export function createMemoryStore() {
       if (runs.has(run.id)) {
         fail("VALIDATION_ERROR", `run "${run.id}" already exists`, { entity: "run", id: run.id });
       }
+      const branchTaken = [...runs.values()].find(
+        (existing) => existing.workBranch === run.workBranch
+          && (tasks.get(existing.taskId)?.projectId ?? null) === task.projectId,
+      );
+      if (branchTaken) {
+        fail("VALIDATION_ERROR", "workBranch is already used in this project", {
+          field: "workBranch",
+          workBranch: run.workBranch,
+          projectId: task.projectId,
+          existingRunId: branchTaken.id,
+        });
+      }
       const candidates = [...runSpecs.entries()].filter(([, row]) => row.runId === null);
       const matched = dto.specHash
         ? candidates.find(([, row]) => row.specHash === dto.specHash)
@@ -754,6 +766,7 @@ export function createMemoryStore() {
         ...command,
         status,
         result: clone(result ?? {}),
+        eventId: result?.eventId ?? command.eventId ?? null,
         completedAt: now,
         claimedUntil: now,
         updatedAt: now,
@@ -1046,7 +1059,21 @@ export function createMemoryStore() {
       requireId(runId, "run.id");
       const run = requireRunEntry(runId);
       const lease = leaseOf(runId);
-      return { run: clone(run), lease: lease === null ? null : clone(lease), sessions: [] };
+      const command = [...dispatchCommands.values()]
+        .filter((candidate) => candidate.runId === runId)
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id))[0] ?? null;
+      return {
+        run: clone(run),
+        lease: lease === null ? null : clone(lease),
+        sessions: [],
+        command: command
+          ? clone({
+              ...command,
+              result: command.result ?? null,
+              eventId: command.eventId ?? command.result?.eventId ?? null,
+            })
+          : null,
+      };
     },
 
     // --- Scheduling (m3-contracts 搂2: snapshot + atomic claim) ------------
@@ -1097,7 +1124,7 @@ export function createMemoryStore() {
       };
     },
 
-    claimTask({ taskId, agentId, expectedTaskVersion, policies, idempotencyKey, workspacePolicy, workspace } = {}) {
+    claimTask({ taskId, agentId, expectedTaskVersion, policies, idempotencyKey, workspacePolicy, workspace, workBranch } = {}) {
       requireId(taskId, "task.id");
       requireId(agentId, "agent.id");
       if (!Number.isInteger(expectedTaskVersion) || expectedTaskVersion < 0) {
@@ -1307,6 +1334,7 @@ export function createMemoryStore() {
         files: candidateFiles,
         id: runId,
         workspace: workspaceValue,
+        workBranch: workBranch ?? `atk/run/${runId}`,
         specHash: frozen.specHash,
       });
       const updatedTask = { ...task, status: "CLAIMED", version: task.version + 1, updatedAt: at };
@@ -1530,11 +1558,30 @@ export function createMemoryStore() {
           runId: dto.runId,
           actor: dto.actor,
           reviewerAgentId: dto.reviewerAgentId,
+          reviewerRunId: dto.reviewerRunId,
           assignedTo: dto.assignedTo,
           createdByRole: dto.createdByRole,
         },
         { now: at, attempt: nextAttempt },
       );
+      if ((review.assignedTo ?? "HUMAN") === "AGENT") {
+        const reviewerRun = runs.get(review.reviewerRunId);
+        if (
+          !reviewerRun ||
+          reviewerRun.function !== "REVIEWER" ||
+          reviewerRun.taskId !== review.taskId ||
+          canonicalAgentId(reviewerRun.agentId) !== canonicalAgentId(review.reviewerAgentId ?? "")
+        ) {
+          fail("REVIEW_RUN_NOT_REVIEWER", "reviewer Run is not a trusted REVIEWER execution", {
+            taskId: review.taskId,
+            reviewerRunId: review.reviewerRunId ?? null,
+            runFunction: reviewerRun?.function ?? null,
+            runTaskId: reviewerRun?.taskId ?? null,
+            runAgentId: reviewerRun?.agentId ?? null,
+            reviewerAgentId: review.reviewerAgentId ?? null,
+          });
+        }
+      }
       if (needsTransition) {
         const previousStatus = task.status;
         transitionTaskEntry(task.id, "REVIEWING");
@@ -1609,6 +1656,25 @@ export function createMemoryStore() {
         });
       }
       if ((row.assignedTo ?? "HUMAN") === "AGENT") {
+        if (!row.reviewerRunId) {
+          fail("REVIEW_RUN_NOT_REVIEWER", "review has no reviewer Run", { reviewId: id, taskId: row.taskId });
+        }
+        const reviewerRun = runs.get(row.reviewerRunId);
+        if (
+          !reviewerRun ||
+          reviewerRun.function !== "REVIEWER" ||
+          reviewerRun.taskId !== row.taskId ||
+          canonicalAgentId(reviewerRun.agentId) !== canonicalAgentId(row.reviewerAgentId ?? "")
+        ) {
+          fail("REVIEW_RUN_NOT_REVIEWER", "reviewer Run is not a trusted REVIEWER execution", {
+            reviewId: id,
+            taskId: row.taskId,
+            reviewerRunId: row.reviewerRunId,
+            runFunction: reviewerRun?.function ?? null,
+            runAgentId: reviewerRun?.agentId ?? null,
+            assignedAgentId: row.reviewerAgentId ?? null,
+          });
+        }
         const assigned = row.reviewerAgentId ?? null;
         const presented = typeof reviewerAgentId === "string" ? reviewerAgentId : null;
         if (!presented || !assigned || canonicalAgentId(presented) !== canonicalAgentId(assigned)) {

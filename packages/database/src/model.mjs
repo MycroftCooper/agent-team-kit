@@ -30,7 +30,7 @@ import {
 import { fail } from "./errors.mjs";
 
 /** Schema version written by the latest migration file. */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 export const DEFAULT_HEARTBEAT_TTL_MS = 30_000;
 export const DEFAULT_LIST_LIMIT = 100;
 export const MAX_LIST_LIMIT = 10000;
@@ -795,6 +795,15 @@ export function normalizeReview(dto, { now, attempt = 1, id } = {}) {
       field: "reviewerAgentId",
     });
   }
+  if (assignedTo === "AGENT" && (dto.reviewerRunId === undefined || dto.reviewerRunId === null)) {
+    fail("VALIDATION_ERROR", "review.reviewerRunId is required when assignedTo=AGENT", {
+      field: "reviewerRunId",
+    });
+  }
+  const reviewerRunId =
+    dto.reviewerRunId === undefined || dto.reviewerRunId === null
+      ? null
+      : requireId(dto.reviewerRunId, "review.reviewerRunId");
   const at = nowIso(now);
   const review = {
     id: id ?? generateId("REV"),
@@ -807,6 +816,7 @@ export function normalizeReview(dto, { now, attempt = 1, id } = {}) {
     assignedTo,
   };
   if (reviewerAgentId) review.reviewerAgentId = reviewerAgentId;
+  if (reviewerRunId) review.reviewerRunId = reviewerRunId;
   if (dto.createdByRole !== undefined && dto.createdByRole !== null) {
     review.createdByRole = validateToken(dto.createdByRole, "review.createdByRole");
   }
@@ -1433,6 +1443,10 @@ export function normalizeRun(dto, { now, attempt, id } = {}) {
     run.workspace = normalizeWorkspaceSection(dto.workspace);
   }
   if (runFiles.length > 0) run.files = runFiles;
+  run.workBranch = dto.workBranch ?? `atk/run/${run.id}`;
+  if (typeof run.workBranch !== "string" || run.workBranch.trim() === "") {
+    fail("VALIDATION_ERROR", "run.workBranch must be a non-empty string", { field: "workBranch" });
+  }
   return run;
 }
 

@@ -240,9 +240,11 @@ test("F06 createReview is an assignment and enters REVIEWING atomically", (t) =>
     const run = makeRunWithLease(store, taskId);
     store.updateRunStatus(run.id, { status: "RUNNING", generation: 1 });
     store.updateRunStatus(run.id, { status: "COMPLETED", exitCode: 0, generation: 1 });
+    const reviewerRun = store.createRun({ taskId, agentId: "reviewer-agent-1", function: "REVIEWER", role: "QA" });
     const review = store.createReview({
       taskId,
       runId: run.id,
+      reviewerRunId: reviewerRun.id,
       reviewerAgentId: "reviewer-agent-1",
       assignedTo: "AGENT",
       createdByRole: "scheduler",
@@ -343,6 +345,10 @@ test("F06 self-review uses the reviewed producer, never the reviewer's active Ru
     const review = store.createReview({
       taskId,
       runId: producer.id,
+      reviewerRunId: (() => {
+        const reviewerRun = store.createRun({ taskId, agentId: "reviewer-1", function: "REVIEWER", role: "QA" });
+        return reviewerRun.id;
+      })(),
       reviewerAgentId: "reviewer-1",
       assignedTo: "AGENT",
       createdByRole: "scheduler",
@@ -368,11 +374,13 @@ test("F06 self-review uses the reviewed producer, never the reviewer's active Ru
     const selfRun = makeRunWithLease(store, selfTask);
     store.updateRunStatus(selfRun.id, { status: "RUNNING", generation: 1 });
     store.updateRunStatus(selfRun.id, { status: "COMPLETED", exitCode: 0, generation: 1 });
+    const selfReviewerRun = store.createRun({ taskId: selfTask, agentId: "agent-1", function: "REVIEWER", role: "QA" });
     assert.throws(
       () =>
         store.createReview({
           taskId: selfTask,
           runId: selfRun.id,
+          reviewerRunId: selfReviewerRun.id,
           reviewerAgentId: "agent-1",
           assignedTo: "AGENT",
           createdByRole: "scheduler",

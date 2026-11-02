@@ -501,6 +501,7 @@ export function openStore(options = {}) {
       updatedAt: row.updated_at,
     };
     if (row.workspace_id !== null && row.workspace_id !== undefined) run.workspaceId = row.workspace_id;
+    if (row.work_branch !== null && row.work_branch !== undefined) run.workBranch = row.work_branch;
     if (row.workspace_kind !== null && row.workspace_kind !== undefined) {
       run.workspace = {
         kind: row.workspace_kind,
@@ -543,7 +544,8 @@ export function openStore(options = {}) {
       updatedAt: row.updated_at,
     };
     const result = parseJsonColumn(row.result_json);
-    if (result !== null) command.result = result;
+    command.result = result ?? null;
+    command.eventId = row.event_id ?? result?.eventId ?? null;
     if (row.completed_at !== null && row.completed_at !== undefined) command.completedAt = row.completed_at;
     return command;
   }
@@ -620,6 +622,9 @@ export function openStore(options = {}) {
     if (row.reviewer_agent_id !== null && row.reviewer_agent_id !== undefined) {
       review.reviewerAgentId = row.reviewer_agent_id;
     }
+    if (row.reviewer_run_id !== null && row.reviewer_run_id !== undefined) {
+      review.reviewerRunId = row.reviewer_run_id;
+    }
     return review;
   }
 
@@ -641,7 +646,9 @@ export function openStore(options = {}) {
     return approval;
   }
 
-  function eventJson(row) {    const eventId = row.event_id ?? null;
+  function eventJson(row) {
+    const legacy = row.legacy === null || row.legacy === undefined ? (row.event_id == null ? 1 : 0) : Number(row.legacy);
+    const eventId = legacy === 1 ? null : (row.event_id ?? null);
     return {
       schemaVersion: Number(row.schema_version),
       seq: Number(row.seq),
@@ -651,7 +658,7 @@ export function openStore(options = {}) {
       type: row.type,
       payload: parseJsonColumn(row.payload_json) ?? {},
       happenedAt: row.happened_at,
-      ...(eventId === null ? { legacy: true } : { eventId }),
+      ...(legacy === 1 ? { legacy: true } : { eventId }),
       ...(row.session_seq === null || row.session_seq === undefined
         ? {}
         : { sessionSeq: Number(row.session_seq) }),
@@ -1226,12 +1233,23 @@ export function openStore(options = {}) {
         if (getRunRow(run.id)) {
           fail("VALIDATION_ERROR", `run "${run.id}" already exists`, { entity: "run", id: run.id });
         }
+        const branchTaken = stmt(
+          "SELECT id FROM runs WHERE project_id = ? AND work_branch = ? LIMIT 1",
+        ).get(taskRow.project_id, run.workBranch);
+        if (branchTaken) {
+          fail("VALIDATION_ERROR", "workBranch is already used in this project", {
+            field: "workBranch",
+            workBranch: run.workBranch,
+            projectId: taskRow.project_id,
+            existingRunId: branchTaken.id,
+          });
+        }
         stmt(
           `INSERT INTO runs
              (id, task_id, agent_id, function, status, attempt, started_at, ended_at, error_json,
               version, role, workspace_id, exit_code, files_json, created_at, updated_at,
-              workspace_path, base_commit, target_branch, workspace_kind)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              workspace_path, base_commit, target_branch, workspace_kind, project_id, work_branch)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           run.id,
           run.taskId,
@@ -1253,6 +1271,8 @@ export function openStore(options = {}) {
           run.workspace?.baseCommit ?? null,
           run.workspace?.targetBranch ?? null,
           run.workspace?.kind ?? null,
+          taskRow.project_id,
+          run.workBranch,
         );
         // F05: bind the frozen spec from freezeTaskSpec to this Run. The copy is
         // immutable, so later Task edits cannot change what the Run executes.
@@ -1881,7 +1901,15 @@ export function openStore(options = {}) {
       requireId(runId, "run.id");
       const run = runJson(requireRunRow(runId));
       const lease = getLeaseRow(runId);
-      return { run, lease: lease === null ? null : leaseJson(lease), sessions: [] };
+      const commandRow = stmt(
+        "SELECT * FROM dispatch_commands WHERE run_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+      ).get(runId);
+      return {
+        run,
+        lease: lease === null ? null : leaseJson(lease),
+        sessions: [],
+        command: commandRow ? commandJson(commandRow) : null,
+      };
     },
 
     // --- Scheduling (m3-contracts 搂2: snapshot + atomic claim) ------------
@@ -1943,7 +1971,7 @@ export function openStore(options = {}) {
      * transaction: any failed check (or the CAS losing a race) rolls back to
      * byte-for-byte no change. Same idempotencyKey replays the original result.
      */
-    claimTask({ taskId, agentId, expectedTaskVersion, policies, idempotencyKey, workspacePolicy, workspace } = {}) {
+    claimTask({ taskId, agentId, expectedTaskVersion, policies, idempotencyKey, workspacePolicy, workspace, workBranch } = {}) {
       requireId(taskId, "task.id");
       requireId(agentId, "agent.id");
       if (!Number.isInteger(expectedTaskVersion) || expectedTaskVersion < 0) {
@@ -2185,6 +2213,7 @@ export function openStore(options = {}) {
           files: candidateFiles,
           id: runId,
           workspace: workspaceValue,
+          workBranch: workBranch ?? `atk/run/${runId}`,
           specHash: frozen.specHash,
         });
         const command = store.enqueueDispatchCommand({
@@ -2492,17 +2521,36 @@ export function openStore(options = {}) {
             runId: dto.runId ?? (needsTransition ? undefined : undefined),
             actor: dto.actor,
             reviewerAgentId: dto.reviewerAgentId,
+            reviewerRunId: dto.reviewerRunId,
             assignedTo: dto.assignedTo,
             createdByRole: dto.createdByRole,
           },
           { now: at, attempt: nextAttempt },
         );
+        if ((review.assignedTo ?? "HUMAN") === "AGENT") {
+          const reviewerRun = getRunRow(review.reviewerRunId);
+          if (
+            !reviewerRun ||
+            reviewerRun.function !== "REVIEWER" ||
+            reviewerRun.task_id !== review.taskId ||
+            canonicalAgentId(reviewerRun.agent_id) !== canonicalAgentId(review.reviewerAgentId ?? "")
+          ) {
+            fail("REVIEW_RUN_NOT_REVIEWER", "reviewer Run is not a trusted REVIEWER execution", {
+              taskId: review.taskId,
+              reviewerRunId: review.reviewerRunId ?? null,
+              runFunction: reviewerRun?.function ?? null,
+              runTaskId: reviewerRun?.task_id ?? null,
+              runAgentId: reviewerRun?.agent_id ?? null,
+              reviewerAgentId: review.reviewerAgentId ?? null,
+            });
+          }
+        }
         stmt(
           `INSERT INTO reviews
              (id, task_id, run_id, status, verdict, manifest_hash, commit_sha, findings_json, attempt,
               version, reviewer, evidence_json, submitted_at, created_at, updated_at,
-              reviewer_agent_id, assigned_to)
-           VALUES (?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, ?, 0, NULL, NULL, NULL, ?, ?, ?, ?)`,
+              reviewer_agent_id, assigned_to, reviewer_run_id)
+           VALUES (?, ?, ?, 'PENDING', NULL, NULL, NULL, NULL, ?, 0, NULL, NULL, NULL, ?, ?, ?, ?, ?)`,
         ).run(
           review.id,
           review.taskId,
@@ -2512,6 +2560,7 @@ export function openStore(options = {}) {
           at,
           review.reviewerAgentId ?? null,
           review.assignedTo ?? "HUMAN",
+          review.reviewerRunId ?? null,
         );
         stmt(
           `INSERT INTO review_attempts
@@ -2581,7 +2630,30 @@ export function openStore(options = {}) {
           });
         }
         if ((row.assigned_to ?? "HUMAN") === "AGENT") {
-          const assigned = row.reviewer_agent_id ?? null;
+          if (!row.reviewer_run_id) {
+            fail("REVIEW_RUN_NOT_REVIEWER", "review has no reviewer Run", {
+              reviewId: id,
+              taskId: row.task_id,
+            });
+          }
+          const reviewerRun = getRunRow(row.reviewer_run_id);
+          const reviewerAgent = row.reviewer_agent_id ?? null;
+          if (
+            !reviewerRun ||
+            reviewerRun.function !== "REVIEWER" ||
+            reviewerRun.task_id !== row.task_id ||
+            canonicalAgentId(reviewerRun.agent_id) !== canonicalAgentId(reviewerAgent ?? "")
+          ) {
+            fail("REVIEW_RUN_NOT_REVIEWER", "reviewer Run is not a trusted REVIEWER execution", {
+              reviewId: id,
+              taskId: row.task_id,
+              reviewerRunId: row.reviewer_run_id,
+              runFunction: reviewerRun?.function ?? null,
+              runAgentId: reviewerRun?.agent_id ?? null,
+              assignedAgentId: reviewerAgent,
+            });
+          }
+          const assigned = reviewerAgent;
           const presented = typeof reviewerAgentId === "string" ? reviewerAgentId : null;
           if (!presented || !assigned || canonicalAgentId(presented) !== canonicalAgentId(assigned)) {
             fail("SELF_REVIEW_FORBIDDEN", "review must be submitted by its assigned reviewer", {
