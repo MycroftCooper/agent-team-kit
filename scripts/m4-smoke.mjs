@@ -266,7 +266,7 @@ function eventRow(type, aggregateId) {
 // ---------------------------------------------------------------------------
 let backend = null;
 let backendOut = "";
-let internalToken = "";
+let internalTokens = { scheduler: "", host: "" };
 let publicToken = "";
 let csrf = "";
 let sseController = null;
@@ -290,8 +290,11 @@ async function startBackend() {
       return false;
     }
   }, 20000, "backend health");
-  const match = backendOut.match(/internal token:\s*(\S+)/);
-  if (match) internalToken = match[1];
+  const both = backendOut.match(/internal tokens:\s*scheduler=(\S+)\s+runtime-host=(\S+)/);
+  const legacy = backendOut.match(/internal token:\s*(\S+)/);
+  internalTokens = both
+    ? { scheduler: both[1], host: both[2] }
+    : { scheduler: legacy ? legacy[1] : "", host: legacy ? legacy[1] : "" };
   const session = await (await fetch(`${base}/api/v1/session`)).json();
   publicToken = session.token;
   csrf = session.csrf;
@@ -324,7 +327,8 @@ async function api(method, requestPath, body, actor) {
 
 /** Internal API call (Scheduler/Host credential plane; never the browser session). */
 async function internalApi(method, requestPath, body, role = "scheduler") {
-  const headers = { "x-atk-internal": internalToken, "x-atk-internal-role": role, accept: "application/json" };
+  const token = role === "runtime-host" ? internalTokens.host : internalTokens.scheduler;
+  const headers = { "x-atk-internal": token, "x-atk-internal-role": role, accept: "application/json" };
   if (body !== undefined) headers["content-type"] = "application/json";
   const response = await fetch(`${base}${requestPath}`, {
     method,
@@ -679,7 +683,7 @@ check("6. rework loop: REJECTED -> READY -> re-executed Run (attempt 2); over-li
   // DB shows the Run COMPLETED. A host `--once` run would call host.stop()
   // immediately after one tick and cancel the session, so it could not prove
   // claim -> complete; this is still the real CLI binary, killed afterwards.
-  if (!internalToken) throw new SkipCheck("backend did not expose an internal token, cannot drive Scheduler/Host");
+  if (!internalTokens.scheduler || !internalTokens.host) throw new SkipCheck("backend did not expose internal credentials, cannot drive Scheduler/Host");
   const schedulerScript = path.join(ROOT, "apps", "scheduler", "cli.mjs");
   const schedulerRun = await runCliProcess(
     schedulerScript,

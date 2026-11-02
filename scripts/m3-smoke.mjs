@@ -99,7 +99,7 @@ if (migrate.status !== 0) {
 const store = openStore({ file: dbFile, migrate: true });
 let backend = null;
 let backendOut = "";
-let internalToken = "";
+let internalTokens = { scheduler: "", host: "" };
 let publicToken = "";
 let csrf = "";
 
@@ -149,9 +149,13 @@ async function startBackend() {
       return false;
     }
   }, 20000, "backend health");
-  const match = backendOut.match(/internal token:\s*(\S+)/);
-  if (!match) throw new Error(`backend did not print an internal token:\n${backendOut}`);
-  internalToken = match[1];
+  // M6.3: one credential per internal role; fleet them out where they belong.
+  const both = backendOut.match(/internal tokens:\s*scheduler=(\S+)\s+runtime-host=(\S+)/);
+  const legacy = backendOut.match(/internal token:\s*(\S+)/);
+  if (!both && !legacy) throw new Error(`backend did not print internal credentials:\n${backendOut}`);
+  internalTokens = both
+    ? { scheduler: both[1], host: both[2] }
+    : { scheduler: legacy[1], host: legacy[1] };
   const session = await (await fetch(`${base}/api/v1/session`)).json();
   publicToken = session.token;
   csrf = session.csrf;
@@ -173,7 +177,7 @@ async function patchTask(taskId, changes) {
   return response.json();
 }
 async function liveLeasesPerRun() {
-  const snapshot = await createSchedulerClient({ baseUrl: base, token: internalToken }).snapshot();
+  const snapshot = await createSchedulerClient({ baseUrl: base, token: internalTokens.scheduler }).snapshot();
   const counts = new Map();
   for (const lease of snapshot.leases ?? []) {
     const live = lease.claimedUntil && Date.parse(lease.claimedUntil) > Date.now();
@@ -184,7 +188,7 @@ async function liveLeasesPerRun() {
 }
 
 function scheduler(core = { planDispatch }) {
-  const client = createSchedulerClient({ baseUrl: base, token: internalToken });
+  const client = createSchedulerClient({ baseUrl: base, token: internalTokens.scheduler });
   return createScheduler({ client, core, policies: POLICIES, ownerId: `scheduler-smoke-${Math.random().toString(36).slice(2, 7)}`, pollMs: 20, heartbeatMs: 500, logger: quietLogger });
 }
 
@@ -251,7 +255,7 @@ try {
     await runner.runOnce();
     await runner.stop();
 
-    const internal = createInternalClient({ baseUrl: base, token: internalToken });
+    const internal = createInternalClient({ baseUrl: base, token: internalTokens.host });
     // Claim every available command; a claim is global, so the invariant is "one
     // live lease per RUN", not "the second claim is empty".
     const claimedRuns = [];
@@ -273,7 +277,7 @@ try {
     const extra = await internal.claim({ ownerId: "host-lease-extra", leaseMs: 5000 });
     expect(extra === null, `expected no claim while every command is leased, got ${extra?.run?.id}`);
 
-    const snapshot = await createSchedulerClient({ baseUrl: base, token: internalToken }).snapshot();
+    const snapshot = await createSchedulerClient({ baseUrl: base, token: internalTokens.scheduler }).snapshot();
     const perTask = new Map();
     for (const run of snapshot.runs) perTask.set(run.taskId, (perTask.get(run.taskId) ?? 0) + 1);
     for (const [taskId, count] of perTask) expect(count === 1, `task ${taskId} has ${count} active runs`);
@@ -298,13 +302,13 @@ try {
   });
 
   check("a restarted scheduler does not dispatch an already claimed task twice", async () => {
-    const before = (await createSchedulerClient({ baseUrl: base, token: internalToken }).snapshot()).runs.length;
+    const before = (await createSchedulerClient({ baseUrl: base, token: internalTokens.scheduler }).snapshot()).runs.length;
     const restarted = scheduler(); // no state carried over: it only sees the snapshot
     const round = await restarted.runOnce();
     await restarted.stop();
     const claimedA = round.results.filter((result) => result.taskId === "M3-A" && result.claimed);
     expect(claimedA.length === 0, "a restarted scheduler must not claim the already claimed M3-A");
-    const after = (await createSchedulerClient({ baseUrl: base, token: internalToken }).snapshot()).runs.length;
+    const after = (await createSchedulerClient({ baseUrl: base, token: internalTokens.scheduler }).snapshot()).runs.length;
     expect(after === before, `active runs changed from ${before} to ${after}`);
     return `no duplicate claim; ${after} active run(s) unchanged`;
   });
@@ -312,7 +316,7 @@ try {
   check("after the root is accepted, the next task is dispatched", async () => {
     // Run the root through its real lifecycle with a mock runtime.
     const host = createHost({
-      client: createInternalClient({ baseUrl: base, token: internalToken }),
+      client: createInternalClient({ baseUrl: base, token: internalTokens.host }),
       runtime: createMockRuntime({ scenario: "complete", sessionIdFactory: () => "mock-m3" }),
       ownerId: "host-m3",
       leaseMs: 5000,
@@ -377,7 +381,7 @@ try {
       encoding: "utf8",
       windowsHide: true,
       timeout: 30000,
-      env: { ...process.env, ATK_BACKEND_URL: base, ATK_INTERNAL_TOKEN: internalToken, SCHEDULER_OWNER: "cli-smoke" },
+      env: { ...process.env, ATK_BACKEND_URL: base, ATK_INTERNAL_TOKEN: internalTokens.scheduler, SCHEDULER_OWNER: "cli-smoke" },
     });
     expect(result.status === 0, `the scheduler CLI exited ${result.status}: ${result.stderr}`);
     const line = result.stdout.trim().split("\n").pop();

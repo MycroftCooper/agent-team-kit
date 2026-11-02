@@ -118,7 +118,7 @@ function seedRun(store, label) {
 let currentStore = seed;
 let backend = null;
 let backendOut = "";
-let internalToken = "";
+let internalTokens = { scheduler: "", host: "" };
 let publicToken = "";
 
 async function startBackend(store) {
@@ -136,9 +136,13 @@ async function startBackend(store) {
       return false;
     }
   }, 20000, "backend health");
-  const match = backendOut.match(/internal token:\s*(\S+)/);
-  if (!match) throw new Error(`backend did not print an internal token:\n${backendOut}`);
-  internalToken = match[1];
+  // M6.3: each internal role gets its own credential; the backend prints both once.
+  const both = backendOut.match(/internal tokens:\s*scheduler=(\S+)\s+runtime-host=(\S+)/);
+  const legacy = backendOut.match(/internal token:\s*(\S+)/);
+  if (!both && !legacy) throw new Error(`backend did not print internal credentials:\n${backendOut}`);
+  internalTokens = both
+    ? { scheduler: both[1], host: both[2] }
+    : { scheduler: legacy[1], host: legacy[1] };
   const session = await (await fetch(`${base}/api/v1/session`)).json();
   publicToken = session.token;
   void store;
@@ -204,7 +208,7 @@ try {
   check("a dispatch command is claimed, the session runs and the run COMPLETES", async () => {
     const happy = seedRun(seed, "happy");
     const runtime = createMockRuntime({ scenario: "complete", sessionIdFactory: () => "mock-happy" });
-    const client = createInternalClient({ baseUrl: base, token: internalToken });
+    const client = createInternalClient({ baseUrl: base, token: internalTokens.host });
     const host = createHost({ client, runtime, ownerId: "host-happy", leaseMs: LEASE_MS, pollMs: 20, flushMs: 10, heartbeatMs: 500, logger: quietLogger });
     await host.tick();
     await waitFor(async () => (await getRun(happy.run.id)).status === "COMPLETED", 15000, "run COMPLETED");
@@ -233,7 +237,7 @@ try {
   // -------------------------------------------------------------------------
   check("a dead host's command is reclaimed as INTERRUPTED and never restarted", async () => {
     const crash = seedRun(seed, "crash");
-    const client = createInternalClient({ baseUrl: base, token: internalToken });
+    const client = createInternalClient({ baseUrl: base, token: internalTokens.host });
     // ignoreStop:true is what makes the simulated crash faithful — a real dead
     // process cannot emit a polite cancelled event on its way out.
     const hangingRuntime = createMockRuntime({ scenario: "hang", ignoreStop: true, sessionIdFactory: () => "mock-crash" });
@@ -267,7 +271,7 @@ try {
   // 3. the "events landed, result never sent" window (QA-003 MAJOR-2)
   // -------------------------------------------------------------------------
   check("a command whose run already finished is closed by the backend sweep", async () => {
-    const internal = createInternalClient({ baseUrl: base, token: internalToken });
+    const internal = createInternalClient({ baseUrl: base, token: internalTokens.host });
     const orphan = seedRun(seed, "orphan");
     const victim = await internal.claim({ ownerId: "host-d3", leaseMs: 5000 });
     expect(victim?.command?.id === orphan.command.id, `expected to claim the orphan command, got ${victim?.command?.id}`);
@@ -298,7 +302,7 @@ try {
   // -------------------------------------------------------------------------
   check("an outdated generation is refused and leaves the run untouched", async () => {
     const fenced = seedRun(seed, "fenced");
-    const client = createInternalClient({ baseUrl: base, token: internalToken });
+    const client = createInternalClient({ baseUrl: base, token: internalTokens.host });
     const claim = await client.claim({ ownerId: "host-stale", leaseMs: LEASE_MS });
     expect(claim?.command?.id, "expected to claim the seeded command");
     const renewed = await client.renew(claim.run.id, { ownerId: "host-stale", generation: claim.lease.generation, leaseMs: LEASE_MS });

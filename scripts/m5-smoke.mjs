@@ -217,7 +217,7 @@ try {
     const offenders = [];
     for (const file of walkFiles(path.join(dataDir, "logs"))) {
       const text = readFileSync(file, "utf8");
-      const leakedValue = /internal token:\s*(?!\[REDACTED\])\S{20,}/i.test(text) || /[A-Za-z0-9_-]{40,}/.test(text.replace(/\[REDACTED\]/g, ""));
+      const leakedValue = /internal tokens?:\s*(?!\[REDACTED\])\S{20,}/i.test(text) || /[A-Za-z0-9_-]{40,}/.test(text.replace(/\[REDACTED\]/g, ""));
       if (leakedValue) offenders.push(path.basename(file));
     }
     expect(offenders.length === 0, `log files leak the internal credential value: ${offenders.join(",")}`);
