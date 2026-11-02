@@ -13,6 +13,7 @@ import { StoreError, fail, notFound } from "./errors.mjs";
 import { INTERNAL } from "./internal.mjs";
 import {
   DEFAULT_LEASE_MS,
+  DEFAULT_HEARTBEAT_TTL_MS,
   DEFAULT_MAX_REVIEW_ATTEMPTS,
   MAX_EVENT_LIMIT,
   MAX_EVENT_PAGE_LIMIT,
@@ -23,6 +24,7 @@ import {
   assertEnumFilter,
   assertRunTransition,
   assertTaskTransition,
+  buildFrozenExecutionSpec,
   buildOverview,
   canTransition,
   canonicalAgentId,
@@ -498,6 +500,14 @@ export function openStore(options = {}) {
       updatedAt: row.updated_at,
     };
     if (row.workspace_id !== null && row.workspace_id !== undefined) run.workspaceId = row.workspace_id;
+    if (row.workspace_path !== null && row.workspace_path !== undefined) {
+      run.workspace = {
+        kind: "worktree",
+        path: row.workspace_path,
+        baseCommit: row.base_commit ?? null,
+        targetBranch: row.target_branch ?? null,
+      };
+    }
     if (row.started_at !== null && row.started_at !== undefined) run.startedAt = row.started_at;
     if (row.ended_at !== null && row.ended_at !== undefined) run.endedAt = row.ended_at;
     if (row.exit_code !== null && row.exit_code !== undefined) run.exitCode = Number(row.exit_code);
@@ -558,6 +568,11 @@ export function openStore(options = {}) {
     if (row.task !== null && row.task !== undefined) agent.task = row.task;
     if (row.detail !== null && row.detail !== undefined) agent.detail = row.detail;
     if (row.since !== null && row.since !== undefined) agent.since = row.since;
+    if (row.host_id !== null && row.host_id !== undefined) agent.hostId = row.host_id;
+    if (row.last_heartbeat_at !== null && row.last_heartbeat_at !== undefined) {
+      agent.lastHeartbeatAt = row.last_heartbeat_at;
+    }
+    if (row.capacity !== null && row.capacity !== undefined) agent.capacity = Number(row.capacity);
     return agent;
   }
 
@@ -1150,6 +1165,48 @@ export function openStore(options = {}) {
     },
 
     // --- Run lifecycle (m2-contracts 搂2/搂3) -------------------------------
+    /**
+     * M6.2 F05: freeze the current Task + project into an immutable
+     * TaskExecutionSpec v1. The pending row is bound to the next Run of the
+     * Task (or one created with this specHash) and never follows Task edits.
+     */
+    freezeTaskSpec(taskId, { now, workspace, constraints } = {}) {
+      requireId(taskId, "task.id");
+      return transaction(() => {
+        const taskRow = requireTaskRow(taskId);
+        const projectRow = requireProject(taskRow.project_id);
+        const { spec, specHash, frozenAt } = buildFrozenExecutionSpec({
+          task: taskJson(taskRow),
+          project: projectJson(projectRow),
+          workspace,
+          constraints,
+          now,
+        });
+        stmt("DELETE FROM run_specs WHERE run_id IS NULL AND task_id = ?").run(taskId);
+        stmt(
+          `INSERT INTO run_specs (run_id, task_id, task_version, spec_json, spec_hash, frozen_at)
+           VALUES (NULL, ?, ?, ?, ?, ?)`,
+        ).run(taskId, spec.taskVersion, JSON.stringify(spec), specHash, frozenAt);
+        return { spec, specHash, frozenAt };
+      });
+    },
+
+    /** The frozen spec a Run is executing (immutable across Task edits). */
+    getRunSpec(runId) {
+      requireId(runId, "run.id");
+      const row = stmt("SELECT * FROM run_specs WHERE run_id = ?").get(runId);
+      if (!row) {
+        fail("NOT_FOUND", `run "${runId}" has no frozen spec`, { runId, reason: "spec-not-frozen" });
+      }
+      return {
+        spec: parseJsonColumn(row.spec_json),
+        specHash: row.spec_hash,
+        frozenAt: row.frozen_at,
+        taskId: row.task_id,
+        taskVersion: Number(row.task_version),
+      };
+    },
+
     createRun(dto) {
       ensurePlainObject(dto, "run");
       return transaction(() => {
@@ -1164,8 +1221,9 @@ export function openStore(options = {}) {
         stmt(
           `INSERT INTO runs
              (id, task_id, agent_id, function, status, attempt, started_at, ended_at, error_json,
-              version, role, workspace_id, exit_code, files_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              version, role, workspace_id, exit_code, files_json, created_at, updated_at,
+              workspace_path, base_commit, target_branch)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           run.id,
           run.taskId,
@@ -1183,7 +1241,22 @@ export function openStore(options = {}) {
           run.files === undefined ? null : JSON.stringify(run.files),
           run.createdAt,
           run.updatedAt,
+          run.workspace?.path ?? null,
+          run.workspace?.baseCommit ?? null,
+          run.workspace?.targetBranch ?? null,
         );
+        // F05: bind the frozen spec from freezeTaskSpec to this Run. The copy is
+        // immutable, so later Task edits cannot change what the Run executes.
+        const pendingSpec = dto.specHash
+          ? stmt(
+              "SELECT rowid, * FROM run_specs WHERE run_id IS NULL AND spec_hash = ? ORDER BY frozen_at DESC LIMIT 1",
+            ).get(dto.specHash)
+          : stmt(
+              "SELECT rowid, * FROM run_specs WHERE run_id IS NULL AND task_id = ? ORDER BY frozen_at DESC LIMIT 1",
+            ).get(dto.taskId);
+        if (pendingSpec) {
+          stmt("UPDATE run_specs SET run_id = ? WHERE rowid = ?").run(run.id, pendingSpec.rowid);
+        }
         insertEvent(
           makeEvent({
             projectId: taskRow.project_id,
@@ -2123,6 +2196,59 @@ export function openStore(options = {}) {
 
     listAgents() {
       return stmt("SELECT * FROM agent_instances ORDER BY id ASC").all().map(agentJson);
+    },
+
+    /** M6.2 F10: host heartbeat updates every listed agent's liveness + capacity. */
+    recordHeartbeat({ hostId, agentIds, capacity, now } = {}) {
+      if (typeof hostId !== "string" || hostId.trim() === "") {
+        fail("VALIDATION_ERROR", "heartbeat.hostId is required", { field: "hostId" });
+      }
+      if (!Array.isArray(agentIds) || agentIds.length === 0) {
+        fail("VALIDATION_ERROR", "heartbeat.agentIds must be a non-empty array", { field: "agentIds" });
+      }
+      if (!Number.isInteger(capacity) || capacity < 0) {
+        fail("VALIDATION_ERROR", "heartbeat.capacity must be a non-negative integer", { field: "capacity" });
+      }
+      const at = nowIso(now);
+      return transaction(() => {
+        for (const agentId of agentIds) {
+          requireId(agentId, "agent.id");
+          const result = stmt(
+            `UPDATE agent_instances
+                SET host_id = ?, last_heartbeat_at = ?, capacity = ?, updated_at = ?
+              WHERE id = ?`,
+          ).run(hostId, at, capacity, at, agentId);
+          if (Number(result.changes) === 0) notFound("agent", agentId);
+        }
+        return { hostId, agentIds: [...agentIds], capacity, at };
+      });
+    },
+
+    /**
+     * F10: availability comes from a fresh heartbeat + capacity, NEVER from
+     * `status === "IDLE"`. With no agentId this is the project-wide gate.
+     */
+    agentAvailability({ agentId, now, ttlMs = DEFAULT_HEARTBEAT_TTL_MS } = {}) {
+      if (!Number.isInteger(ttlMs) || ttlMs <= 0) {
+        fail("VALIDATION_ERROR", "agentAvailability.ttlMs must be a positive integer", { ttlMs });
+      }
+      const at = nowIso(now);
+      const rows = agentId === undefined || agentId === null
+        ? stmt("SELECT * FROM agent_instances").all()
+        : [stmt("SELECT * FROM agent_instances WHERE id = ?").get(agentId)].filter(Boolean);
+      if (rows.length === 0) return { available: false, reason: "no-heartbeat" };
+      const withHeartbeat = rows.filter(
+        (row) => row.last_heartbeat_at !== null && row.last_heartbeat_at !== undefined,
+      );
+      if (withHeartbeat.length === 0) return { available: false, reason: "no-heartbeat" };
+      const fresh = withHeartbeat.filter(
+        (row) => Date.parse(row.last_heartbeat_at) + ttlMs >= Date.parse(at),
+      );
+      if (fresh.length === 0) return { available: false, reason: "stale-heartbeat" };
+      if (!fresh.some((row) => Number(row.capacity ?? 0) > 0)) {
+        return { available: false, reason: "no-capacity" };
+      }
+      return { available: true, reason: "ok" };
     },
 
     upsertAgent(dto) {

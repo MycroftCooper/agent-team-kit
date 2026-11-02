@@ -14,6 +14,7 @@ import { fail, notFound } from "./errors.mjs";
 import { INTERNAL } from "./internal.mjs";
 import {
   DEFAULT_LEASE_MS,
+  DEFAULT_HEARTBEAT_TTL_MS,
   DEFAULT_MAX_REVIEW_ATTEMPTS,
   MAX_EVENT_LIMIT,
   MAX_EVENT_PAGE_LIMIT,
@@ -25,6 +26,7 @@ import {
   assertEnumFilter,
   assertRunTransition,
   assertTaskTransition,
+  buildFrozenExecutionSpec,
   buildOverview,
   canTransition,
   canonicalAgentId,
@@ -89,6 +91,7 @@ export function createMemoryStore() {
   const projectMeta = new Map();
   const taskMeta = new Map();
   const runs = new Map();
+  const runSpecs = new Map();
   const runLeases = new Map();
   const dispatchCommands = new Map();
   const commandIdempotency = new Map();
@@ -431,6 +434,89 @@ export function createMemoryStore() {
     },
 
     // --- Run lifecycle (m2-contracts 搂2/搂3) -------------------------------
+    freezeTaskSpec(taskId, { now, workspace, constraints } = {}) {
+      requireId(taskId, "task.id");
+      const task = requireTaskEntry(taskId);
+      const project = requireProject(task.projectId);
+      const { spec, specHash, frozenAt } = buildFrozenExecutionSpec({
+        task,
+        project,
+        workspace,
+        constraints,
+        now,
+      });
+      for (const [key, row] of runSpecs) {
+        if (row.runId === null && row.taskId === taskId) runSpecs.delete(key);
+      }
+      runSpecs.set(`PENDING:${taskId}`, {
+        runId: null,
+        taskId,
+        taskVersion: spec.taskVersion,
+        spec,
+        specHash,
+        frozenAt,
+      });
+      return { spec: clone(spec), specHash, frozenAt };
+    },
+
+    getRunSpec(runId) {
+      requireId(runId, "run.id");
+      const row = runSpecs.get(runId);
+      if (!row) {
+        fail("NOT_FOUND", `run "${runId}" has no frozen spec`, { runId, reason: "spec-not-frozen" });
+      }
+      return {
+        spec: clone(row.spec),
+        specHash: row.specHash,
+        frozenAt: row.frozenAt,
+        taskId: row.taskId,
+        taskVersion: row.taskVersion,
+      };
+    },
+
+    recordHeartbeat({ hostId, agentIds, capacity, now } = {}) {
+      if (typeof hostId !== "string" || hostId.trim() === "") {
+        fail("VALIDATION_ERROR", "heartbeat.hostId is required", { field: "hostId" });
+      }
+      if (!Array.isArray(agentIds) || agentIds.length === 0) {
+        fail("VALIDATION_ERROR", "heartbeat.agentIds must be a non-empty array", { field: "agentIds" });
+      }
+      if (!Number.isInteger(capacity) || capacity < 0) {
+        fail("VALIDATION_ERROR", "heartbeat.capacity must be a non-negative integer", { field: "capacity" });
+      }
+      const at = nowIso(now);
+      for (const agentId of agentIds) {
+        const agent = agents.get(agentId);
+        if (!agent) notFound("agent", agentId);
+        agent.hostId = hostId;
+        agent.lastHeartbeatAt = at;
+        agent.capacity = capacity;
+        agent.updatedAt = at;
+      }
+      return { hostId, agentIds: [...agentIds], capacity, at };
+    },
+
+    agentAvailability({ agentId, now, ttlMs = DEFAULT_HEARTBEAT_TTL_MS } = {}) {
+      if (!Number.isInteger(ttlMs) || ttlMs <= 0) {
+        fail("VALIDATION_ERROR", "agentAvailability.ttlMs must be a positive integer", { ttlMs });
+      }
+      const at = nowIso(now);
+      const candidates = agentId === undefined || agentId === null
+        ? [...agents.values()]
+        : [agents.get(agentId)].filter(Boolean);
+      if (candidates.length === 0) return { available: false, reason: "no-heartbeat" };
+      const withHeartbeat = candidates.filter((agent) => agent.lastHeartbeatAt !== undefined);
+      if (withHeartbeat.length === 0) return { available: false, reason: "no-heartbeat" };
+      const fresh = withHeartbeat.filter(
+        (agent) => Date.parse(agent.lastHeartbeatAt) + ttlMs >= Date.parse(at),
+      );
+      if (fresh.length === 0) return { available: false, reason: "stale-heartbeat" };
+      if (!fresh.some((agent) => Number(agent.capacity ?? 0) > 0)) {
+        return { available: false, reason: "no-capacity" };
+      }
+      return { available: true, reason: "ok" };
+    },
+
     createRun(dto) {
       ensurePlainObject(dto, "run");
       const task = requireTaskEntry(dto.taskId);
@@ -439,6 +525,15 @@ export function createMemoryStore() {
       const run = normalizeRun(dto, { now: at, attempt, id: dto.id });
       if (runs.has(run.id)) {
         fail("VALIDATION_ERROR", `run "${run.id}" already exists`, { entity: "run", id: run.id });
+      }
+      const candidates = [...runSpecs.entries()].filter(([, row]) => row.runId === null);
+      const matched = dto.specHash
+        ? candidates.find(([, row]) => row.specHash === dto.specHash)
+        : candidates.find(([, row]) => row.taskId === dto.taskId);
+      if (matched) {
+        const [key, pendingSpec] = matched;
+        runSpecs.delete(key);
+        runSpecs.set(run.id, { ...pendingSpec, runId: run.id });
       }
       runs.set(run.id, run);
       appendEventEntry(
@@ -2012,6 +2107,7 @@ export function createMemoryStore() {
           projectMeta: new Map([...projectMeta].map(([key, value]) => [key, clone(value)])),
           taskMeta: new Map([...taskMeta].map(([key, value]) => [key, clone(value)])),
           runs: new Map([...runs].map(([key, value]) => [key, clone(value)])),
+          runSpecs: new Map([...runSpecs].map(([key, value]) => [key, clone(value)])),
           runLeases: new Map([...runLeases].map(([key, value]) => [key, clone(value)])),
           dispatchCommands: new Map([...dispatchCommands].map(([key, value]) => [key, clone(value)])),
           commandIdempotency: new Map([...commandIdempotency].map(([key, value]) => [key, value])),
@@ -2036,6 +2132,7 @@ export function createMemoryStore() {
           restore(projectMeta, snapshot.projectMeta);
           restore(taskMeta, snapshot.taskMeta);
           restore(runs, snapshot.runs);
+          restore(runSpecs, snapshot.runSpecs);
           restore(runLeases, snapshot.runLeases);
           restore(dispatchCommands, snapshot.dispatchCommands);
           restore(commandIdempotency, snapshot.commandIdempotency);
@@ -2058,6 +2155,7 @@ export function createMemoryStore() {
         projectMeta.clear();
         taskMeta.clear();
         runs.clear();
+        runSpecs.clear();
         runLeases.clear();
         dispatchCommands.clear();
         commandIdempotency.clear();

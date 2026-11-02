@@ -4,6 +4,7 @@
 // (contracts), defaults, patch whitelists, version bumps, sorting and the
 // overview projection. The two stores only differ in persistence, so this is
 // how "memory must behave like SQLite" is kept true instead of hoped for.
+import { createHash } from "node:crypto";
 import {
   ACCEPTANCE_STATUSES,
   AGENT_STATUSES,
@@ -15,6 +16,7 @@ import {
   RUN_STATUSES,
   TASK_STATUSES,
   createEvent,
+  createTaskExecutionSpec,
   eventDedupeKey,
   normalizeRepoPath as contractsNormalizeRepoPath,
   overlappingPaths,
@@ -27,7 +29,8 @@ import {
 import { fail } from "./errors.mjs";
 
 /** Schema version written by the latest migration file. */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
+export const DEFAULT_HEARTBEAT_TTL_MS = 30_000;
 export const DEFAULT_LIST_LIMIT = 100;
 export const MAX_LIST_LIMIT = 10000;
 export const MAX_EVENT_LIMIT = 10000;
@@ -1266,6 +1269,54 @@ export function leaseExpiryAfter(now, leaseMs) {
  * the store (same task, N-th run) and passed in; `dto.attempt` is validated but
  * the store's counter wins so two clients cannot collide on the same attempt.
  */
+/** Freeze one Task version into an immutable TaskExecutionSpec v1 snapshot. */
+export function buildFrozenExecutionSpec({ task, project, workspace, now, constraints } = {}) {
+  if (!task || !project) {
+    fail("VALIDATION_ERROR", "freezeTaskSpec requires an existing task and project", {});
+  }
+  const frozenAt = nowIso(now);
+  const spec = createTaskExecutionSpec({
+    task,
+    project,
+    workspace: workspace ?? { kind: "none", path: null, baseCommit: null, targetBranch: null },
+    constraints: constraints ?? {},
+    frozenAt,
+  });
+  return { spec, specHash: hashExecutionSpec(spec), frozenAt };
+}
+
+/** Stable sha256 of a frozen execution spec (persisted alongside it). */
+export function hashExecutionSpec(spec) {
+  return createHash("sha256").update(JSON.stringify(spec)).digest("hex");
+}
+
+/* M6.2 F04: workspace binding persisted on the Run (never client-supplied cwd). */
+export function normalizeWorkspaceSection(value, label = "run.workspace") {
+  if (!isPlainObject(value)) {
+    fail("VALIDATION_ERROR", `${label} must be an object`, { entity: label, value: value ?? null });
+  }
+  const kind = value.kind ?? "none";
+  if (!["worktree", "none"].includes(kind)) {
+    fail("VALIDATION_ERROR", `${label}.kind must be worktree|none`, { entity: label, kind });
+  }
+  const path = value.path ?? null;
+  const baseCommit = value.baseCommit ?? null;
+  const targetBranch = value.targetBranch ?? null;
+  if (path !== null && (typeof path !== "string" || path.trim() === "")) {
+    fail("VALIDATION_ERROR", `${label}.path must be a non-empty string or null`, { entity: label, path });
+  }
+  if (baseCommit !== null && (typeof baseCommit !== "string" || baseCommit.trim() === "")) {
+    fail("VALIDATION_ERROR", `${label}.baseCommit must be a non-empty string or null`, { entity: label });
+  }
+  if (targetBranch !== null && (typeof targetBranch !== "string" || targetBranch.trim() === "")) {
+    fail("VALIDATION_ERROR", `${label}.targetBranch must be a non-empty string or null`, { entity: label });
+  }
+  if (kind === "worktree" && (!path || !baseCommit)) {
+    fail("VALIDATION_ERROR", `${label} worktree requires path and baseCommit`, { entity: label });
+  }
+  return { kind, path, baseCommit, targetBranch };
+}
+
 export function normalizeRun(dto, { now, attempt, id } = {}) {
   ensurePlainObject(dto, "run");
   const errors = [];
@@ -1305,6 +1356,9 @@ export function normalizeRun(dto, { now, attempt, id } = {}) {
     updatedAt: at,
   };
   if (dto.workspaceId !== undefined && dto.workspaceId !== null) run.workspaceId = dto.workspaceId;
+  if (dto.workspace !== undefined && dto.workspace !== null) {
+    run.workspace = normalizeWorkspaceSection(dto.workspace);
+  }
   if (runFiles.length > 0) run.files = runFiles;
   return run;
 }

@@ -14,7 +14,7 @@ test("memory store exposes the same API shape with no file", (t) => {
   assert.deepEqual(store.health(), {
     ok: true,
     file: null,
-    schemaVersion: 6,
+    schemaVersion: 7,
     counts: { projects: 0, tasks: 0, runs: 0, events: 0, agents: 0 },
   });
   assert.deepEqual(store.listProjects(), []);

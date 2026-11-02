@@ -390,10 +390,10 @@ test("replace never clears schema_migrations (reopen does not re-migrate)", (t) 
     now: T,
     projectId: "proj-1",
   });
-  assert.equal(store.health().schemaVersion, 6);
+  assert.equal(store.health().schemaVersion, 7);
   store.close();
   const reopened = open();
-  assert.equal(reopened.health().schemaVersion, 6);
+  assert.equal(reopened.health().schemaVersion, 7);
   assert.equal(reopened.getProject("proj-1").id, "proj-1");
   const warnings = reopened[INTERNAL].migrationWarnings();
   assert.deepEqual(warnings, [], "reopening a replaced database must not re-run migrations");
@@ -405,7 +405,7 @@ test("verifySwitchReadiness blocks active Runs/leases and clears when idle", (t)
     const idle = verifySwitchReadiness(store);
     assert.equal(idle.ok, true, label);
     assert.deepEqual(idle.blockers, [], label);
-    assert.equal(idle.schemaVersion, 6, label);
+    assert.equal(idle.schemaVersion, 7, label);
     assert.ok(idle.counts.tasks >= 1, label);
 
     const run = store.createRun({ taskId: "TASK-SEED", agentId: "agent-1", function: "WORKER", role: "DEV" });
