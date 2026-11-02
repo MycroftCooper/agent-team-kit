@@ -19,9 +19,10 @@ export class InternalApiError extends Error {
   }
 }
 
-export function createInternalClient({ baseUrl, token, fetchImpl = globalThis.fetch, timeoutMs = 15000 } = {}) {
+export function createInternalClient({ baseUrl, token, role = "runtime-host", fetchImpl = globalThis.fetch, timeoutMs = 15000 } = {}) {
   if (!baseUrl) throw new Error("createInternalClient: baseUrl is required");
   if (!token) throw new Error("createInternalClient: internal token is required");
+  if (typeof role !== "string" || role.trim() === "") throw new Error("createInternalClient: role is required");
 
   async function call(method, path, body) {
     const controller = new AbortController();
@@ -32,6 +33,9 @@ export function createInternalClient({ baseUrl, token, fetchImpl = globalThis.fe
         method,
         headers: {
           "x-atk-internal": token,
+          // m6.1-contracts §2: the credential alone is not enough; every internal
+          // caller asserts the role it acts as. The Host is runtime-host.
+          "x-atk-internal-role": role,
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -55,7 +59,7 @@ export function createInternalClient({ baseUrl, token, fetchImpl = globalThis.fe
       const query = new URLSearchParams({ owner: ownerId, leaseMs: String(leaseMs) });
       return call("GET", `/internal/v1/dispatch/claim?${query}`);
     },
-    result(commandId, { ownerId, generation, status, exitCode, summary, error }) {
+    result(commandId, { ownerId, generation, status, exitCode, summary, error, idempotencyKey }) {
       // The backend validates the result body: ownerId + generation prove the
       // holder, status is DONE|FAILED, and only exitCode/summary/error are
       // accepted as payload. A missing ownerId here used to fail with 400 and get
@@ -67,6 +71,9 @@ export function createInternalClient({ baseUrl, token, fetchImpl = globalThis.fe
         ...(exitCode === undefined ? {} : { exitCode }),
         ...(summary === undefined ? {} : { summary }),
         ...(error === undefined ? {} : { error }),
+        // F02: the same terminal fact must be replayed with the same key so the
+        // backend can de-duplicate a lost response.
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       });
     },
     renew(runId, { ownerId, generation, leaseMs }) {

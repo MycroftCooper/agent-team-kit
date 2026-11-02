@@ -84,6 +84,13 @@ async function main() {
   if (recovered.total > 0) {
     logger.warn?.(`[host] reconciled ${recovered.total} in-flight run(s) from ${stateFile}`);
   }
+  if (recovered.corrupt) {
+    logger.error?.(
+      `[host] state RECOVERY_REQUIRED: ${stateFile} is corrupt; refusing to claim new work until it is reconciled manually`,
+    );
+  } else if (host.mode() !== "RUNNING") {
+    logger.warn?.(`[host] state ${host.mode()}: new claims are blocked until the outstanding fact is acknowledged`);
+  }
   if (args.once) {
     await host.tick();
     process.stdout.write(`${JSON.stringify({ recovered, stats: host.stats })}\n`);

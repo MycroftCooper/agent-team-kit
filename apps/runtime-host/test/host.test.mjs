@@ -38,7 +38,8 @@ function fakeClient({ claims = [], staleOnEvents = false, staleOnRenew = false }
     },
     result(commandId, body) {
       calls.result.push({ commandId, ...body });
-      return Promise.resolve({ command: { id: commandId }, run: { id: "run-1" } });
+      // M6.1 F02 ack contract: only a persisted:true response confirms delivery.
+      return Promise.resolve({ persisted: true, command: { id: commandId }, run: { id: "run-1" } });
     },
     heartbeat(body) {
       calls.heartbeat.push(body);
