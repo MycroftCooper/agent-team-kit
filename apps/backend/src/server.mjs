@@ -10,9 +10,10 @@ import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
-import { EVENT_TYPES, ID_RE, ApiError, isEnumValue, validateProject, validateTask } from "@atk/contracts";
+import { EVENT_TYPES, ID_RE, ApiError, isEnumValue, validateProject, validateTask, validateTaskExecutionSpec } from "@atk/contracts";
 
 import {
   CLI_CLIENT_HEADER,
@@ -179,7 +180,105 @@ export function createServer({
     : { persisted: false, tokenFile: tokenFile ?? null, warning: null };
 
   const hub = createSseHub({ store, heartbeatMs: sseHeartbeatMs, pollMs: ssePollMs, logger, now });
-  const internalRouter = createInternalRouter({ store, hub, now, logger });
+
+  // M6.2 F05: the claim path must freeze + validate the execution spec before
+  // the store creates the Run, so the very first (durable-idempotency replay)
+  // claim already has a spec bound to it. This facade keeps that guarantee
+  // linear across every caller of the store's atomic claim.
+  function freezeClaimSpec(taskId) {
+    if (typeof store.freezeTaskSpec !== "function") {
+      throw new ApiError("INTERNAL_ERROR", "this store cannot freeze an execution spec", {
+        details: { reason: "spec-freeze-unavailable", taskId },
+      });
+    }
+    const frozen = store.freezeTaskSpec(taskId, { now: new Date(now()).toISOString() });
+    if (!isPlainObject(frozen) || typeof frozen.specHash !== "string" || frozen.specHash === "") {
+      throw new ApiError("INTERNAL_ERROR", "execution spec is unavailable for dispatch", { details: { taskId } });
+    }
+    const validation = validateTaskExecutionSpec(frozen.spec);
+    if (!validation.ok) {
+      throw new ApiError("INTERNAL_ERROR", "frozen execution spec did not pass the contract validator", {
+        details: { taskId, errors: validation.errors },
+      });
+    }
+    return frozen;
+  }
+
+  const internalStore = Object.create(store);
+  if (typeof store.claimTask === "function") {
+    const enrichClaim = (result, frozen) => {
+      if (!isPlainObject(result) || !frozen) return result;
+      const enriched = { ...result };
+      const addSpec = (object) => (isPlainObject(object) ? { ...object, specHash: frozen.specHash, spec: frozen.spec } : object);
+      if (result.run) enriched.run = addSpec(result.run);
+      if (result.command) {
+        enriched.command = addSpec(result.command);
+        if (isPlainObject(result.command.payload)) {
+          enriched.command.payload = { ...result.command.payload, specHash: frozen.specHash, spec: frozen.spec };
+        }
+      }
+      return enriched;
+    };
+    internalStore.claimTask = (dto = {}) => {
+      // M6.2: claimTask freezes the spec + binds the workspace inside its own
+      // transaction. Never re-freeze here - especially not on idempotent replay.
+      const result = store.claimTask(dto);
+      if (!isPlainObject(result)) return result;
+      if (typeof store.getRunSpec !== "function") return result;
+      let frozen = null;
+      if (result.run?.id) {
+        try {
+          frozen = store.getRunSpec(result.run.id);
+        } catch {
+          frozen = null;
+        }
+      }
+      if (!isPlainObject(frozen)) {
+        throw new ApiError("INTERNAL_ERROR", "claim returned a Run without a frozen execution spec", {
+          details: { reason: "spec-missing", runId: result.run?.id ?? null, taskId: dto.taskId },
+        });
+      }
+      const validation = validateTaskExecutionSpec(frozen.spec);
+      if (!validation.ok) {
+        throw new ApiError("INTERNAL_ERROR", "frozen execution spec did not pass the contract validator", {
+          details: { runId: result.run?.id ?? null, errors: validation.errors },
+        });
+      }
+      return enrichClaim(result, frozen);
+    };
+  }
+  if (typeof store.claimDispatchCommand === "function" && typeof store.getRunSpec === "function") {
+    internalStore.claimDispatchCommand = (dto = {}) => {
+      const result = store.claimDispatchCommand(dto);
+      if (!result || !isPlainObject(result.command)) return result;
+      let frozen = null;
+      try {
+        frozen = store.getRunSpec(result.command.runId);
+      } catch {
+        // Legacy commands created before M6.2 (or seeded by tooling) have no
+        // Run-bound spec; freeze one now so the Host never receives a bare
+        // "execute task X" instruction.
+        try {
+          frozen = freezeClaimSpec(result.command.taskId);
+        } catch {
+          throw new ApiError("INTERNAL_ERROR", "dispatch command has no frozen execution spec", {
+            details: { reason: "spec-missing", runId: result.command.runId, commandId: result.command.id, taskId: result.command.taskId },
+          });
+        }
+      }
+      const addSpec = (object) => (isPlainObject(object) ? { ...object, specHash: frozen.specHash, spec: frozen.spec } : object);
+      return {
+        ...result,
+        command: (() => {
+          const command = addSpec(result.command);
+          if (isPlainObject(command.payload)) command.payload = { ...command.payload, specHash: frozen.specHash, spec: frozen.spec };
+          return command;
+        })(),
+        ...(result.run ? { run: addSpec(result.run) } : {}),
+      };
+    };
+  }
+  const internalRouter = createInternalRouter({ store: internalStore, hub, now, logger });
   const staticHandler = createStaticHandler({
     webDist: webDist === undefined ? DEFAULT_WEB_DIST : webDist,
     logger,
@@ -1096,6 +1195,7 @@ export function createServer({
         let items;
         let hasMore;
         let nextAfterSeq;
+        let earliestSeq;
         if (typeof store.listEventsPage === "function") {
           const page = store.listEventsPage({ ...filter, limit });
           items = page && Array.isArray(page.items) ? page.items.slice(0, limit) : [];
@@ -1103,6 +1203,7 @@ export function createServer({
           if (hasMore && items.length > 0) {
             nextAfterSeq = Number.isInteger(page?.nextAfterSeq) ? page.nextAfterSeq : Number(items[items.length - 1].seq);
           }
+          if (Number.isInteger(page?.earliestSeq)) earliestSeq = page.earliestSeq;
         } else {
           const raw = store.listEvents({ ...filter, limit: Math.min(limit + 1, 10_000) });
           const rows = Array.isArray(raw) ? raw : raw && Array.isArray(raw.items) ? raw.items : [];
@@ -1115,7 +1216,24 @@ export function createServer({
           }
           if (hasMore && items.length > 0) nextAfterSeq = Number(items[items.length - 1].seq);
         }
-        const body = { items, hasMore };
+        // m6.2 F12: the smallest seq the server still retains. The client can
+        // compare it with its first returned seq to detect truncation exactly.
+        if (earliestSeq === undefined) {
+          try {
+            if (typeof store.earliestSeq === "function") {
+              const value = Number(store.earliestSeq());
+              earliestSeq = Number.isInteger(value) ? value : null;
+            } else {
+              const rawEarliest = store.listEvents({ limit: 1 });
+              const earliestRows = Array.isArray(rawEarliest) ? rawEarliest : rawEarliest && Array.isArray(rawEarliest.items) ? rawEarliest.items : [];
+              const firstSeq = earliestRows.length > 0 ? Number(earliestRows[0].seq) : null;
+              earliestSeq = Number.isInteger(firstSeq) ? firstSeq : null;
+            }
+          } catch {
+            earliestSeq = null;
+          }
+        }
+        const body = { items, hasMore, earliestSeq };
         if (nextAfterSeq !== undefined) body.nextAfterSeq = nextAfterSeq;
         sendJson(res, 200, body);
         return;
@@ -1164,6 +1282,66 @@ export function createServer({
           throw new ApiError("NOT_AUTHORIZED", "missing or invalid internal credential", {
             details: { reason: internalCheck.reason },
           });
+        }
+        // --- M6.2 F10: host-level heartbeat (new shape) ----------------------
+        // The legacy M2 heartbeat shape is still served by the internal router
+        // (replayed below); the host-level shape is handled here so the WP6
+        // route owner can migrate without a second overlapping implementation.
+        if (method === "POST" && pathname === "/internal/v1/runtime/heartbeat") {
+          const body = await requireJsonBody(req);
+          const isHostHeartbeat = isPlainObject(body)
+            && (body.hostId !== undefined || body.agentIds !== undefined || body.capacity !== undefined);
+          if (isHostHeartbeat) {
+            const roleCheck = checkInternalRole(req.headers[INTERNAL_ROLE_HEADER], ["runtime-host"]);
+            if (!roleCheck.ok) {
+              throw new ApiError("NOT_AUTHORIZED", "internal role is not allowed for runtime heartbeat", {
+                details: { reason: roleCheck.reason, role: roleCheck.role ?? null, allowedRoles: ["runtime-host"] },
+              });
+            }
+            const invalid = (field, message) => new ApiError("VALIDATION_ERROR", message, { details: { field } });
+            if (typeof body.hostId !== "string" || body.hostId.trim() === "") {
+              throw invalid("hostId", "heartbeat.hostId must be a non-empty string");
+            }
+            if (!Array.isArray(body.agentIds) || body.agentIds.length === 0 || body.agentIds.some((id) => typeof id !== "string" || !ID_RE.test(id))) {
+              throw invalid("agentIds", "heartbeat.agentIds must be a non-empty array of agent ids");
+            }
+            if (!Number.isInteger(body.capacity) || body.capacity < 0) {
+              throw invalid("capacity", "heartbeat.capacity must be a non-negative integer");
+            }
+            if (typeof store.recordHeartbeat !== "function") {
+              throw new ApiError("INTERNAL_ERROR", "this store cannot record runtime heartbeats", {
+                details: { reason: "heartbeat-unsupported" },
+              });
+            }
+            const atIso = new Date(now()).toISOString();
+            const recorded = store.recordHeartbeat({
+              hostId: body.hostId,
+              agentIds: [...body.agentIds],
+              capacity: body.capacity,
+              now: atIso,
+            });
+            const at = typeof recorded?.at === "string" ? recorded.at : atIso;
+            const agents = body.agentIds.map((agentId) => {
+              let availability = { available: false, reason: "no-heartbeat" };
+              try {
+                availability = store.agentAvailability({ agentId, now: at });
+              } catch {
+                // A store without the availability view still gets a truthful 200.
+              }
+              return { agentId, available: Boolean(availability?.available), reason: availability?.reason ?? null };
+            });
+            sendJson(res, 200, { at, agents, hostId: body.hostId, capacity: body.capacity });
+            return;
+          }
+          // Legacy M2 heartbeat: replay the consumed body into the router.
+          const replay = Object.assign(Readable.from([Buffer.from(JSON.stringify(body))]), {
+            headers: req.headers,
+            method: req.method,
+            url: req.url,
+            socket: req.socket,
+          });
+          await internalRouter.handle({ req: replay, res, method, pathname, url });
+          return;
         }
         await internalRouter.handle({ req, res, method, pathname, url });
         return;

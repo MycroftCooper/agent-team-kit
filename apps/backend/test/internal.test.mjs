@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { validateErrorBody } from "@atk/contracts";
+import { validateErrorBody, validateTaskExecutionSpec } from "@atk/contracts";
 
 import { createServer } from "../src/server.mjs";
 import { createFakeStore } from "./fake-store.mjs";
@@ -56,6 +56,9 @@ function createScenario({ enqueue = true } = {}) {
     ],
     agents: [{ id: "agent-1", role: "BE", capabilities: ["WORKER"], status: "IDLE" }],
   });
+  // M6.2 F05: a Run is dispatched with a frozen spec, so freeze one first; the
+  // fake store binds it to the Run created next (like the real store does).
+  store.freezeTaskSpec("TASK-1", { workspace: { kind: "none" } });
   const run = store.createRun({ id: "RUN-1", taskId: "TASK-1", agentId: "agent-1", function: "WORKER", attempt: 1 });
   if (enqueue) {
     store.enqueueDispatchCommand({
@@ -1372,5 +1375,270 @@ test("F12: /events pagination rejects malformed afterSeq/limit by field; interna
   });
   assert.equal(reconciled.status, 200, reconciled.text);
   assert.deepEqual(Object.keys(reconciled.json).sort(), ["lease", "run", "sessions"]);
+});
+
+// ---------------------------------------------------------------------------
+// M6.2 F05/F10 (phase A reproducers; expected RED before the fix)
+// ---------------------------------------------------------------------------
+
+function claimableScenario() {
+  return createFakeStore({
+    projects: [{ id: "P-1", name: "Demo", repoPath: "C:\\repo", defaultBranch: "main" }],
+    tasks: [
+      {
+        id: "TASK-1",
+        projectId: "P-1",
+        title: "Do work",
+        description: "d",
+        functionRequired: "WORKER",
+        roleRequired: "BE",
+        priority: 2,
+        deps: [],
+        status: "READY",
+        version: 0,
+      },
+    ],
+    agents: [{ id: "agent-1", role: "BE", capabilities: ["WORKER"], status: "IDLE" }],
+  });
+}
+
+async function startClaimable(t) {
+  const store = claimableScenario();
+  const { server, base } = await startServer({ store });
+  t.after(() => server.close());
+  const claim = (idempotencyKey = "m62-claim-1") =>
+    request(base, {
+      method: "POST",
+      path: "/internal/v1/tasks/TASK-1/claim",
+      headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+      body: { agentId: "agent-1", expectedTaskVersion: 0, idempotencyKey },
+    });
+  return { store, base, claim };
+}
+
+test("F05: task claim carries a validated frozen spec and replays the same specHash", async (t) => {
+  const { store, claim } = await startClaimable(t);
+
+  const first = await claim();
+  assert.equal(first.status, 200, first.text);
+  assert.equal(typeof first.json.command.specHash, "string");
+  assert.match(first.json.command.specHash, /^[0-9a-f]{64}$/);
+  assert.deepEqual(validateTaskExecutionSpec(first.json.command.spec), { ok: true, errors: [] });
+  assert.equal(first.json.command.spec.taskId, "TASK-1");
+  assert.equal(first.json.command.spec.workspace.kind, "none");
+
+  const replay = await claim();
+  assert.equal(replay.status, 200, replay.text);
+  assert.equal(replay.json.command.specHash, first.json.command.specHash, "a replay must not re-freeze a different spec");
+  assert.equal(replay.json.command.id, first.json.command.id);
+
+  // A durable replay (fresh Backend process / empty idempotency cache) must
+  // still answer the ORIGINAL Run-bound spec: the facade may freeze a new
+  // pending spec on replay, but the Run-bound one is authoritative.
+  const restarted = await startServer({ store });
+  t.after(() => restarted.server.close());
+  await delay(5);
+  const delayed = await request(restarted.base, {
+    method: "POST",
+    path: "/internal/v1/tasks/TASK-1/claim",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    body: { agentId: "agent-1", expectedTaskVersion: 0, idempotencyKey: "m62-claim-1" },
+  });
+  assert.equal(delayed.status, 200, delayed.text);
+  assert.equal(delayed.json.command.specHash, first.json.command.specHash, "delayed replay keeps the original specHash");
+  assert.deepEqual(delayed.json.command.spec, first.json.command.spec);
+});
+
+test("F05: a claim that cannot freeze a valid spec is a 500 and sends no partial command", async (t) => {
+  const store = claimableScenario();
+  delete store.freezeTaskSpec;
+  const { server, base } = await startServer({ store });
+  t.after(() => server.close());
+
+  const res = await request(base, {
+    method: "POST",
+    path: "/internal/v1/tasks/TASK-1/claim",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    body: { agentId: "agent-1", expectedTaskVersion: 0, idempotencyKey: "m62-no-spec" },
+  });
+
+  assertErrorEnvelope(res, "INTERNAL_ERROR", 500);
+  assert.equal(store.getTask("TASK-1").status, "READY", "no partial claim may be written");
+  assert.deepEqual(store._listDispatchCommands(), []);
+});
+
+test("F05: GET /runs/:id/spec serves the frozen spec and 404s with spec-not-frozen", async (t) => {
+  const { base, claim } = await startClaimable(t);
+  const claimed = await claim();
+  assert.equal(claimed.status, 200, claimed.text);
+  const runId = claimed.json.run.id;
+
+  const spec = await request(base, {
+    path: `/internal/v1/runs/${runId}/spec`,
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+  });
+  assert.equal(spec.status, 200, spec.text);
+  assert.deepEqual(Object.keys(spec.json).sort(), ["frozenAt", "spec", "specHash", "taskId", "taskVersion"]);
+  assert.equal(spec.json.specHash, claimed.json.command.specHash);
+
+  const runtime = await request(base, {
+    path: `/internal/v1/runs/${runId}/spec`,
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host"),
+  });
+  assert.equal(runtime.status, 200, runtime.text);
+
+  const forbidden = await request(base, {
+    path: `/internal/v1/runs/${runId}/spec`,
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "user-action"),
+  });
+  assertErrorEnvelope(forbidden, "NOT_AUTHORIZED", 403);
+  assert.equal(forbidden.json.error.details.reason, "internal-role-forbidden");
+
+  const missing = await request(base, {
+    path: "/internal/v1/runs/RUN-NOPE/spec",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+  });
+  assertErrorEnvelope(missing, "NOT_FOUND", 404);
+  assert.equal(missing.json.error.details.reason, "spec-not-frozen");
+});
+
+test("F05: claim forwards the workspace and freezes it into the Run-bound spec", async (t) => {
+  const { base } = await startClaimable(t);
+  const workspace = {
+    kind: "worktree",
+    root: "C:\\wt\\TASK-1",
+    path: "C:\\wt\\TASK-1",
+    baseCommit: "a".repeat(40),
+    targetBranch: "feature/m62",
+  };
+  const res = await request(base, {
+    method: "POST",
+    path: "/internal/v1/tasks/TASK-1/claim",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+    body: { agentId: "agent-1", expectedTaskVersion: 0, idempotencyKey: "m62-workspace-1", workspace },
+  });
+
+  assert.equal(res.status, 200, res.text);
+  const runId = res.json.run.id;
+  assert.equal(res.json.run.workspace.kind, "worktree");
+  assert.equal(res.json.run.workspace.path, workspace.path);
+  assert.equal(res.json.run.workspace.baseCommit, workspace.baseCommit);
+  assert.equal(res.json.command.spec.workspace.kind, "worktree");
+  assert.equal(res.json.command.spec.workspace.path, workspace.path);
+  assert.equal(res.json.command.spec.workspace.baseCommit, workspace.baseCommit);
+  assert.equal(res.json.command.payload.specHash, res.json.command.specHash);
+  assert.deepEqual(res.json.command.payload.spec, res.json.command.spec);
+
+  const specRes = await request(base, {
+    path: `/internal/v1/runs/${runId}/spec`,
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+  });
+  assert.equal(specRes.status, 200, specRes.text);
+  assert.equal(specRes.json.specHash, res.json.command.specHash);
+  assert.equal(specRes.json.spec.workspace.kind, "worktree");
+  assert.equal(specRes.json.spec.workspace.path, workspace.path);
+});
+
+test("F05: workspace shape errors are 400 naming the field (store validates worktree root)", async (t) => {
+  const { base } = await startClaimable(t);
+  const claimWith = (workspace) =>
+    request(base, {
+      method: "POST",
+      path: "/internal/v1/tasks/TASK-1/claim",
+      headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+      body: { agentId: "agent-1", expectedTaskVersion: 0, idempotencyKey: "m62-workspace-bad", workspace },
+    });
+
+  for (const [workspace, field] of [
+    [{ kind: "container" }, "workspace.kind"],
+    [{}, "workspace.kind"],
+    [{ kind: "worktree" }, "workspace.root"],
+    [{ kind: "worktree", root: "C:\\wt" }, "workspace.baseCommit"],
+  ]) {
+    const res = await claimWith(workspace);
+    assertErrorEnvelope(res, "VALIDATION_ERROR", 400);
+    assert.equal(res.json.error.details.field, field, JSON.stringify(workspace));
+  }
+});
+
+test("F10: runtime heartbeat records host/agents/capacity and rejects malformed fields", async (t) => {
+  const store = claimableScenario();
+  const { server, base } = await startServer({ store });
+  t.after(() => server.close());
+  const post = (body, role = "runtime-host") =>
+    request(base, {
+      method: "POST",
+      path: "/internal/v1/runtime/heartbeat",
+      headers: internalHeaders(TEST_INTERNAL_TOKEN, role),
+      body,
+    });
+
+  const ok = await post({ hostId: "host-1", agentIds: ["agent-1"], capacity: 2 });
+  assert.equal(ok.status, 200, ok.text);
+  assert.deepEqual(ok.json.agents.map((entry) => entry.agentId), ["agent-1"]);
+  assert.equal(ok.json.agents[0].available, true);
+  assert.equal(ok.json.agents[0].reason, "ok");
+  assert.equal(ok.json.hostId, "host-1");
+  assert.equal(ok.json.capacity, 2);
+  assert.equal(Number.isNaN(Date.parse(ok.json.at)), false);
+  const agent = store.listAgents().find((entry) => entry.id === "agent-1");
+  assert.equal(agent.hostId, "host-1");
+  assert.equal(agent.capacity, 2);
+  assert.equal(Number.isNaN(Date.parse(agent.lastHeartbeatAt)), false);
+  const availabilityView = await request(base, {
+    path: "/internal/v1/runtime/availability?agentId=agent-1",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "scheduler"),
+  });
+  assert.equal(availabilityView.status, 200, availabilityView.text);
+  assert.deepEqual(availabilityView.json, { agentId: "agent-1", available: true, reason: "ok" });
+
+  for (const [body, field] of [
+    [{ agentIds: ["agent-1"], capacity: 1 }, "hostId"],
+    [{ hostId: "host-1", agentIds: [], capacity: 1 }, "agentIds"],
+    [{ hostId: "host-1", agentIds: ["agent-1"], capacity: -1 }, "capacity"],
+  ]) {
+    const res = await post(body);
+    assertErrorEnvelope(res, "VALIDATION_ERROR", 400);
+    assert.equal(res.json.error.details.field, field, JSON.stringify(body));
+  }
+
+  const wrongRole = await post({ hostId: "host-1", agentIds: ["agent-1"], capacity: 2 }, "scheduler");
+  assertErrorEnvelope(wrongRole, "NOT_AUTHORIZED", 403);
+  assert.equal(wrongRole.json.error.details.reason, "internal-role-forbidden");
+});
+
+test("F10: runtime availability comes from heartbeats, not from status IDLE", async (t) => {
+  const store = claimableScenario();
+  const { server, base } = await startServer({ store });
+  t.after(() => server.close());
+  const availability = (agentId, role = "scheduler") =>
+    request(base, {
+      path: `/internal/v1/runtime/availability?agentId=${encodeURIComponent(agentId)}`,
+      headers: internalHeaders(TEST_INTERNAL_TOKEN, role),
+    });
+
+  const before = await availability("agent-1");
+  assert.equal(before.status, 200, before.text);
+  assert.deepEqual(before.json, { agentId: "agent-1", available: false, reason: "no-heartbeat" });
+
+  const heartbeat = await request(base, {
+    method: "POST",
+    path: "/internal/v1/runtime/heartbeat",
+    headers: internalHeaders(TEST_INTERNAL_TOKEN, "runtime-host"),
+    body: { hostId: "host-1", agentIds: ["agent-1"], capacity: 2 },
+  });
+  assert.equal(heartbeat.status, 200, heartbeat.text);
+
+  const after = await availability("agent-1");
+  assert.equal(after.status, 200, after.text);
+  assert.deepEqual(after.json, { agentId: "agent-1", available: true, reason: "ok" });
+
+  const unknown = await availability("agent-ghost");
+  assert.equal(unknown.status, 200, unknown.text);
+  assert.deepEqual(unknown.json, { agentId: "agent-ghost", available: false, reason: "no-heartbeat" });
+
+  const forbidden = await availability("agent-1", "runtime-host");
+  assertErrorEnvelope(forbidden, "NOT_AUTHORIZED", 403);
+  assert.equal(forbidden.json.error.details.reason, "internal-role-forbidden");
 });
 

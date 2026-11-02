@@ -36,6 +36,8 @@ export const INTERNAL_ROLE_MATRIX = Object.freeze([
   { method: "POST", pattern: /^\/internal\/v1\/runs\/[^/]+\/renew$/, roles: ["runtime-host"] },
   { method: "POST", pattern: /^\/internal\/v1\/runs\/[^/]+\/events$/, roles: ["runtime-host"] },
   { method: "GET", pattern: /^\/internal\/v1\/runs\/[^/]+\/reconcile$/, roles: ["runtime-host"] },
+  { method: "GET", pattern: /^\/internal\/v1\/runs\/[^/]+\/spec$/, roles: ["scheduler", "runtime-host"] },
+  { method: "GET", pattern: /^\/internal\/v1\/runtime\/availability$/, roles: ["scheduler"] },
   { method: "POST", pattern: /^\/internal\/v1\/runtime\/heartbeat$/, roles: ["runtime-host"] },
 ]);
 

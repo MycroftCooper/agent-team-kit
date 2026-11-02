@@ -6,7 +6,9 @@
 // - sync methods, plain JSON-serialisable values
 // - CAS on patchTask with `details.currentVersion`
 // - `_dropEventsBefore(seq)` simulates a pruned event log for the resync test
+import { createTaskExecutionSpec } from "@atk/contracts";
 import { createEvent, eventDedupeKey } from "@atk/contracts";
+import { createHash } from "node:crypto";
 
 const RUN_STATUSES = Object.freeze([
   "QUEUED",
@@ -49,6 +51,10 @@ export function createFakeStore(seed = {}) {
   const reviews = new Map();
   const approvals = new Map();
   const integrations = new Map();
+  /** M6.2 F05: pending task-level spec, and the spec bound to a Run. */
+  const pendingSpecs = new Map();
+  const runSpecs = new Map();
+  const DEFAULT_HEARTBEAT_TTL_MS = 30_000;
   const dispatchCommands = new Map();
   const leases = new Map();
   let events = [];
@@ -270,6 +276,13 @@ export function createFakeStore(seed = {}) {
         updatedAt: now,
       };
       runs.set(id, run);
+      // M6.2 F05: a run created after freezeTaskSpec binds the pending spec, so
+      // later Task edits cannot change what this Run executes.
+      const pending = pendingSpecs.get(run.taskId);
+      if (pending) {
+        pendingSpecs.delete(run.taskId);
+        runSpecs.set(id, clone(pending));
+      }
       const task = tasks.get(run.taskId);
       seq += 1;
       events.push(
@@ -710,6 +723,80 @@ export function createFakeStore(seed = {}) {
       return { run: clone(run), lease: clone(leases.get(runId) ?? null), sessions: [] };
     },
 
+    // ---- M6.2 F05: frozen Task Execution Spec ------------------------------
+    freezeTaskSpec(taskId, { now, workspace, constraints } = {}) {
+      const task = requireTask(taskId);
+      const project = projects.get(task.projectId);
+      if (!project) fail("NOT_FOUND", `project ${task.projectId} not found`, { entity: "project", id: task.projectId });
+      const frozenAt = typeof now === "string" && !Number.isNaN(Date.parse(now)) ? now : nowIso();
+      const spec = createTaskExecutionSpec({
+        task: clone(task),
+        project: clone(project),
+        workspace: workspace ?? { kind: "none", path: null, baseCommit: null, targetBranch: null },
+        constraints: constraints ?? {},
+        frozenAt,
+      });
+      const specHash = createHash("sha256").update(JSON.stringify(spec)).digest("hex");
+      pendingSpecs.set(taskId, { taskId, taskVersion: spec.taskVersion, spec, specHash, frozenAt });
+      return { spec: clone(spec), specHash, frozenAt };
+    },
+    getRunSpec(runId) {
+      if (typeof runId !== "string" || runId.trim() === "") {
+        fail("VALIDATION_ERROR", "run.id is required", { field: "runId" });
+      }
+      const row = runSpecs.get(runId);
+      if (!row) fail("NOT_FOUND", `run "${runId}" has no frozen spec`, { runId, reason: "spec-not-frozen" });
+      return clone(row);
+    },
+
+    // ---- M6.2 F10: host heartbeat + availability (never derived from IDLE) --
+    recordHeartbeat({ hostId, agentIds, capacity, now } = {}) {
+      if (typeof hostId !== "string" || hostId.trim() === "") {
+        fail("VALIDATION_ERROR", "heartbeat.hostId is required", { field: "hostId" });
+      }
+      if (!Array.isArray(agentIds) || agentIds.length === 0) {
+        fail("VALIDATION_ERROR", "heartbeat.agentIds must be a non-empty array", { field: "agentIds" });
+      }
+      for (const agentId of agentIds) {
+        if (typeof agentId !== "string" || agentId.trim() === "") {
+          fail("VALIDATION_ERROR", "heartbeat.agentIds must contain agent ids", { field: "agentIds" });
+        }
+      }
+      if (!Number.isInteger(capacity) || capacity < 0) {
+        fail("VALIDATION_ERROR", "heartbeat.capacity must be a non-negative integer", { field: "capacity" });
+      }
+      const at = typeof now === "string" && !Number.isNaN(Date.parse(now)) ? now : nowIso();
+      for (const agentId of agentIds) {
+        const agent = agents.get(agentId);
+        if (!agent) fail("NOT_FOUND", `agent ${agentId} not found`, { entity: "agent", id: agentId });
+        agent.hostId = hostId;
+        agent.lastHeartbeatAt = at;
+        agent.capacity = capacity;
+        agent.updatedAt = at;
+      }
+      return { hostId, agentIds: [...agentIds], capacity, at };
+    },
+    agentAvailability({ agentId, now, ttlMs = DEFAULT_HEARTBEAT_TTL_MS } = {}) {
+      if (!Number.isInteger(ttlMs) || ttlMs <= 0) {
+        fail("VALIDATION_ERROR", "agentAvailability.ttlMs must be a positive integer", { ttlMs });
+      }
+      const at = typeof now === "string" && !Number.isNaN(Date.parse(now)) ? now : nowIso();
+      const candidates = agentId === undefined || agentId === null
+        ? [...agents.values()]
+        : [agents.get(agentId)].filter(Boolean);
+      if (candidates.length === 0) return { available: false, reason: "no-heartbeat" };
+      const withHeartbeat = candidates.filter((agent) => agent.lastHeartbeatAt !== undefined);
+      if (withHeartbeat.length === 0) return { available: false, reason: "no-heartbeat" };
+      const fresh = withHeartbeat.filter(
+        (agent) => Date.parse(agent.lastHeartbeatAt) + ttlMs >= Date.parse(at),
+      );
+      if (fresh.length === 0) return { available: false, reason: "stale-heartbeat" };
+      if (!fresh.some((agent) => Number(agent.capacity ?? 0) > 0)) {
+        return { available: false, reason: "no-capacity" };
+      }
+      return { available: true, reason: "ok" };
+    },
+
     // ---- M3: scheduling snapshot + atomic claim (m3-contracts §2) ----
     schedulingSnapshot() {
       return {
@@ -728,6 +815,7 @@ export function createFakeStore(seed = {}) {
       function: requiredFunction,
       role: requiredRole,
       workspacePolicy = null,
+      workspace = null,
       policies = null,
       idempotencyKey = null,
     } = {}) {
@@ -830,6 +918,42 @@ export function createFakeStore(seed = {}) {
         }
       }
 
+      // M6.2 F04/F05: validate the workspace and freeze the Run-bound spec in
+      // the same "transaction" as the claim (mirrors the real store).
+      let workspaceBinding = null;
+      if (workspace !== undefined && workspace !== null) {
+        if (!isPlainObject(workspace)) fail("VALIDATION_ERROR", "workspace must be an object", { field: "workspace" });
+        if (workspace.kind !== "worktree" && workspace.kind !== "none") {
+          fail("VALIDATION_ERROR", 'workspace.kind must be "worktree" or "none"', { field: "workspace.kind" });
+        }
+        if (workspace.kind === "worktree" && (typeof workspace.root !== "string" || workspace.root.trim() === "")) {
+          fail("VALIDATION_ERROR", "workspace.root is required for a worktree", { field: "workspace.root" });
+        }
+        workspaceBinding = {
+          kind: workspace.kind,
+          path: workspace.path ?? workspace.root ?? null,
+          baseCommit: workspace.baseCommit ?? null,
+          targetBranch: workspace.targetBranch ?? null,
+        };
+      }
+      const specWorkspace = workspaceBinding ?? { kind: "none", path: null, baseCommit: null, targetBranch: null };
+      if (specWorkspace.kind === "worktree" && (specWorkspace.path === null || specWorkspace.baseCommit === null)) {
+        fail("VALIDATION_ERROR", "a worktree workspace requires path and baseCommit", {
+          field: specWorkspace.path === null ? "workspace.path" : "workspace.baseCommit",
+        });
+      }
+      const project = projects.get(task.projectId);
+      if (!project) fail("NOT_FOUND", `project ${task.projectId} not found`, { entity: "project", id: task.projectId });
+      const frozenAt = nowIso();
+      const frozenSpec = createTaskExecutionSpec({
+        task: clone(task),
+        project: clone(project),
+        workspace: specWorkspace,
+        constraints: {},
+        frozenAt,
+      });
+      const frozenSpecHash = createHash("sha256").update(JSON.stringify(frozenSpec)).digest("hex");
+
       // Atomic commit (the fake is synchronous, so the whole block is "one transaction").
       const previousStatus = task.status;
       task.status = "CLAIMED";
@@ -852,9 +976,13 @@ export function createFakeStore(seed = {}) {
         createdAt: now,
         updatedAt: now,
         ...(workspacePolicy ? { workspacePolicy: clone(workspacePolicy) } : {}),
+        ...(workspaceBinding ? { workspace: clone(workspaceBinding) } : {}),
         ...(candidateFiles.length > 0 ? { files: clone(candidateFiles) } : {}),
       };
       runs.set(runId, run);
+      // The claim transaction freezes the spec and binds it to the new Run.
+      pendingSpecs.delete(taskId);
+      runSpecs.set(runId, clone({ taskId, taskVersion: frozenSpec.taskVersion, spec: frozenSpec, specHash: frozenSpecHash, frozenAt }));
       seq += 1;
       events.push(
         createEvent({
@@ -882,7 +1010,12 @@ export function createFakeStore(seed = {}) {
         runId,
         taskId,
         commandType: "RUN_TASK",
-        payload: { taskId, agentId, workspacePolicy: workspacePolicy ? clone(workspacePolicy) : null },
+        payload: {
+          taskId,
+          agentId,
+          workspacePolicy: workspacePolicy ? clone(workspacePolicy) : null,
+          ...(workspaceBinding ? { workspace: clone(workspaceBinding) } : {}),
+        },
         idempotencyKey,
         status: "PENDING",
         ownerId: null,

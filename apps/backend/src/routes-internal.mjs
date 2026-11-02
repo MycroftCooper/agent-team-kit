@@ -5,7 +5,7 @@
 // `x-atk-token`. The Backend is the single writer: handlers translate Host
 // reports into persisted events + Run transitions, then wake the SSE hub so the
 // browser sees real business events instead of just keep-alives.
-import { ID_RE, ApiError, createEvent, isEnumValue } from "@atk/contracts";
+import { ID_RE, ApiError, createEvent, isEnumValue, validateTaskExecutionSpec } from "@atk/contracts";
 
 import { normalizeLease, requiredInternalRoles, checkInternalRole, INTERNAL_ROLE_HEADER } from "./internal.mjs";
 import { isPlainObject, parseIntegerParam, queryString, requireJsonBody, sendJson } from "./http.mjs";
@@ -50,7 +50,9 @@ const ROUTES = [
   { name: "runs.renew", method: "POST", regex: /^\/internal\/v1\/runs\/([^/]+)\/renew$/, keys: ["id"] },
   { name: "runs.events", method: "POST", regex: /^\/internal\/v1\/runs\/([^/]+)\/events$/, keys: ["id"] },
   { name: "runtime.heartbeat", method: "POST", regex: /^\/internal\/v1\/runtime\/heartbeat$/, keys: [] },
+  { name: "runtime.availability", method: "GET", regex: /^\/internal\/v1\/runtime\/availability$/, keys: [] },
   { name: "runs.reconcile", method: "GET", regex: /^\/internal\/v1\/runs\/([^/]+)\/reconcile$/, keys: ["id"] },
+  { name: "runs.spec", method: "GET", regex: /^\/internal\/v1\/runs\/([^/]+)\/spec$/, keys: ["id"] },
   { name: "scheduling.snapshot", method: "GET", regex: /^\/internal\/v1\/scheduling\/snapshot$/, keys: [] },
   { name: "tasks.claim", method: "POST", regex: /^\/internal\/v1\/tasks\/([^/]+)\/claim$/, keys: ["id"] },
   { name: "tasks.integration", method: "POST", regex: /^\/internal\/v1\/tasks\/([^/]+)\/integration$/, keys: ["id"] },
@@ -59,6 +61,11 @@ const ROUTES = [
 
 function validationError(message, errors) {
   return new ApiError("VALIDATION_ERROR", message, { details: { errors } });
+}
+
+/** 400 that names the offending request field (m6.2 claim.workspace contract). */
+function fieldValidationError(message, field) {
+  return new ApiError("VALIDATION_ERROR", message, { details: { field, errors: [message] } });
 }
 
 /**
@@ -512,12 +519,34 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
       if (!isPlainObject(body.workspacePolicy)) throw validationError("invalid task claim", ["workspacePolicy must be an object"]);
       workspacePolicy = body.workspacePolicy;
     }
+    // M6.2 F04/F05: the workspace the Run will execute in travels with the claim
+    // and is frozen into the spec by the store's claim transaction. Only shape /
+    // enum checks happen here; deeper validation (worktree root) is the store's.
+    let workspace;
+    if (body.workspace !== undefined && body.workspace !== null) {
+      if (!isPlainObject(body.workspace)) {
+        throw fieldValidationError("workspace must be an object", "workspace");
+      }
+      if (body.workspace.kind !== "worktree" && body.workspace.kind !== "none") {
+        throw fieldValidationError('workspace.kind must be "worktree" or "none"', "workspace.kind");
+      }
+      workspace = { kind: body.workspace.kind };
+      for (const field of ["root", "path", "baseCommit", "targetBranch"]) {
+        const value = body.workspace[field];
+        if (value === undefined || value === null) continue;
+        if (typeof value !== "string" || value.trim() === "") {
+          throw fieldValidationError(`workspace.${field} must be a non-empty string when present`, `workspace.${field}`);
+        }
+        workspace[field] = value;
+      }
+    }
     return {
       agentId,
       expectedTaskVersion,
       requestedFunction,
       requestedRole,
       workspacePolicy,
+      workspace,
       policies: parseClaimPolicies(body),
       idempotencyKey: body.idempotencyKey,
     };
@@ -650,6 +679,38 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
     while (claimIdempotency.size > CLAIM_IDEMPOTENCY_LIMIT) {
       claimIdempotency.delete(claimIdempotency.keys().next().value);
     }
+  }
+
+  /**
+   * M6.2 F05: the createServer facade (server.mjs, WP1) freezes the spec and
+   * passes its hash into `store.claimTask`; the Run is the authority for what
+   * was frozen. This route validates and serves that Run-bound spec, so a replay
+   * always answers the original specHash instead of freezing a new one.
+   */
+  function assertSpecSupport() {
+    if (typeof store.freezeTaskSpec !== "function" || typeof store.getRunSpec !== "function") {
+      logger?.error?.("[atk] store has no M6.2 spec API; refusing to dispatch without a spec");
+      throw new ApiError("INTERNAL_ERROR", "frozen task execution spec is unavailable");
+    }
+  }
+
+  /** Attach the Run-bound frozen spec to the command a Host is about to execute. */
+  function withFrozenSpec(result, frozen) {
+    let record = frozen;
+    if (!record) {
+      try {
+        record = store.getRunSpec(result.run.id);
+      } catch (error) {
+        logger?.error?.(`[atk] failed to read the frozen run spec: ${error?.message ?? error}`);
+        throw new ApiError("INTERNAL_ERROR", "frozen task execution spec is unavailable");
+      }
+    }
+    const check = validateTaskExecutionSpec(record?.spec);
+    if (!check.ok) {
+      logger?.error?.(`[atk] frozen run spec is invalid: ${check.errors.join("; ")}`);
+      throw new ApiError("INTERNAL_ERROR", "frozen task execution spec is invalid");
+    }
+    return { ...result, command: { ...result.command, specHash: record.specHash, spec: record.spec } };
   }
 
 
@@ -918,6 +979,50 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
         return;
       }
 
+      case "runs.spec": {
+        // M6.2 F05: the frozen Task Execution Spec a Run is executing. It never
+        // follows later Task edits, which is the point of freezing it.
+        if (typeof store.getRunSpec !== "function") {
+          logger?.error?.("[atk] store.getRunSpec is unavailable");
+          throw new ApiError("INTERNAL_ERROR", "frozen task execution spec is unavailable");
+        }
+        const runSpec = store.getRunSpec(params.id);
+        const specCheck = validateTaskExecutionSpec(runSpec?.spec);
+        if (!specCheck.ok) {
+          logger?.error?.(`[atk] stored run spec is invalid: ${specCheck.errors.join("; ")}`);
+          throw new ApiError("INTERNAL_ERROR", "stored task execution spec is invalid");
+        }
+        sendJson(res, 200, {
+          spec: runSpec.spec,
+          specHash: runSpec.specHash,
+          frozenAt: runSpec.frozenAt,
+          taskId: runSpec.taskId,
+          taskVersion: runSpec.taskVersion,
+        });
+        return;
+      }
+
+      case "runtime.availability": {
+        // M6.2 F10: dispatchability comes from a fresh heartbeat + capacity, not
+        // from `agent.status === "IDLE"`. Query is optional: no agentId = the
+        // project-wide availability gate.
+        const agentId = queryString(url.searchParams, "agentId");
+        if (agentId !== undefined && agentId.trim() === "") {
+          throw validationError("invalid availability query", ["agentId must be a non-empty string when present"]);
+        }
+        const ttlMs = parseIntegerParam(url.searchParams, "ttlMs", { min: 1, max: 86_400_000 });
+        if (typeof store.agentAvailability !== "function") {
+          logger?.error?.("[atk] store.agentAvailability is unavailable");
+          throw new ApiError("INTERNAL_ERROR", "runtime availability store method is unavailable");
+        }
+        const availability = store.agentAvailability({
+          ...(agentId === undefined ? {} : { agentId }),
+          ...(ttlMs === undefined ? {} : { ttlMs }),
+        });
+        sendJson(res, 200, { agentId: agentId ?? null, ...availability });
+        return;
+      }
+
       case "scheduling.snapshot": {
         sendJson(res, 200, buildSchedulingSnapshot());
         return;
@@ -947,6 +1052,10 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
         // 404 first: a missing Task is NOT_FOUND, not a claim conflict.
         const task = store.getTask(taskId);
 
+        // M6.2 F05: a Host must never receive a command without a frozen spec,
+        // so refuse early on stores that cannot provide one (no partial claim).
+        assertSpecSupport();
+
         // B6: durable idempotency before the contract-layer "claimable" checks.
         // After a Backend restart the in-process map is empty and the Task is
         // already CLAIMED, so those checks would answer 409 before the store can
@@ -963,17 +1072,19 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
               function: request.requestedFunction,
               role: request.requestedRole,
               workspacePolicy: request.workspacePolicy,
+              workspace: request.workspace,
               policies: request.policies,
               idempotencyKey: request.idempotencyKey,
             });
             if (isPlainObject(replayed) && replayed.run && replayed.command && replayed.task) {
-              rememberClaim(request.idempotencyKey, replayed);
+              const replayedWithSpec = withFrozenSpec(replayed);
+              rememberClaim(request.idempotencyKey, replayedWithSpec);
               try {
                 hub?.pump?.();
               } catch (error) {
                 logger?.error?.(`[atk] SSE pump failed after replayed claim: ${error?.message ?? error}`);
               }
-              sendJson(res, 200, replayed);
+              sendJson(res, 200, replayedWithSpec);
               return;
             }
           } catch {
@@ -1007,6 +1118,7 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
           function: effective.function,
           role: effective.role,
           workspacePolicy: request.workspacePolicy,
+          workspace: request.workspace,
           policies: request.policies,
           idempotencyKey: request.idempotencyKey,
         });
@@ -1015,13 +1127,14 @@ export function createInternalRouter({ store, hub, now = () => Date.now(), logge
           throw new ApiError("INTERNAL_ERROR", "atomic claim returned an incomplete result");
         }
 
-        rememberClaim(request.idempotencyKey, result);
+        const claimedWithSpec = withFrozenSpec(result);
+        rememberClaim(request.idempotencyKey, claimedWithSpec);
         try {
           hub?.pump?.();
         } catch (error) {
           logger?.error?.(`[atk] SSE pump failed after claim: ${error?.message ?? error}`);
         }
-        sendJson(res, 200, result);
+        sendJson(res, 200, claimedWithSpec);
         return;
       }
 

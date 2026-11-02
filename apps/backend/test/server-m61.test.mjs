@@ -534,3 +534,45 @@ test("F06 real SQLite: producer is review.runId, self-review 403 and unknown pro
   assert.equal(noProducer.json.error.code, "VALIDATION_ERROR");
   assert.equal(noProducer.json.error.details.reason, "review-run-unknown");
 });
+
+test("F12 real SQLite: events response exposes the retained earliestSeq", async (t) => {
+  const { openStore } = await import(
+    pathToFileURL(path.join(import.meta.dirname, "..", "..", "..", "packages", "database", "src", "index.mjs")).href
+  );
+  const { DatabaseSync } = await import("node:sqlite");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "atk-m61-earliest-"));
+  const file = path.join(dir, "atk.db");
+  const store = openStore({ file, migrate: true });
+  store.createProject({ id: "P-1", name: "P", repoPath: ".", defaultBranch: "main" });
+  const ctx = await startServer({ store });
+  t.after(async () => {
+    await ctx.server.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  const empty = await request(ctx.base, { path: "/api/v1/events", headers: readHeaders() });
+  assert.equal(empty.status, 200, empty.text);
+  assert.equal(empty.json.earliestSeq, null, "an empty log has no retained seq");
+  assert.equal(empty.json.items.length, 0);
+
+  for (let index = 0; index < 3; index += 1) {
+    store.appendEvent({ projectId: "P-1", aggregateType: "task", aggregateId: "T-1", type: "task.updated", payload: { index } });
+  }
+  const before = await request(ctx.base, { path: "/api/v1/events", headers: readHeaders() });
+  assert.equal(before.json.earliestSeq, 1);
+  assert.deepEqual(before.json.items.map((event) => event.seq), [1, 2, 3]);
+
+  // Simulate retention trimming and prove the metadata moves with it.
+  const raw = new DatabaseSync(file);
+  raw.prepare("DELETE FROM events WHERE seq < 3").run();
+  raw.close();
+  const trimmed = await request(ctx.base, { path: "/api/v1/events", headers: readHeaders() });
+  assert.equal(trimmed.json.earliestSeq, 3, "earliestSeq is the smallest RETAINED seq");
+  assert.deepEqual(trimmed.json.items.map((event) => event.seq), [3]);
+  // It is global metadata, not the filtered page's first seq: a filter with no
+  // matches still reports the retained floor.
+  const filtered = await request(ctx.base, { path: "/api/v1/events?aggregateId=T-NOPE", headers: readHeaders() });
+  assert.equal(filtered.json.items.length, 0);
+  assert.equal(filtered.json.earliestSeq, 3);
+});
