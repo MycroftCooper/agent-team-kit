@@ -20,6 +20,10 @@ export function RunTimeline({
   loading,
   failure,
   truncated,
+  incomplete,
+  prunedEvents,
+  earliestSeq,
+  catchingUp,
   connection,
   onRetry,
 }: {
@@ -27,6 +31,10 @@ export function RunTimeline({
   loading: boolean;
   failure: ApiFailure | null;
   truncated: boolean;
+  incomplete: boolean;
+  prunedEvents: number | null;
+  earliestSeq: number | null;
+  catchingUp: boolean;
   connection: ConnectionState;
   onRetry: () => void;
 }) {
@@ -58,8 +66,22 @@ export function RunTimeline({
           {t(notice.key)}
         </p>
       ) : null}
-      {truncated ? (
-        <p className="muted" data-testid="timeline-truncated">
+      {catchingUp ? (
+        <p className="notice" role="status" data-testid="timeline-filling">
+          {t("runs.timelineFilling")}
+        </p>
+      ) : null}
+      {/* Exactly one history warning: exact (earliestSeq) > heuristic > page-cap truncation. */}
+      {prunedEvents !== null ? (
+        <p className="notice notice--danger" role="alert" data-testid="timeline-history-incomplete" data-exact="true">
+          {t("runs.timelineHistoryIncompleteExact", { n: prunedEvents, earliestSeq: earliestSeq ?? prunedEvents + 1 })}
+        </p>
+      ) : incomplete ? (
+        <p className="notice notice--danger" role="alert" data-testid="timeline-history-incomplete">
+          {t("runs.timelineHistoryIncomplete")}
+        </p>
+      ) : truncated ? (
+        <p className="notice notice--danger" role="alert" data-testid="timeline-truncated">
           {t("runs.timelineTruncated", { n: entries.length })}
         </p>
       ) : null}

@@ -1,5 +1,11 @@
-// Pure logic for the M5 Runs pages: list ordering, id/time formatting, and the
-// event timeline (snapshot + live SSE frames, ordered by seq and deduplicated).
+// F12 (M6.2): the Run timeline is fetched per aggregate from the server
+// (`GET /events?aggregateId=<runId>&limit=&afterSeq=`). The old global-log scan
+// (page everything, filter in the browser) is gone — it silently truncated once
+// the log outgrew the page budget.
+//
+// The same module still merges the history with live SSE frames: ordered by seq,
+// de-duplicated by seq only (never by (type, happenedAt) — two different events
+// can share a type and a timestamp).
 //
 // No React, no DOM, no fetch — everything here is covered by node:test.
 import type { AtkEvent, Run } from "../api/types.ts";
@@ -20,10 +26,10 @@ export type TimelineFrame = {
   data?: unknown;
 };
 
-/** The events endpoint caps `limit` at 1000 (backend `parseIntegerParam`). */
-export const EVENTS_PAGE_SIZE = 1000;
-/** Bounded history walk: 5 pages = 5000 events, enough for any realistic run. */
-export const EVENTS_MAX_PAGES = 5;
+/** The events endpoint caps `limit` at 1000; 500 keeps per-run pages cheap. */
+export const RUN_EVENTS_PAGE_LIMIT = 500;
+/** Safety net for a runaway pagination loop (a single run should never hit it). */
+export const RUN_EVENTS_MAX_PAGES = 20;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -51,7 +57,10 @@ export function belongsToRun(event: Pick<AtkEvent, "aggregateId" | "payload"> | 
 }
 
 export function frameBelongsToRun(frame: TimelineFrame, runId: string): boolean {
-  return payloadRunId(frame.data) === runId;
+  const payload = payloadOf(frame.data);
+  // SSE frames carry the event payload only; `runId` is the M5 field and
+  // `aggregateId` is accepted defensively for newer/relayed frames.
+  return payloadRunId(payload) === runId || readString(payload, "aggregateId") === runId;
 }
 
 function seqOf(value: unknown): number | null {
@@ -206,29 +215,192 @@ export function runDurationMs(run: Pick<Run, "startedAt" | "endedAt"> | null | u
   return ended - started;
 }
 
-// ------------------------------------------------------------------ fetching ---
+// ------------------------------------------------------ per-run event history ---
 
-/** `GET /events` paging: the endpoint filters by `afterSeq`, not by aggregate. */
-export function buildEventsQuery(afterSeq: number | null, limit = EVENTS_PAGE_SIZE): string {
-  const params = new URLSearchParams({ limit: String(limit) });
+/** One aggregate-filtered page (`GET /events?aggregateId=…`). */
+export type RunEventPage = {
+  items?: AtkEvent[];
+  hasMore?: boolean;
+  nextAfterSeq?: number | null;
+  /**
+   * Optional WP1/M6.2 field: the global oldest retained seq (null on an empty db).
+   * When present the history warning becomes exact instead of heuristic.
+   */
+  earliestSeq?: number | null;
+};
+
+export type RunHistory = {
+  items: AtkEvent[];
+  pages: number;
+  /** The page cap stopped us while the server still had more. */
+  truncated: boolean;
+  /** Earlier events for this run are gone (heuristic or exact `earliestSeq`). */
+  incomplete: boolean;
+  /** Global number of pruned events, when the server confirmed pruning. */
+  prunedEvents: number | null;
+  /** Global oldest retained seq from the server (null = empty db / older backend). */
+  earliestSeq: number | null;
+  /** True when the warning is driven by the exact `earliestSeq` instead of the heuristic. */
+  exact: boolean;
+  nextAfterSeq: number | null;
+};
+
+/** Build the per-aggregate page query; `afterSeq` is the resume cursor. */
+export function buildRunEventsQuery(input: { runId: string; afterSeq?: number | null; limit?: number }): string {
+  const params = new URLSearchParams();
+  params.set("aggregateId", input.runId);
+  params.set("limit", String(input.limit ?? RUN_EVENTS_PAGE_LIMIT));
+  const afterSeq = input.afterSeq ?? null;
   if (typeof afterSeq === "number" && Number.isInteger(afterSeq) && afterSeq >= 0) {
     params.set("afterSeq", String(afterSeq));
   }
   return `/events?${params.toString()}`;
 }
 
+function eventSeq(event: AtkEvent): number | null {
+  return typeof event.seq === "number" && Number.isInteger(event.seq) && event.seq >= 1 ? event.seq : null;
+}
+
 /**
- * Decide whether another events page is worth requesting. `truncated` means the
- * page cap stopped us while a full page was returned (older events exist).
+ * Decide whether the timeline is incomplete. Two data sources drive this:
+ *
+ *  1. exact (WP1 M6.2): `earliestSeq` is the global oldest retained seq.
+ *     `earliestSeq != null && earliestSeq > firstReturnedSeq - 1` means the
+ *     server pruned events before the first one we received; `prunedEvents` then
+ *     reports how many (earliestSeq - 1). Empty timelines never trigger it.
+ *  2. heuristic fallback (older backend / missing created event): a run's first
+ *     persisted event is `run.created`; anything else is a second signal.
+ *
+ * Only one warning is shown: the exact one wins when both fire.
  */
-export function planNextEventsPage(input: { count: number; limit: number; pageIndex: number; maxPages: number }): {
-  hasMore: boolean;
+export function detectHistoryGap(input: {
+  entries: readonly TimelineEntry[];
   truncated: boolean;
-} {
-  const limit = Math.max(1, Math.floor(input.limit));
-  const fullPage = input.count >= limit;
-  const hasMore = fullPage && input.pageIndex + 1 < input.maxPages;
-  return { hasMore, truncated: fullPage && !hasMore };
+  earliestSeq?: number | null;
+}): { incomplete: boolean; truncated: boolean; prunedEvents: number | null; exact: boolean } {
+  const first = input.entries[0] ?? null;
+  const firstSeq = first === null ? null : first.seq;
+  const missingCreated = first !== null && first.type !== "run.created";
+
+  const earliestSeq = input.earliestSeq ?? null;
+  const knownEarliest =
+    typeof earliestSeq === "number" && Number.isInteger(earliestSeq) && earliestSeq > 1 ? earliestSeq : null;
+
+  // Lead's precise rule: the first retained event is at or after the pruning
+  // point, so events before it were deleted server-side.
+  const exactPruned = knownEarliest !== null && firstSeq !== null && knownEarliest > firstSeq - 1;
+  const prunedEvents = exactPruned && knownEarliest !== null ? knownEarliest - 1 : null;
+
+  return {
+    incomplete: prunedEvents !== null || missingCreated,
+    truncated: Boolean(input.truncated),
+    prunedEvents,
+    exact: prunedEvents !== null,
+  };
+}
+
+/** Which warning the timeline must show; the caller only ever renders one. */
+export function historyWarningKey(input: {
+  prunedEvents: number | null;
+  incomplete: boolean;
+  truncated: boolean;
+}): MessageKey | null {
+  if (input.prunedEvents !== null) return "runs.timelineHistoryIncompleteExact";
+  if (input.incomplete) return "runs.timelineHistoryIncomplete";
+  if (input.truncated) return "runs.timelineTruncated";
+  return null;
+}
+
+/**
+ * Gap filling is shown only when a timeline is already on screen and the data is
+ * being caught up — an initial load has its own loading state, and an empty
+ * timeline must not flash a "catching up" banner.
+ */
+export function isCatchingUp(input: {
+  loading: boolean;
+  connection: string | null | undefined;
+  entryCount: number;
+}): boolean {
+  if (input.entryCount <= 0) return false;
+  if (input.loading) return true;
+  return input.connection === "resyncing" || input.connection === "reconnecting" || input.connection === "connecting";
+}
+
+/**
+ * Walk the aggregate-filtered pages for one run:
+ *  * every request carries `aggregateId`, so the browser never pages the global log;
+ *  * `afterSeq` advances by `nextAfterSeq` (or the last seq of the page);
+ *  * entries are de-duplicated by seq and returned in ascending order;
+ *  * `truncated` is raised when the page cap stops us although the server still
+ *    has more — the UI then warns instead of pretending the history is complete.
+ */
+export async function loadRunHistory(input: {
+  runId: string;
+  fetchPage: (query: string) => Promise<RunEventPage | null | undefined>;
+  limit?: number;
+  maxPages?: number;
+}): Promise<RunHistory> {
+  const limit = Math.max(1, Math.floor(input.limit ?? RUN_EVENTS_PAGE_LIMIT));
+  const maxPages = Math.max(1, Math.floor(input.maxPages ?? RUN_EVENTS_MAX_PAGES));
+  const bySeq = new Map<number, AtkEvent>();
+
+  let afterSeq: number | null = null;
+  let pages = 0;
+  let serverHasMore = false;
+  let earliestSeq: number | null = null;
+
+  for (;;) {
+    if (pages >= maxPages) break;
+    const query = buildRunEventsQuery({ runId: input.runId, afterSeq, limit });
+    const page = await input.fetchPage(query);
+    pages += 1;
+
+    const pageItems = Array.isArray(page?.items) ? page.items : [];
+    for (const event of pageItems) {
+      if (!belongsToRun(event, input.runId)) continue;
+      const seq = eventSeq(event);
+      if (seq === null) continue;
+      if (!bySeq.has(seq)) bySeq.set(seq, event);
+    }
+    if (typeof page?.earliestSeq === "number" && Number.isInteger(page.earliestSeq) && page.earliestSeq >= 0) {
+      earliestSeq = page.earliestSeq;
+    }
+    if (pageItems.length === 0) {
+      serverHasMore = false;
+      break;
+    }
+
+    const lastSeq = pageItems.reduce<number | null>((last, event) => {
+      const seq = eventSeq(event);
+      if (seq === null) return last;
+      return last === null || seq > last ? seq : last;
+    }, null);
+    const cursor =
+      typeof page?.nextAfterSeq === "number" && Number.isInteger(page.nextAfterSeq) ? page.nextAfterSeq : lastSeq;
+    serverHasMore = page?.hasMore === true;
+
+    // A non-advancing cursor would loop forever; if the server still claims more,
+    // that is unrecoverable truncation and must be reported.
+    const advanced = cursor !== null && (afterSeq === null || cursor > afterSeq);
+    if (!advanced) break;
+    afterSeq = cursor;
+    if (!serverHasMore) break;
+  }
+
+  const items = [...bySeq.values()].sort((left, right) => Number(left.seq) - Number(right.seq));
+  const entries = items.map(eventToEntry).filter((entry): entry is TimelineEntry => entry !== null);
+  const gap = detectHistoryGap({ entries, truncated: serverHasMore, earliestSeq });
+
+  return {
+    items,
+    pages,
+    truncated: gap.truncated,
+    incomplete: gap.incomplete,
+    prunedEvents: gap.prunedEvents,
+    earliestSeq,
+    exact: gap.exact,
+    nextAfterSeq: afterSeq,
+  };
 }
 
 // ------------------------------------------------------------- payload views ---

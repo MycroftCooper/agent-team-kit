@@ -49,12 +49,11 @@ export function App() {
   const projects = useApi<{ items: Project[] }>("/projects", { refetchKey: resyncCount });
   const project = projects.data?.items?.[0] ?? null;
 
-  // After a gap the timeline is rebuilt from the snapshot; stale live frames would
-  // otherwise re-introduce the events the backend told us to discard.
-  useEffect(() => {
-    setStreamFrames([]);
-  }, [resyncCount]);
-
+  // Gap filling (F12): frames are NOT cleared on resync. The timeline refetches a
+  // fresh snapshot and merges by seq, so already-rendered rows stay on screen
+  // (no flash back) and duplicates collapse. Dropping the buffer here would make
+  // live rows disappear for the duration of the snapshot reload.
+  //
   // Keep the "resyncing" indicator for a moment after a gap was reported.
   useEffect(() => {
     if (resyncedAt === null) return;

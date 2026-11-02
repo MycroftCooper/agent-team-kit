@@ -3,19 +3,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { apiGet, resetSession } from "../src/api/client.ts";
 import {
-  EVENTS_MAX_PAGES,
-  EVENTS_PAGE_SIZE,
   belongsToRun,
-  buildEventsQuery,
+  buildRunEventsQuery,
   describeDuration,
   eventToEntry,
   frameBelongsToRun,
   frameToEntry,
   mergeTimeline,
   payloadRunId,
-  planNextEventsPage,
   runDurationMs,
   runLogFields,
   runStatusChange,
@@ -169,74 +165,16 @@ test("merging snapshot + live frames produces one ascending sequence without dup
   assert.equal(timelineLastSeq(merged), 3);
   assert.equal(timelineLastSeq([]), null);
 
-  // After a resync the live buffer is cleared; a stale replay of seq 2 must not
-  // re-append anything new.
+  // Gap filling refetches the snapshot and merges with the retained live buffer;
+  // a replay of seq 2 collapses onto the existing entry instead of duplicating.
   assert.equal(mergeTimeline(snapshot, []).length, 2);
 });
 
-test("events paging queries follow the endpoint contract", () => {
-  assert.equal(EVENTS_PAGE_SIZE, 1000);
-  assert.equal(EVENTS_MAX_PAGES, 5);
-  assert.equal(buildEventsQuery(null), "/events?limit=1000");
-  assert.equal(buildEventsQuery(41), "/events?limit=1000&afterSeq=41");
-  assert.equal(buildEventsQuery(41, 2), "/events?limit=2&afterSeq=41");
-  assert.equal(buildEventsQuery(-5), "/events?limit=1000", "invalid seq is not sent");
-});
-
-test("planNextEventsPage stops on a short page, at the page cap, or reports truncation", () => {
-  assert.deepEqual(planNextEventsPage({ count: 1000, limit: 1000, pageIndex: 0, maxPages: 5 }), { hasMore: true, truncated: false });
-  assert.deepEqual(planNextEventsPage({ count: 3, limit: 1000, pageIndex: 0, maxPages: 5 }), { hasMore: false, truncated: false });
-  assert.deepEqual(planNextEventsPage({ count: 1000, limit: 1000, pageIndex: 4, maxPages: 5 }), { hasMore: false, truncated: true });
-  assert.deepEqual(planNextEventsPage({ count: 0, limit: 1000, pageIndex: 0, maxPages: 5 }), { hasMore: false, truncated: false });
-});
-
-test("the history walk fetches pages through the real client (mocked transport)", async () => {
-  const calls = [];
-  const all = Array.from({ length: 5 }, (_, index) => EVENT(index + 1));
-  const original = globalThis.fetch;
-  globalThis.fetch = async (url) => {
-    calls.push(String(url));
-    if (String(url).endsWith("/api/v1/session")) {
-      return new Response(JSON.stringify({ token: "tok", csrf: "csrf" }), { status: 200 });
-    }
-    const parsed = new URL(String(url), "http://127.0.0.1");
-    const afterSeq = Number(parsed.searchParams.get("afterSeq") ?? 0);
-    const limit = Number(parsed.searchParams.get("limit") ?? 1000);
-    const items = all.filter((event) => event.seq > afterSeq).slice(0, limit);
-    return new Response(JSON.stringify({ items }), { status: 200, headers: { "content-type": "application/json" } });
-  };
-  resetSession();
-  try {
-    const limit = 2;
-    const collected = [];
-    let afterSeq = null;
-    let pageIndex = 0;
-    let hasMore = true;
-    let truncated = false;
-    while (hasMore) {
-      const page = await apiGet(buildEventsQuery(afterSeq, limit));
-      const pageItems = Array.isArray(page?.items) ? page.items : [];
-      collected.push(...pageItems);
-      afterSeq = pageItems[pageItems.length - 1]?.seq ?? afterSeq;
-      const plan = planNextEventsPage({ count: pageItems.length, limit, pageIndex, maxPages: 5 });
-      hasMore = plan.hasMore && pageItems.length > 0;
-      truncated = plan.truncated;
-      pageIndex += 1;
-    }
-    assert.deepEqual(
-      collected.map((event) => event.seq),
-      [1, 2, 3, 4, 5],
-    );
-    assert.equal(truncated, false);
-    assert.deepEqual(
-      calls.filter((call) => call.includes("/events")),
-      ["/api/v1/events?limit=2", "/api/v1/events?limit=2&afterSeq=2", "/api/v1/events?limit=2&afterSeq=4"],
-    );
-    assert.deepEqual(timelineFromEvents(collected, "RUN-1").map((entry) => entry.seq), [1, 2, 3, 4, 5]);
-  } finally {
-    globalThis.fetch = original;
-    resetSession();
-  }
+test("the per-run paging query is aggregate-filtered (F12 / M6.2)", () => {
+  // The global-log pagers were replaced by the aggregate-filtered loader; its
+  // full contract is covered by run-timeline-query.test.mjs.
+  assert.equal(typeof buildRunEventsQuery, "function");
+  assert.match(buildRunEventsQuery({ runId: "RUN-1" }), /^\/events\?aggregateId=RUN-1&limit=500$/);
 });
 
 test("reconnect notices map each connection state to a translated message", () => {

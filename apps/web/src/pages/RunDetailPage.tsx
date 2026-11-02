@@ -15,6 +15,7 @@ import { StatusBadge } from "../components/StatusBadge.tsx";
 import { describeError } from "../domain/errors.ts";
 import {
   describeDuration,
+  isCatchingUp,
   mergeTimeline,
   runDurationMs,
   timelineFromEvents,
@@ -38,11 +39,14 @@ export function RunDetailPage({
   const t = useT();
   const { lang } = useLang();
   const runState = useApi<Run>(`/runs/${encodeURIComponent(runId)}`, { refetchKey });
-  const eventsState = useRunEvents(refetchKey);
+  const eventsState = useRunEvents(runId, refetchKey);
 
   const snapshotEntries = useMemo(() => timelineFromEvents(eventsState.items, runId), [eventsState.items, runId]);
   const liveEntries = useMemo(() => timelineFromFrames(frames, runId), [frames, runId]);
   const timeline = useMemo(() => mergeTimeline(snapshotEntries, liveEntries), [snapshotEntries, liveEntries]);
+  // Gap filling keeps the already-rendered rows on screen and only says it is
+  // catching up (never a white flash while the snapshot is refetched).
+  const catchingUp = isCatchingUp({ loading: eventsState.loading, connection, entryCount: timeline.length });
 
   if (runState.error) {
     const descriptor = describeError(runState.error);
@@ -160,6 +164,10 @@ export function RunDetailPage({
         loading={eventsState.loading}
         failure={eventsState.error}
         truncated={eventsState.truncated}
+        incomplete={eventsState.incomplete}
+        prunedEvents={eventsState.prunedEvents}
+        earliestSeq={eventsState.earliestSeq}
+        catchingUp={catchingUp}
         connection={connection}
         onRetry={eventsState.refresh}
       />
