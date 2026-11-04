@@ -1,75 +1,43 @@
 {
   "name": "agent-team-kit",
-  "version": "0.2.0",
-  "description": "Reusable multi-agent delivery workflow: a state-machine CLI (atk), role contracts, evidence gates and a DeepSeek Harness kanban board plugin.",
-  "keywords": [
-    "agent",
-    "multi-agent",
-    "workflow",
-    "kanban",
-    "task-board",
-    "deepseek-harness",
-    "dsh",
-    "coding-agent",
-    "cli"
-  ],
+  "version": "2.0.0-alpha.1",
+  "description": "Local web workspace for human-approved plans and external pull-based agents.",
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=20.11"
+    "node": ">=24"
   },
   "bin": {
-    "atk": "bin/atk.mjs",
-    "agent-team-kit": "bin/atk.mjs"
-  },
-  "exports": {
-    ".": "./lib/index.mjs",
-    "./config": "./lib/config.mjs",
-    "./permissions": "./lib/permissions.mjs",
-    "./util": "./lib/util.mjs",
-    "./labels": "./lib/labels.mjs",
-    "./package.json": "./package.json"
+    "atk": "apps/launcher/cli.mjs",
+    "atk-agent": "apps/agent-cli/cli.mjs"
   },
   "files": [
-    "bin",
-    "lib",
-    "templates",
-    "presets",
-    "skills",
+    "apps/backend",
+    "apps/launcher",
+    "apps/agent-cli",
+    "apps/web/dist",
+    "packages",
     "docs",
-    "plugins",
-    "agent-flow.config.schema.json",
     "README.md",
     "README.zh-CN.md",
-    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
+    "start": "node apps/launcher/cli.mjs start",
+    "dev": "node apps/backend/cli.mjs serve",
     "test": "node scripts/test.mjs",
-    "test:workspace": "node scripts/test-workspace.mjs",
-    "boundaries": "node scripts/check-boundaries.mjs",
-    "web:build": "pnpm --filter @atk/web build",
-    "backend:start": "node apps/backend/cli.mjs serve",
-    "backend:migrate": "node apps/backend/cli.mjs migrate",
-    "selftest": "node scripts/test.mjs && node plugins/dsh-agent-board/selftest.mjs && node plugins/dsh-agent-board/selftest-client.mjs",
-    "plugin:selftest": "node plugins/dsh-agent-board/selftest.mjs && node plugins/dsh-agent-board/selftest-client.mjs",
-    "selfhost": "node scripts/selfhost.mjs",
-    "verify": "node scripts/selfhost-verify.mjs",
-    "board": "node bin/atk.mjs board",
-    "serve": "node bin/atk.mjs serve",
-    "check": "node --check bin/atk.mjs && node -e \"import('./lib/index.mjs')\""
+    "test:workspace": "node scripts/test.mjs",
+    "check": "node scripts/check-boundaries.mjs",
+    "web:build": "node scripts/build-web.mjs",
+    "build": "node scripts/build-web.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "benchmark": "node scripts/benchmark.mjs",
+    "test:e2e": "node scripts/e2e.mjs",
+    "prepack": "node scripts/build-web.mjs"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/MycroftCooper/agent-team-kit.git"
   },
-  "bugs": {
-    "url": "https://github.com/MycroftCooper/agent-team-kit/issues"
-  },
-  "homepage": "https://github.com/MycroftCooper/agent-team-kit#readme",
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ]
-  }
+  "packageManager": "pnpm@11.6.0"
 }

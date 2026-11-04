@@ -1,0 +1,75 @@
+{
+  "passed": true,
+  "steps": [
+    {
+      "name": "Linear workspace renders without overflow",
+      "passed": true,
+      "at": "2026-11-04T19:35:03.133Z"
+    },
+    {
+      "name": "register a non-Git project from the UI",
+      "passed": true,
+      "at": "2026-11-04T19:35:03.234Z"
+    },
+    {
+      "name": "create PM, worker and reviewer identities in the UI",
+      "passed": true,
+      "at": "2026-11-04T19:35:03.588Z"
+    },
+    {
+      "name": "submit a DRAFT request in the browser",
+      "passed": true,
+      "at": "2026-11-04T19:35:03.788Z"
+    },
+    {
+      "name": "external PM pulls and submits a structured plan",
+      "passed": true,
+      "at": "2026-11-04T19:35:03.814Z"
+    },
+    {
+      "name": "approve the exact plan version in the UI",
+      "passed": true,
+      "at": "2026-11-04T19:35:04.141Z"
+    },
+    {
+      "name": "ui-refresh-latency",
+      "ms": 292.66539999999986
+    },
+    {
+      "name": "worker output updates the task list through SSE",
+      "passed": true,
+      "at": "2026-11-04T19:35:04.582Z"
+    },
+    {
+      "name": "independent reviewer unlocks the human dependency",
+      "passed": true,
+      "at": "2026-11-04T19:35:05.052Z"
+    },
+    {
+      "name": "finish downstream work and accept the plan in the UI",
+      "passed": true,
+      "at": "2026-11-04T19:35:05.355Z"
+    },
+    {
+      "name": "language switch, keyboard navigation and 1280px layout",
+      "passed": true,
+      "at": "2026-11-04T19:35:05.468Z"
+    },
+    {
+      "name": "keyboard dialog and form preservation during SSE refresh",
+      "passed": true,
+      "at": "2026-11-04T19:35:06.002Z"
+    },
+    {
+      "name": "plan revision and human-readable version comparison",
+      "passed": true,
+      "at": "2026-11-04T19:35:06.765Z"
+    },
+    {
+      "name": "browser reconnect fills missed task updates without duplicates",
+      "passed": true,
+      "at": "2026-11-04T19:35:07.617Z"
+    }
+  ],
+  "errors": []
+}

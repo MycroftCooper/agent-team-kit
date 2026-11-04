@@ -1,23 +1,10 @@
 {
   "name": "@atk/database",
-  "version": "0.1.0",
+  "version": "2.0.0-alpha.1",
   "private": true,
-  "description": "M1: SQLite schema, migrations and repositories. Only apps/backend may import this package.",
-  "license": "MIT",
   "type": "module",
-  "main": "./src/index.mjs",
-  "exports": {
-    ".": "./src/index.mjs",
-    "./memory": "./src/memory.mjs",
-    "./package.json": "./package.json"
-  },
-  "scripts": {
-    "test": "node --test test/*.test.mjs"
-  },
-  "dependencies": {
-    "@atk/contracts": "workspace:*"
-  },
+  "main": "src/index.mjs",
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=24"
   }
 }

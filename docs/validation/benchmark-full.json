@@ -1,0 +1,2386 @@
+{
+  "seed": 20261105,
+  "durationMs": 1800000,
+  "machine": {
+    "platform": "win32",
+    "node": "v24.16.0",
+    "cpus": 24,
+    "cpu": "12th Gen Intel(R) Core(TM) i9-12900K",
+    "memoryGiB": 64
+  },
+  "dataset": {
+    "projects": 10,
+    "tasks": 10000,
+    "clients": 20
+  },
+  "samples": [
+    {
+      "elapsedMs": 16,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3413858
+    },
+    {
+      "elapsedMs": 5019,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3909482
+    },
+    {
+      "elapsedMs": 10030,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4421288
+    },
+    {
+      "elapsedMs": 15041,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3728962
+    },
+    {
+      "elapsedMs": 20053,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3653066
+    },
+    {
+      "elapsedMs": 25055,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4225602
+    },
+    {
+      "elapsedMs": 30070,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 2640871
+    },
+    {
+      "elapsedMs": 35072,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3053627
+    },
+    {
+      "elapsedMs": 40088,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 2808971
+    },
+    {
+      "elapsedMs": 45105,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3328145
+    },
+    {
+      "elapsedMs": 50109,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3155829
+    },
+    {
+      "elapsedMs": 55118,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 2889017
+    },
+    {
+      "elapsedMs": 60124,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3399694
+    },
+    {
+      "elapsedMs": 65130,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3254862
+    },
+    {
+      "elapsedMs": 70136,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3061778
+    },
+    {
+      "elapsedMs": 75143,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3588935
+    },
+    {
+      "elapsedMs": 80147,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3439907
+    },
+    {
+      "elapsedMs": 85160,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3246975
+    },
+    {
+      "elapsedMs": 90173,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3749472
+    },
+    {
+      "elapsedMs": 95188,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3487552
+    },
+    {
+      "elapsedMs": 100197,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3329444
+    },
+    {
+      "elapsedMs": 105205,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3205623
+    },
+    {
+      "elapsedMs": 110215,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3705105
+    },
+    {
+      "elapsedMs": 115234,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3520675
+    },
+    {
+      "elapsedMs": 120248,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3261306
+    },
+    {
+      "elapsedMs": 125255,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3761272
+    },
+    {
+      "elapsedMs": 130270,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3605574
+    },
+    {
+      "elapsedMs": 135274,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3417461
+    },
+    {
+      "elapsedMs": 140276,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3916891
+    },
+    {
+      "elapsedMs": 145291,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3654761
+    },
+    {
+      "elapsedMs": 150301,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3410194
+    },
+    {
+      "elapsedMs": 155303,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3915100
+    },
+    {
+      "elapsedMs": 160307,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3730654
+    },
+    {
+      "elapsedMs": 165312,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3583409
+    },
+    {
+      "elapsedMs": 170314,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4083271
+    },
+    {
+      "elapsedMs": 175314,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3909649
+    },
+    {
+      "elapsedMs": 180325,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3722404
+    },
+    {
+      "elapsedMs": 185327,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4225998
+    },
+    {
+      "elapsedMs": 190331,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3963488
+    },
+    {
+      "elapsedMs": 195339,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3721423
+    },
+    {
+      "elapsedMs": 200354,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4221713
+    },
+    {
+      "elapsedMs": 205364,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4043767
+    },
+    {
+      "elapsedMs": 210375,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3791498
+    },
+    {
+      "elapsedMs": 215385,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4291592
+    },
+    {
+      "elapsedMs": 220395,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4122590
+    },
+    {
+      "elapsedMs": 225406,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3938921
+    },
+    {
+      "elapsedMs": 230418,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4437923
+    },
+    {
+      "elapsedMs": 235422,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4173397
+    },
+    {
+      "elapsedMs": 240428,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3934204
+    },
+    {
+      "elapsedMs": 245431,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3086163
+    },
+    {
+      "elapsedMs": 250437,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3624525
+    },
+    {
+      "elapsedMs": 255452,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3377733
+    },
+    {
+      "elapsedMs": 260465,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3217223
+    },
+    {
+      "elapsedMs": 265473,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3032329
+    },
+    {
+      "elapsedMs": 270477,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3530788
+    },
+    {
+      "elapsedMs": 275481,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3373626
+    },
+    {
+      "elapsedMs": 280493,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3183368
+    },
+    {
+      "elapsedMs": 285501,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3585187
+    },
+    {
+      "elapsedMs": 290532,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3325175
+    },
+    {
+      "elapsedMs": 295537,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3170597
+    },
+    {
+      "elapsedMs": 300550,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3669172
+    },
+    {
+      "elapsedMs": 305557,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3481650
+    },
+    {
+      "elapsedMs": 310560,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3312676
+    },
+    {
+      "elapsedMs": 315573,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3810979
+    },
+    {
+      "elapsedMs": 320583,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3637429
+    },
+    {
+      "elapsedMs": 325587,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3379171
+    },
+    {
+      "elapsedMs": 330600,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3877590
+    },
+    {
+      "elapsedMs": 335612,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3718008
+    },
+    {
+      "elapsedMs": 340614,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3524874
+    },
+    {
+      "elapsedMs": 345617,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4025553
+    },
+    {
+      "elapsedMs": 350621,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3757143
+    },
+    {
+      "elapsedMs": 355625,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3520221
+    },
+    {
+      "elapsedMs": 360627,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4021236
+    },
+    {
+      "elapsedMs": 365633,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3827322
+    },
+    {
+      "elapsedMs": 370639,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3566140
+    },
+    {
+      "elapsedMs": 375641,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4064535
+    },
+    {
+      "elapsedMs": 380648,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3886841
+    },
+    {
+      "elapsedMs": 385654,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3621163
+    },
+    {
+      "elapsedMs": 390665,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4123390
+    },
+    {
+      "elapsedMs": 395676,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3868468
+    },
+    {
+      "elapsedMs": 400687,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3699266
+    },
+    {
+      "elapsedMs": 405696,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4198709
+    },
+    {
+      "elapsedMs": 410709,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4034959
+    },
+    {
+      "elapsedMs": 415722,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3861681
+    },
+    {
+      "elapsedMs": 420726,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4360076
+    },
+    {
+      "elapsedMs": 425741,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4118586
+    },
+    {
+      "elapsedMs": 430744,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3828266
+    },
+    {
+      "elapsedMs": 435755,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4326581
+    },
+    {
+      "elapsedMs": 440770,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4156895
+    },
+    {
+      "elapsedMs": 445781,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3884937
+    },
+    {
+      "elapsedMs": 450796,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4383188
+    },
+    {
+      "elapsedMs": 455799,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4126362
+    },
+    {
+      "elapsedMs": 460805,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3964940
+    },
+    {
+      "elapsedMs": 465808,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4463367
+    },
+    {
+      "elapsedMs": 470809,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3187317
+    },
+    {
+      "elapsedMs": 475823,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 2944527
+    },
+    {
+      "elapsedMs": 480833,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3445063
+    },
+    {
+      "elapsedMs": 485845,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3292133
+    },
+    {
+      "elapsedMs": 490850,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3137975
+    },
+    {
+      "elapsedMs": 495854,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3639330
+    },
+    {
+      "elapsedMs": 500860,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3486232
+    },
+    {
+      "elapsedMs": 505867,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3336234
+    },
+    {
+      "elapsedMs": 510869,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3831269
+    },
+    {
+      "elapsedMs": 515886,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3651791
+    },
+    {
+      "elapsedMs": 520892,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3393501
+    },
+    {
+      "elapsedMs": 525906,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3887648
+    },
+    {
+      "elapsedMs": 530911,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3615810
+    },
+    {
+      "elapsedMs": 535927,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3362360
+    },
+    {
+      "elapsedMs": 540930,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3856531
+    },
+    {
+      "elapsedMs": 545933,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3589761
+    },
+    {
+      "elapsedMs": 550943,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4083295
+    },
+    {
+      "elapsedMs": 555956,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3829042
+    },
+    {
+      "elapsedMs": 560963,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3568464
+    },
+    {
+      "elapsedMs": 565971,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4061566
+    },
+    {
+      "elapsedMs": 570972,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3706837
+    },
+    {
+      "elapsedMs": 576152,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3538415
+    },
+    {
+      "elapsedMs": 581155,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4031609
+    },
+    {
+      "elapsedMs": 586159,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3771744
+    },
+    {
+      "elapsedMs": 591177,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4264238
+    },
+    {
+      "elapsedMs": 596187,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3896966
+    },
+    {
+      "elapsedMs": 601200,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3638633
+    },
+    {
+      "elapsedMs": 606202,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4133991
+    },
+    {
+      "elapsedMs": 611204,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3878017
+    },
+    {
+      "elapsedMs": 616219,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4372044
+    },
+    {
+      "elapsedMs": 621234,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4130206
+    },
+    {
+      "elapsedMs": 626239,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3936308
+    },
+    {
+      "elapsedMs": 631734,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3777381
+    },
+    {
+      "elapsedMs": 636746,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4279331
+    },
+    {
+      "elapsedMs": 641755,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4014641
+    },
+    {
+      "elapsedMs": 646769,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4508684
+    },
+    {
+      "elapsedMs": 651785,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4244726
+    },
+    {
+      "elapsedMs": 656786,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3997328
+    },
+    {
+      "elapsedMs": 661794,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4491419
+    },
+    {
+      "elapsedMs": 666823,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4206083
+    },
+    {
+      "elapsedMs": 671832,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3949477
+    },
+    {
+      "elapsedMs": 676841,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4443620
+    },
+    {
+      "elapsedMs": 681850,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4177606
+    },
+    {
+      "elapsedMs": 686860,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4670824
+    },
+    {
+      "elapsedMs": 691862,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3235415
+    },
+    {
+      "elapsedMs": 696867,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3755013
+    },
+    {
+      "elapsedMs": 701875,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3491007
+    },
+    {
+      "elapsedMs": 706887,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3244998
+    },
+    {
+      "elapsedMs": 711899,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3738148
+    },
+    {
+      "elapsedMs": 716910,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3493950
+    },
+    {
+      "elapsedMs": 721925,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3317861
+    },
+    {
+      "elapsedMs": 726928,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3812043
+    },
+    {
+      "elapsedMs": 731929,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3555497
+    },
+    {
+      "elapsedMs": 736932,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3286220
+    },
+    {
+      "elapsedMs": 741939,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3779310
+    },
+    {
+      "elapsedMs": 746950,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3522236
+    },
+    {
+      "elapsedMs": 751955,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4016387
+    },
+    {
+      "elapsedMs": 756963,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3755009
+    },
+    {
+      "elapsedMs": 761974,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3489555
+    },
+    {
+      "elapsedMs": 766979,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3983606
+    },
+    {
+      "elapsedMs": 771989,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3720704
+    },
+    {
+      "elapsedMs": 777004,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3458362
+    },
+    {
+      "elapsedMs": 782010,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3952369
+    },
+    {
+      "elapsedMs": 787021,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3691131
+    },
+    {
+      "elapsedMs": 792035,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4184329
+    },
+    {
+      "elapsedMs": 797039,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3919856
+    },
+    {
+      "elapsedMs": 802054,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3669502
+    },
+    {
+      "elapsedMs": 807088,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4064270
+    },
+    {
+      "elapsedMs": 812101,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3906829
+    },
+    {
+      "elapsedMs": 817115,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3724527
+    },
+    {
+      "elapsedMs": 822117,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4217685
+    },
+    {
+      "elapsedMs": 827125,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3947332
+    },
+    {
+      "elapsedMs": 832126,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3687370
+    },
+    {
+      "elapsedMs": 837126,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4180624
+    },
+    {
+      "elapsedMs": 842135,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3920019
+    },
+    {
+      "elapsedMs": 847151,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4413121
+    },
+    {
+      "elapsedMs": 852153,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4172151
+    },
+    {
+      "elapsedMs": 857163,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3993002
+    },
+    {
+      "elapsedMs": 862173,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4486236
+    },
+    {
+      "elapsedMs": 867185,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4227330
+    },
+    {
+      "elapsedMs": 872191,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3958249
+    },
+    {
+      "elapsedMs": 877204,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4451435
+    },
+    {
+      "elapsedMs": 882219,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4197433
+    },
+    {
+      "elapsedMs": 887222,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3933188
+    },
+    {
+      "elapsedMs": 892224,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4426390
+    },
+    {
+      "elapsedMs": 897233,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4183996
+    },
+    {
+      "elapsedMs": 902237,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3992159
+    },
+    {
+      "elapsedMs": 907246,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4485257
+    },
+    {
+      "elapsedMs": 912258,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4223251
+    },
+    {
+      "elapsedMs": 917259,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3141943
+    },
+    {
+      "elapsedMs": 922267,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3666153
+    },
+    {
+      "elapsedMs": 927270,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3407743
+    },
+    {
+      "elapsedMs": 932275,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3169215
+    },
+    {
+      "elapsedMs": 937283,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3663065
+    },
+    {
+      "elapsedMs": 942293,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3489779
+    },
+    {
+      "elapsedMs": 947303,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3223098
+    },
+    {
+      "elapsedMs": 952313,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3716184
+    },
+    {
+      "elapsedMs": 957321,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3456446
+    },
+    {
+      "elapsedMs": 962330,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3854881
+    },
+    {
+      "elapsedMs": 967333,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3607537
+    },
+    {
+      "elapsedMs": 972337,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3432987
+    },
+    {
+      "elapsedMs": 977342,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3927846
+    },
+    {
+      "elapsedMs": 982345,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3759072
+    },
+    {
+      "elapsedMs": 987352,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3582998
+    },
+    {
+      "elapsedMs": 992356,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4077961
+    },
+    {
+      "elapsedMs": 997362,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3812395
+    },
+    {
+      "elapsedMs": 1002375,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3553813
+    },
+    {
+      "elapsedMs": 1007389,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4048520
+    },
+    {
+      "elapsedMs": 1012399,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3889074
+    },
+    {
+      "elapsedMs": 1017403,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3701786
+    },
+    {
+      "elapsedMs": 1022410,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4195919
+    },
+    {
+      "elapsedMs": 1027424,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3933971
+    },
+    {
+      "elapsedMs": 1032436,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3668271
+    },
+    {
+      "elapsedMs": 1037443,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4170300
+    },
+    {
+      "elapsedMs": 1042445,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3909932
+    },
+    {
+      "elapsedMs": 1047454,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3644888
+    },
+    {
+      "elapsedMs": 1052469,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4139025
+    },
+    {
+      "elapsedMs": 1057476,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3884285
+    },
+    {
+      "elapsedMs": 1062487,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4386569
+    },
+    {
+      "elapsedMs": 1067501,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4231642
+    },
+    {
+      "elapsedMs": 1072511,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4039678
+    },
+    {
+      "elapsedMs": 1077525,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3778922
+    },
+    {
+      "elapsedMs": 1082528,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4281955
+    },
+    {
+      "elapsedMs": 1087541,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4013811
+    },
+    {
+      "elapsedMs": 1092553,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4507043
+    },
+    {
+      "elapsedMs": 1097570,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4253300
+    },
+    {
+      "elapsedMs": 1102574,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3905352
+    },
+    {
+      "elapsedMs": 1107587,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4398592
+    },
+    {
+      "elapsedMs": 1112591,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4216785
+    },
+    {
+      "elapsedMs": 1117595,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3970653
+    },
+    {
+      "elapsedMs": 1122605,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4465393
+    },
+    {
+      "elapsedMs": 1127608,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4291254
+    },
+    {
+      "elapsedMs": 1132613,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4108158
+    },
+    {
+      "elapsedMs": 1137629,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4601426
+    },
+    {
+      "elapsedMs": 1142638,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4350751
+    },
+    {
+      "elapsedMs": 1147641,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3360071
+    },
+    {
+      "elapsedMs": 1152646,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3133263
+    },
+    {
+      "elapsedMs": 1157662,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3629429
+    },
+    {
+      "elapsedMs": 1162677,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3465597
+    },
+    {
+      "elapsedMs": 1167687,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3193185
+    },
+    {
+      "elapsedMs": 1172702,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3687214
+    },
+    {
+      "elapsedMs": 1177709,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3431746
+    },
+    {
+      "elapsedMs": 1182716,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3925010
+    },
+    {
+      "elapsedMs": 1187732,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3658207
+    },
+    {
+      "elapsedMs": 1192745,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3399975
+    },
+    {
+      "elapsedMs": 1197751,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3893335
+    },
+    {
+      "elapsedMs": 1202758,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3633140
+    },
+    {
+      "elapsedMs": 1207773,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3374840
+    },
+    {
+      "elapsedMs": 1212780,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3868088
+    },
+    {
+      "elapsedMs": 1217786,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3692021
+    },
+    {
+      "elapsedMs": 1222800,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3433361
+    },
+    {
+      "elapsedMs": 1227804,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3926549
+    },
+    {
+      "elapsedMs": 1232813,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3656142
+    },
+    {
+      "elapsedMs": 1237815,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4149302
+    },
+    {
+      "elapsedMs": 1242821,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3886514
+    },
+    {
+      "elapsedMs": 1247823,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3551915
+    },
+    {
+      "elapsedMs": 1252826,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4045971
+    },
+    {
+      "elapsedMs": 1257835,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3870935
+    },
+    {
+      "elapsedMs": 1262836,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3683460
+    },
+    {
+      "elapsedMs": 1267849,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4176736
+    },
+    {
+      "elapsedMs": 1272860,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3912756
+    },
+    {
+      "elapsedMs": 1277868,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3658697
+    },
+    {
+      "elapsedMs": 1282878,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4151805
+    },
+    {
+      "elapsedMs": 1287884,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3891953
+    },
+    {
+      "elapsedMs": 1292897,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3734370
+    },
+    {
+      "elapsedMs": 1297907,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4227658
+    },
+    {
+      "elapsedMs": 1302919,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4058982
+    },
+    {
+      "elapsedMs": 1307926,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3890907
+    },
+    {
+      "elapsedMs": 1312937,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4392755
+    },
+    {
+      "elapsedMs": 1317951,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4224771
+    },
+    {
+      "elapsedMs": 1322958,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4034124
+    },
+    {
+      "elapsedMs": 1327966,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4527816
+    },
+    {
+      "elapsedMs": 1332972,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4267316
+    },
+    {
+      "elapsedMs": 1337979,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4008537
+    },
+    {
+      "elapsedMs": 1342990,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4501633
+    },
+    {
+      "elapsedMs": 1347999,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4233565
+    },
+    {
+      "elapsedMs": 1353003,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3993878
+    },
+    {
+      "elapsedMs": 1358010,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4487974
+    },
+    {
+      "elapsedMs": 1363014,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4326298
+    },
+    {
+      "elapsedMs": 1368017,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4133855
+    },
+    {
+      "elapsedMs": 1373020,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3254139
+    },
+    {
+      "elapsedMs": 1378028,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3774551
+    },
+    {
+      "elapsedMs": 1383036,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3417597
+    },
+    {
+      "elapsedMs": 1388049,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3185577
+    },
+    {
+      "elapsedMs": 1393065,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3678789
+    },
+    {
+      "elapsedMs": 1398071,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3495594
+    },
+    {
+      "elapsedMs": 1403074,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3238858
+    },
+    {
+      "elapsedMs": 1408081,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3731994
+    },
+    {
+      "elapsedMs": 1413094,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3464203
+    },
+    {
+      "elapsedMs": 1418100,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3957415
+    },
+    {
+      "elapsedMs": 1423101,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3705535
+    },
+    {
+      "elapsedMs": 1428105,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3531616
+    },
+    {
+      "elapsedMs": 1433112,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4024880
+    },
+    {
+      "elapsedMs": 1438122,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3757016
+    },
+    {
+      "elapsedMs": 1443127,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3494441
+    },
+    {
+      "elapsedMs": 1448142,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3987605
+    },
+    {
+      "elapsedMs": 1453144,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3743641
+    },
+    {
+      "elapsedMs": 1458156,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3562670
+    },
+    {
+      "elapsedMs": 1463165,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4055922
+    },
+    {
+      "elapsedMs": 1468171,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3789446
+    },
+    {
+      "elapsedMs": 1473185,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3523067
+    },
+    {
+      "elapsedMs": 1478191,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4016231
+    },
+    {
+      "elapsedMs": 1483195,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3761451
+    },
+    {
+      "elapsedMs": 1488202,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4255756
+    },
+    {
+      "elapsedMs": 1493216,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3990088
+    },
+    {
+      "elapsedMs": 1498230,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3732064
+    },
+    {
+      "elapsedMs": 1503243,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4226061
+    },
+    {
+      "elapsedMs": 1508257,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3952105
+    },
+    {
+      "elapsedMs": 1513270,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3715073
+    },
+    {
+      "elapsedMs": 1518293,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4111910
+    },
+    {
+      "elapsedMs": 1523295,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3937534
+    },
+    {
+      "elapsedMs": 1528311,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3754578
+    },
+    {
+      "elapsedMs": 1533318,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4248699
+    },
+    {
+      "elapsedMs": 1538320,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3997175
+    },
+    {
+      "elapsedMs": 1543335,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4490427
+    },
+    {
+      "elapsedMs": 1548344,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4226084
+    },
+    {
+      "elapsedMs": 1553350,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3957604
+    },
+    {
+      "elapsedMs": 1558364,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4450712
+    },
+    {
+      "elapsedMs": 1563375,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4193177
+    },
+    {
+      "elapsedMs": 1568380,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3947961
+    },
+    {
+      "elapsedMs": 1573386,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4441893
+    },
+    {
+      "elapsedMs": 1578398,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4261194
+    },
+    {
+      "elapsedMs": 1583405,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3992474
+    },
+    {
+      "elapsedMs": 1588411,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4485730
+    },
+    {
+      "elapsedMs": 1593416,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4225275
+    },
+    {
+      "elapsedMs": 1598427,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3047687
+    },
+    {
+      "elapsedMs": 1603440,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3577979
+    },
+    {
+      "elapsedMs": 1608451,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3328849
+    },
+    {
+      "elapsedMs": 1613462,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3167177
+    },
+    {
+      "elapsedMs": 1618466,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3660405
+    },
+    {
+      "elapsedMs": 1623472,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3396970
+    },
+    {
+      "elapsedMs": 1628485,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3891534
+    },
+    {
+      "elapsedMs": 1633490,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3647450
+    },
+    {
+      "elapsedMs": 1638494,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3464647
+    },
+    {
+      "elapsedMs": 1643505,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3957843
+    },
+    {
+      "elapsedMs": 1648515,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3698407
+    },
+    {
+      "elapsedMs": 1653520,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3429304
+    },
+    {
+      "elapsedMs": 1658522,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3823996
+    },
+    {
+      "elapsedMs": 1663524,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3572152
+    },
+    {
+      "elapsedMs": 1668540,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4066997
+    },
+    {
+      "elapsedMs": 1673548,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3792721
+    },
+    {
+      "elapsedMs": 1678556,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3532145
+    },
+    {
+      "elapsedMs": 1683569,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4026290
+    },
+    {
+      "elapsedMs": 1688584,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3790250
+    },
+    {
+      "elapsedMs": 1693594,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3595654
+    },
+    {
+      "elapsedMs": 1698607,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4089727
+    },
+    {
+      "elapsedMs": 1703615,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3832583
+    },
+    {
+      "elapsedMs": 1708616,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3566951
+    },
+    {
+      "elapsedMs": 1713632,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4061036
+    },
+    {
+      "elapsedMs": 1718632,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3793584
+    },
+    {
+      "elapsedMs": 1723642,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4286680
+    },
+    {
+      "elapsedMs": 1728643,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4029745
+    },
+    {
+      "elapsedMs": 1733655,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3766737
+    },
+    {
+      "elapsedMs": 1738666,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4260005
+    },
+    {
+      "elapsedMs": 1743674,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3998318
+    },
+    {
+      "elapsedMs": 1748681,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3748638
+    },
+    {
+      "elapsedMs": 1753695,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4241926
+    },
+    {
+      "elapsedMs": 1758701,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4058579
+    },
+    {
+      "elapsedMs": 1763704,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3810495
+    },
+    {
+      "elapsedMs": 1768717,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4312447
+    },
+    {
+      "elapsedMs": 1773725,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4127336
+    },
+    {
+      "elapsedMs": 1778736,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 3867068
+    },
+    {
+      "elapsedMs": 1783748,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4360244
+    },
+    {
+      "elapsedMs": 1788749,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4018381
+    },
+    {
+      "elapsedMs": 1793752,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4508781
+    },
+    {
+      "elapsedMs": 1798755,
+      "domNodes": 637,
+      "timeline": 100,
+      "heap": 4321206
+    }
+  ],
+  "passed": true,
+  "fullThirtyMinutes": true,
+  "metadataP95Ms": 129.00119999999993,
+  "uiRefreshMs": 362.0796000000555,
+  "roundTrips": [
+    11.787699999999973,
+    82.1431,
+    82.10350000000005,
+    82.06399999999996,
+    82.08220000000006,
+    82.08810000000005,
+    82.25469999999996,
+    82.37419999999997,
+    82.43309999999997,
+    82.4731999999999,
+    82.54100000000005,
+    82.64199999999994,
+    82.75450000000001,
+    82.83030000000008,
+    84.26959999999997,
+    84.0829,
+    83.85660000000007,
+    83.68740000000003,
+    83.57000000000005,
+    83.50279999999998,
+    19.843799999999987,
+    20.15840000000003,
+    83.6585,
+    83.67349999999999,
+    83.7858,
+    83.27840000000003,
+    83.30709999999999,
+    83.39109999999994,
+    83.44380000000001,
+    83.48429999999996,
+    83.52890000000002,
+    83.55679999999995,
+    83.57910000000004,
+    83.59659999999997,
+    85.36660000000006,
+    85.2518,
+    84.5191000000001,
+    84.42000000000007,
+    84.35810000000004,
+    84.25930000000005,
+    85.12599999999998,
+    85.14729999999997,
+    85.08049999999992,
+    85.10940000000005,
+    85.09929999999997,
+    85.11580000000004,
+    85.12749999999994,
+    85.14210000000003,
+    84.56729999999993,
+    84.5652,
+    84.53949999999998,
+    84.5433999999999,
+    84.52909999999997,
+    87.01420000000007,
+    86.6603,
+    86.4423999999999,
+    86.26279999999997,
+    85.57339999999999,
+    85.40640000000008,
+    85.24850000000004,
+    63.89829999999995,
+    63.899200000000064,
+    63.86609999999996,
+    63.84159999999997,
+    63.789100000000076,
+    63.75660000000005,
+    63.73670000000004,
+    63.78800000000001,
+    64.50599999999997,
+    64.53639999999996,
+    64.56150000000002,
+    64.60910000000001,
+    66.269,
+    65.98059999999998,
+    65.81349999999998,
+    65.6617,
+    65.50019999999995,
+    65.3569,
+    65.2278,
+    74.54520000000002,
+    71.82219999999995,
+    71.8288,
+    71.79390000000001,
+    71.77460000000008,
+    71.75419999999997,
+    71.76530000000002,
+    71.77109999999993,
+    71.7758,
+    71.79219999999998,
+    72.08390000000009,
+    72.10680000000002,
+    72.1309,
+    72.14729999999997,
+    73.82299999999998,
+    73.4973,
+    73.28679999999997,
+    73.14299999999992,
+    73.11349999999993,
+    73.0702,
+    72.9973,
+    76.33270000000005,
+    76.37170000000003,
+    76.30739999999992,
+    76.32029999999997,
+    76.30920000000003,
+    76.32870000000003,
+    76.33579999999995,
+    76.39139999999998,
+    76.47699999999998,
+    76.50490000000002,
+    76.46989999999994,
+    76.50869999999998,
+    76.58370000000002,
+    78.27359999999999,
+    77.91690000000006,
+    77.70529999999997,
+    77.58820000000003,
+    77.46860000000004,
+    77.32249999999999,
+    77.18359999999996,
+    128.80639999999994,
+    128.84859999999992,
+    128.84769999999992,
+    128.88009999999997,
+    128.91750000000002,
+    128.96029999999996,
+    128.9882,
+    128.9921999999999,
+    128.98789999999985,
+    129.00119999999993,
+    129.05100000000004,
+    129.0861,
+    129.1067999999999,
+    130.63419999999985,
+    130.31240000000003,
+    130.16279999999995,
+    130.0854999999999,
+    129.9654999999999,
+    129.85699999999997,
+    129.7639999999999,
+    74.62220000000002,
+    74.62740000000008,
+    74.6377,
+    74.67520000000013,
+    74.75189999999998,
+    74.80970000000002,
+    74.79079999999999,
+    74.8161,
+    74.82780000000002,
+    74.85820000000012,
+    74.86619999999994,
+    74.89429999999993,
+    74.86729999999989,
+    76.68820000000005,
+    76.27009999999996,
+    76.04280000000017,
+    75.93069999999989,
+    75.81660000000011,
+    75.72039999999993,
+    75.57590000000005,
+    74.05089999999996,
+    74.06750000000011,
+    74.1369000000002,
+    74.19039999999995,
+    74.24699999999984,
+    74.28710000000001,
+    74.32310000000007,
+    74.34159999999997,
+    74.34019999999987,
+    74.34429999999998,
+    74.38429999999994,
+    74.40599999999995,
+    74.42280000000005,
+    75.75659999999993,
+    75.45209999999997,
+    75.34050000000002,
+    75.24659999999994,
+    75.16729999999984,
+    75.10529999999994,
+    75.01459999999997,
+    71.7077999999999,
+    71.70820000000003,
+    71.64319999999998,
+    71.66139999999996,
+    71.64089999999987,
+    71.6531,
+    71.66689999999994,
+    71.69630000000006,
+    71.72919999999999,
+    71.77390000000014,
+    71.7958000000001,
+    71.80490000000009,
+    71.81870000000004,
+    73.21759999999995,
+    72.91859999999997,
+    72.74810000000002,
+    72.60459999999989,
+    72.47889999999984,
+    72.40369999999984,
+    72.30039999999985
+  ],
+  "failures": [],
+  "totalMs": 1802638
+}

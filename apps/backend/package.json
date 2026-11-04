@@ -1,23 +1,12 @@
 {
   "name": "@atk/backend",
-  "version": "0.1.0",
+  "version": "2.0.0-alpha.1",
   "private": true,
-  "description": "M1: ATK Backend - HTTP API, SQLite owner, SSE. Binds 127.0.0.1:1421.",
-  "license": "MIT",
   "type": "module",
-  "main": "./src/server.mjs",
-  "bin": {
-    "atk-backend": "./cli.mjs"
+  "engines": {
+    "node": ">=24"
   },
   "scripts": {
-    "start": "node ./cli.mjs serve",
-    "migrate": "node ./cli.mjs migrate"
-  },
-  "dependencies": {
-    "@atk/contracts": "workspace:*",
-    "@atk/database": "workspace:*"
-  },
-  "engines": {
-    "node": ">=22.5.0"
+    "start": "node cli.mjs serve"
   }
 }

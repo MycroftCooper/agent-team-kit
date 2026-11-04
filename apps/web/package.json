@@ -1,15 +1,14 @@
 {
   "name": "@atk/web",
-  "version": "0.1.0",
+  "version": "2.0.0-alpha.1",
   "private": true,
-  "description": "M1: ATK Web - React SPA (zh-CN / en) served by the backend at 127.0.0.1:1421.",
+  "description": "Linear-inspired web workspace for local multi-project agent collaboration",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview",
-    "test": "node --test test/*.test.mjs"
+    "preview": "vite preview"
   },
   "dependencies": {
     "@atk/contracts": "workspace:*",
@@ -24,6 +23,6 @@
     "vite": "^6.0.0"
   },
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=24"
   }
 }

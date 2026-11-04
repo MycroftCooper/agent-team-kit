@@ -1,128 +1,90 @@
-# Architecture
+# Architecture and workflow
 
-agent-team-kit is a **state machine with role contracts and evidence gates**,
-plus a board that only renders. Four layers, each cheap to explain and cheap to
-enforce:
+## Boundaries
 
-```
-                   +---------------------------------------+
- human  ---------> |  board  (markdown / HTML / SSE / DSH) |  read-only view
-                   +---------------------------------------+
-                                   ^ derives
-                   +---------------------------------------+
-                   |  evidence gates  (receipts, manifests) |  what counts as done
-                   +---------------------------------------+
-                                   ^ produce
-                   +---------------------------------------+
- agents ---------> |  role contracts (ownership.json + cards) |  who may write what
-                   +---------------------------------------+
-                                   ^ coordinate
-                   +---------------------------------------+
-                   |  state machine (state.json + atk CLI)  |  what exists, in which stage
-                   +---------------------------------------+
+The web client communicates only through HTTP and one SSE stream. The backend is
+the only application database writer. External agents call a distinct authenticated
+API; they neither inherit a browser session nor choose their own function.
+
+```text
+Browser ── /api/v1 + SSE ── Backend ── SQLite (one global authority)
+                              │
+External agents ─ /api/agent/v1┤
+                              └── project/.agent-team (documents + snapshots)
 ```
 
-## 0. Entities and Functions
+The backend uses pure domain and scheduling functions inside atomic claims.
+There is no resident scheduler worker, runtime host, provider SDK or model route.
+The launcher manages only the backend. The machine CLI handles HTTP, receipt
+retry and lease renewal, never AI process execution.
 
-Above the four layers sits a small coordination model: **Project**, **Role**,
-**Agent Instance**, **Task** and **Run**, with three Functions —
-`ORCHESTRATOR` / `WORKER` / `REVIEWER`. A Role declares the Functions it may
-perform, an Agent Instance declares the Functions it supports, and a Run records
-the one it performed.
+Node.js 24, built-in `node:sqlite`, React/TypeScript/Vite. Production Node modules
+use relative package paths so the installed package needs no workspace links.
+The web build bundles React. Tests use throwaway SQLite files rather than a
+second production memory-store implementation.
 
-The scheduler (`atk`) enforces the model's hard rule: **an Agent Instance may not
-review the code it produced.** Review dispatches require `--agent <id>`; the
-frozen manifest records the producing run; the QA approval records the reviewing
-run; `atk batch verify` / `apply` refuse a self-review; `atk evidence` refuses to
-count a provably self-reviewed approval. [ENTITIES.md](ENTITIES.md) is the
-reference; the data contracts are in [INTERNALS.md](INTERNALS.md).
+## State and identity
 
-The same scheduler applies the **permission layer**: subjects `HUMAN`, the three
-Agent Functions and the trusted `SYSTEM` layer are mapped against every operation
-in a deny-by-default matrix. `atk permit check` evaluates
-`RBAC ∧ Scope ∧ Ownership ∧ State ∧ Policy ∧ Approval`, returns a machine-readable
-reason code, and appends the decision to an audit trail. [PERMISSIONS.md](PERMISSIONS.md)
-owns the matrix and the enforcement points.
+- REQUEST tasks start DRAFT. ORCHESTRATOR planning runs leave them DRAFT until
+  the human approves a submitted plan version.
+- Approval atomically materializes WORK tasks. REQUESTs are containers and cannot
+  be claimed as execution tasks.
+- WORK flows READY → RUNNING → optional REVIEWING → VERIFIED. VERIFIED or DONE
+  dependencies unlock downstream work. Final plan acceptance makes VERIFIED
+  children and the REQUEST DONE.
+- HUMAN work starts through the UI and completes through explicit human action.
+  Its browser renews the lease while the inbox is open. A lost human lease uses
+  the same conservative recovery rules as an agent lease.
+- Failed execution, content drift, review exhaustion and lease loss are BLOCKED
+  reasons, not successful completion. Human retry creates another generation.
+- A plan's author identity cannot execute/review its work. An execution author
+  cannot review that candidate. These checks use credential-bound IDs.
+- Approved plans freeze role instructions. Editing a role does not silently alter
+  an existing plan. Changing the function of a role with live identities requires
+  a new role instead.
 
-## 1. State machine — `state.json` + `atk`
+Plans have explicit revisions and approval versions. Revision requests stop
+future claims, cancel superseded unfinished nodes and return the REQUEST to
+DRAFT. Existing edits remain in the project. Active/uncertain runs must be
+reconciled before a revision can replace work.
 
-`state.json` is the single source of truth: one `batch`, its `slices`, the active
-`packages`, and `subitems`. Every command is a small, deterministic transition:
+## File coordination and evidence
 
-- query: `atk state check | board | queue | task`
-- derive: `atk evidence` (receipt -> `qaPassed` / `applied`)
-- apply: `atk batch manifest | verify | apply`
-- archive: `atk state archive` (refused unless `verification.humanAccepted`)
+Claims transactionally check dependencies, team/agent capacity, identity, full
+file scope and global real-path conflicts. Directory scopes cover descendants.
+Windows aliases, alternate streams, device paths and out-of-project symlinks are
+rejected. Role permissions are checked against resolved paths as well as labels.
 
-The CLI never asks an LLM what the status is. If a receipt is missing, the state
-is not advanced. `atk sync` chains import -> evidence -> board, so state and board
-cannot drift apart after a batch.
+No partial lock acquisition or live scope expansion is supported. Stop and report
+the old attempt before applying for a larger approved scope. A plan revision is
+needed when the approved task's scope itself changes.
 
-## 2. Role contracts — `ownership.json` + role cards
+Before/after content lives in project snapshots; the database keeps versions,
+hashes, metadata and receipt references. Claim/status replies omit snapshots and
+full history. Structured results are authenticated external reports, not a claim
+that the platform independently reran the reported commands.
 
-- `roles` in `agent-flow.config.json` lists the identifiers.
-- `ownership.json` maps **path prefixes** to roles (longest prefix wins, two roles
-  on one path is a config error) and reserves root files.
-- `roles/<ROLE>.md` is the human/agent contract: write scope, do-not-do list, task
-  loop, receipt format, command list, round budget, proof ladder.
+Only a stopped execution with a durably saved receipt releases its locks. Lease
+expiry quarantines them. Confirming stopped preserves files and records the
+interrupted candidate. Cooperative locks do not fence arbitrary filesystem writes.
 
-Enforcement is a command, not a review habit: `atk ownership check --role <ROLE>`
-fails when a change escapes the role's scope. That is what turns "single writer"
-from a social rule into a checkable one.
+Pending reviews recheck the candidate. VERIFIED historical outputs remain valid
+for approved downstream edits. Final acceptance checks the merged latest output
+manifest against current files inside the backend's claim-exclusion transaction.
+Changed files/new files in directory scopes make pending targets stale.
 
-## 3. Evidence gates — receipts, manifests, approvals
+## Persistence and events
 
-"Done" is derived from artifacts, never from a chat message:
+SQLite WAL and `BEGIN IMMEDIATE` protect state changes. Queue/status/project and
+plan lookups are indexed. Events have unique producer IDs and monotonic sequence
+numbers; repeated IDs cannot be reused across runs. Submission keys make retries
+safe; clients retain unacknowledged submissions on disk.
 
-| Artifact | Produced by | Proves |
-|---|---|---|
-| candidate snapshot | executor | work exists outside the original tree |
-| `manifest` + `manifestSha256` | `atk batch manifest` | an exact, frozen set of files and hashes |
-| `qa-approval.json` | QA | that manifest hash was verified |
-| apply receipt | `atk batch apply` | the frozen bytes landed in the original tree |
-| `verification.humanAccepted` | LEAD, after the human accepts | the product is accepted |
+Document jobs are persisted and retried, with failures visible in My inbox.
+Generated JSON is an output view, never an alternate authority for task state.
+Project paths may be relocated while inactive; projects may be archived without
+deleting their directories.
 
-`atk batch verify` refuses when the manifest is stale, the candidate changed, the
-QA approval does not bind the current hash, or the original tree drifted.
-`atk evidence` is idempotent and never invents facts: absent receipts stay absent.
-
-## 4. Board — derived view
-
-`atk state board` renders the configured `board.md`; `atk board` renders a
-self-contained HTML board; `atk serve` adds file watching and SSE. The DSH plugin
-(`atk plugin sync`) is a third renderer of the same `state.json` — it registers one
-same-origin read-only route and never writes task state.
-
-Because every renderer reads `state.json` directly, the board is never an input.
-The only write the board interface may perform is ticking a **human-only** todo.
-
-## Module map
-
-| Layer | Modules |
-|---|---|
-| CLI / context | `bin/atk.mjs`, `lib/dispatch.mjs`, `lib/context.mjs` |
-| Config / labels | `lib/config.mjs`, `lib/labels.mjs`, `lib/util.mjs` |
-| Entities / Functions | `lib/functions.mjs` (taxonomy, runtime agents, separation-of-duties checks) |
-| Permissions | `lib/permission-registry.mjs` (matrix), `lib/permissions.mjs` (decision pipeline, audit, `atk permit`) |
-| State machine | `lib/state.mjs`, `lib/human-todos.mjs`, `lib/evidence.mjs` |
-| Batch / gates | `lib/batch.mjs`, `lib/gate.mjs`, `lib/select-tests.mjs`, `lib/baseline.mjs`, `lib/ownership.mjs` |
-| Board / plugin | `lib/board.mjs`, `lib/plugin.mjs`, `plugins/dsh-agent-board/` |
-| Scaffolding | `lib/init.mjs`, `presets/`, `templates/flow/` |
-
-`templates/flow/` is the canonical content of everything `atk init` writes;
-`presets/` holds the starting configurations. A consuming project never imports
-the toolkit's source for normal operation — it calls the CLI.
-
-## Design constraints
-
-- **Zero third-party dependencies**, Node >= 20.11, ESM. The toolkit must run from
-  a bare `node` inside any project.
-- **No hard-coded project knowledge.** Paths come from config; roles from config;
-  labels from `lib/labels.mjs`.
-- **Deterministic output.** Sorted collections, JSON on stdout for `--json`,
-  short human output otherwise.
-- **Exit codes**: `0` ok, `1` check/gate failed or refusal, `2` usage error,
-  `3` concurrency/drift refusal.
-
-The precise module contract (fields, data formats, command surface) lives in
-[INTERNALS.md](INTERNALS.md) and is what the test suite enforces.
+SSE replays forward by sequence and signals resync for invalid/future cursors.
+The UI batches ordinary entity invalidations, keeps at most 200 live events and
+renders at most 100 timeline entries. Logs and snapshots are read on demand.

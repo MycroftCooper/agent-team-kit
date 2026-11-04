@@ -1,151 +1,90 @@
-# agent-team-kit
+# Agent Team Kit
 
-[![ci](https://github.com/MycroftCooper/agent-team-kit/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MycroftCooper/agent-team-kit/actions/workflows/ci.yml)
-[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![node](https://img.shields.io/badge/node-%3E%3D20.11-brightgreen.svg)](package.json)
+通过网页管理多个本地项目，由外部 Agent 主动领取任务的独立协作工具。
 
-可复用的多 agent 交付工作流：状态机 CLI（`atk`）+ 角色合同与可执行的写域检查 +
-证据门禁（缺回执就不推进）+ 看板（Markdown / HTML / SSE / DeepSeek Harness 插件）。
+当前版本 **2.0.0-alpha.1**。这是一次不保留兼容层的重构：旧任务池、旧 CLI、DSH
+插件、模型运行时和 worktree 流程均已退出生产代码。工具不配置模型、不转发请求，
+不启动外部 Agent，也不会自动清理旧数据库或用户项目。
 
-- **零第三方依赖**：仅 Node.js >= 20.11 内置模块，ESM，在任何项目里裸 `node` 可跑。
-- **配置驱动**：路径、角色、门禁、看板插件身份都来自 `agent-flow.config.json`，
-  代码里没有项目私有知识。
-- **对 agent 友好**：9 行任务单、6 行回执、每角色一个队列命令、极简看板视图，
-  以及三个可安装的 skill。
-- **强制职责分离**：Role 声明 Function（`ORCHESTRATOR` / `WORKER` / `REVIEWER`），
-  Agent Instance 携带 id 与 capabilities；调度器拒绝让产出 manifest 的实例审查自己。
-  见 [docs/ENTITIES.zh-CN.md](docs/ENTITIES.zh-CN.md)。
-- **默认拒绝的权限层**：用户 / 三个 Function / 受控 `SYSTEM` 主体 × 操作矩阵决定每个
-  敏感动作；`atk permit check` 返回机器可识别原因码，所有决策追加到审计文件。
-  见 [docs/PERMISSIONS.zh-CN.md](docs/PERMISSIONS.zh-CN.md)。
+## 启动
 
-## 60 秒开始
+需要 **Node.js 24**。发布包包含构建好的网页，没有生产依赖；安装位置与目标项目无关。
 
-```bash
-npm install --global agent-team-kit      # 或 npx agent-team-kit <cmd>
-cd my-project
-atk init --project my-app                # 配置 + 流程目录 + 看板插件副本
-atk board                                # 渲染看板
-atk state check                          # 校验 state.json
+以下 npm 安装方式适用于新版本正式发布后；本次 GitHub 源码提交不等于 npm 发布：
+
+```powershell
+npm install -g agent-team-kit@next
+atk start
+# 打开输出的 http://127.0.0.1:1421
+atk status
+atk stop
 ```
 
-agent 侧：
+源码开发：
 
-```bash
-atk queue --for DEV
-atk task <ID> --for DEV --message        # 可直接执行的任务单
-atk gate fast --files <改动> --role DEV
-atk evidence                             # 从回执派生 qaPassed / applied
+```powershell
+corepack pnpm install --frozen-lockfile
+node scripts/build-web.mjs
+node apps/launcher/cli.mjs start
+# 也可构建并安装独立发布包：
+npm pack
+npm install -g ./agent-team-kit-2.0.0-alpha.1.tgz
+# 前后端可以分别启动；前端开发服务器为 http://127.0.0.1:5173
+pnpm --filter @atk/web dev
 ```
 
-`init` 常用参数：`--preset generic|p4deck`、`--roles LEAD,DEV,QA`、
-`--language en|zh-CN`、`--flow-dir <目录>`、`--force`、`--dry-run`、
-`--no-plugin`、`--json`。
+新数据目录默认 `%LOCALAPPDATA%\AgentTeamKit\Next`，可通过 `--data <目录>` 覆盖。
+在网页中注册已有项目目录即可；无需在项目里安装依赖、添加插件或初始化 Git。
 
-## 四层结构
+## 使用流程
 
-```
-                 +---------------------------------------+
- 人  ----------> |  看板（Markdown / HTML / SSE / DSH）  |  只读视图
-                 +---------------------------------------+
-                                  ^ 派生
-                 +---------------------------------------+
-                 |  证据门禁（回执 / manifest / 批准）    |  什么算完成
-                 +---------------------------------------+
-                                  ^ 产出
-                 +---------------------------------------+
- agent ---------> |  角色合同（ownership.json + 角色卡）  |  谁能写哪里
-                 +---------------------------------------+
-                                  ^ 协调
-                 +---------------------------------------+
-                 |  状态机（state.json + atk CLI）        |  有什么、在哪个阶段
-                 +---------------------------------------+
-```
+1. 人工在网页新建需求，进入 **DRAFT 预排池**。
+2. 外部 PM 身份以固定 **ORCHESTRATOR** 阶段领取，提交分工、依赖、文件范围和验收要求。
+3. 人工批准具体计划版本后，一次性发布 **READY** 执行任务。
+4. 外部 Agent 领取任务和文件锁，在项目目录执行，持续续租，回传检查结果和交付记录。
+5. 按批准计划配置可选独立评审；中间任务 **VERIFIED** 后推进依赖，人工任务在“待我处理”完成。
+6. 所有任务满足要求后，对整份计划统一人工验收。无需每个中间任务反复点确认。
 
-1. **状态机**：`state.json` 是唯一真值；每条 `atk` 命令都是确定性的查询或状态
-   迁移。状态不来自聊天记录。
-2. **角色合同**：`ownership.json` 用路径前缀分配写域（最长前缀优先、一个路径只属于
-   一个角色），`atk ownership check` 强制执行；每个角色有一张卡（写域、禁做、任务
-   循环、6 行回执、命令、轮次预算、证据阶梯）。
-3. **证据门禁**：候选快照 → 冻结 manifest（`manifestSha256`）→ QA 批准绑定该 hash
-   → verify → apply 回执 → `atk evidence` 派生。归档要求
-   `verification.humanAccepted === true`。
-4. **看板**：Markdown、静态 HTML、实时 SSE 服务与 DSH 侧栏面板都渲染同一份
-   `state.json`；看板永远不是输入。
+PM 不能执行或评审自己规划的任务；WORKER 不能自审；Agent 凭据不能代替人工批准。
 
-更多见 [docs/ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md)。
+## 文件锁与交付
 
-## 命令
+- 同文件、父目录和子文件的写入冲突会等待；不同文件可以并行。
+- 执行结束并确认停止、快照与回执持久化后即释放锁，不等待评审和验收。
+- 失联只会将锁标为异常占用；需要确认旧执行停止后才能释放。
+- 评审或验收目标变化会失效；已验证任务的合法后继修改保留历史记录。
+- 修改直接发生在项目目录，失败、停止和取消不会自动回滚代码。
+- 这是协议层的协作锁，不能阻止编辑器和不遵守协议的进程写入文件。
 
-| 命令 | 作用 |
-|---|---|
-| `atk init` | 把工作流脚手架进项目（或适配已有布局） |
-| `atk state check\|board\|queue\|task\|import\|archive\|restore` | 状态机 |
-| `atk board [--json\|--compact]` | 渲染 HTML 看板 |
-| `atk serve` | 实时看板（文件监听 + SSE，兜底轮询） |
-| `atk evidence [--collect-temp\|--dry]` | 从回执派生验收事实 |
-| `atk ownership map\|check\|verify-config` | 写域检查 |
-| `atk permit matrix\|check\|explain\|audit` | 默认拒绝的实体权限判定与审计 |
-| `atk batch manifest\|verify\|apply` | 冻结 / 校验 / 应用候选批次 |
-| `atk baseline start\|changed` | 不依赖 git commit 的改动基线 |
-| `atk cache status\|clean` | 查看 / 清理共享构建缓存 |
-| `atk gate fast\|quick\|local` | 配置驱动的门禁 |
-| `atk select-tests` | 由改动文件生成选测计划 |
-| `atk todo list\|add\|toggle\|done\|undone\|remove` | 人类待办 |
-| `atk measure record\|summary` | 量测记录与汇总 |
-| `atk sync` | import → evidence → board 一条命令 |
-| `atk docs rotate` | 长文档轮转（默认 dry-run） |
-| `atk plugin sync\|verify` | 安装 / 校验 DSH 看板插件副本 |
+全局 SQLite 保存权威状态。项目资料默认写入各自 `.agent-team/`，包括计划、
+执行前后快照、检查证据和验收记录。资料生成失败会显示在网页并可重试。
 
-别名：`atk task`、`atk queue`、`atk check`、`atk import`、`atk archive`、
-`atk restore`、`atk tests`。所有命令都支持 `--cwd <dir> --config <file>`。
+## 外部 Agent
 
-## 看板与 DeepSeek Harness
+![网页工作台](docs/screenshots/overview.png)
 
-`atk init` 默认复制看板插件（`--no-plugin` 可跳过）。在 DSH 的 **Plugins** 页安装
-`config.plugin.dir`，把生成的 `cordis.patch.yml` 的 `insert:` 段合并进 profile
-patch，然后**重启 DSH**——插件树与客户端 bundle 在启动时组合。路由、SSE 行为与
-排障见 [docs/BOARD.md](docs/BOARD.md)。
+在网页创建角色、团队和 Agent 身份，保存只展示一次的凭据。接入时通过外部环境
+变量 `ATK_AGENT_TOKEN` 提供凭据，`ATK_URL` 默认为 `http://127.0.0.1:1421`。
 
-## Agent skills
-
-[`skills/agent-team-flow`](skills/agent-team-flow/SKILL.md) 教 agent 取任务、遵守
-写域、跑门禁、交 6 行回执；[`skills/agent-team-board`](skills/agent-team-board/SKILL.md)
-覆盖看板渲染、服务、插件安装与状态诚实；[`skills/agent-team-roles`](skills/agent-team-roles/SKILL.md)
-按项目实际情况新增、删除、改名或调整 agent（角色），且不需要重跑 `atk init`。
-安装说明见 [skills/README.md](skills/README.md)。
-
-## 示例
-
-[`examples/minimal/`](examples/minimal/README.md) 是一个可直接渲染的迷你项目：
-
-```bash
-node bin/atk.mjs --cwd examples/minimal board
+```powershell
+atk-agent connect
+atk-agent claim --wait 30000
+atk-agent watch <runId> --generation <n>
+atk-agent submit <runId> plan --file plan-receipt.json
+atk-agent submit <runId> result --file result-receipt.json
+atk-agent submit <runId> review --file review-receipt.json
 ```
 
-## 文档
+`watch` 与实际执行同时运行，只维护租约，不会启动或终止 AI。出现 `STOP REQUIRED`、
+续租失败或停止请求时，外部执行端必须停止写入。模型和登录由外部 Agent 自己管理。
 
-- [快速开始](docs/QUICKSTART.zh-CN.md)（[English](docs/QUICKSTART.md)）
-- [架构](docs/ARCHITECTURE.zh-CN.md)（[English](docs/ARCHITECTURE.md)）
-- [实体与 Function](docs/ENTITIES.zh-CN.md)（[English](docs/ENTITIES.md)）
-- [实体权限](docs/PERMISSIONS.zh-CN.md)（[English](docs/PERMISSIONS.md)）
-- [自举开发](docs/SELFHOSTING.zh-CN.md)（[English](docs/SELFHOSTING.md)）
-- [配置](docs/CONFIG.md) · [角色与写域](docs/ROLES.md) ·
-  [工作流](docs/WORKFLOW.zh-CN.md)（[English](docs/WORKFLOW.md)）
-- [看板与插件](docs/BOARD.md) · [迁移](docs/MIGRATION.md) ·
-  [发布](docs/PUBLISHING.md) · [FAQ](docs/FAQ.md) ·
-  [内部契约](docs/INTERNALS.md)
+## 文档与验证
 
-## 环境
+- [架构与状态机](docs/ARCHITECTURE.md)
+- [完整 Agent 协议及样例](docs/AGENT-PROTOCOL.md)
+- [启动、备份、恢复](docs/OPERATIONS.md)
+- [模块处置及阶段验收](docs/REFACTOR.md)
+- [测试证据、性能及边界](docs/VALIDATION.md)
 
-Node.js >= 20.11，无运行时依赖。测试用内置 runner：
-
-```bash
-npm test          # node scripts/test.mjs（Node 20 / Windows / POSIX 都可用）
-npm run selftest  # 测试 + 看板插件自测
-```
-
-## 许可
-
-MIT，见 [LICENSE](LICENSE)。
-
+网页采用 Linear 风格，支持中英双语、列表与看板、计划审批、人工待办、实时事件、
+交付差异和多项目切换。第一版限定本机单用户，不提供远程执行或模型网关。

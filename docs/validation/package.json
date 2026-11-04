@@ -1,0 +1,38 @@
+{
+  "passed": true,
+  "package": "agent-team-kit-2.0.0-alpha.1.tgz",
+  "steps": [
+    {
+      "name": "npm pack includes built UI and excludes legacy runtimes",
+      "passed": true
+    },
+    {
+      "name": "install tarball into an isolated prefix without production dependencies",
+      "passed": true
+    },
+    {
+      "name": "start the installed tool from an unrelated working directory",
+      "passed": true
+    },
+    {
+      "name": "serve the complete bundled web application",
+      "passed": true
+    },
+    {
+      "name": "register multiple ordinary project folders through the installed API",
+      "passed": true
+    },
+    {
+      "name": "external protocol client works from the installed package",
+      "passed": true
+    },
+    {
+      "name": "backup and restore both database and project artifacts",
+      "passed": true
+    },
+    {
+      "name": "stop the matching installation without trusting a stale PID",
+      "passed": true
+    }
+  ]
+}

@@ -1,36 +1,35 @@
 name: publish
-
 on:
   push:
     tags: ["v*"]
-
 permissions:
   contents: read
   id-token: write
-
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.6.0
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
-      - name: Unit tests
-        run: npm test
-      - name: Board plugin selftests
-        run: npm run plugin:selftest
-      - name: Check whether this version is already on npm
-        id: published
+      - run: pnpm install --frozen-lockfile
+      - run: node scripts/check-boundaries.mjs
+      - run: node scripts/test.mjs
+      - run: node scripts/build-web.mjs
+      - run: node scripts/e2e.mjs
+      - run: node scripts/smoke.mjs
+      - name: Verify tag and publish
+        shell: bash
         run: |
-          if npm view "agent-team-kit@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then
-            echo "already=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "already=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Publish with provenance
-        if: steps.published.outputs.already != 'true'
-        run: npm publish --access public --provenance
+          version=$(node -p "JSON.parse(require('fs').readFileSync('package.json')).version")
+          test "$GITHUB_REF_NAME" = "v$version"
+          tag=latest
+          case "$version" in *-*) tag=next ;; esac
+          npm publish --access public --provenance --tag "$tag"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

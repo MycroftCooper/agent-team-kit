@@ -1,11 +1,64 @@
-// Single entry point for the contracts draft.
-//
-// DRAFT (M0 / ATK-005): nothing imports this package yet. M1 wires it into the
-// pnpm workspace and adds OpenAPI generation (ATK-103).
-export * from "./version.mjs";
-export * from "./enums.mjs";
-export * from "./errors.mjs";
-export * from "./dto.mjs";
-export * from "./events.mjs";
-export * from "./paths.mjs";
-export * from "./execution-spec.mjs";
+export const VERSION = "2.0.0-alpha.1";
+export const FUNCTIONS = Object.freeze(["ORCHESTRATOR", "WORKER", "REVIEWER"]);
+export const TASK_STATUSES = Object.freeze([
+  "DRAFT",
+  "READY",
+  "RUNNING",
+  "REVIEWING",
+  "VERIFIED",
+  "AWAITING_ACCEPTANCE",
+  "DONE",
+  "BLOCKED",
+  "CANCELLED",
+]);
+export const STAGES = Object.freeze([
+  "PLANNING",
+  "EXECUTION",
+  "REVIEW",
+  "HUMAN",
+]);
+export const LEASE_MS = 30_000;
+export const HEARTBEAT_MS = 10_000;
+export const MAX_ATTEMPTS = 3;
+export class AppError extends Error {
+  constructor(code, message, status = 400, details = {}) {
+    super(message);
+    this.code = code;
+    this.status = status;
+    this.details = details;
+  }
+}
+export function requireThat(
+  condition,
+  code,
+  message,
+  status = 400,
+  details = {},
+) {
+  if (!condition) throw new AppError(code, message, status, details);
+}
+export function requiredString(value, name, max = 65536) {
+  requireThat(
+    typeof value === "string" && value.trim().length > 0 && value.length <= max,
+    "VALIDATION_ERROR",
+    `${name} must be a non-empty string (max ${max})`,
+  );
+  return value.trim();
+}
+export function object(value, name = "body") {
+  requireThat(
+    value && typeof value === "object" && !Array.isArray(value),
+    "VALIDATION_ERROR",
+    `${name} must be an object`,
+  );
+  return value;
+}
+export function integer(value, fallback, min = 0, max = 1000) {
+  if (value === undefined) return fallback;
+  requireThat(
+    Number.isInteger(value) && value >= min && value <= max,
+    "VALIDATION_ERROR",
+    `expected integer ${min}..${max}`,
+  );
+  return value;
+}

@@ -1,1640 +1,594 @@
-// ATK Backend HTTP server (M1 / ATK-102, ATK-107).
-//
-// Design constraints:
-// - ADR-009: node:http only, a hand-written route table over the small API.
-// - ADR-008: loopback bind + Host allow-list + write Origin/CSRF + session token.
-// - m1-contracts §1/§2/§3: the store is INJECTED. This module never imports
-//   @atk/database, so tests and callers can supply any implementation and the
-//   database package can be built in parallel.
-import crypto from "node:crypto";
-import { readFileSync } from "node:fs";
 import http from "node:http";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-
-import { EVENT_TYPES, ID_RE, ApiError, isEnumValue, validateProject, validateTask, validateTaskExecutionSpec } from "@atk/contracts";
-
+import crypto from "node:crypto";
+import { createService } from "./service.mjs";
+import { acquireInstance } from "./instance-lock.mjs";
+import { backup, restore } from "./operations.mjs";
 import {
-  CLI_CLIENT_HEADER,
-  DEFAULT_SESSION_TTL_MS,
-  WRITE_METHODS,
-  checkBootstrapOrigin,
-  checkCsrf,
-  checkToken,
-  checkWriteOrigin,
   createSession,
-  isLoopbackRemote,
   isSessionExpired,
-  parseHostHeader,
-  persistSessionToken,
+  isAllowedHost,
+  isLoopbackRemote,
+  safeEqual,
 } from "./auth.mjs";
 import {
-  isPlainObject,
-  parseIntegerParam,
-  queryString,
-  requireJsonBody,
-  sendApiError,
-  sendJson,
-  toApiError,
-} from "./http.mjs";
-import {
-  INTERNAL_ROLE_HEADER,
-  INTERNAL_ROLE_RUNTIME_HOST,
-  INTERNAL_ROLE_SCHEDULER,
-  INTERNAL_TOKEN_HEADER,
-  checkInternalRole,
-  checkInternalRoleHeader,
-  createInternalTokens,
-  normalizeInternalTokens,
-  resolveInternalIdentity,
-} from "./internal.mjs";
-import { createInternalRouter } from "./routes-internal.mjs";
-import { createSseHub } from "./sse.mjs";
-import { createStaticHandler } from "./static.mjs";
-
-const PACKAGE = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-const BACKEND_VERSION = typeof PACKAGE.version === "string" ? PACKAGE.version : "0.0.0";
-
-/** apps/web/dist relative to this file: apps/backend/src -> apps/web/dist. */
-const DEFAULT_WEB_DIST = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "web", "dist");
-
-/** Fields a PATCH /tasks/:id may change (everything else is owned by other actors). */
-const PATCHABLE_TASK_FIELDS = new Set([
-  "title",
-  "description",
-  "priority",
-  "roleRequired",
-  "functionRequired",
-  "acceptance",
-  "deps",
-  "status",
-]);
-
-/**
- * `allowedActions` is UI guidance only (M1 shows it, does not execute it).
- * The state machine itself lives in the store / scheduler.
- */
-const ALLOWED_ACTIONS_BY_STATUS = Object.freeze({
-  DRAFT: [],
-  READY: ["claim", "cancel"],
-  CLAIMED: ["cancel"],
-  RUNNING: ["cancel"],
-  REVIEWING: ["cancel"],
-  INTEGRATING: ["cancel"],
-  AWAITING_ACCEPTANCE: ["accept", "reject"],
-  DONE: [],
-  BLOCKED: ["unblock", "cancel"],
-  CANCELLED: [],
-});
-
-function allowedActionsFor(task) {
-  const actions = ALLOWED_ACTIONS_BY_STATUS[task?.status];
-  return Array.isArray(actions) ? [...actions] : [];
+  AppError,
+  requireThat,
+  VERSION,
+} from "../../../packages/contracts/src/index.mjs";
+const DEFAULT_WEB = fileURLToPath(new URL("../../web/dist/", import.meta.url));
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
+};
+function number(value, fallback, min = 0, max = 500) {
+  if (value === null || value === undefined) return fallback;
+  const n = Number(value);
+  requireThat(
+    Number.isInteger(n) && n >= min && n <= max,
+    "VALIDATION_ERROR",
+    `Expected integer ${min}..${max}`,
+  );
+  return n;
 }
-
-// --- M4 review / rework / human acceptance ---------------------------------
-
-/** Review verdicts accepted by the M4 submit endpoint. */
-const M4_VERDICTS = new Set(["PASS", "CHANGES_REQUESTED", "BLOCKED"]);
-
-/** Review statuses (M4 adds CHANGES_REQUESTED/BLOCKED to the M1 enum). */
-const M4_REVIEW_STATUSES = new Set(["PENDING", "PASS", "CHANGES_REQUESTED", "BLOCKED", "RUNNING", "FAIL", "INVALIDATED"]);
-
-/** m4-contracts §0.4: same Task may be reworked at most this many times. */
-const MAX_REVIEW_ATTEMPTS = 3;
-
-/** Human acceptance decisions. */
-const APPROVAL_DECISIONS = new Set(["APPROVED", "REJECTED"]);
-
-const ROUTES = [
-  { name: "projects.list", method: "GET", regex: /^\/api\/v1\/projects$/, keys: [] },
-  { name: "projects.create", method: "POST", regex: /^\/api\/v1\/projects$/, keys: [] },
-  { name: "projects.overview", method: "GET", regex: /^\/api\/v1\/projects\/([^/]+)\/overview$/, keys: ["id"] },
-  { name: "tasks.list", method: "GET", regex: /^\/api\/v1\/tasks$/, keys: [] },
-  { name: "tasks.create", method: "POST", regex: /^\/api\/v1\/tasks$/, keys: [] },
-  { name: "tasks.get", method: "GET", regex: /^\/api\/v1\/tasks\/([^/]+)$/, keys: ["id"] },
-  { name: "tasks.patch", method: "PATCH", regex: /^\/api\/v1\/tasks\/([^/]+)$/, keys: ["id"] },
-  { name: "runs.list", method: "GET", regex: /^\/api\/v1\/runs$/, keys: [] },
-  { name: "runs.get", method: "GET", regex: /^\/api\/v1\/runs\/([^/]+)$/, keys: ["id"] },
-  { name: "agents.list", method: "GET", regex: /^\/api\/v1\/agents$/, keys: [] },
-  { name: "reviews.list", method: "GET", regex: /^\/api\/v1\/reviews$/, keys: [] },
-  { name: "reviews.create", method: "POST", regex: /^\/api\/v1\/reviews$/, keys: [] },
-  { name: "reviews.submit", method: "POST", regex: /^\/api\/v1\/reviews\/([^/]+)\/submit$/, keys: ["id"] },
-  { name: "reviews.rework", method: "POST", regex: /^\/api\/v1\/reviews\/([^/]+)\/rework$/, keys: ["id"] },
-  { name: "approvals.list", method: "GET", regex: /^\/api\/v1\/approvals$/, keys: [] },
-  { name: "approvals.create", method: "POST", regex: /^\/api\/v1\/approvals$/, keys: [] },
-  { name: "approvals.decide", method: "POST", regex: /^\/api\/v1\/approvals\/([^/]+)\/decide$/, keys: ["id"] },
-  { name: "events.list", method: "GET", regex: /^\/api\/v1\/events$/, keys: [] },
-  { name: "events.stream", method: "GET", regex: /^\/api\/v1\/events\/stream$/, keys: [] },
-];
-
-/**
- * Create the backend server.
- *
- * @param {object} options
- * @param {object} options.store            injected store (m1-contracts §1); required
- * @param {string|null} [options.webDist]   dist directory; defaults to apps/web/dist
- * @param {string} [options.token]          fixed session token (tests / tooling)
- * @param {string} [options.csrf]           fixed CSRF token (tests / tooling)
- * @param {string} [options.tokenFile]      override the on-disk token path
- * @param {boolean} [options.persistToken]  force/disable token persistence
- * @param {string[]} [options.allowedOrigins] extra write origins (default: none)
- * @param {string} [options.internalToken] legacy single credential (tests only; maps both roles)
- * @param {{scheduler:string, "runtime-host"?:string, host?:string}} [options.internalTokens]
- *        independent per-role credentials (M6.3 P0-2; default: freshly generated)
- * @returns {{ listen: Function, close: Function, stats: Function, url: string|null, session: object, internalToken: string, internalTokens: object }}
- */
-export function createServer({
-  store,
-  webDist,
-  token,
-  csrf,
-  logger = console,
-  now = () => Date.now(),
-  sessionTtlMs = DEFAULT_SESSION_TTL_MS,
-  tokenFile,
-  persistToken,
-  allowedOrigins = [],
-  sseHeartbeatMs = 25_000,
-  ssePollMs = 300,
-  internalToken,
-  internalTokens,
-} = {}) {
-  if (!store || typeof store !== "object") {
-    throw new TypeError(
-      "@atk/backend: createServer() requires an injected `store` (m1-contracts §1). " +
-        "The server never imports @atk/database itself.",
+async function readBody(req) {
+  let bytes = 0,
+    chunks = [];
+  for await (const chunk of req) {
+    bytes += chunk.length;
+    requireThat(
+      bytes <= 512 * 1024,
+      "BODY_TOO_LARGE",
+      "Body exceeds 512 KiB",
+      413,
     );
+    chunks.push(chunk);
   }
-
-  const startedAt = now();
-  let session = createSession({ now: startedAt, ttlMs: sessionTtlMs, token, csrf });
-
-  // ADR-008 §5 / M6.3 P0-2: two independent internal credentials, one per role.
-  // They are minted per process, never persisted, never logged and never
-  // returned by an HTTP response.
-  const resolvedInternalTokens = normalizeInternalTokens(internalTokens)
-    ?? normalizeInternalTokens(
-      internalToken === undefined
-        ? null
-        : { scheduler: internalToken, "runtime-host": internalToken },
-    )
-    ?? createInternalTokens();
-  if (
-    typeof resolvedInternalTokens[INTERNAL_ROLE_SCHEDULER] !== "string" ||
-    typeof resolvedInternalTokens[INTERNAL_ROLE_RUNTIME_HOST] !== "string"
-  ) {
-    throw new TypeError("@atk/backend: internalTokens must contain non-empty scheduler and runtime-host tokens");
+  if (!bytes) return {};
+  try {
+    const b = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    requireThat(
+      b && typeof b === "object" && !Array.isArray(b),
+      "VALIDATION_ERROR",
+      "JSON object required",
+    );
+    return b;
+  } catch (e) {
+    if (e instanceof AppError) throw e;
+    throw new AppError("INVALID_JSON", "Invalid JSON");
   }
-
-  // A caller-provided token is deterministic tooling input; only a server-minted
-  // token is persisted to the user-scoped token file unless overridden.
-  const shouldPersist = typeof persistToken === "boolean" ? persistToken : token === undefined;
-  const tokenPersistence = shouldPersist
-    ? persistSessionToken(session.token, { tokenFile, logger })
-    : { persisted: false, tokenFile: tokenFile ?? null, warning: null };
-
-  const hub = createSseHub({ store, heartbeatMs: sseHeartbeatMs, pollMs: ssePollMs, logger, now });
-
-  // M6.2 F05: the claim path must freeze + validate the execution spec before
-  // the store creates the Run, so the very first (durable-idempotency replay)
-  // claim already has a spec bound to it. This facade keeps that guarantee
-  // linear across every caller of the store's atomic claim.
-  function freezeClaimSpec(taskId) {
-    if (typeof store.freezeTaskSpec !== "function") {
-      throw new ApiError("INTERNAL_ERROR", "this store cannot freeze an execution spec", {
-        details: { reason: "spec-freeze-unavailable", taskId },
-      });
-    }
-    const frozen = store.freezeTaskSpec(taskId, { now: new Date(now()).toISOString() });
-    if (!isPlainObject(frozen) || typeof frozen.specHash !== "string" || frozen.specHash === "") {
-      throw new ApiError("INTERNAL_ERROR", "execution spec is unavailable for dispatch", { details: { taskId } });
-    }
-    const validation = validateTaskExecutionSpec(frozen.spec);
-    if (!validation.ok) {
-      throw new ApiError("INTERNAL_ERROR", "frozen execution spec did not pass the contract validator", {
-        details: { taskId, errors: validation.errors },
-      });
-    }
-    return frozen;
+}
+export function createServer({
+  dataDir,
+  webDist = DEFAULT_WEB,
+  service,
+  now,
+  logger = console,
+} = {}) {
+  const instanceId = crypto.randomUUID(),
+    ownership = acquireInstance(dataDir ?? service?.dataDir, instanceId),
+    streams = new Set();
+  let app;
+  try {
+    app = service ?? createService({ dataDir, now });
+  } catch (error) {
+    ownership.release();
+    throw error;
   }
-
-  /**
-   * M6.2 F04 bridge: a Scheduler proposal carries a workspacePolicy, not the
-   * final workspace. Translate it to the claim.workspace shape. An incomplete
-   * real-task policy is refused (never silently degraded to "none", which would
-   * let the Agent write into the main worktree).
-   */
-  function workspaceFromPolicy(dto = {}) {
-    if (isPlainObject(dto.workspace)) return dto.workspace;
-    const policy = dto.workspacePolicy;
-    if (policy === undefined || policy === null) return undefined; // store default: none
-    if (!isPlainObject(policy)) {
-      throw new ApiError("VALIDATION_ERROR", "workspacePolicy must be an object", {
-        details: { field: "workspacePolicy", errors: ["workspacePolicy must be an object"] },
-      });
+  let session = createSession(),
+    maintenance,
+    streamTimer;
+  let port = 0;
+  let shutdownHandler;
+  const json = (res, status, value) => {
+    res.writeHead(status, {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    });
+    res.end(JSON.stringify(value));
+  };
+  function originAllowed(req) {
+    if (req.headers["sec-fetch-site"] === "cross-site") return false;
+    if (!req.headers.origin) return true;
+    try {
+      const u = new URL(req.headers.origin);
+      return (
+        u.protocol === "http:" &&
+        ["127.0.0.1", "localhost", "[::1]"].includes(u.hostname) &&
+        u.host === req.headers.host
+      );
+    } catch {
+      return false;
     }
-    const kind = policy.kind ?? (policy.root !== undefined || policy.baseCommit !== undefined ? "worktree" : "none");
-    if (kind !== "worktree" && kind !== "none") {
-      throw new ApiError("VALIDATION_ERROR", "workspacePolicy.kind must be worktree|none", {
-        details: { field: "workspacePolicy.kind", errors: ["workspacePolicy.kind must be worktree|none"] },
+  }
+  function pump() {
+    for (const client of streams) {
+      const events = app.store.events({
+        after: client.seq,
+        limit: 200,
+        projectId: client.projectId,
       });
-    }
-    if (kind === "none") return { kind: "none" };
-
-    const missing = [];
-    let root = typeof policy.root === "string" && policy.root.trim() !== "" ? policy.root : null;
-    if (root === null) {
-      // The project's parent directory is an acceptable explicit fallback, but
-      // only when we can resolve it to an absolute path.
-      let project = null;
-      try {
-        const task = store.getTask(dto.taskId);
-        project = (store.listProjects() ?? []).find((candidate) => candidate.id === task?.projectId) ?? null;
-      } catch {
-        project = null;
+      for (const e of events) {
+        client.res.write(
+          `id: ${e.seq}\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`,
+        );
+        client.seq = e.seq;
       }
-      if (typeof project?.repoPath === "string" && path.isAbsolute(project.repoPath)) {
-        root = path.dirname(project.repoPath);
-      } else {
-        missing.push("root");
+      if (client.res.writableLength > 1024 * 1024) {
+        client.res.destroy();
+        streams.delete(client);
       }
     }
-    const baseCommit = typeof policy.baseCommit === "string" ? policy.baseCommit : null;
-    if (baseCommit === null || !/^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$/.test(baseCommit)) missing.push("baseCommit");
-    if (missing.length > 0) {
-      throw new ApiError("VALIDATION_ERROR", "workspacePolicy is not specific enough to dispatch a real task", {
-        details: { field: "workspacePolicy", reason: "workspace-policy-incomplete", missing, kind },
-      });
-    }
-    return {
-      kind: "worktree",
-      root,
-      baseCommit,
-      targetBranch: typeof policy.targetBranch === "string" && policy.targetBranch !== "" ? policy.targetBranch : null,
-      ...(typeof policy.path === "string" && policy.path !== "" ? { path: policy.path } : {}),
-    };
   }
-
-  const internalStore = Object.create(store);
-  if (typeof store.claimTask === "function") {
-    const enrichClaim = (result, frozen) => {
-      if (!isPlainObject(result) || !frozen) return result;
-      const enriched = { ...result };
-      const addSpec = (object) => (isPlainObject(object) ? { ...object, specHash: frozen.specHash, spec: frozen.spec } : object);
-      if (result.run) enriched.run = addSpec(result.run);
-      if (result.command) {
-        enriched.command = addSpec(result.command);
-        if (isPlainObject(result.command.payload)) {
-          enriched.command.payload = { ...result.command.payload, specHash: frozen.specHash, spec: frozen.spec };
+  app.signals.on("change", pump);
+  app.signals.on("restore", () => {
+    for (const c of streams) {
+      c.res.write("event: system.resync-required\ndata: {}\n\n");
+      c.seq = 0;
+    }
+  });
+  async function waitClaim(agentId, body, req) {
+    const deadline = Date.now() + number(body.waitMs, 0, 0, 30000);
+    let result;
+    do {
+      result = app.claim(agentId, body);
+      if (result.run || Date.now() >= deadline || req.aborted) return result;
+      await new Promise((resolve) => {
+        const timer = setTimeout(done, Math.min(1000, deadline - Date.now()));
+        function done() {
+          clearTimeout(timer);
+          app.signals.off("change", done);
+          resolve();
         }
-      }
-      return enriched;
-    };
-    internalStore.claimTask = (dto = {}) => {
-      // M6.2: claimTask freezes the spec + binds the workspace inside its own
-      // transaction. Never re-freeze here - especially not on idempotent replay.
-      const workspace = workspaceFromPolicy(dto);
-      const result = store.claimTask({ ...dto, ...(workspace === undefined ? {} : { workspace }) });
-      if (!isPlainObject(result)) return result;
-      if (typeof store.getRunSpec !== "function") return result;
-      let frozen = null;
-      if (result.run?.id) {
-        try {
-          frozen = store.getRunSpec(result.run.id);
-        } catch {
-          frozen = null;
-        }
-      }
-      if (!isPlainObject(frozen)) {
-        throw new ApiError("INTERNAL_ERROR", "claim returned a Run without a frozen execution spec", {
-          details: { reason: "spec-missing", runId: result.run?.id ?? null, taskId: dto.taskId },
+        app.signals.once("change", done);
+      });
+    } while (!req.aborted);
+    return result;
+  }
+  const server = http.createServer(async (req, res) => {
+    const started = performance.now();
+    let url;
+    try {
+      requireThat(req.url.length < 8192, "URL_TOO_LONG", "URL too long", 414);
+      requireThat(
+        isLoopbackRemote(req.socket.remoteAddress) &&
+          isAllowedHost(req.headers.host),
+        "ACCESS_DENIED",
+        "Loopback access only",
+        403,
+      );
+      res.setHeader("x-content-type-options", "nosniff");
+      res.setHeader("referrer-policy", "no-referrer");
+      res.setHeader("x-frame-options", "DENY");
+      url = new URL(req.url, `http://127.0.0.1:${port}`);
+      const pathname = decodeURIComponent(url.pathname);
+      const method = req.method;
+      if (pathname === "/api/v1/system/health" && method === "GET")
+        return json(res, 200, {
+          ok: true,
+          version: VERSION,
+          format: "atk-next-1",
+          instanceId,
+        });
+      if (pathname === "/api/v1/session" && method === "GET") {
+        requireThat(
+          originAllowed(req),
+          "ORIGIN_FORBIDDEN",
+          "Cross-origin session bootstrap refused",
+          403,
+        );
+        if (isSessionExpired(session)) session = createSession();
+        return json(res, 200, {
+          token: session.token,
+          csrf: session.csrf,
+          expiresAt: session.expiresAt,
         });
       }
-      const validation = validateTaskExecutionSpec(frozen.spec);
-      if (!validation.ok) {
-        throw new ApiError("INTERNAL_ERROR", "frozen execution spec did not pass the contract validator", {
-          details: { runId: result.run?.id ?? null, errors: validation.errors },
-        });
+      const isAgent = pathname.startsWith("/api/agent/v1/");
+      let agent;
+      if (isAgent) {
+        requireThat(
+          !req.headers.origin,
+          "AGENT_BROWSER_FORBIDDEN",
+          "Use the browser API for human actions",
+          403,
+        );
+        agent = app.authenticate(
+          req.headers.authorization?.replace(/^Bearer /, ""),
+        );
+      } else if (pathname.startsWith("/api/")) {
+        requireThat(
+          !isSessionExpired(session) &&
+            safeEqual(req.headers["x-atk-token"], session.token),
+          "UNAUTHENTICATED",
+          "Browser session required",
+          401,
+        );
+        requireThat(
+          originAllowed(req),
+          "ORIGIN_FORBIDDEN",
+          "Cross-origin request refused",
+          403,
+        );
+        if (!["GET", "HEAD"].includes(method))
+          requireThat(
+            safeEqual(req.headers["x-atk-csrf"], session.csrf),
+            "CSRF_REQUIRED",
+            "CSRF token required",
+            403,
+          );
       }
-      return enrichClaim(result, frozen);
-    };
-  }
-  if (typeof store.claimDispatchCommand === "function" && typeof store.getRunSpec === "function") {
-    internalStore.claimDispatchCommand = (dto = {}) => {
-      const result = store.claimDispatchCommand(dto);
-      if (!result || !isPlainObject(result.command)) return result;
-      let frozen = null;
-      try {
-        frozen = store.getRunSpec(result.command.runId);
-      } catch {
-        // Legacy commands created before M6.2 (or seeded by tooling) have no
-        // Run-bound spec; freeze one now so the Host never receives a bare
-        // "execute task X" instruction.
-        try {
-          frozen = freezeClaimSpec(result.command.taskId);
-        } catch {
-          throw new ApiError("INTERNAL_ERROR", "dispatch command has no frozen execution spec", {
-            details: { reason: "spec-missing", runId: result.command.runId, commandId: result.command.id, taskId: result.command.taskId },
+      const body = ["POST", "PATCH", "PUT"].includes(method)
+        ? await readBody(req)
+        : {};
+      const segments = pathname.split("/").filter(Boolean),
+        route = isAgent ? segments.slice(3) : segments.slice(2);
+      const [resource, id, action] = route;
+      const projectId = url.searchParams.get("projectId") ?? undefined;
+      if (isAgent) {
+        let result;
+        if (method === "POST" && resource === "connect")
+          result = app.connect(agent.id);
+        else if (method === "POST" && resource === "heartbeat")
+          result = app.heartbeat(agent.id, null, body);
+        else if (method === "POST" && resource === "claims")
+          result = await waitClaim(agent.id, body, req);
+        else if (method === "GET" && resource === "plans" && id) {
+          const plan = app.get("plans", id),
+            p = app.get("projects", plan.projectId),
+            team = app.get("teams", agent.teamId);
+          requireThat(
+            p.teamId === team.id &&
+              (team.projectIds.length === 0 || team.projectIds.includes(p.id)),
+            "PROJECT_FORBIDDEN",
+            "Project not authorized",
+            403,
+          );
+          result = plan;
+        } else if (resource === "runs" && id) {
+          const run = app.get("runs", id);
+          const targetProject = app.get("projects", run.projectId),
+            team = app.get("teams", agent.teamId);
+          requireThat(
+            targetProject.teamId === team.id &&
+              (team.projectIds.length === 0 ||
+                team.projectIds.includes(targetProject.id)),
+            "PROJECT_FORBIDDEN",
+            "Project is not assigned to this team",
+            403,
+          );
+          if (method === "GET" && action === "artifact")
+            result = app.artifact(id);
+          else {
+            requireThat(
+              run.agentId === agent.id,
+              "RUN_FORBIDDEN",
+              "Run belongs to another identity",
+              403,
+            );
+            if (method === "GET" && !action) result = app.runStatus(id);
+            else if (method === "POST" && action === "heartbeat")
+              result = app.heartbeat(agent.id, id, body);
+            else if (method === "POST" && action === "events")
+              result = app.runEvents(agent.id, id, body);
+            else if (method === "POST" && action === "plan")
+              result = app.submitPlan(agent.id, id, body);
+            else if (method === "POST" && action === "result")
+              result = app.finishRun(agent.id, id, body);
+            else if (method === "POST" && action === "review")
+              result = app.submitReview(agent.id, id, body);
+            else if (method === "POST" && action === "stopped")
+              result = app.acknowledgeStop(agent.id, id, body);
+          }
+        }
+        requireThat(
+          result !== undefined,
+          "NOT_FOUND",
+          "Unknown agent route",
+          404,
+        );
+        return json(res, 200, result);
+      }
+      if (pathname.startsWith("/api/v1/")) {
+        if (method === "GET" && resource === "events" && id === "stream") {
+          const latest = app.store.latestSeq(),
+            requested =
+              req.headers["last-event-id"] ?? url.searchParams.get("after");
+          let seq =
+            requested === null || requested === undefined
+              ? latest
+              : Number(requested);
+          res.writeHead(200, {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+            connection: "keep-alive",
           });
+          res.write(": connected\n\n");
+          if (!Number.isInteger(seq) || seq < 0 || seq > latest) {
+            res.write("event: system.resync-required\ndata: {}\n\n");
+            seq = 0;
+          }
+          const client = { res, seq, projectId };
+          streams.add(client);
+          res.on("close", () => streams.delete(client));
+          pump();
+          return;
         }
+        let result;
+        const listables = [
+          "projects",
+          "roles",
+          "teams",
+          "agents",
+          "tasks",
+          "plans",
+          "runs",
+          "locks",
+          "acceptances",
+          "materializations",
+        ];
+        if (method === "GET" && resource === "overview")
+          result = app.overview(projectId);
+        else if (method === "GET" && resource === "inbox")
+          result = app.inbox(projectId);
+        else if (method === "GET" && resource === "events")
+          result = {
+            items: app.store.events({
+              projectId,
+              entityId: url.searchParams.get("entityId") ?? undefined,
+              after: number(
+                url.searchParams.get("after"),
+                0,
+                0,
+                Number.MAX_SAFE_INTEGER,
+              ),
+              limit: number(url.searchParams.get("limit"), 100, 1, 500),
+            }),
+            latestSeq: app.store.latestSeq(),
+          };
+        else if (method === "GET" && listables.includes(resource)) {
+          if (id)
+            result =
+              action === "artifact" && resource === "runs"
+                ? app.artifact(id)
+                : app.get(resource, id);
+          else
+            result = app.list(resource, {
+              projectId,
+              status: url.searchParams.get("status") ?? undefined,
+              parentId: url.searchParams.get("parentId") ?? undefined,
+              limit: number(url.searchParams.get("limit"), 100, 1, 500),
+              offset: number(url.searchParams.get("cursor"), 0, 0, 1_000_000),
+            });
+        } else if (method === "POST" && resource === "projects" && !id)
+          result = app.createProject(body);
+        else if (method === "PATCH" && resource === "projects" && id)
+          result = app.updateProject(id, body);
+        else if (
+          method === "POST" &&
+          resource === "projects" &&
+          action === "retry-documents"
+        )
+          result = app.retryDocuments(id);
+        else if (method === "POST" && resource === "roles" && !id)
+          result = app.createRole(body);
+        else if (method === "PATCH" && resource === "roles" && id)
+          result = app.updateRole(id, body);
+        else if (method === "POST" && resource === "teams" && !id)
+          result = app.createTeam(body);
+        else if (method === "PATCH" && resource === "teams" && id)
+          result = app.updateTeam(id, body);
+        else if (method === "POST" && resource === "agents" && !id)
+          result = app.createAgent(body);
+        else if (method === "PATCH" && resource === "agents" && id)
+          result = app.updateAgent(id, body);
+        else if (
+          method === "POST" &&
+          resource === "agents" &&
+          action === "revoke"
+        )
+          result = app.revokeAgent(id);
+        else if (method === "POST" && resource === "tasks" && !id)
+          result = app.createDraft(body);
+        else if (
+          method === "POST" &&
+          resource === "plans" &&
+          action === "approve"
+        )
+          result = app.approvePlan(id, body);
+        else if (
+          method === "POST" &&
+          resource === "plans" &&
+          action === "revise"
+        )
+          result = app.requestPlanRevision(id, body);
+        else if (method === "POST" && resource === "runs" && action === "stop")
+          result = app.requestStop(id);
+        else if (
+          method === "POST" &&
+          resource === "runs" &&
+          action === "confirm-stopped"
+        )
+          result = app.confirmStopped(id, body);
+        else if (
+          method === "POST" &&
+          resource === "tasks" &&
+          action === "retry"
+        )
+          result = app.retryTask(id, body);
+        else if (
+          method === "POST" &&
+          resource === "tasks" &&
+          action === "human-start"
+        )
+          result = app.startHuman(id, body);
+        else if (
+          method === "POST" &&
+          resource === "tasks" &&
+          action === "human-complete"
+        )
+          result = app.finishHuman(id, body);
+        else if (
+          method === "POST" &&
+          resource === "tasks" &&
+          action === "human-heartbeat"
+        )
+          result = app.heartbeatHuman(id);
+        else if (
+          method === "POST" &&
+          resource === "acceptances" &&
+          action === "approve"
+        )
+          result = app.accept(id, body);
+        else if (
+          method === "POST" &&
+          resource === "acceptances" &&
+          action === "revalidate"
+        )
+          result = app.revalidateAcceptance(id);
+        else if (
+          method === "POST" &&
+          resource === "operations" &&
+          id === "shutdown"
+        ) {
+          result = { stopping: true };
+          setTimeout(() => shutdownHandler?.(), 100);
+        } else if (
+          method === "POST" &&
+          resource === "operations" &&
+          id === "backup"
+        )
+          result = backup(app, body.destination);
+        else if (
+          method === "POST" &&
+          resource === "operations" &&
+          id === "restore"
+        )
+          result = restore(app, body.source);
+        requireThat(
+          result !== undefined,
+          "NOT_FOUND",
+          "Unknown browser route",
+          404,
+        );
+        return json(res, 200, result);
       }
-      const addSpec = (object) => (isPlainObject(object) ? { ...object, specHash: frozen.specHash, spec: frozen.spec } : object);
-      return {
-        ...result,
-        command: (() => {
-          const command = addSpec(result.command);
-          if (isPlainObject(command.payload)) command.payload = { ...command.payload, specHash: frozen.specHash, spec: frozen.spec };
-          return command;
-        })(),
-        ...(result.run ? { run: addSpec(result.run) } : {}),
-      };
-    };
-  }
-  const internalRouter = createInternalRouter({ store: internalStore, hub, now, logger });
-  const staticHandler = createStaticHandler({
-    webDist: webDist === undefined ? DEFAULT_WEB_DIST : webDist,
-    logger,
-  });
-
-  const sockets = new Set();
-  const httpServer = http.createServer();
-  httpServer.on("connection", (socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-  });
-
-  let listening = false;
-  let baseUrl = null;
-  let boundPort = null;
-
-  function healthPayload() {
-    let db;
-    try {
-      db = store.health();
-    } catch (error) {
-      logger?.error?.(`[atk] store.health() failed: ${error?.message ?? error}`);
-      db = { ok: false, error: "store-health-unavailable" };
-    }
-    const payload = { ok: true, version: BACKEND_VERSION, db, uptimeMs: Math.max(0, now() - startedAt) };
-    // M6: can this database be switched to SQLite right now? Older stores do
-    // not implement verifySwitchReadiness: omit the field instead of failing.
-    if (typeof store.verifySwitchReadiness === "function") {
-      try {
-        const readiness = store.verifySwitchReadiness();
-        payload.switchReadiness = {
-          ok: Boolean(readiness?.ok),
-          blockers: Array.isArray(readiness?.blockers) ? readiness.blockers : [],
-        };
-      } catch (error) {
-        logger?.error?.(`[atk] store.verifySwitchReadiness() failed: ${error?.message ?? error}`);
-        payload.switchReadiness = {
-          ok: false,
-          blockers: [{ code: "switch-readiness-error", message: String(error?.message ?? error) }],
-        };
-      }
-    }
-    return payload;
-  }
-
-  function sessionPayload() {
-    // A server process outlives its session TTL (8h by default). Without
-    // rotation, reloading the page would hand the browser the SAME expired
-    // token and every request would answer NOT_AUTHORIZED/token-expired until
-    // someone restarted the backend. Mint and persist a fresh session instead.
-    if (isSessionExpired(session, now())) {
-      session = createSession({ now: now(), ttlMs: sessionTtlMs, actor: session.actor });
-      if (shouldPersist && tokenFile) persistSessionToken(session.token, { tokenFile, logger });
-      logger?.info?.(`[atk] session expired; issued a new session (ttl ${sessionTtlMs}ms)`);
-    }
-    // The cookie-free bootstrap: exactly the fields m1-contracts §2 publishes.
-    return { token: session.token, csrf: session.csrf, actor: session.actor, expiresAt: session.expiresAt };
-  }
-
-  function validationError(message, errors) {
-    return new ApiError("VALIDATION_ERROR", message, { details: { errors } });
-  }
-
-  /** Validation errors that name the offending field (m6.1 F12). */
-  function fieldValidationError(field, message) {
-    return new ApiError("VALIDATION_ERROR", message, { details: { field, errors: [message] } });
-  }
-
-  function requireBodyObject(body, label) {
-    if (!isPlainObject(body)) throw validationError(`${label} must be a JSON object`, [`${label} must be an object`]);
-    return body;
-  }
-
-  function listPayload(items) {
-    return { items: Array.isArray(items) ? items : [] };
-  }
-
-  // --- m6.1 F01: generic PATCH may only touch non-execution states ----------
-  const EXECUTION_TARGET_STATES = new Set(["CLAIMED", "RUNNING", "REVIEWING", "INTEGRATING", "AWAITING_ACCEPTANCE", "DONE"]);
-  const GENERIC_PATCH_TARGETS = ["READY", "BLOCKED", "CANCELLED"];
-
-  function executionStateGuardError(taskId, requestedStatus) {
-    return new ApiError("TASK_VERSION_CONFLICT", `status "${requestedStatus}" can only be reached through its dedicated service`, {
-      details: {
-        taskId,
-        requestedStatus,
-        reason: "execution-state-guard",
-        allowedTransitions: [...GENERIC_PATCH_TARGETS],
-      },
-    });
-  }
-
-  function assertGenericTaskStatusAllowed(task, requestedStatus) {
-    if (requestedStatus === undefined) return;
-    if (requestedStatus === task.status) return; // no-op (idempotent)
-    if (EXECUTION_TARGET_STATES.has(requestedStatus)) throw executionStateGuardError(task.id, requestedStatus);
-    if (requestedStatus === "READY") {
-      if (!["DRAFT", "REJECTED", "BLOCKED"].includes(task.status)) throw executionStateGuardError(task.id, requestedStatus);
-      return;
-    }
-    if (requestedStatus === "BLOCKED" || requestedStatus === "CANCELLED") {
-      if (["DONE", "CANCELLED"].includes(task.status)) throw executionStateGuardError(task.id, requestedStatus);
-      return;
-    }
-    throw executionStateGuardError(task.id, requestedStatus);
-  }
-
-  // --- M4 contract-layer helpers (never delegated to the store for codes) ---
-
-  function requireNonEmptyString(value, label) {
-    if (typeof value !== "string" || value.trim() === "") {
-      throw validationError(`invalid ${label}`, [`${label} must be a non-empty string`]);
-    }
-    return value;
-  }
-
-  /**
-   * `actor` defaults to HUMAN for browser sessions; agents must be explicit.
-   *
-   * SECURITY BOUNDARY (m4-contracts §0.1): `actor` is a CLIENT-DECLARED identity,
-   * not an authenticated principal. The self-review invariant below is
-   * "refuse by declaration", not authentication: a malicious caller could
-   * declare a different actor. It stops accidental self-approval from a
-   * well-behaved client; real identity enforcement belongs to a later auth layer.
-   */
-  function actorFrom(body, { required = false } = {}) {
-    if (body.actor === undefined) {
-      if (required) throw validationError("invalid actor", ["actor is required"]);
-      return "HUMAN";
-    }
-    const actor = requireNonEmptyString(body.actor, "actor");
-    // Canonical form only: surrounding whitespace is a spoofing attempt, not an
-    // id. Mixed case is accepted and compared case-insensitively below.
-    if (actor !== actor.trim()) {
-      throw new ApiError("VALIDATION_ERROR", "actor must be canonical (no leading/trailing whitespace)", {
-        details: { reason: "actor-not-normalized", actor },
+      requireThat(
+        ["GET", "HEAD"].includes(method),
+        "NOT_FOUND",
+        "Unknown route",
+        404,
+      );
+      const target = path.resolve(webDist, "." + pathname);
+      requireThat(
+        target === path.resolve(webDist) ||
+          target.startsWith(path.resolve(webDist) + path.sep),
+        "NOT_FOUND",
+        "Invalid path",
+        404,
+      );
+      let file = target;
+      if (!fs.existsSync(file) || fs.statSync(file).isDirectory())
+        file = path.join(webDist, "index.html");
+      requireThat(
+        fs.existsSync(file),
+        "WEB_NOT_BUILT",
+        "Build the web application first",
+        503,
+      );
+      requireThat(
+        fs.realpathSync(file).startsWith(fs.realpathSync(webDist) + path.sep),
+        "NOT_FOUND",
+        "Invalid static path",
+        404,
+      );
+      res.setHeader(
+        "content-security-policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+      );
+      res.writeHead(200, {
+        "content-type": MIME[path.extname(file)] ?? "application/octet-stream",
+        "cache-control": file.endsWith("index.html")
+          ? "no-cache"
+          : "public, max-age=3600",
       });
-    }
-    return actor;
-  }
-
-  /** Case/space-insensitive identity used only for the declared self-review check. */
-  function canonicalActor(value) {
-    if (typeof value !== "string") return null;
-    const trimmed = value.trim().toLowerCase();
-    return trimmed === "" ? null : trimmed;
-  }
-
-  function pumpSse() {
-    try {
-      hub.pump();
-    } catch (error) {
-      logger?.error?.(`[atk] SSE pump failed: ${error?.message ?? error}`);
-    }
-  }
-
-  function taskStateConflict(task, reason) {
-    return new ApiError("TASK_VERSION_CONFLICT", `task "${task.id}" is in state ${task.status}`, {
-      details: { taskId: task.id, status: task.status, currentVersion: task.version, reason },
-    });
-  }
-
-  function reviewCasConflict(review, expectedVersion) {
-    return new ApiError("VERSION_CONFLICT", `review "${review.id}" version conflict`, {
-      details: { entity: "review", id: review.id, currentVersion: review.version, expectedVersion },
-    });
-  }
-
-  function reviewStateConflict(review, reason) {
-    return new ApiError("VERSION_CONFLICT", `review "${review.id}" cannot accept this action`, {
-      details: { entity: "review", id: review.id, status: review.status, reason },
-    });
-  }
-
-  function approvalStale({ approvalId, taskId, expectedTargetHash, receivedTargetHash }) {
-    return new ApiError("APPROVAL_STALE", "target hash does not match the current target", {
-      details: { approvalId, taskId, expectedTargetHash: expectedTargetHash ?? null, receivedTargetHash: receivedTargetHash ?? null },
-    });
-  }
-
-  function reworkLimitReached({ taskId, attempt, maxAttempts }) {
-    return new ApiError("REWORK_LIMIT_REACHED", `task "${taskId}" reached the rework limit`, {
-      details: { taskId, attempt, maxAttempts },
-    });
-  }
-
-  function getReviewOrThrow(id) {
-    if (typeof store.getReview !== "function") {
-      throw new ApiError("INTERNAL_ERROR", "store.getReview is unavailable");
-    }
-    return store.getReview(id);
-  }
-
-  /** Hard invariant §0.1: the author (Run agent or current assignee) cannot review. */
-  function assertNotSelfReview(review, task, actor) {
-    const authorIds = new Set();
-    if (review.runId) {
-      try {
-        const run = store.getRun(review.runId);
-        if (typeof run?.agentId === "string" && run.agentId !== "") authorIds.add(run.agentId);
-      } catch {
-        // A missing Run is reported by the store on submit; self-review just has
-        // nothing to compare against here.
+      if (method === "HEAD") res.end();
+      else fs.createReadStream(file).pipe(res);
+    } catch (e) {
+      if (res.headersSent) {
+        res.end();
+        return;
       }
-    }
-    if (typeof task?.assignee === "string" && task.assignee !== "") authorIds.add(task.assignee);
-    const canonical = canonicalActor(actor);
-    const self = [...authorIds].find((id) => canonicalActor(id) === canonical);
-    if (self !== undefined) {
-      throw new ApiError("SELF_REVIEW_FORBIDDEN", "the author cannot review their own work", {
-        details: { actor, authorAgentId: self },
-      });
-    }
-  }
-
-  /** Hard invariant §0.2: a PASS must carry a manifest hash and a full green test run. */
-  function assertPassEvidence(manifestHash, evidence) {
-    const missing = [];
-    if (typeof manifestHash !== "string" || manifestHash.trim() === "") missing.push("manifestHash");
-    const tests = isPlainObject(evidence?.tests) ? evidence.tests : null;
-    if (!tests) {
-      missing.push("evidence.tests");
-    } else {
-      if (!Number.isInteger(tests.passed) || tests.passed < 0) missing.push("evidence.tests.passed");
-      if (!Number.isInteger(tests.total) || tests.total < 1) missing.push("evidence.tests.total");
-      if (!missing.includes("evidence.tests.passed") && !missing.includes("evidence.tests.total") && tests.passed !== tests.total) {
-        missing.push("evidence.tests.passed===total");
-      }
-    }
-    if (missing.length > 0) {
-      throw new ApiError("EVIDENCE_MISSING", "PASS requires manifestHash and evidence.tests.passed === evidence.tests.total > 0", {
-        details: {
-          missing,
-          verdict: "PASS",
-          manifestHashProvided: typeof manifestHash === "string" && manifestHash.trim() !== "",
-          testsPresent: Boolean(tests),
+      const status = e instanceof AppError ? e.status : 500;
+      const message =
+        e instanceof AppError ? e.message : "Unexpected server error";
+      if (status === 500) logger.error?.(e.stack ?? e.message);
+      json(res, status, {
+        error: {
+          code: e.code ?? "INTERNAL_ERROR",
+          message,
+          details: e.details ?? {},
         },
       });
-    }
-  }
-
-  function encodeReviewCursor(review) {
-    return Buffer.from(`${review.createdAt ?? ""}|${review.id}`, "utf8").toString("base64url");
-  }
-
-  function decodeReviewCursor(cursor) {
-    if (typeof cursor !== "string" || cursor.trim() === "") return null;
-    let raw;
-    try {
-      raw = Buffer.from(cursor, "base64url").toString("utf8");
-    } catch {
-      return null;
-    }
-    const at = raw.indexOf("|");
-    if (at < 0) return null;
-    const createdAt = raw.slice(0, at);
-    const id = raw.slice(at + 1);
-    if (id === "" || Number.isNaN(Date.parse(createdAt))) return null;
-    return { createdAt, id };
-  }
-
-  function compareReviewsDesc(a, b) {
-    const at = String(a.createdAt ?? "");
-    const bt = String(b.createdAt ?? "");
-    if (at !== bt) return at < bt ? 1 : -1;
-    return String(a.id) < String(b.id) ? 1 : -1;
-  }
-
-  function isAfterReviewCursor(review, cursor) {
-    const createdAt = String(review.createdAt ?? "");
-    if (createdAt !== cursor.createdAt) return createdAt < cursor.createdAt;
-    return String(review.id) < cursor.id;
-  }
-
-  function reviewFilterFrom(searchParams) {
-    const filter = {};
-    const taskId = queryString(searchParams, "taskId");
-    if (taskId !== undefined) {
-      if (taskId.trim() === "" || !ID_RE.test(taskId)) {
-        throw fieldValidationError("taskId", "taskId must be an id string");
-      }
-      filter.taskId = taskId;
-    }
-    const status = queryString(searchParams, "status");
-    if (status !== undefined) {
-      if (!M4_REVIEW_STATUSES.has(status)) throw fieldValidationError("status", "status must be a known review status");
-      filter.status = status;
-    }
-    const limit = parseIntegerParam(searchParams, "limit", { min: 1, max: 100, fallback: 50 });
-    filter.limit = limit;
-    const cursor = queryString(searchParams, "cursor");
-    if (cursor !== undefined) {
-      const decoded = decodeReviewCursor(cursor);
-      if (decoded === null) throw fieldValidationError("cursor", "cursor is not a valid review cursor");
-      filter.cursor = cursor;
-      filter.cursorValue = decoded;
-    }
-    filter.withTotal = queryString(searchParams, "withTotal") === "1";
-    return filter;
-  }
-
-  function matchRoute(pathname, method) {
-    for (const route of ROUTES) {
-      if (route.method !== method) continue;
-      const match = route.regex.exec(pathname);
-      if (!match) continue;
-      const params = {};
-      for (const [index, key] of route.keys.entries()) {
-        try {
-          params[key] = decodeURIComponent(match[index + 1]);
-        } catch {
-          throw validationError(`malformed path parameter "${key}"`, [`path parameter ${key} is not valid URL encoding`]);
-        }
-      }
-      return { name: route.name, params };
-    }
-    return null;
-  }
-
-  function validateTaskChanges(changes) {
-    const errors = [];
-    if (!isPlainObject(changes)) return ["changes must be a JSON object"];
-    for (const key of Object.keys(changes)) {
-      if (!PATCHABLE_TASK_FIELDS.has(key)) errors.push(`task.${key} is not a patchable field`);
-    }
-    if ("title" in changes && (typeof changes.title !== "string" || changes.title.trim() === "")) {
-      errors.push("task.title must be a non-empty string");
-    }
-    if ("description" in changes && (typeof changes.description !== "string" || changes.description.trim() === "")) {
-      errors.push("task.description must be a non-empty string");
-    }
-    if ("priority" in changes && !Number.isInteger(changes.priority)) {
-      errors.push("task.priority must be an integer");
-    }
-    if ("roleRequired" in changes && (typeof changes.roleRequired !== "string" || !/^[A-Z][A-Z0-9_]*$/.test(changes.roleRequired))) {
-      errors.push("task.roleRequired must be an upper-case role identifier");
-    }
-    if ("functionRequired" in changes && !isEnumValue("functions", changes.functionRequired)) {
-      errors.push("task.functionRequired must be one of the functions enum values");
-    }
-    if ("acceptance" in changes && typeof changes.acceptance !== "string") {
-      errors.push("task.acceptance must be a string");
-    }
-    if ("deps" in changes) {
-      if (!Array.isArray(changes.deps)) errors.push("task.deps must be an array of task ids");
-      else {
-        for (const [index, dep] of changes.deps.entries()) {
-          if (typeof dep !== "string" || !ID_RE.test(dep)) errors.push(`task.deps[${index}] must be an id string`);
-        }
-      }
-    }
-    if ("status" in changes && !isEnumValue("task", changes.status)) {
-      errors.push("task.status must be one of the task enum values");
-    }
-    return errors;
-  }
-
-  async function dispatch({ req, res, method, pathname, url }) {
-    const route = matchRoute(pathname, method);
-    if (!route) throw new ApiError("NOT_FOUND", `no route for ${method} ${pathname}`);
-    const { params } = route;
-
-    switch (route.name) {
-      case "projects.list": {
-        sendJson(res, 200, listPayload(store.listProjects()));
-        return;
-      }
-      case "projects.create": {
-        const body = requireBodyObject(await requireJsonBody(req), "project");
-        const result = validateProject(body);
-        if (!result.ok) throw validationError("invalid project payload", result.errors);
-        sendJson(res, 201, store.createProject(body));
-        return;
-      }
-      case "projects.overview": {
-        sendJson(res, 200, store.overview(params.id));
-        return;
-      }
-      case "tasks.list": {
-        const filter = {};
-        const projectId = queryString(url.searchParams, "projectId");
-        if (projectId !== undefined) {
-          if (projectId.trim() === "" || !ID_RE.test(projectId)) {
-            throw validationError("invalid task filter", ["projectId must be an id string"]);
-          }
-          filter.projectId = projectId;
-        }
-        const status = queryString(url.searchParams, "status");
-        if (status !== undefined) {
-          if (!isEnumValue("task", status)) {
-            throw validationError("invalid task filter", ["status must be one of the task enum values"]);
-          }
-          filter.status = status;
-        }
-        const q = queryString(url.searchParams, "q");
-        if (q !== undefined) filter.q = q;
-        const limit = parseIntegerParam(url.searchParams, "limit", { min: 1, max: 500 });
-        if (limit !== undefined) filter.limit = limit;
-        sendJson(res, 200, listPayload(store.listTasks(filter)));
-        return;
-      }
-      case "tasks.create": {
-        const body = requireBodyObject(await requireJsonBody(req), "task");
-        if (Object.prototype.hasOwnProperty.call(body, "status")) {
-          throw validationError("task.status is server-owned", ["omit task.status on create; the server starts tasks as READY"]);
-        }
-        const result = validateTask(body);
-        if (!result.ok) throw validationError("invalid task payload", result.errors);
-        sendJson(res, 201, store.createTask(body));
-        return;
-      }
-      case "tasks.get": {
-        const task = store.getTask(params.id);
-        sendJson(res, 200, { ...task, allowedActions: allowedActionsFor(task) });
-        return;
-      }
-      case "tasks.patch": {
-        const body = requireBodyObject(await requireJsonBody(req), "task patch");
-        if (!Number.isInteger(body.expectedVersion) || body.expectedVersion < 0) {
-          throw validationError("PATCH /tasks/:id requires an integer expectedVersion", [
-            "expectedVersion is required for a conditional update (CAS)",
-          ]);
-        }
-        // Accept both the contract body ({ expectedVersion, changes }) and a flat
-        // body ({ expectedVersion, title: ... }) so clients cannot silently lose fields.
-        const changes = isPlainObject(body.changes)
-          ? body.changes
-          : Object.fromEntries(Object.entries(body).filter(([key]) => key !== "expectedVersion"));
-        const errors = validateTaskChanges(changes);
-        if (errors.length > 0) throw validationError("invalid task changes", errors);
-        const currentTask = store.getTask(params.id); // 404 NOT_FOUND
-        // m6.1 F01: generic PATCH cannot advance execution states; those have
-        // dedicated services (claim / runtime events / review / integration /
-        // approval). Same-status is an idempotent no-op.
-        assertGenericTaskStatusAllowed(currentTask, changes.status);
-        if (changes.status === currentTask.status && Object.keys(changes).length === 1) {
-          if (currentTask.version !== body.expectedVersion) {
-            throw new ApiError("VERSION_CONFLICT", `task "${currentTask.id}" version conflict`, {
-              details: { entity: "task", id: currentTask.id, currentVersion: currentTask.version, expectedVersion: body.expectedVersion },
-            });
-          }
-          sendJson(res, 200, currentTask);
-          return;
-        }
-        sendJson(res, 200, store.patchTask(params.id, { expectedVersion: body.expectedVersion, changes }));
-        return;
-      }
-      case "runs.list": {
-        const filter = {};
-        const taskId = queryString(url.searchParams, "taskId");
-        if (taskId !== undefined) {
-          if (taskId.trim() === "" || !ID_RE.test(taskId)) {
-            throw validationError("invalid run filter", ["taskId must be an id string"]);
-          }
-          filter.taskId = taskId;
-        }
-        const limit = parseIntegerParam(url.searchParams, "limit", { min: 1, max: 200 });
-        if (limit !== undefined) filter.limit = limit;
-        sendJson(res, 200, listPayload(store.listRuns(filter)));
-        return;
-      }
-      case "runs.get": {
-        sendJson(res, 200, store.getRun(params.id));
-        return;
-      }
-      case "agents.list": {
-        sendJson(res, 200, listPayload(store.listAgents()));
-        return;
-      }
-      case "reviews.list": {
-        // m6.1 §6: filter FIRST, then keyset-paginate. The store owns the page
-        // when it exposes listReviewsPage; the fallback keeps the same shape for
-        // older stores/tests (never truncate before filtering).
-        const filter = reviewFilterFrom(url.searchParams);
-        let items;
-        let hasMore;
-        let nextCursor;
-        let total;
-        if (typeof store.listReviewsPage === "function") {
-          const page = store.listReviewsPage({
-            taskId: filter.taskId,
-            status: filter.status,
-            limit: filter.limit,
-            cursor: filter.cursor,
-          });
-          items = page && Array.isArray(page.items) ? page.items : [];
-          hasMore = Boolean(page?.hasMore);
-          nextCursor = typeof page?.nextCursor === "string" ? page.nextCursor : undefined;
-          if (Number.isInteger(page?.total)) total = page.total;
-          // Store pages do not carry a count; withTotal=1 walks the filter only
-          // when the caller explicitly accepts that cost.
-          if (filter.withTotal && !Number.isInteger(total)) {
-            let count = 0;
-            let scanCursor;
-            for (let guard = 0; guard < 10_000; guard += 1) {
-              const scanned = store.listReviewsPage({
-                taskId: filter.taskId,
-                status: filter.status,
-                limit: 100,
-                cursor: scanCursor,
-              });
-              const scannedItems = Array.isArray(scanned?.items) ? scanned.items : [];
-              count += scannedItems.length;
-              if (!scanned?.hasMore || typeof scanned.nextCursor !== "string" || scannedItems.length === 0) break;
-              scanCursor = scanned.nextCursor;
-            }
-            total = count;
-          }
-        } else {
-          let rows = store.listReviews(filter.taskId ? { taskId: filter.taskId } : {});
-          rows = Array.isArray(rows) ? rows : [];
-          if (filter.status !== undefined) rows = rows.filter((review) => review.status === filter.status);
-          rows.sort(compareReviewsDesc);
-          const filteredTotal = rows.length;
-          if (filter.cursorValue !== undefined) rows = rows.filter((review) => isAfterReviewCursor(review, filter.cursorValue));
-          hasMore = rows.length > filter.limit;
-          items = rows.slice(0, filter.limit);
-          if (hasMore && items.length > 0) nextCursor = encodeReviewCursor(items[items.length - 1]);
-          total = filteredTotal;
-        }
-        const body = { items, hasMore };
-        if (nextCursor !== undefined) body.nextCursor = nextCursor;
-        if (filter.withTotal && Number.isInteger(total)) body.total = total;
-        sendJson(res, 200, body);
-        return;
-      }
-      case "reviews.create": {
-        const body = requireBodyObject(await requireJsonBody(req), "review");
-        if (typeof body.taskId !== "string" || !ID_RE.test(body.taskId)) {
-          throw fieldValidationError("taskId", "taskId must be an id string");
-        }
-        // m6.1 §2: body.actor is ignored. Reviewer identity is an explicit
-        // assignment created by a trusted human/scheduler action.
-        const assignedTo = body.assignedTo === undefined ? "HUMAN" : body.assignedTo;
-        if (assignedTo !== "AGENT" && assignedTo !== "HUMAN") {
-          throw fieldValidationError("assignedTo", 'assignedTo must be "AGENT" or "HUMAN"');
-        }
-        let reviewerAgentId = null;
-        if (body.reviewerAgentId !== undefined) {
-          if (typeof body.reviewerAgentId !== "string" || !ID_RE.test(body.reviewerAgentId)) {
-            throw fieldValidationError("reviewerAgentId", "reviewerAgentId must be an agent id string");
-          }
-          reviewerAgentId = body.reviewerAgentId;
-        }
-        if (assignedTo === "AGENT" && reviewerAgentId === null) {
-          throw fieldValidationError("reviewerAgentId", "an AGENT review requires reviewerAgentId");
-        }
-        let runId = null;
-        if (body.runId !== undefined) {
-          if (typeof body.runId !== "string" || !ID_RE.test(body.runId)) {
-            throw fieldValidationError("runId", "runId must be an id string when provided");
-          }
-          runId = body.runId;
-        }
-        // M6.3 P1-8: an AGENT assignment must name the reviewer's own Run; the
-        // store proves it is a REVIEWER Run for this Task.
-        let reviewerRunId = null;
-        if (body.reviewerRunId !== undefined) {
-          if (typeof body.reviewerRunId !== "string" || !ID_RE.test(body.reviewerRunId)) {
-            throw fieldValidationError("reviewerRunId", "reviewerRunId must be a run id string");
-          }
-          reviewerRunId = body.reviewerRunId;
-        }
-        if (assignedTo === "AGENT" && reviewerRunId === null) {
-          throw fieldValidationError("reviewerRunId", "an AGENT review requires reviewerRunId");
-        }
-        const task = store.getTask(body.taskId); // 404 NOT_FOUND
-        if (runId !== null) {
-          const run = store.getRun(runId); // 404 NOT_FOUND
-          if (run.taskId !== task.id) throw fieldValidationError("runId", "runId does not belong to the task");
-        }
-        // §1: one active Review per Task (contract-layer, not store-dependent).
-        const active = (store.listReviews({ taskId: task.id }) ?? []).find(
-          (review) => review.status === "PENDING" && (review.verdict === null || review.verdict === undefined),
+    } finally {
+      const ms = performance.now() - started;
+      if (ms > 500 && url?.pathname !== "/api/agent/v1/claims")
+        logger.warn?.(
+          `Slow request ${req.method} ${url?.pathname}: ${Math.round(ms)}ms`,
         );
-        if (active) {
-          throw new ApiError("VERSION_CONFLICT", `task "${task.id}" already has an active review`, {
-            details: { entity: "review", taskId: task.id, activeReviewId: active.id, currentVersion: active.version ?? 0 },
-          });
-        }
-        // The M6.1 store method binds the assignment + COMPLETED-Run precondition
-        // + REVIEWING transition in one transaction. Older stores cannot do that:
-        // refuse a trusted assignment instead of silently creating an unbound one.
-        const trustedAssignments = typeof store.listReviewsPage === "function" || typeof store.createReviewWithTransition === "function";
-        let review;
-        if (trustedAssignments) {
-          const runs = Array.isArray(store.listRuns({ taskId: task.id })) ? store.listRuns({ taskId: task.id }) : [];
-          const completed = runId !== null
-            ? runs.some((run) => run.id === runId && run.status === "COMPLETED") || store.getRun(runId)?.status === "COMPLETED"
-            : runs.some((run) => run.status === "COMPLETED");
-          if (!completed) {
-            throw new ApiError("TASK_VERSION_CONFLICT", `task "${task.id}" has no COMPLETED Run to review`, {
-              details: { taskId: task.id, reason: "completed-run-required", runId },
-            });
-          }
-          const payload = {
-            taskId: task.id,
-            runId,
-            reviewerAgentId,
-            reviewerRunId,
-            assignedTo,
-            createdByRole: "user-action",
-            actor: assignedTo === "AGENT" ? reviewerAgentId : "HUMAN",
-          };
-          review = typeof store.createReviewWithTransition === "function"
-            ? store.createReviewWithTransition(payload)
-            : store.createReview(payload);
-        } else {
-          // Legacy store: preserve the M4 contract (task already REVIEWING).
-          if (task.status !== "REVIEWING") throw taskStateConflict(task, "not-reviewing");
-          if (assignedTo === "AGENT" || reviewerAgentId !== null) {
-            throw new ApiError("INTERNAL_ERROR", "this store build cannot bind trusted review assignments yet", {
-              details: { reason: "review-assignment-unsupported" },
-            });
-          }
-          review = store.createReview({ taskId: task.id, runId, actor: "HUMAN" });
-        }
-        pumpSse();
-        sendJson(res, 201, review);
-        return;
-      }
-      case "reviews.submit": {
-        const body = requireBodyObject(await requireJsonBody(req), "review submission");
-        const expectedVersion = body.expectedVersion;
-        if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
-          throw validationError("invalid review submission", ["expectedVersion must be a non-negative integer"]);
-        }
-        if (!M4_VERDICTS.has(body.verdict)) {
-          throw validationError("invalid review submission", ["verdict must be PASS, CHANGES_REQUESTED or BLOCKED"]);
-        }
-        const review = getReviewOrThrow(params.id); // 404 NOT_FOUND
-        if (review.status !== "PENDING") throw reviewStateConflict(review, "not-pending");
-        if (review.version !== expectedVersion) throw reviewCasConflict(review, expectedVersion);
-        const task = store.getTask(review.taskId); // 404 NOT_FOUND
-        if (task.status !== "REVIEWING") throw taskStateConflict(task, "not-reviewing");
-
-        // m6.1 §2 F06: the caller identity is trusted, the body.actor is NOT.
-        // - browser session → only HUMAN assignments (actor is server-filled);
-        // - internal credential → only runtime-host, only AGENT assignments;
-        // - reviewer identity comes from the review assignment, never the body.
-        const principal = req.atkPrincipal ?? { kind: "session", role: "user-action" };
-        const assignedTo = review.assignedTo === "AGENT" ? "AGENT" : "HUMAN";
-        const reviewerAgentId = typeof review.reviewerAgentId === "string" && review.reviewerAgentId !== "" ? review.reviewerAgentId : null;
-        let submitActor = "HUMAN";
-        if (assignedTo === "AGENT") {
-          if (principal.kind !== "internal") {
-            throw new ApiError("NOT_AUTHORIZED", "agent reviews must be submitted with the runtime-host internal credential", {
-              details: { reason: "review-requires-runtime-host", reviewId: review.id, assignedTo },
-            });
-          }
-          if (reviewerAgentId === null) {
-            throw new ApiError("NOT_AUTHORIZED", "review has no trusted reviewer assignment", {
-              details: { reason: "review-assignment-required", reviewId: review.id, taskId: review.taskId },
-            });
-          }
-          // The trusted execution subject proves itself with its own Run: the
-          // optional body.runId must belong to this Task AND be run by the
-          // assigned reviewer. A forged/missing Run is a self-review attempt.
-          const presentedRunId = typeof body.runId === "string" && ID_RE.test(body.runId) ? body.runId : null;
-          let reviewerRun = null;
-          if (presentedRunId !== null) {
-            try {
-              reviewerRun = store.getRun(presentedRunId);
-            } catch {
-              reviewerRun = null;
-            }
-          }
-          if (
-            reviewerRun === null ||
-            reviewerRun.taskId !== review.taskId ||
-            canonicalActor(reviewerRun.agentId) !== canonicalActor(reviewerAgentId)
-          ) {
-            throw new ApiError("SELF_REVIEW_FORBIDDEN", "the review submission is not backed by the assigned reviewer's Run", {
-              details: {
-                reviewerAgentId,
-                authorAgentId: reviewerRun?.agentId ?? null,
-                runId: presentedRunId,
-              },
-            });
-          }
-          let authorAgentId = null;
-          try {
-            if (review.runId) {
-              authorAgentId = store.getRun(review.runId)?.agentId ?? null;
-            } else {
-              const runs = Array.isArray(store.listRuns({ taskId: review.taskId })) ? store.listRuns({ taskId: review.taskId }) : [];
-              const completed = runs.filter((run) => run.status === "COMPLETED");
-              authorAgentId = completed[0]?.agentId ?? null;
-            }
-          } catch {
-            authorAgentId = null;
-          }
-          // The assignment must exist and must not be the author of the reviewed Run.
-          if (authorAgentId !== null && canonicalActor(authorAgentId) === canonicalActor(reviewerAgentId)) {
-            throw new ApiError("SELF_REVIEW_FORBIDDEN", "the author cannot review their own work", {
-              details: { reviewerAgentId, authorAgentId, reviewId: review.id, taskId: review.taskId },
-            });
-          }
-          submitActor = reviewerAgentId;
-        } else if (principal.kind === "internal") {
-          throw new ApiError("NOT_AUTHORIZED", "human review assignments cannot be submitted with the runtime-host credential", {
-            details: { reason: "review-assignment-required", reviewId: review.id, assignedTo },
-          });
-        }
-
-        let findings;
-        if (body.findings !== undefined) {
-          if (!Array.isArray(body.findings) || body.findings.some((finding) => !isPlainObject(finding) || typeof finding.code !== "string" || finding.code === "")) {
-            throw validationError("invalid review submission", ["findings must be an array of objects with a non-empty code"]);
-          }
-          findings = body.findings;
-        }
-        if (body.commitSha !== undefined) {
-          if (typeof body.commitSha !== "string" || !/^[0-9a-f]{7,64}$/i.test(body.commitSha)) {
-            throw validationError("invalid review submission", ["commitSha must be a git sha"]);
-          }
-        }
-        if (body.evidence !== undefined && body.evidence !== null && !isPlainObject(body.evidence)) {
-          throw validationError("invalid review submission", ["evidence must be an object"]);
-        }
-        if (body.verdict === "PASS") assertPassEvidence(body.manifestHash, body.evidence);
-        if (body.verdict === "CHANGES_REQUESTED" && (!Array.isArray(findings) || findings.length === 0)) {
-          throw validationError("invalid review submission", ["CHANGES_REQUESTED requires at least one finding"]);
-        }
-
-        // findings is only required for CHANGES_REQUESTED. PASS/BLOCKED must not
-        // send an empty array: the store rejects any explicitly empty findings
-        // list, so normalise "empty" to "absent".
-        const storeFindings = Array.isArray(findings) && findings.length > 0 ? findings : undefined;
-
-        const result = store.submitReview({
-          id: review.id,
-          expectedVersion,
-          verdict: body.verdict,
-          manifestHash: body.manifestHash ?? null,
-          commitSha: body.commitSha ?? null,
-          findings: storeFindings,
-          evidence: body.evidence ?? null,
-          actor: submitActor,
-          ...(assignedTo === "AGENT" ? { reviewerAgentId } : {}),
-        });
-        if (!isPlainObject(result) || !result.review || !result.task) {
-          throw new ApiError("INTERNAL_ERROR", "review submission returned an incomplete result");
-        }
-        // "Looks successful but did nothing" guard: the returned facts must match.
-        const expectedTaskStatus = body.verdict === "PASS" ? "INTEGRATING" : body.verdict === "CHANGES_REQUESTED" ? "REJECTED" : "BLOCKED";
-        if (result.review.verdict !== body.verdict || result.review.status === "PENDING" || result.task.status !== expectedTaskStatus) {
-          logger?.error?.(
-            `[atk] review submit did not persist expected facts: verdict=${result.review.verdict} reviewStatus=${result.review.status} taskStatus=${result.task.status}`,
-          );
-          throw new ApiError("INTERNAL_ERROR", "review submission did not persist the expected state");
-        }
-        pumpSse();
-        sendJson(res, 200, result);
-        return;
-      }
-      case "reviews.rework": {
-        const body = requireBodyObject(await requireJsonBody(req), "review rework");
-        const reason = requireNonEmptyString(body.reason, "reason");
-        const actor = actorFrom(body);
-        const review = getReviewOrThrow(params.id); // 404 NOT_FOUND
-        if (review.status !== "CHANGES_REQUESTED") throw reviewStateConflict(review, "not-changes-requested");
-        const task = store.getTask(review.taskId); // 404 NOT_FOUND
-        // §0.4: reaching maxAttempts must BLOCK the Task and raise
-        // REWORK_LIMIT_REACHED atomically — the store owns that transition, the
-        // Backend normalises the error so the code/details are contract-stable.
-        let result;
-        try {
-          result = store.reworkTask({ taskId: task.id, reviewId: review.id, reason, actor });
-        } catch (error) {
-          if (error?.code === "REWORK_LIMIT_REACHED") {
-            throw reworkLimitReached({
-              taskId: task.id,
-              attempt: error.details?.attempt ?? review.attempt,
-              maxAttempts: error.details?.maxAttempts ?? MAX_REVIEW_ATTEMPTS,
-            });
-          }
-          throw error;
-        }
-        if (!isPlainObject(result) || !result.review || !result.task) {
-          throw new ApiError("INTERNAL_ERROR", "review rework returned an incomplete result");
-        }
-        if (result.task.status !== "READY") {
-          logger?.error?.(`[atk] rework did not move the task to READY (status=${result.task.status})`);
-          throw new ApiError("INTERNAL_ERROR", "review rework did not persist the expected state");
-        }
-        pumpSse();
-        sendJson(res, 200, result);
-        return;
-      }
-      case "approvals.list": {
-        const filter = {};
-        const taskId = queryString(url.searchParams, "taskId");
-        if (taskId !== undefined) {
-          if (taskId.trim() === "" || !ID_RE.test(taskId)) {
-            throw validationError("invalid approval filter", ["taskId must be an id string"]);
-          }
-          filter.taskId = taskId;
-        }
-        const status = queryString(url.searchParams, "status");
-        if (status !== undefined) {
-          if (!isEnumValue("acceptance", status)) {
-            throw validationError("invalid approval filter", ["status must be one of the acceptance enum values"]);
-          }
-          filter.status = status;
-        }
-        const limit = parseIntegerParam(url.searchParams, "limit", { min: 1, max: 100 });
-        if (limit !== undefined) filter.limit = limit;
-        sendJson(res, 200, listPayload(store.listApprovals(filter)));
-        return;
-      }
-      case "approvals.create": {
-        const body = requireBodyObject(await requireJsonBody(req), "approval");
-        if (typeof body.taskId !== "string" || !ID_RE.test(body.taskId)) {
-          throw validationError("invalid approval", ["taskId must be an id string"]);
-        }
-        requireNonEmptyString(body.scope, "scope");
-        requireNonEmptyString(body.targetHash, "targetHash");
-        const task = store.getTask(body.taskId); // 404 NOT_FOUND
-        if (task.status !== "AWAITING_ACCEPTANCE") throw taskStateConflict(task, "not-awaiting-acceptance");
-        // §0.3 binding: the acceptance must reference the Task's real candidate
-        // hash (written by submitReview(PASS)). A caller-supplied hash is never
-        // trusted on its own.
-        const taskTargetHash = typeof task.targetHash === "string" ? task.targetHash : "";
-        if (taskTargetHash.trim() === "") {
-          throw new ApiError("TASK_VERSION_CONFLICT", `task "${task.id}" has no candidate target hash; complete a PASS review first`, {
-            details: { taskId: task.id, status: task.status, reason: "target-hash-missing" },
-          });
-        }
-        if (body.targetHash !== taskTargetHash) {
-          throw new ApiError("APPROVAL_STALE", "target hash does not match the task's candidate hash", {
-            details: {
-              taskId: task.id,
-              expectedTargetHash: taskTargetHash,
-              receivedTargetHash: body.targetHash,
-            },
-          });
-        }
-        const approval = store.createApproval({
-          taskId: task.id,
-          scope: body.scope,
-          targetHash: body.targetHash,
-          actor: "HUMAN",
-          status: "PENDING",
-        });
-        pumpSse();
-        sendJson(res, 201, approval);
-        return;
-      }
-      case "approvals.decide": {
-        const body = requireBodyObject(await requireJsonBody(req), "approval decision");
-        if (!APPROVAL_DECISIONS.has(body.decision)) {
-          throw validationError("invalid approval decision", ['decision must be "APPROVED" or "REJECTED"']);
-        }
-        const targetHash = requireNonEmptyString(body.targetHash, "targetHash");
-        const approvals = Array.isArray(store.listApprovals({})) ? store.listApprovals({}) : [];
-        const approval = approvals.find((candidate) => candidate.id === params.id);
-        if (!approval) throw new ApiError("NOT_FOUND", `approval "${params.id}" not found`, { details: { entity: "approval", id: params.id } });
-        if (approval.status !== "PENDING") {
-          throw new ApiError("VERSION_CONFLICT", `approval "${approval.id}" is not pending`, {
-            details: { entity: "approval", id: approval.id, status: approval.status, reason: "not-pending" },
-          });
-        }
-        const task = store.getTask(approval.taskId); // 404 NOT_FOUND
-        // §0.3: the acceptance is bound to the hash it was created for AND to the
-        // Task's current target hash (if the Task carries one).
-        if (approval.targetHash !== targetHash) {
-          throw approvalStale({
-            approvalId: approval.id,
-            taskId: task.id,
-            expectedTargetHash: approval.targetHash,
-            receivedTargetHash: targetHash,
-          });
-        }
-        if (typeof task.targetHash === "string" && task.targetHash !== "" && task.targetHash !== targetHash) {
-          throw approvalStale({
-            approvalId: approval.id,
-            taskId: task.id,
-            expectedTargetHash: task.targetHash,
-            receivedTargetHash: targetHash,
-          });
-        }
-        if (task.status !== "AWAITING_ACCEPTANCE") throw taskStateConflict(task, "not-awaiting-acceptance");
-        const result = store.decideApproval({ id: approval.id, decision: body.decision, actor: "HUMAN", targetHash });
-        if (!isPlainObject(result) || !result.approval || !result.task) {
-          throw new ApiError("INTERNAL_ERROR", "approval decision returned an incomplete result");
-        }
-        const expectedTaskStatus = body.decision === "APPROVED" ? "DONE" : "READY";
-        if (result.approval.status !== body.decision || result.task.status !== expectedTaskStatus) {
-          logger?.error?.(`[atk] approval decide did not persist expected facts: approval=${result.approval.status} task=${result.task.status}`);
-          throw new ApiError("INTERNAL_ERROR", "approval decision did not persist the expected state");
-        }
-        pumpSse();
-        sendJson(res, 200, result);
-        return;
-      }
-      case "events.list": {
-        // M6: server-side aggregate filters, so a Run timeline does not have to
-        // page the whole log and filter client-side (which truncates).
-        const afterSeq = parseIntegerParam(url.searchParams, "afterSeq", { min: 0, max: Number.MAX_SAFE_INTEGER });
-        const limit = parseIntegerParam(url.searchParams, "limit", { min: 1, max: 1000, fallback: 100 });
-        const aggregateId = queryString(url.searchParams, "aggregateId");
-        const aggregateType = queryString(url.searchParams, "aggregateType");
-        const type = queryString(url.searchParams, "type");
-        const filter = {};
-        if (afterSeq !== undefined) filter.afterSeq = afterSeq;
-        if (aggregateId !== undefined) {
-          if (!ID_RE.test(aggregateId)) throw fieldValidationError("aggregateId", "aggregateId must be an id string");
-          filter.aggregateId = aggregateId;
-        }
-        if (aggregateType !== undefined) {
-          if (typeof aggregateType !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]*$/.test(aggregateType)) {
-            throw fieldValidationError("aggregateType", "aggregateType must be a non-empty identifier");
-          }
-          filter.aggregateType = aggregateType;
-        }
-        if (type !== undefined) {
-          if (!EVENT_TYPES.includes(type)) {
-            throw fieldValidationError("type", "type must be one of the known event types");
-          }
-          filter.type = type;
-        }
-
-        // Pagination must be computed for the REQUESTED limit. Never reuse a
-        // store page's hasMore/nextAfterSeq when that page was fetched with
-        // limit+1 (it thinks the page is complete and drops the next cursor).
-        let items;
-        let hasMore;
-        let nextAfterSeq;
-        let earliestSeq;
-        if (typeof store.listEventsPage === "function") {
-          const page = store.listEventsPage({ ...filter, limit });
-          items = page && Array.isArray(page.items) ? page.items.slice(0, limit) : [];
-          hasMore = Boolean(page?.hasMore);
-          if (hasMore && items.length > 0) {
-            nextAfterSeq = Number.isInteger(page?.nextAfterSeq) ? page.nextAfterSeq : Number(items[items.length - 1].seq);
-          }
-          if (Number.isInteger(page?.earliestSeq)) earliestSeq = page.earliestSeq;
-        } else {
-          const raw = store.listEvents({ ...filter, limit: Math.min(limit + 1, 10_000) });
-          const rows = Array.isArray(raw) ? raw : raw && Array.isArray(raw.items) ? raw.items : [];
-          items = rows.slice(0, limit);
-          hasMore = rows.length > limit;
-          // limit=1000 cannot fetch one extra row from the store's hard cap;
-          // fall back to seq monotonicity (conservative: never lose events).
-          if (!hasMore && limit === 1000 && items.length === 1000 && typeof store.latestSeq === "function") {
-            hasMore = store.latestSeq() > Number(items[items.length - 1].seq);
-          }
-          if (hasMore && items.length > 0) nextAfterSeq = Number(items[items.length - 1].seq);
-        }
-        // m6.2 F12: the smallest seq the server still retains. The client can
-        // compare it with its first returned seq to detect truncation exactly.
-        if (earliestSeq === undefined) {
-          try {
-            if (typeof store.earliestSeq === "function") {
-              const value = Number(store.earliestSeq());
-              earliestSeq = Number.isInteger(value) ? value : null;
-            } else {
-              const rawEarliest = store.listEvents({ limit: 1 });
-              const earliestRows = Array.isArray(rawEarliest) ? rawEarliest : rawEarliest && Array.isArray(rawEarliest.items) ? rawEarliest.items : [];
-              const firstSeq = earliestRows.length > 0 ? Number(earliestRows[0].seq) : null;
-              earliestSeq = Number.isInteger(firstSeq) ? firstSeq : null;
-            }
-          } catch {
-            earliestSeq = null;
-          }
-        }
-        const body = { items, hasMore, earliestSeq };
-        if (nextAfterSeq !== undefined) body.nextAfterSeq = nextAfterSeq;
-        sendJson(res, 200, body);
-        return;
-      }
-      case "events.stream": {
-        hub.attach(req, res, { lastEventId: req.headers["last-event-id"] });
-        return;
-      }
-      default: {
-        throw new ApiError("NOT_FOUND", `no route for ${method} ${pathname}`);
-      }
     }
-  }
-
-  async function handleRequest(req, res) {
-    const requestId = crypto.randomUUID();
-    res.setHeader("x-request-id", requestId);
-    res.setHeader("referrer-policy", "no-referrer");
-    try {
-      // Layer 1: peer must be the local machine (defence in depth behind the bind).
-      if (!isLoopbackRemote(req.socket?.remoteAddress)) {
-        throw new ApiError("NOT_AUTHORIZED", "request must originate from loopback", { details: { reason: "remote-address" } });
-      }
-      // Layer 2: Host allow-list (DNS-rebinding boundary).
-      const hostHeader = req.headers.host;
-      const host = parseHostHeader(hostHeader);
-      if (!host.ok) {
-        throw new ApiError("NOT_AUTHORIZED", "untrusted Host header", { details: { reason: host.reason } });
-      }
-      let url;
-      try {
-        url = new URL(req.url ?? "/", `http://${hostHeader}`);
-      } catch {
-        throw new ApiError("VALIDATION_ERROR", "invalid request target");
-      }
-      const pathname = url.pathname;
-      const method = req.method ?? "GET";
-
-      // ADR-008 §5 / ADR-010 §2: `/internal/v1/*` is a separate credential
-      // plane. It never accepts the browser session token, and the browser API
-      // above never accepts `x-atk-internal`.
-      const isInternal = pathname === "/internal" || pathname.startsWith("/internal/");
-      if (isInternal) {
-        // M6.3 P0-2: the token→role binding is the ONLY authority. The optional
-        // client role header is an additional assertion and must agree with it.
-        const identity = resolveInternalIdentity(resolvedInternalTokens, req.headers[INTERNAL_TOKEN_HEADER]);
-        if (!identity.ok) {
-          throw new ApiError("NOT_AUTHORIZED", "missing or invalid internal credential", {
-            details: { reason: identity.reason },
-          });
-        }
-        const roleHeader = checkInternalRoleHeader(identity.role, req.headers[INTERNAL_ROLE_HEADER]);
-        if (!roleHeader.ok) {
-          throw new ApiError("NOT_AUTHORIZED", "the declared internal role does not match the credential", {
-            details: { reason: roleHeader.reason, role: roleHeader.role, expectedRole: roleHeader.expectedRole },
-          });
-        }
-        // Routes/matrix consume the identity-bound role. The original header is
-        // left untouched so the route can still perform the assertion check.
-        // M6.3 P0-1: host registration before the first heartbeat.
-        if (method === "POST" && pathname === "/internal/v1/runtime/register") {
-          if (identity.role !== INTERNAL_ROLE_RUNTIME_HOST) {
-            throw new ApiError("NOT_AUTHORIZED", "internal role is not allowed for runtime registration", {
-              details: { reason: "internal-role-forbidden", role: identity.role, allowedRoles: ["runtime-host"] },
-            });
-          }
-          const body = await requireJsonBody(req);
-          const invalid = (field, message) => new ApiError("VALIDATION_ERROR", message, { details: { field } });
-          if (!isPlainObject(body) || typeof body.hostId !== "string" || body.hostId.trim() === "") {
-            throw invalid("hostId", "register.hostId must be a non-empty string");
-          }
-          if (!Array.isArray(body.agents) || body.agents.length === 0) {
-            throw invalid("agents", "register.agents must be a non-empty array");
-          }
-          if (typeof store.upsertAgent !== "function") {
-            throw new ApiError("INTERNAL_ERROR", "this store cannot register runtime agents");
-          }
-          const agents = [];
-          for (const [index, entry] of body.agents.entries()) {
-            if (!isPlainObject(entry)) throw invalid(`agents[${index}]`, "each agent must be an object");
-            if (typeof entry.agentId !== "string" || !ID_RE.test(entry.agentId)) {
-              throw invalid(`agents[${index}].agentId`, "agentId must be an id string");
-            }
-            if (typeof entry.role !== "string" || !/^[A-Z][A-Z0-9_]*$/.test(entry.role)) {
-              throw invalid(`agents[${index}].role`, "role must be an upper-case role identifier");
-            }
-            if (!isEnumValue("functions", entry.function)) {
-              throw invalid(`agents[${index}].function`, "function must be one of the functions enum values");
-            }
-            if (entry.capacity !== undefined && (!Number.isInteger(entry.capacity) || entry.capacity < 0)) {
-              throw invalid(`agents[${index}].capacity`, "capacity must be a non-negative integer");
-            }
-            store.upsertAgent({
-              id: entry.agentId,
-              role: entry.role,
-              capabilities: [entry.function],
-              status: "IDLE",
-            });
-            agents.push({
-              agentId: entry.agentId,
-              role: entry.role,
-              function: entry.function,
-              capacity: entry.capacity ?? null,
-            });
-          }
-          sendJson(res, 200, { hostId: body.hostId, agents });
-          return;
-        }
-        await internalRouter.handle({ req, res, method, pathname, url, identity });
-        return;
-      }
-
-      const isApi = pathname === "/api" || pathname.startsWith("/api/");
-
-      if (!isApi) {
-        await staticHandler.handle(req, res, pathname, method);
-        return;
-      }
-
-      // m6.1 §2 / M6.3 P0-2: review submission accepts the internal plane, but
-      // only the runtime-host token. Human approvals never accept an internal
-      // credential: they are browser session + CSRF only.
-      const isApprovalDecide = method === "POST" && /^\/api\/v1\/approvals\/[^/]+\/decide$/.test(pathname);
-      if (isApprovalDecide && req.headers[INTERNAL_TOKEN_HEADER] !== undefined) {
-        throw new ApiError("NOT_AUTHORIZED", "human approval requires a browser session", {
-          details: { reason: "human-approval-requires-session" },
-        });
-      }
-      const isReviewSubmit = method === "POST" && /^\/api\/v1\/reviews\/[^/]+\/submit$/.test(pathname);
-      if (isReviewSubmit && req.headers[INTERNAL_TOKEN_HEADER] !== undefined) {
-        const identity = resolveInternalIdentity(resolvedInternalTokens, req.headers[INTERNAL_TOKEN_HEADER]);
-        if (!identity.ok) {
-          throw new ApiError("NOT_AUTHORIZED", "missing or invalid internal credential", {
-            details: { reason: identity.reason },
-          });
-        }
-        const roleHeader = checkInternalRoleHeader(identity.role, req.headers[INTERNAL_ROLE_HEADER]);
-        if (!roleHeader.ok) {
-          throw new ApiError("NOT_AUTHORIZED", "the declared internal role does not match the credential", {
-            details: { reason: roleHeader.reason, role: roleHeader.role, expectedRole: roleHeader.expectedRole },
-          });
-        }
-        if (identity.role !== INTERNAL_ROLE_RUNTIME_HOST) {
-          throw new ApiError("NOT_AUTHORIZED", "internal role is not allowed for review submission", {
-            details: { reason: "internal-role-forbidden", role: identity.role, allowedRoles: ["runtime-host"] },
-          });
-        }
-        req.atkPrincipal = { kind: "internal", role: identity.role };
-        await dispatch({ req, res, method, pathname, url });
-        return;
-      }
-
-      // Layer 3a: unauthenticated read-only diagnostics.
-      if (pathname === "/api/v1/system/health" && method === "GET") {
-        sendJson(res, 200, healthPayload());
-        return;
-      }
-      // Layer 3b: session bootstrap (loopback + Host + same-origin if Origin present).
-      if (pathname === "/api/v1/session" && method === "GET") {
-        const originCheck = checkBootstrapOrigin({ origin: req.headers.origin, hostHeader, allowedOrigins });
-        if (!originCheck.ok) {
-          throw new ApiError("NOT_AUTHORIZED", "session bootstrap rejected by origin policy", {
-            details: { reason: originCheck.reason },
-          });
-        }
-        sendJson(res, 200, sessionPayload());
-        return;
-      }
-      // Layer 3c: every other API call needs the session token.
-      const tokenCheck = checkToken(session, req.headers["x-atk-token"], now());
-      if (!tokenCheck.ok) {
-        throw new ApiError("NOT_AUTHORIZED", "missing or invalid session token", { details: { reason: tokenCheck.reason } });
-      }
-      // Layer 4: writes additionally need Origin (or explicit CLI marker) + CSRF.
-      if (WRITE_METHODS.has(method)) {
-        const originCheck = checkWriteOrigin({
-          origin: req.headers.origin,
-          hostHeader,
-          cliHeader: req.headers[CLI_CLIENT_HEADER],
-          allowedOrigins,
-        });
-        if (!originCheck.ok) {
-          throw new ApiError("NOT_AUTHORIZED", "write request rejected by origin policy", {
-            details: { reason: originCheck.reason },
-          });
-        }
-        const csrfCheck = checkCsrf(session, req.headers["x-atk-csrf"]);
-        if (!csrfCheck.ok) {
-          throw new ApiError("NOT_AUTHORIZED", "missing or invalid CSRF token", { details: { reason: csrfCheck.reason } });
-        }
-        const idempotencyKey = req.headers["idempotency-key"];
-        if (typeof idempotencyKey === "string" && idempotencyKey !== "") {
-          // M1 records the key for audit; dedupe arrives with the scheduler.
-          logger?.info?.(`[atk] Idempotency-Key observed on ${method} ${pathname} (recorded, not enforced)`);
-        }
-      }
-
-      await dispatch({ req, res, method, pathname, url });
-    } catch (error) {
-      const apiError = toApiError(error);
-      if (apiError.code === "INTERNAL_ERROR") {
-        logger?.error?.(`[atk] ${requestId} ${req.method ?? "?"} ${req.url ?? "?"}: ${error?.stack ?? error}`);
-      }
-      if (res.headersSent || res.writableEnded) {
-        try {
-          res.end();
-        } catch {
-          // Connection already gone.
-        }
-        return;
-      }
-      try {
-        sendApiError(res, requestId, apiError);
-      } catch (sendError) {
-        // The client vanished while we were writing; nothing left to tell it.
-        logger?.error?.(`[atk] failed to send error response: ${sendError?.message ?? sendError}`);
-        try {
-          res.destroy();
-        } catch {
-          // already destroyed
-        }
-      }
-    }
-  }
-
-  httpServer.on("request", (req, res) => {
-    handleRequest(req, res).catch((error) => {
-      // Last-resort guard: handleRequest already maps errors, this is for bugs.
-      logger?.error?.(`[atk] unhandled request error: ${error?.stack ?? error}`);
-      if (!res.headersSent) sendApiError(res, null, toApiError(error));
-      else res.destroy();
-    });
   });
-
-  async function listen({ port = 1421, host = "127.0.0.1" } = {}) {
-    if (listening) throw new Error("@atk/backend: server is already listening");
-    if (host !== "127.0.0.1") {
-      throw new Error(`@atk/backend: refusing to bind "${host}"; ADR-008 requires 127.0.0.1`);
-    }
-    const normalizedPort = Number(port);
-    if (!Number.isInteger(normalizedPort) || normalizedPort < 0 || normalizedPort > 65535) {
-      throw new Error(`@atk/backend: invalid port "${port}"`);
-    }
-    await new Promise((resolve, reject) => {
-      const onError = (error) => {
-        httpServer.off("listening", onListening);
-        reject(error);
-      };
-      const onListening = () => {
-        httpServer.off("error", onError);
-        resolve();
-      };
-      httpServer.once("error", onError);
-      httpServer.once("listening", onListening);
-      httpServer.listen({ port: normalizedPort, host });
-    });
-    listening = true;
-    const address = httpServer.address();
-    boundPort = typeof address === "object" && address ? address.port : normalizedPort;
-    baseUrl = `http://127.0.0.1:${boundPort}`;
-    return { port: boundPort, host, url: baseUrl };
-  }
-
-  async function close() {
-    hub.closeAll();
-    for (const socket of sockets) {
-      try {
-        socket.destroy();
-      } catch {
-        // already gone
-      }
-    }
-    sockets.clear();
-    if (!listening) return;
-    listening = false;
-    const closed = new Promise((resolve) => {
-      try {
-        httpServer.close(() => resolve());
-      } catch {
-        resolve();
-      }
-    });
-    httpServer.closeAllConnections?.();
-    await closed;
-  }
-
   return {
-    listen,
-    close,
-    /** Session material for in-process callers (CLI prints only the token file path). */
-    get session() {
-      return { token: session.token, csrf: session.csrf, actor: session.actor, expiresAt: session.expiresAt };
+    app,
+    server,
+    instanceId,
+    set onShutdown(fn) {
+      shutdownHandler = fn;
     },
-    get url() {
-      return baseUrl;
+    async listen({ port: desired = 1421 } = {}) {
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(desired, "127.0.0.1", resolve);
+      }).catch((error) => {
+        ownership.release();
+        app.close();
+        throw error;
+      });
+      port = server.address().port;
+      ownership.update({ url: `http://127.0.0.1:${port}` });
+      maintenance = setInterval(() => {
+        try {
+          app.maintenance();
+        } catch (e) {
+          logger.error?.(e.message);
+        }
+      }, 1000);
+      maintenance.unref();
+      streamTimer = setInterval(() => {
+        for (const c of streams) c.res.write(": heartbeat\n\n");
+      }, 15000);
+      streamTimer.unref();
+      return { url: `http://127.0.0.1:${port}`, port };
     },
-    /** Diagnostics for tests: proves SSE timers/connections were cleaned up. */
-    stats() {
-      return {
-        listening,
-        port: boundPort,
-        url: baseUrl,
-        sseClients: hub.size(),
-        schedulerHeartbeat: internalRouter.lastHeartbeat(),
-      };
+    async close() {
+      clearInterval(maintenance);
+      clearInterval(streamTimer);
+      for (const c of streams) c.res.end();
+      streams.clear();
+      app.signals.off("change", pump);
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+      try {
+        app.close();
+      } finally {
+        ownership.release();
+      }
     },
-    tokenFile: tokenPersistence.tokenFile,
-    tokenPersisted: tokenPersistence.persisted,
-    tokenWarning: tokenPersistence.warning,
-    /** Internal credential for in-process callers (CLI prints it once; never in HTTP). */
-    /** @deprecated single-token compatibility view (scheduler role). */
-    get internalToken() {
-      return resolvedInternalTokens[INTERNAL_ROLE_SCHEDULER];
-    },
-    internalTokens: Object.freeze({ ...resolvedInternalTokens }),
-    httpServer,
   };
 }

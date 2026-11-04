@@ -1,46 +1,17 @@
 name: ci
-
 on:
   push:
-    branches: [main]
+    branches: [main, "codex/**"]
   pull_request:
-
 permissions:
   contents: read
-
 jobs:
-  test:
-    name: node ${{ matrix.node }} / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  verify:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        node: [20, 22, 24]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node }}
-      - name: Unit tests
-        run: npm test
-      - name: Board plugin selftests
-        run: npm run plugin:selftest
-      - name: Package contents
-        run: npm pack --dry-run
-      - name: Dependency boundaries
-        run: node scripts/check-boundaries.mjs
-
-  # The M1 workspace needs Node >= 22.5 for node:sqlite and a pnpm install.
-  # It is a separate job so the legacy zero-dependency CLI keeps testing on
-  # Node 20 without a package manager.
-  workspace:
-    name: workspace / node 24 / ${{ matrix.os }}
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -50,22 +21,19 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - name: Install workspace
-        run: pnpm install --frozen-lockfile
-      - name: Dependency boundaries
-        run: node scripts/check-boundaries.mjs
-      - name: Workspace tests (SQLite, backend, web logic)
-        run: node scripts/test-workspace.mjs
-      - name: Build the web SPA
-        run: pnpm --filter @atk/web build
-      - name: Backend smoke test
-        shell: bash
-        run: |
-          node apps/backend/cli.mjs serve --port 14211 --data "$RUNNER_TEMP/atk-ci.db" &
-          server=$!
-          for i in $(seq 1 30); do
-            if node -e "fetch('http://127.0.0.1:14211/api/v1/system/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then break; fi
-            sleep 1
-          done
-          node -e "fetch('http://127.0.0.1:14211/api/v1/system/health').then(async r=>{const b=await r.json();if(!r.ok||!b.ok){console.error('health failed',r.status,b);process.exit(1)}console.log('health ok')})"
-          kill $server
+      - run: pnpm install --frozen-lockfile
+      - run: node scripts/check-boundaries.mjs
+      - run: node scripts/test.mjs
+      - run: node scripts/build-web.mjs
+      - run: node scripts/e2e.mjs
+      - run: node scripts/smoke.mjs
+      - run: node scripts/benchmark.mjs --duration 30000
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-${{ matrix.os }}
+          path: |
+            artifacts/e2e/*.png
+            artifacts/e2e/report.json
+            artifacts/benchmark/report.json
+            artifacts/smoke/report.json
