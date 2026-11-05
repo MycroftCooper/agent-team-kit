@@ -78,3 +78,18 @@ its report is labelled as short rather than another full thirty-minute soak.
 Final short check: 30,000 ms, metadata P95 106.66 ms, UI refresh 307.03 ms;
 [raw report](validation/benchmark-final.json). This additional check does not
 replace the full soak above.
+
+## 2026-11-06 approval and recovery fixes
+
+The follow-up fixes passed 41 backend/protocol tests, 18 browser checks (including
+the latency observation), 8 installed-package checks, the production web build
+and the module boundary check. Regression coverage now includes private browser
+authorization, stale acceptance isolation, complete directory-scope lock checks,
+review feedback delivery and human-output drift recovery through the UI. Brief
+network failures retry read requests without requiring an SSE disconnection.
+
+The repair revision's 30-second performance smoke used the same 10-project,
+10,000-task, 20-client seed: metadata round-trip P95 128.90 ms, UI refresh
+306.11 ms, bounded 100-entry timeline. This was a short smoke, not a new full
+30-minute soak. Local raw results are in `artifacts/fixes-20261106/benchmark`;
+browser and installation results are in `artifacts/e2e` and `artifacts/smoke`.

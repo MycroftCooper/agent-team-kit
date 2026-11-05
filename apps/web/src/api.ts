@@ -1,10 +1,28 @@
 import { useEffect, useState, useRef } from "react";
 import type { Row } from "@atk/contracts";
 let session: Promise<{ token: string; csrf: string }> | null = null;
+let accessKey = sessionStorage.getItem("atk-browser-access") ?? "";
+function consumeAccessFragment() {
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  if (!fragment.has("access")) return;
+  accessKey = fragment.get("access") ?? "";
+  session = null;
+  fragment.delete("access");
+  history.replaceState(
+    null,
+    "",
+    location.pathname + location.search + (fragment.size ? "#" + fragment : ""),
+  );
+}
+consumeAccessFragment();
 async function auth() {
-  session ??= fetch("/api/v1/session")
+  consumeAccessFragment();
+  session ??= fetch("/api/v1/session", {
+    headers: { "x-atk-access": accessKey },
+  })
     .then(async (r) => {
       if (!r.ok) throw new Error("Session unavailable");
+      sessionStorage.setItem("atk-browser-access", accessKey);
       return r.json();
     })
     .catch((e) => {
@@ -12,6 +30,13 @@ async function auth() {
       throw e;
     });
   return session;
+}
+export async function authorize(code?: string) {
+  if (code !== undefined) {
+    accessKey = code.trim();
+    session = null;
+  }
+  return auth();
 }
 export async function api<T = Row>(
   route: string,
@@ -49,7 +74,9 @@ export function useData<T = Row>(route: string | null, epoch: number) {
     loading: boolean;
   }>({ data: null, error: null, loading: true });
   useEffect(() => {
-    let alive = true;
+    let alive = true,
+      attempt = 0,
+      retry: ReturnType<typeof setTimeout> | undefined;
     previousRoute.current = route;
     if (!route) {
       set({ data: null, error: null, loading: false });
@@ -61,15 +88,23 @@ export function useData<T = Row>(route: string | null, epoch: number) {
       error: null,
     }));
     previousRoute.current = route;
-    api<T>(route)
-      .then((data) => {
-        if (alive) set({ data, error: null, loading: false });
-      })
-      .catch((error) => {
-        if (alive) set((s) => ({ ...s, error, loading: false }));
-      });
+    function read() {
+      api<T>(route!)
+        .then((data) => {
+          if (alive) set({ data, error: null, loading: false });
+        })
+        .catch((error) => {
+          if (!alive) return;
+          set((s) => ({ ...s, error, loading: false }));
+          // A brief outage may fail a refresh without closing the SSE stream.
+          if (!error.code && attempt < 5)
+            retry = setTimeout(read, Math.min(10000, 1000 * 2 ** attempt++));
+        });
+    }
+    read();
     return () => {
       alive = false;
+      clearTimeout(retry);
     };
   }, [route, epoch]);
   return sameRoute ? state : { data: null, error: null, loading: true };
@@ -171,11 +206,13 @@ export function useLive(onChange: () => void) {
       }
     }
     void connect();
+    window.addEventListener("online", invalidate);
     return () => {
       disposed = true;
       controller?.abort();
       clearTimeout(timer);
       clearTimeout(refresh);
+      window.removeEventListener("online", invalidate);
     };
   }, [onChange]);
   return { connection, events };

@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import {
   runtimePaths,
   argumentsOf,
+  readBrowserAccess,
+  browserUrl,
 } from "../../packages/platform/src/index.mjs";
 import { VERSION } from "../../packages/contracts/src/index.mjs";
 const args = argumentsOf(process.argv.slice(2)),
@@ -36,7 +38,11 @@ async function health() {
 }
 async function humanCall(url, body) {
   const s = state();
-  const auth = await fetch(s.url + "/api/v1/session").then((r) => r.json());
+  const authResponse = await fetch(s.url + "/api/v1/session", {
+    headers: { "x-atk-access": readBrowserAccess(dataDir) },
+  });
+  if (!authResponse.ok) throw new Error("Browser authorization failed");
+  const auth = await authResponse.json();
   const response = await fetch(s.url + url, {
     method: "POST",
     headers: {
@@ -65,7 +71,7 @@ async function main() {
   if (command === "start") {
     const current = await health();
     if (current.running) {
-      console.log(JSON.stringify(current));
+      console.log(JSON.stringify({ ...current, browserUrl: browserUrl(current.url, readBrowserAccess(dataDir)) }));
       return;
     }
     const runtime = path.join(dataDir, "runtime"),
@@ -100,7 +106,7 @@ async function main() {
       await new Promise((r) => setTimeout(r, 150));
       const next = await health();
       if (next.running) {
-        console.log(JSON.stringify(next));
+        console.log(JSON.stringify({ ...next, browserUrl: browserUrl(next.url, readBrowserAccess(dataDir)) }));
         return;
       }
     }

@@ -33,7 +33,7 @@ second production memory-store implementation.
   dependencies unlock downstream work. Final plan acceptance makes VERIFIED
   children and the REQUEST DONE.
 - HUMAN work starts through the UI and completes through explicit human action.
-  Its browser renews the lease while the inbox is open. A lost human lease uses
+  Its browser renews the lease across pages and workspace switches. A lost human lease uses
   the same conservative recovery rules as an agent lease.
 - Failed execution, content drift, review exhaustion and lease loss are BLOCKED
   reasons, not successful completion. Human retry creates another generation.
@@ -47,6 +47,12 @@ Plans have explicit revisions and approval versions. Revision requests stop
 future claims, cancel superseded unfinished nodes and return the REQUEST to
 DRAFT. Existing edits remain in the project. Active/uncertain runs must be
 reconciled before a revision can replace work.
+
+Superseded acceptance targets stay as history and disappear from the inbox.
+Revalidation requires the current approved plan and unchanged delivery results;
+it cannot alter a revised requirement or a newer delivery. Drift in a human-owned
+final output reopens that HUMAN task through BLOCKED and explicit retry, while
+legal downstream edits preserve the earlier human completion.
 
 ## File coordination and evidence
 
@@ -72,6 +78,9 @@ Pending reviews recheck the candidate. VERIFIED historical outputs remain valid
 for approved downstream edits. Final acceptance checks the merged latest output
 manifest against current files inside the backend's claim-exclusion transaction.
 Changed files/new files in directory scopes make pending targets stale.
+Acceptance checks locks over the full approved scope, including empty directories
+and not-yet-created descendants. Rework claims include the last review summary
+and references to its detailed findings and the exact rejected output.
 
 ## Persistence and events
 

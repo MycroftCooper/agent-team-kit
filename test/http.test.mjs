@@ -5,6 +5,7 @@ import path from "node:path";
 import { createServer } from "../apps/backend/src/server.mjs";
 import { createAgentClient } from "../packages/agent-client/src/index.mjs";
 import { fixture, node, plan } from "./helpers.mjs";
+import { readBrowserAccess } from "../packages/platform/src/index.mjs";
 async function serverFixture(t) {
   const f = fixture();
   const server = createServer({
@@ -16,7 +17,9 @@ async function serverFixture(t) {
     await server.close();
     fs.rmSync(f.root, { recursive: true, force: true });
   });
-  const session = await fetch(info.url + "/api/v1/session").then((r) =>
+  const session = await fetch(info.url + "/api/v1/session", {
+    headers: { "x-atk-access": readBrowserAccess(f.data) },
+  }).then((r) =>
     r.json(),
   );
   async function human(route, body) {
@@ -39,6 +42,19 @@ test("browser session and CSRF are distinct from agent credentials", async (t) =
     code: "INSTANCE_ACTIVE",
   });
   assert.equal((await fetch(f.url + "/api/v1/projects")).status, 401);
+  for (const headers of [
+    {},
+    { "x-atk-access": "incorrect" },
+    { authorization: `Bearer ${f.pm.credential}` },
+    { "x-atk-access": f.pm.credential, "sec-fetch-site": "same-origin" },
+  ]) {
+    const locked = await fetch(f.url + "/api/v1/session", { headers });
+    assert.equal(locked.status, 401);
+    const body = await locked.json();
+    assert.equal(body.error.code, "UI_LOCKED");
+    assert.equal(body.token, undefined);
+    assert.equal(body.csrf, undefined);
+  }
   assert.equal(
     (
       await fetch(f.url + "/api/v1/session", {
@@ -103,6 +119,37 @@ test("HTTP clients race atomically, report receipts and replay idempotently", as
     summary: "complete",
   });
   assert.equal(second.run.resultHash, output.run.resultHash);
+});
+
+test("a real submitted plan needs private web authorization and rework feedback is readable by its worker", async (t) => {
+  const f = await serverFixture(t),
+    dev = createAgentClient({ baseUrl: f.url, credential: f.dev.credential });
+  const draft = f.app.createDraft({ projectId: f.p.id, title: "Protected approval", description: "x" });
+  const planning = f.app.claim(f.pm.agent.id, { taskId: draft.id });
+  const submitted = f.app.submitPlan(f.pm.agent.id, planning.run.id, {
+    generation: planning.generation, idempotencyKey: "protected-plan",
+    plan: { summary: "Protected plan", nodes: [node("a", { reviewPolicy: "INDEPENDENT", reviewRoleId: "role-qa" })] },
+  });
+  const blocked = await fetch(`${f.url}/api/v1/plans/${submitted.plan.id}/approve`, {
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${f.pm.credential}` },
+    body: JSON.stringify({ version: submitted.plan.version }),
+  });
+  assert.equal(blocked.status, 401);
+  assert.equal(f.app.get("plans", submitted.plan.id).status, "SUBMITTED");
+  const approved = await f.human(`/plans/${submitted.plan.id}/approve`, { version: submitted.plan.version });
+  assert.equal(approved.status, 200);
+  const worker = await dev.claim({ taskId: approved.body.tasks[0].id, waitMs: 0 });
+  const delivered = await dev.submit(worker.run.id, "result", {
+    generation: worker.generation, stopped: true, outcome: "COMPLETED", summary: "Candidate",
+  });
+  const reviewer = f.app.claim(f.qa.agent.id, {});
+  f.app.submitReview(f.qa.agent.id, reviewer.run.id, {
+    generation: reviewer.generation, idempotencyKey: "feedback", targetHash: delivered.task.resultHash,
+    verdict: "CHANGES_REQUESTED", summary: "Fix empty input", findings: [{ message: "Empty input crashes" }],
+  });
+  const retry = await dev.claim({ waitMs: 0 });
+  const feedback = await dev.request(retry.spec.rework.reviewRef.replace("/api/agent/v1", ""));
+  assert.equal(feedback.review.findings[0].message, "Empty input crashes");
 });
 test("long poll waits without work and returns on a new eligible DRAFT", async (t) => {
   const f = await serverFixture(t),

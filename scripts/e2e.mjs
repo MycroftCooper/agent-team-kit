@@ -23,7 +23,16 @@ async function step(name, fn) {
 }
 try {
   browser = await openBrowser({ url: info.url, outputDir: output });
-  await browser.wait("document.body.innerText.includes('概览')");
+  await step("web access stays locked until opened with the private launcher link", async () => {
+    await browser.wait("document.body.innerText.includes('解锁工作空间')");
+    await browser.fill("accessCode", "not-the-access-code");
+    await browser.evaluate("document.querySelector('.auth-panel form').requestSubmit()");
+    await browser.wait("document.body.innerText.includes('解锁失败')");
+    await browser.send("Page.navigate", { url: info.browserUrl });
+    await browser.wait("document.body.innerText.includes('概览')");
+    assert.equal(await browser.evaluate("location.hash"), "");
+    assert.equal(await browser.evaluate("localStorage.getItem('atk-browser-access')"), null);
+  });
   await step("Linear workspace renders without overflow", async () => {
     await browser.wait("document.body.innerText.includes('添加本地项目')");
     assert.equal(
@@ -442,6 +451,55 @@ try {
     await browser.evaluate("localStorage.setItem('atk-workspace','missing-project')");
     await browser.send("Page.reload");
     await browser.wait(`document.querySelector('[name=workspace]')?.value === ${JSON.stringify(project.id)} && localStorage.getItem('atk-workspace') === ${JSON.stringify(project.id)}`);
+  });
+  await step("human delivery drift can be reopened and finally accepted entirely in the UI", async () => {
+    const draft = server.app.createDraft({ projectId: project.id, title: "Human drift recovery", description: "Confirm a human-owned file" });
+    const planning = await pm.claim({ taskId: draft.id, waitMs: 0 });
+    await pm.submit(planning.run.id, "plan", {
+      generation: planning.generation,
+      plan: { summary: "Human drift recovery", nodes: [{ key: "human", title: "Reconfirm manual output", description: "Read manual.txt", acceptance: "Confirm current contents", executorType: "HUMAN", files: ["manual.txt"], checks: [], reviewPolicy: "NONE", deps: [] }] },
+    });
+    await browser.click("My inbox", { exact: true });
+    await browser.wait("[...document.querySelectorAll('.inbox-row')].some(r=>r.textContent.includes('Human drift recovery'))");
+    await browser.click("Review plan", { within: "[...document.querySelectorAll('.inbox-row')].find(r=>r.textContent.includes('Human drift recovery'))" });
+    await browser.click("Approve this version & release tasks");
+    await browser.wait("!document.querySelector('[role=dialog]')");
+    await browser.click("Start", { exact: true });
+    fs.writeFileSync(path.join(projectRoot, "manual.txt"), "confirmed");
+    await browser.click("Complete", { exact: true });
+    await browser.fill("summary", "Confirmed original contents");
+    await browser.submit();
+    await browser.wait("!document.querySelector('[role=dialog]')");
+    await browser.wait("document.body.innerText.includes('Inspect output')");
+    fs.writeFileSync(path.join(projectRoot, "manual.txt"), "changed");
+    await browser.click("Inspect output");
+    await browser.click("Detect changes & revalidate");
+    await browser.wait("!document.querySelector('[role=dialog]')");
+    await browser.wait("[...document.querySelectorAll('.inbox-row')].some(r=>r.textContent.includes('Reconfirm manual output') && r.textContent.includes('Open task'))");
+    await browser.click("Open task", { within: "[...document.querySelectorAll('.inbox-row')].find(r=>r.textContent.includes('Reconfirm manual output'))" });
+    await browser.click("Requeue task");
+    await browser.wait("!document.querySelector('[role=dialog]')");
+    await browser.click("Start", { exact: true });
+    await browser.click("Complete", { exact: true });
+    await browser.fill("summary", "Reconfirmed changed contents");
+    await browser.submit();
+    await browser.wait("!document.querySelector('[role=dialog]')");
+    await browser.click("Inspect output");
+    await browser.click("Accept this plan", { exact: true });
+    await browser.wait("!document.querySelector('[role=dialog]')");
+    assert.equal(server.app.get("tasks", draft.id).status, "DONE");
+  });
+  await step("manual access-code unlock survives reload without exposing the code in the URL", async () => {
+    await browser.evaluate("sessionStorage.clear()");
+    await browser.send("Page.reload");
+    await browser.wait("!!document.querySelector('[name=accessCode]:not(:disabled)')");
+    const accessCode = new URLSearchParams(new URL(info.browserUrl).hash.slice(1)).get("access");
+    await browser.fill("accessCode", accessCode);
+    await browser.evaluate("document.querySelector('.auth-panel form').requestSubmit()");
+    await browser.wait("!!document.querySelector('[name=workspace]')");
+    await browser.send("Page.reload");
+    await browser.wait("!!document.querySelector('[name=workspace]')");
+    assert.equal(await browser.evaluate("location.hash"), "");
   });
   assert.deepEqual(browser.errors, []);
   fs.writeFileSync(

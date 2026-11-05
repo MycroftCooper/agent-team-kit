@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import type { Row, Page } from "@atk/contracts";
-import { api, useData, useLive } from "./api";
+import { api, authorize, useData, useLive } from "./api";
 import { label, reason, type Lang } from "./i18n";
 
 type View =
@@ -32,6 +32,69 @@ const navs: [View, string, string, string][] = [
 ];
 const time = (v: string | number) => (v ? new Date(v).toLocaleString() : "—");
 export function App() {
+  const [authorized, setAuthorized] = useState(false),
+    [loading, setLoading] = useState(true),
+    [failed, setFailed] = useState(false);
+  const english = localStorage.getItem("atk-language") === "en";
+  useEffect(() => {
+    const connect = () => {
+      setLoading(true);
+      authorize()
+        .then(() => setAuthorized(true))
+        .catch(() => {})
+        .finally(() => setLoading(false));
+    };
+    connect();
+    window.addEventListener("hashchange", connect);
+    return () => window.removeEventListener("hashchange", connect);
+  }, []);
+  if (authorized) return <WorkspaceApp />;
+  return (
+    <main className="auth-shell">
+      <section className="panel auth-panel">
+        <span className="eyebrow">AGENT TEAM KIT</span>
+        <h1>{english ? "Unlock your workspace" : "解锁工作空间"}</h1>
+        <p className="muted">
+          {english
+            ? "Open the private browserUrl returned by atk start, or enter the access code from that link."
+            : "打开 atk start 返回的私密 browserUrl 链接，或输入该链接中的访问码。"}
+        </p>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            const code = String(new FormData(event.currentTarget).get("accessCode") ?? "");
+            setLoading(true);
+            setFailed(false);
+            authorize(code)
+              .then(() => setAuthorized(true))
+              .catch(() => setFailed(true))
+              .finally(() => setLoading(false));
+          }}
+        >
+          <label className="field">
+            <span>{english ? "Access code" : "网页访问码"}</span>
+            <input
+              name="accessCode"
+              type="password"
+              autoComplete="off"
+              required
+              disabled={loading}
+            />
+          </label>
+          {failed && (
+            <p role="alert" className="danger-text">
+              {english ? "Unable to unlock. Check the code and local service." : "解锁失败，请检查访问码及本地服务。"}
+            </p>
+          )}
+          <button className="primary" disabled={loading}>
+            {loading ? (english ? "Connecting…" : "正在连接…") : (english ? "Unlock" : "解锁")}
+          </button>
+        </form>
+      </section>
+    </main>
+  );
+}
+function WorkspaceApp() {
   const [lang, setLang] = useState<Lang>(() =>
       localStorage.getItem("atk-language") === "en" ? "en" : "zh",
     ),

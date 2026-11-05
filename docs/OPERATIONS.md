@@ -20,6 +20,20 @@ dead owners can be replaced without killing any process. The launcher records UR
 credentials. It shuts down only the matching service through authenticated HTTP,
 not by trusting a possibly reused PID.
 
+`atk start` returns a private `browserUrl` whose fragment unlocks the web client.
+The client removes that fragment immediately and keeps the access code in tab
+session storage, so reloads work. A plain URL opens an access-code form. Calling
+`GET /api/v1/session` requires the separate `x-atk-access` credential; neither
+anonymous requests nor Agent credentials can obtain an approval session. Calling
+`atk start` again retrieves the private link for an already-running installation.
+Do not share that link or pass it to an Agent.
+
+The access key lives in `runtime/browser-access.json` with owner-only creation
+permissions where supported. It is excluded from service state, logs, backups,
+project documents and Agent replies. The launcher reads it locally for privileged
+operations. This is a local single-user boundary, not an OS sandbox: a process
+that can read the user's private files or control their browser is already trusted.
+
 The browser's session is short lived and held in memory. Agent credentials are
 shown once and stored hashed in SQLite. Revocation prevents new Agent requests;
 active executions require confirmed stopping before locks are released.

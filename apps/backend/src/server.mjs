@@ -14,6 +14,10 @@ import {
   safeEqual,
 } from "./auth.mjs";
 import {
+  ensureBrowserAccess,
+  browserUrl,
+} from "../../../packages/platform/src/index.mjs";
+import {
   AppError,
   requireThat,
   VERSION,
@@ -74,8 +78,9 @@ export function createServer({
   const instanceId = crypto.randomUUID(),
     ownership = acquireInstance(dataDir ?? service?.dataDir, instanceId),
     streams = new Set();
-  let app;
+  let app, browserAccess;
   try {
+    browserAccess = ensureBrowserAccess(dataDir ?? service?.dataDir);
     app = service ?? createService({ dataDir, now });
   } catch (error) {
     ownership.release();
@@ -182,6 +187,12 @@ export function createServer({
           "ORIGIN_FORBIDDEN",
           "Cross-origin session bootstrap refused",
           403,
+        );
+        requireThat(
+          safeEqual(req.headers["x-atk-access"], browserAccess),
+          "UI_LOCKED",
+          "Open the private browser URL from atk start, or enter its access code",
+          401,
         );
         if (isSessionExpired(session)) session = createSession();
         return json(res, 200, {
@@ -574,7 +585,8 @@ export function createServer({
         for (const c of streams) c.res.write(": heartbeat\n\n");
       }, 15000);
       streamTimer.unref();
-      return { url: `http://127.0.0.1:${port}`, port };
+      const url = `http://127.0.0.1:${port}`;
+      return { url, browserUrl: browserUrl(url, browserAccess), port };
     },
     async close() {
       clearInterval(maintenance);

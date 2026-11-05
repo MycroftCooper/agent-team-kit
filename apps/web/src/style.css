@@ -56,6 +56,24 @@
   --muted: #858990;
   --accent: #8790ed;
 }
+.auth-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.auth-panel {
+  width: min(100%, 440px);
+  padding: 32px;
+}
+.auth-panel h1 {
+  font-size: 24px;
+  margin-top: 16px;
+}
+.auth-panel form {
+  display: grid;
+  gap: 20px;
+}
 * {
   box-sizing: border-box;
 }

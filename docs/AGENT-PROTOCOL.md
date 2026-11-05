@@ -9,6 +9,8 @@ Create an identity in the browser, bind its role/team, and save its one-time
 credential outside the project. Requests use `Authorization: Bearer <credential>`.
 Agent endpoints reject browser-origin calls. Browser session/CSRF endpoints do
 not accept Agent credentials for human approvals.
+The web interface additionally requires a private installation access code.
+It is not an Agent credential and must not be provided to execution clients.
 
 Base URL: `http://127.0.0.1:1421/api/agent/v1`.
 
@@ -132,6 +134,12 @@ Other verdicts: CHANGES_REQUESTED or BLOCKED. Three failed/rework execution
 attempts block automatic rework; explicit human intervention is then required.
 The reviewer and PM author cannot be the execution author. A changed candidate
 is refused even if the submitted target hash used to be valid.
+
+When a worker claims rework, `spec.rework` contains `reviewRunId`, `verdict`,
+`summary`, `targetHash`, `reviewRef` and `previousOutputRef`. Read the review
+summary before changing files; fetch `reviewRef` for detailed findings and
+`previousOutputRef` for the exact reviewed receipt. Only the current task's
+feedback is attached; full findings and output content remain on demand.
 
 Progress events use `{generation,events:[{eventId,type,message,usage?}]}`. Supported
 types: progress, log, blocked, usage. Events are observations; emitting a message

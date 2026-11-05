@@ -15,7 +15,7 @@
 ```powershell
 npm install -g agent-team-kit@next
 atk start
-# 打开输出的 http://127.0.0.1:1421
+# 打开输出的私密 browserUrl 链接（含访问码，请勿分享）
 atk status
 atk stop
 ```

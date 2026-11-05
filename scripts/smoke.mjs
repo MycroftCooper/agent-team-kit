@@ -15,7 +15,7 @@ const npmCli = [
 ].find((p) => p && fs.existsSync(p));
 assert.ok(npmCli, "npm CLI must be installed with Node");
 const steps = [];
-let baseUrl, launcher, dataDir;
+let baseUrl, launcher, dataDir, accessKey;
 function command(file, args, cwd = process.cwd()) {
   const result = spawnSync(process.execPath, [file, ...args], {
     cwd,
@@ -31,7 +31,9 @@ function command(file, args, cwd = process.cwd()) {
   return result.stdout;
 }
 async function human(route, body) {
-  const session = await fetch(baseUrl + "/api/v1/session").then((r) =>
+  const session = await fetch(baseUrl + "/api/v1/session", {
+    headers: { "x-atk-access": accessKey },
+  }).then((r) =>
     r.json(),
   );
   const response = await fetch(baseUrl + "/api/v1" + route, {
@@ -115,6 +117,10 @@ try {
       );
       assert.ok(started.running);
       baseUrl = started.url;
+      accessKey = new URLSearchParams(new URL(started.browserUrl).hash.slice(1)).get("access");
+      assert.ok(accessKey);
+      assert.ok(!fs.readFileSync(path.join(dataDir, "logs/backend.log"), "utf8").includes(accessKey));
+      assert.ok(!fs.readFileSync(path.join(dataDir, "runtime/service.json"), "utf8").includes(accessKey));
       assert.equal(
         JSON.parse(command(launcher, ["status", "--data", dataDir], outside))
           .running,
@@ -129,6 +135,7 @@ try {
     },
   );
   await step("serve the complete bundled web application", async () => {
+    assert.equal((await fetch(baseUrl + "/api/v1/session")).status, 401);
     fs.writeFileSync(
       path.join(dataDir, "runtime", "service.json"),
       "{corrupt state",

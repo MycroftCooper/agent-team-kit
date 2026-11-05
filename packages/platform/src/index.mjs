@@ -1,5 +1,26 @@
 import os from "node:os";
 import path from "node:path";
+import fs from "node:fs";
+import crypto from "node:crypto";
+export function readBrowserAccess(dataDir) {
+  const file = path.join(dataDir, "runtime", "browser-access.json"),
+    stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink())
+    throw new Error("Invalid browser access file");
+  const { accessKey } = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (!/^[A-Za-z0-9_-]{43}$/.test(accessKey))
+    throw new Error("Invalid browser access key");
+  return accessKey;
+}
+export function ensureBrowserAccess(dataDir) {
+  const file = path.join(dataDir, "runtime", "browser-access.json");
+  if (fs.existsSync(file)) return readBrowserAccess(dataDir);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const accessKey = crypto.randomBytes(32).toString("base64url");
+  fs.writeFileSync(file, JSON.stringify({ accessKey }), { flag: "wx", mode: 0o600 });
+  return accessKey;
+}
+export const browserUrl = (url, accessKey) => `${url}/#access=${accessKey}`;
 export function appDataRoot(env = process.env) {
   return (
     env.LOCALAPPDATA ||

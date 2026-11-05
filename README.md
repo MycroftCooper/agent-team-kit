@@ -15,7 +15,7 @@ After a release has been published to npm (a GitHub source push does not publish
 ```sh
 npm install -g agent-team-kit@next
 atk start
-# Open the printed http://127.0.0.1:1421 URL
+# Open the private browserUrl printed by start (keep its access fragment private)
 atk status
 atk stop
 ```

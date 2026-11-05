@@ -249,6 +249,18 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
   function tasksOf(planId) {
     return store.all("tasks", { planId }).filter((t) => t.kind === "WORK");
   }
+  function currentAcceptance(a) {
+    const plan = store.get("plans", a.planId),
+      source = store.get("tasks", a.sourceTaskId);
+    return (
+      plan?.status === "APPROVED" &&
+      source?.planId === plan.id &&
+      !["DONE", "CANCELLED"].includes(source.status) &&
+      a.results.every(
+        (r) => store.get("tasks", r.taskId)?.resultHash === r.resultHash,
+      )
+    );
+  }
   function manifestFor(planId) {
     const tasks = tasksOf(planId),
       outputs = Object.create(null),
@@ -300,8 +312,8 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       if (!acceptance) {
         for (const old of store
           .all("acceptances", { parentId: source.id })
-          .filter((a) => a.status === "PENDING"))
-          put("acceptances", { ...old, status: "STALE" });
+          .filter((a) => ["PENDING", "STALE"].includes(a.status)))
+          put("acceptances", { ...old, status: "SUPERSEDED" });
         acceptance = make("acceptances", {
           projectId: p.id,
           sourceTaskId: source.id,
@@ -404,6 +416,17 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       base.artifactRef = `/api/agent/v1/runs/${task.latestRunId}/artifact`;
       base.instructions +=
         "\nRead-only review. Do not edit project files. Bind your verdict to targetHash.";
+    }
+    if (stage === "EXECUTION" && task.reviewRunId) {
+      const review = get("runs", task.reviewRunId);
+      base.rework = {
+        reviewRunId: review.id,
+        verdict: review.review.verdict,
+        summary: review.review.summary,
+        targetHash: review.review.targetHash,
+        reviewRef: `/api/agent/v1/runs/${review.id}/artifact`,
+        previousOutputRef: review.spec.artifactRef,
+      };
     }
     return base;
   }
@@ -1209,8 +1232,8 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           if (t.status !== "DONE") put("tasks", { ...t, status: "CANCELLED" });
         for (const a of store
           .all("acceptances", { parentId: source.id })
-          .filter((a) => a.status === "PENDING"))
-          put("acceptances", { ...a, status: "STALE" });
+          .filter((a) => ["PENDING", "STALE"].includes(a.status)))
+          put("acceptances", { ...a, status: "SUPERSEDED" });
         const next = put("tasks", {
           ...source,
           status: "DRAFT",
@@ -1628,7 +1651,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           "Plan has incomplete tasks",
           409,
         );
-        const scopes = locksFor(Object.keys(a.files), p),
+        const scopes = locksFor(a.scopes, p),
           occupied = conflicts(scopes);
         requireThat(
           !occupied.length,
@@ -1678,10 +1701,25 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           "Acceptance already completed",
           409,
         );
+        requireThat(
+          currentAcceptance(a),
+          "APPROVAL_STALE",
+          "This acceptance belongs to a completed, revised or superseded delivery",
+          409,
+        );
+        requireThat(
+          !working().some((r) => r.planId === a.planId),
+          "PLAN_BUSY",
+          "Stop active and uncertain executions before revalidating",
+          409,
+        );
         const p = project(a.projectId),
           changes = currentDifferences(p, a.files, a.scopes);
         const candidates = tasksOf(a.planId)
-          .filter((t) => t.status === "VERIFIED")
+          .filter(
+            (t) => t.status === "VERIFIED" ||
+              (t.executorType === "HUMAN" && t.status === "DONE"),
+          )
           .sort(
             (x, y) =>
               (store.get("runs", y.latestRunId)?.completedSeq ?? 0) -
@@ -1696,9 +1734,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
               )?.id,
           ),
         );
-        for (const t of tasksOf(a.planId).filter(
-          (t) => t.status === "VERIFIED",
-        )) {
+        for (const t of candidates) {
           if (affected.has(t.id))
             put("tasks", {
               ...t,
@@ -1863,7 +1899,9 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         ),
         acceptances: store
           .all("acceptances", filter)
-          .filter((a) => ["PENDING", "STALE"].includes(a.status)),
+          .filter(
+            (a) => ["PENDING", "STALE"].includes(a.status) && currentAcceptance(a),
+          ),
         runs: working().filter(
           (r) =>
             (!projectId || r.projectId === projectId) && r.status !== "RUNNING",

@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { createServer } from "../apps/backend/src/server.mjs";
 import { createAgentClient } from "../packages/agent-client/src/index.mjs";
 import { openBrowser } from "./browser.mjs";
+import { readBrowserAccess } from "../packages/platform/src/index.mjs";
 const arg = process.argv.indexOf("--duration");
 const duration = arg >= 0 ? Number(process.argv[arg + 1]) : 30 * 60 * 1000;
 const output = path.resolve(
@@ -124,7 +125,9 @@ try {
     onError: (e) => failures.push(e.message),
     onStop: () => failures.push("unexpected stop"),
   });
-  const session = await fetch(url + "/api/v1/session").then((r) => r.json());
+  const session = await fetch(url + "/api/v1/session", {
+    headers: { "x-atk-access": readBrowserAccess(app.dataDir) },
+  }).then((r) => r.json());
   for (let wave = 0; wave < 10; wave++)
     await Promise.all(
       Array.from({ length: 20 }, async (_, i) => {
@@ -150,7 +153,7 @@ try {
     "ms",
   );
   browser = await openBrowser({
-    url,
+    url: `${url}/#access=${readBrowserAccess(app.dataDir)}`,
     outputDir: output,
     width: 1440,
     height: 1000,
