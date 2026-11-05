@@ -12,6 +12,14 @@ atk logs
 atk stop
 ```
 
+Windows users can double-click the package's `start.bat` and `stop.bat`. Start
+opens the private web URL in the default browser without printing the access code.
+The scripts work from any current directory. Optional `atk.local.json` beside
+them selects `dataDir` (absolute or relative to that directory); it is local-only
+and excluded from Git and release packages. Explicit `--data` overrides it;
+`ATK_DATA_DIR` also bypasses that file. `--no-open` suppresses the browser for
+headless startup checks. These entrypoints require Node.js 24, not an EXE runtime.
+
 `--data <directory>` isolates an installation. On Windows the default is
 `%LOCALAPPDATA%/AgentTeamKit/Next`; other platforms use the local data directory.
 The service binds 127.0.0.1 and exclusively claims its data directory using a

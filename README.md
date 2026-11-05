@@ -10,6 +10,16 @@ model adapters, model gateway, automatic agent launch, or worktrees.
 Use Node.js 24. The release package contains the built web application and has
 no production dependencies. It installs outside the projects it manages.
 
+On Windows, double-click **start.bat** to start the service and open the unlocked
+web UI in your default browser. Repeated starts reuse the running service.
+**stop.bat** stops it; closing the browser leaves it running. Desktop shortcuts
+to either file work too. A source checkout needs the initial install and web build.
+
+An optional, Git-ignored `atk.local.json` beside the batch files can set
+`{"dataDir":"E:/AgentTeamKitData"}`. Relative paths resolve from that directory.
+Explicit `--data` and `ATK_DATA_DIR` take precedence; without configuration the
+standard application data directory is used.
+
 After a release has been published to npm (a GitHub source push does not publish it):
 
 ```sh

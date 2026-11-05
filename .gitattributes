@@ -1,5 +1,6 @@
 # Normalise line endings so the toolkit works the same on Windows/macOS/Linux.
 * text=auto eol=lf
+*.bat text eol=crlf
 
 *.png binary
 *.jpg binary

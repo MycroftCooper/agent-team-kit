@@ -19,3 +19,4 @@ apps/web/.vite/
 .env
 .env.*
 !.env.example
+atk.local.json

@@ -18,6 +18,8 @@
     "apps/web/dist",
     "packages",
     "docs",
+    "start.bat",
+    "stop.bat",
     "README.md",
     "README.zh-CN.md",
     "LICENSE"

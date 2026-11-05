@@ -93,3 +93,8 @@ The repair revision's 30-second performance smoke used the same 10-project,
 306.11 ms, bounded 100-entry timeline. This was a short smoke, not a new full
 30-minute soak. Local raw results are in `artifacts/fixes-20261106/benchmark`;
 browser and installation results are in `artifacts/e2e` and `artifacts/smoke`.
+
+Windows double-click startup adds one installed-package scenario (9 package
+checks total). Real batch start, repeated start and stop were also exercised from
+an unrelated working directory with isolated state. The local preview preference
+was verified separately without replacing its data or approval state.

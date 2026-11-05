@@ -69,6 +69,10 @@ try {
     const names = packed.files.map((f) => f.path);
     assert.ok(names.includes("apps/web/dist/index.html"));
     assert.ok(names.includes("apps/agent-cli/cli.mjs"));
+    assert.ok(names.includes("apps/launcher/desktop.mjs"));
+    assert.ok(names.includes("start.bat"));
+    assert.ok(names.includes("stop.bat"));
+    assert.ok(!names.includes("atk.local.json"));
     assert.ok(
       names.every(
         (n) =>
@@ -150,6 +154,15 @@ try {
     assert.ok(html.includes("/assets/"));
     const asset = html.match(/src="([^"]+\.js)"/)[1];
     assert.equal((await fetch(baseUrl + asset)).status, 200);
+  });
+  await step("desktop startup reuses the installed service from an unrelated directory", () => {
+    const before = JSON.parse(command(launcher, ["status", "--data", dataDir]));
+    const result = command(path.join(installed, "apps/launcher/desktop.mjs"), ["start", "--no-open", "--data", dataDir], outside);
+    assert.ok(result.includes(baseUrl));
+    assert.ok(!result.includes(accessKey));
+    const after = JSON.parse(command(launcher, ["status", "--data", dataDir]));
+    assert.equal(after.pid, before.pid);
+    assert.equal(after.instanceId, before.instanceId);
   });
   let first;
   await step(
@@ -233,7 +246,7 @@ try {
   await step(
     "stop the matching installation without trusting a stale PID",
     async () => {
-      command(launcher, ["stop", "--data", dataDir]);
+      command(path.join(installed, "apps/launcher/desktop.mjs"), ["stop", "--data", dataDir], outside);
       for (let i = 0; i < 50; i++) {
         await new Promise((r) => setTimeout(r, 100));
         try {
