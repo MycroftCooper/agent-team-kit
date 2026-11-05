@@ -202,6 +202,22 @@ try {
     );
     await browser.click("开始处理");
     await browser.wait("document.body.innerText.includes('确认完成')");
+    const heartbeatRoot = path.join(root, "heartbeat-workspace");
+    fs.mkdirSync(heartbeatRoot);
+    const heartbeatProject = server.app.createProject({
+      name: "Heartbeat Workspace",
+      root: heartbeatRoot,
+    });
+    await browser.wait(`!!document.querySelector('[name=workspace] option[value="${heartbeatProject.id}"]')`);
+    await browser.fill("workspace", heartbeatProject.id);
+    await browser.wait("document.body.innerText.includes('当前没有待处理事项')");
+    const humanRun = server.app.list("runs", { projectId: project.id }).items.find((r) => r.stage === "HUMAN");
+    const leaseBefore = humanRun.leaseUntil;
+    await sleep(11000);
+    assert.ok(server.app.get("runs", humanRun.id).leaseUntil > leaseBefore, "human lease renews while another workspace is selected");
+    await browser.fill("workspace", project.id);
+    await browser.wait("document.body.innerText.includes('确认完成')");
+    server.app.updateProject(heartbeatProject.id, { version: heartbeatProject.version, archived: true });
     await browser.click("确认完成");
     await browser.fill("summary", "The release content is correct.");
     await browser.submit();
@@ -379,6 +395,54 @@ try {
       );
     },
   );
+  await step("project workspaces switch every business page and persist across reloads", async () => {
+    const otherRoot = path.join(root, "other-project");
+    fs.mkdirSync(otherRoot);
+    await browser.click("Projects", { exact: true });
+    await browser.click("Add local project");
+    await browser.fill("name", "Second Workspace");
+    await browser.fill("root", otherRoot);
+    await browser.submit();
+    const other = server.app.list("projects").items.find((p) => p.name === "Second Workspace");
+    await browser.wait(`document.querySelector('[name=workspace]').value === ${JSON.stringify(other.id)} && !document.querySelector('[role=dialog]')`);
+    await browser.click("New request");
+    assert.equal(await browser.evaluate("document.querySelector('[name=projectId]').value"), other.id);
+    assert.equal(await browser.evaluate("!!document.querySelector('select[name=projectId]')"), false);
+    await browser.fill("title", "Only in the second workspace");
+    await browser.fill("description", "Workspace isolation fixture");
+    await browser.submit();
+    await browser.wait("!document.querySelector('[role=dialog]')");
+    await browser.click("Intake", { exact: true });
+    await browser.wait("document.body.innerText.includes('Only in the second workspace')");
+    assert.equal(await browser.evaluate("document.body.innerText.includes('Reconnect delivery')"), false);
+    await browser.click("Tasks", { exact: true });
+    await browser.wait("document.body.innerText.includes('Only in the second workspace')");
+    assert.equal(await browser.evaluate("document.body.innerText.includes('Build the release summary')"), false);
+    await browser.click("My inbox", { exact: true });
+    await browser.wait("document.body.innerText.includes('You’re all caught up')");
+    assert.equal(await browser.evaluate("document.body.innerText.includes('Review plan')"), false);
+    await browser.click("Runs", { exact: true });
+    await browser.wait("document.body.innerText.includes('No runs yet')");
+    await browser.send("Page.reload");
+    await browser.wait(`document.querySelector('[name=workspace]')?.value === ${JSON.stringify(other.id)}`);
+    assert.equal(await browser.evaluate("localStorage.getItem('atk-workspace')"), other.id);
+    await browser.screenshot("08-project-workspace");
+    await browser.fill("workspace", project.id);
+    await browser.click("Intake", { exact: true });
+    await browser.wait("document.body.innerText.includes('Reconnect delivery')");
+    assert.equal(await browser.evaluate("document.body.innerText.includes('Only in the second workspace')"), false);
+    await browser.evaluate("(()=>{const el=document.querySelector('.search input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,'No matching tasks');el.dispatchEvent(new Event('input',{bubbles:true}));})()");
+    await browser.wait("!document.querySelector('.task-row')");
+    await browser.fill("workspace", other.id);
+    await browser.wait("document.body.innerText.includes('Only in the second workspace')");
+    await browser.click("Projects", { exact: true });
+    await browser.click("Archive", { exact: true, within: "[...document.querySelectorAll('.list-row')].find(r=>r.textContent.includes('Second Workspace'))" });
+    await browser.wait(`document.querySelector('[name=workspace]').value === ${JSON.stringify(project.id)} && localStorage.getItem('atk-workspace') === ${JSON.stringify(project.id)}`);
+    assert.equal(await browser.evaluate(`!!document.querySelector('[name=workspace] option[value="${other.id}"]')`), false);
+    await browser.evaluate("localStorage.setItem('atk-workspace','missing-project')");
+    await browser.send("Page.reload");
+    await browser.wait(`document.querySelector('[name=workspace]')?.value === ${JSON.stringify(project.id)} && localStorage.getItem('atk-workspace') === ${JSON.stringify(project.id)}`);
+  });
   assert.deepEqual(browser.errors, []);
   fs.writeFileSync(
     path.join(output, "report.json"),

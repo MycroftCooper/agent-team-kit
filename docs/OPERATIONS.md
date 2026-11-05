@@ -26,6 +26,15 @@ active executions require confirmed stopping before locks are released.
 
 ## Projects
 
+Each project is one workspace. Use **Switch workspace** at the top of the sidebar
+to change the overview, intake, tasks, inbox and run history together. The browser
+remembers the selected workspace across reloads. New requests always belong to
+the current workspace. Creating a project enters it automatically; archiving the
+current project selects another active workspace, or shows the setup screen if
+none remain. Project management, reusable agents/teams and operations settings
+are explicitly shared global administration. Switching workspace does not stop
+running agents or interrupt human-task heartbeats.
+
 Register name, existing root and team in the UI. Git is not required. The default
 artifact directory is `<root>/.agent-team`; another path can be explicitly chosen.
 The tool does not initialize package managers or inject instructions into the

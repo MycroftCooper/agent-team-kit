@@ -36,7 +36,9 @@ export function App() {
       localStorage.getItem("atk-language") === "en" ? "en" : "zh",
     ),
     [view, setView] = useState<View>("overview"),
-    [projectId, setProject] = useState(""),
+    [selectedProjectId, selectProject] = useState(
+      () => localStorage.getItem("atk-workspace") ?? "",
+    ),
     [epoch, setEpoch] = useState(0),
     [modal, setModal] = useState<Modal | null>(null),
     [error, setError] = useState<Row | null>(null),
@@ -48,12 +50,29 @@ export function App() {
   const projects = useData<Page>("/projects?limit=500", epoch),
     roles = useData<Page>("/roles?limit=500", epoch),
     teams = useData<Page>("/teams?limit=500", epoch);
-  const scope = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "",
-    overview = useData<Row>("/overview" + scope, epoch),
-    inbox = useData<Row>("/inbox" + scope, epoch);
-  const current = projects.data?.items.find((p) => p.id === projectId),
-    allRoles = roles.data?.items ?? [],
+  const activeProjects = projects.data?.items.filter((p) => !p.archived) ?? [],
+    current =
+      activeProjects.find((p) => p.id === selectedProjectId) ?? activeProjects[0],
+    projectId = current?.id ?? "",
+    scope = `?projectId=${encodeURIComponent(projectId)}`,
+    overview = useData<Row>(projectId ? "/overview" + scope : null, epoch),
+    inbox = useData<Row>(projectId ? "/inbox" + scope : null, epoch),
+    // Human work keeps its lease even when its workspace is not being viewed.
+    humanWork = useData<Row>("/inbox", epoch);
+  const allRoles = roles.data?.items ?? [],
     allTeams = teams.data?.items ?? [];
+  function setProject(id: string) {
+    selectProject(id);
+    setModal(null);
+    setError(null);
+    setNotice("");
+  }
+  useEffect(() => {
+    if (!projects.data) return;
+    selectProject(projectId);
+    if (projectId) localStorage.setItem("atk-workspace", projectId);
+    else localStorage.removeItem("atk-workspace");
+  }, [projects.data, projectId]);
   const badge = (value: string) => (
     <span className={`badge status-${value}`}>
       <span className="status-dot" />
@@ -144,7 +163,7 @@ export function App() {
   }, [modal?.kind]);
   useEffect(() => {
     const running =
-      inbox.data?.humanTasks?.filter(
+      humanWork.data?.humanTasks?.filter(
         (task: Row) => task.status === "RUNNING",
       ) ?? [];
     if (!running.length) return;
@@ -156,7 +175,7 @@ export function App() {
     const timer = setInterval(heartbeat, 10000);
     return () => clearInterval(timer);
   }, [
-    inbox.data?.humanTasks?.map((r: Row) => r.id + r.status).join(","),
+    humanWork.data?.humanTasks?.map((r: Row) => r.id + r.status).join(","),
     refresh,
   ]);
   const countInbox =
@@ -214,6 +233,7 @@ export function App() {
         epoch,
         live,
         projectId,
+        current,
         setProject,
         setView,
         overview,
@@ -245,32 +265,59 @@ export function App() {
             <span className="alpha">α</span>
           </button>
           <div className="workspace-switch">
-            <span className="workspace-icon">W</span>
-            <div>
-              <strong>{t("本地工作空间", "Local workspace")}</strong>
-              <small>
-                {t("多个项目，一个入口", "Many projects. One workspace.")}
-              </small>
-            </div>
+            <span className="workspace-icon" aria-hidden="true">
+              {current?.name.slice(0, 1).toUpperCase() ?? "W"}
+            </span>
+            <label className="workspace-choice">
+              <span>{t("工作空间", "Workspace")}</span>
+              <select
+                aria-label={t("切换工作空间", "Switch workspace")}
+                name="workspace"
+                title={current ? `${current.name}\n${current.root}` : undefined}
+                value={projectId}
+                disabled={!activeProjects.length || busy}
+                onChange={(e) => setProject(e.target.value)}
+              >
+                {!activeProjects.length && (
+                  <option value="">{t("尚未添加项目", "No projects yet")}</option>
+                )}
+                {activeProjects.map((p) => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="quiet workspace-add"
+              aria-label={t("添加工作空间", "Add workspace")}
+              onClick={() => open("project")}
+            >
+              ＋
+            </button>
           </div>
           <div className="nav-label">{t("工作空间", "WORKSPACE")}</div>
           <nav>
             {navs.map(([key, zh, en, icon]) => (
-              <button
-                key={key}
-                aria-label={t(zh, en)}
-                className={view === key ? "nav-item active" : "nav-item"}
-                onClick={() => {
-                  setView(key);
-                  setError(null);
-                }}
-              >
-                <span className="nav-icon">{icon}</span>
-                {t(zh, en)}
-                {key === "inbox" && countInbox > 0 && (
-                  <span className="nav-count">{countInbox}</span>
+              <div key={key}>
+                {key === "team" && (
+                  <div className="nav-label global-nav-label">
+                    {t("全局管理", "GLOBAL MANAGEMENT")}
+                  </div>
                 )}
-              </button>
+                <button
+                  aria-label={t(zh, en)}
+                  className={view === key ? "nav-item active" : "nav-item"}
+                  onClick={() => {
+                    setView(key);
+                    setError(null);
+                  }}
+                >
+                  <span className="nav-icon">{icon}</span>
+                  {t(zh, en)}
+                  {key === "inbox" && countInbox > 0 && (
+                    <span className="nav-count">{countInbox}</span>
+                  )}
+                </button>
+              </div>
             ))}
           </nav>
           <div className="sidebar-bottom">
@@ -306,7 +353,9 @@ export function App() {
         <div className="main">
           <header className="topbar">
             <div className="breadcrumbs">
-              <span>Workspace</span>
+              <span className="workspace-breadcrumb" title={current?.root}>
+                {current?.name ?? t("工作空间", "Workspace")}
+              </span>
               <span>/</span>
               <strong>{t(titles[1], titles[2])}</strong>
             </div>
@@ -338,40 +387,44 @@ export function App() {
                 </span>
                 <h2>{t(titles[1], titles[2])}</h2>
               </div>
-              <select
-                aria-label={t("项目筛选", "Project filter")}
-                value={projectId}
-                onChange={(e) => setProject(e.target.value)}
-              >
-                <option value="">{t("所有项目", "All projects")}</option>
-                {projects.data?.items
-                  .filter((p) => !p.archived)
-                  .map((p: Row) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
-              </select>
+              {["team", "projects", "settings"].includes(view) && (
+                <span className="muted">
+                  {t("全局管理 · 跨工作空间共享", "Global management · Shared across workspaces")}
+                </span>
+              )}
             </div>
             {!modal && errorPanel(error)}
             {projects.error && errorPanel(projects.error as Row)}
-            {view === "overview" ? (
-              <Overview />
-            ) : view === "drafts" ? (
-              <TaskList key="drafts" drafts />
-            ) : view === "tasks" ? (
-              <TaskList key="tasks" />
-            ) : view === "inbox" ? (
-              <Inbox />
-            ) : view === "runs" ? (
-              <Runs />
-            ) : view === "team" ? (
-              <Team />
-            ) : view === "projects" ? (
-              <Projects />
-            ) : (
-              <Settings />
-            )}
+            <div key={projectId}>
+              {!projectId && !["team", "projects", "settings"].includes(view) ? (
+                empty(
+                  t("添加你的第一个工作空间", "Add your first workspace"),
+                  t(
+                    "一个项目就是一个工作空间，需求、任务和执行记录按项目独立展示。",
+                    "Each project is a workspace with its own requests, tasks and runs.",
+                  ),
+                  <button className="primary" onClick={() => open("project")}>
+                    {t("添加本地项目", "Add a local project")}
+                  </button>,
+                )
+              ) : view === "overview" ? (
+                <Overview />
+              ) : view === "drafts" ? (
+                <TaskList key="drafts" drafts />
+              ) : view === "tasks" ? (
+                <TaskList key="tasks" />
+              ) : view === "inbox" ? (
+                <Inbox />
+              ) : view === "runs" ? (
+                <Runs />
+              ) : view === "team" ? (
+                <Team />
+              ) : view === "projects" ? (
+                <Projects />
+              ) : (
+                <Settings />
+              )}
+            </div>
           </main>
           <footer>
             <span>AGENT TEAM KIT</span>
@@ -445,23 +498,10 @@ export function App() {
                       }}
                     >
                       <Fields>
-                        <Field name="projectId" title={t("项目", "Project")}>
-                          <select
-                            name="projectId"
-                            defaultValue={
-                              projectId ||
-                              projects.data?.items.find((p) => !p.archived)?.id
-                            }
-                          >
-                            {projects.data?.items
-                              .filter((p) => !p.archived)
-                              .map((p: Row) => (
-                                <option key={p.id} value={p.id}>
-                                  {p.name}
-                                </option>
-                              ))}
-                          </select>
-                        </Field>
+                        <input type="hidden" name="projectId" value={projectId} />
+                        <p className="muted">
+                          {t("当前工作空间", "Current workspace")} · {current?.name}
+                        </p>
                         <Field
                           name="title"
                           title={t("需求标题", "Title")}
@@ -520,7 +560,12 @@ export function App() {
                           version: item?.version,
                         },
                         item ? "PATCH" : "POST",
-                      );
+                      ).then((saved) => {
+                        if (saved && !item) {
+                          setProject(saved.id);
+                          setView("overview");
+                        }
+                      });
                     }}
                   >
                     <Fields>
@@ -1784,7 +1829,7 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
 }
 
 function Overview() {
-  const { lang, t, setProject, setView, overview, inbox, open, countInbox } =
+  const { lang, t, setView, current, overview, inbox, countInbox } =
     useUI();
   const o = overview.data;
   if (!o)
@@ -1798,7 +1843,7 @@ function Overview() {
     <>
       <div className="intro">
         <span className="eyebrow">
-          WORKSPACE / {t("交付工作台", "DELIVERY WORKSPACE")}
+          WORKSPACE / {current?.name}
         </span>
         <h1>
           {t("让每一步交付，都清晰可见。", "A clear view of every delivery.")}
@@ -1821,7 +1866,8 @@ function Overview() {
           [t("已完成", "Completed"), counts.DONE ?? 0, "✓"],
           [
             t("在线 Agent", "Online agents"),
-            o.agents.filter((a: Row) => a.online).length,
+            o.agents.filter((a: Row) => a.online && a.teamId === current?.teamId)
+              .length,
             "⊞",
           ],
         ].map(([name, value, icon]) => (
@@ -1914,20 +1960,19 @@ function Overview() {
         </section>
       </div>
       <div className="section-title">
-        <h3>{t("项目空间", "Project spaces")}</h3>
-        <button className="text-button" onClick={() => open("project")}>
-          ＋ {t("添加项目", "Add project")}
+        <h3>{t("当前项目", "Current project")}</h3>
+        <button className="text-button" onClick={() => setView("projects")}>
+          {t("管理工作空间", "Manage workspaces")} ↗
         </button>
       </div>
       <div className="project-grid">
         {o.projects
-          .filter((p: Row) => !p.archived)
+          .filter((p: Row) => p.id === current?.id)
           .map((p: Row) => (
             <button
               className="project-card"
               key={p.id}
               onClick={() => {
-                setProject(p.id);
                 setView("tasks");
               }}
             >
@@ -1945,16 +1990,6 @@ function Overview() {
               </div>
             </button>
           ))}
-        <button
-          className="project-card add-project"
-          onClick={() => open("project")}
-        >
-          <b>＋</b>
-          <strong>{t("添加本地项目", "Add a local project")}</strong>
-          <small>
-            {t("无需插件，无需初始化工程", "No plugins. No project setup.")}
-          </small>
-        </button>
       </div>
     </>
   );
@@ -2266,13 +2301,13 @@ function Team() {
 }
 
 function Projects() {
-  const { t, projects, open, act } = useUI();
+  const { t, projects, open, act, projectId, setProject, setView } = useUI();
   return (
     <>
       <p className="page-description">
         {t(
-          "管理多个本地目录。项目无需安装工具或依赖 Git。",
-          "Manage local directories without project installation or Git.",
+          "一个项目就是一个工作空间。通过左上角切换，或从这里进入；项目无需安装工具或依赖 Git。",
+          "Each project is a workspace. Switch at the top left or enter below. No project installation or Git required.",
         )}
       </p>
       <div className="task-list">
@@ -2288,6 +2323,19 @@ function Projects() {
             </div>
             {p.archived && (
               <span className="badge">{t("已归档", "Archived")}</span>
+            )}
+            {!p.archived && (
+              <button
+                disabled={p.id === projectId}
+                onClick={() => {
+                  setProject(p.id);
+                  setView("overview");
+                }}
+              >
+                {p.id === projectId
+                  ? t("当前工作空间", "Current workspace")
+                  : t("进入工作空间", "Enter workspace")}
+              </button>
             )}
             <button onClick={() => open("project", p)}>
               {t("编辑 / 重新定位", "Edit / relocate")}
