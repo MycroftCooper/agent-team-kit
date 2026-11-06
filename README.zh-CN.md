@@ -53,6 +53,18 @@ pnpm --filter @atk/web dev
 5. 按批准计划配置可选独立评审；中间任务 **VERIFIED** 后推进依赖，人工任务在“待我处理”完成。
 6. 所有任务满足要求后，对整份计划统一人工验收。无需每个中间任务反复点确认。
 
+任务默认使用看板，可以按流程或执行方分组，也可以切回列表。需求、人工任务和 Agent 任务共用同一个看板；
+人工任务依赖满足后可在卡片上开始或提交交付。对已批准、尚未执行或已停止的 Agent 任务，
+可以从卡片或任务详情指定同团队、符合角色的具体 Agent，也可以恢复为由符合角色的 Agent 领取。
+指派不会启动进程；指定的 Agent 仍需主动领取，并满足依赖、并发和文件锁条件。
+
+任务页工具栏的「显示」可切换看板、列表、表格和泳道。泳道按执行方横向分区，各区共享流程列。
+可以调整排序方向、隐藏子任务，以及选择看板或泳道中的列与卡片属性。设置按工作空间保存在浏览器中。
+
+在任务详情的「日期和标签」里可设置、修改或清除截止日期和标签。在「显示」里可选择卡片是否展示这两个字段；
+任务页的「筛选」支持指定日期、今天、未来七天、已逾期或没有截止日期，并可和标签组合筛选。
+这些字段用于整理任务，不影响领取或审批。
+
 PM 不能执行或评审自己规划的任务；WORKER 不能自审；Agent 凭据不能代替人工批准。
 
 ## 文件锁与交付
@@ -75,6 +87,7 @@ PM 不能执行或评审自己规划的任务；WORKER 不能自审；Agent 凭�
 变量 `ATK_AGENT_TOKEN` 提供凭据，`ATK_URL` 默认为 `http://127.0.0.1:1421`。
 
 ```powershell
+atk-agent doctor
 atk-agent connect
 atk-agent claim --wait 30000
 atk-agent watch <runId> --generation <n>
@@ -82,6 +95,9 @@ atk-agent submit <runId> plan --file plan-receipt.json
 atk-agent submit <runId> result --file result-receipt.json
 atk-agent submit <runId> review --file review-receipt.json
 ```
+
+`doctor` 只验证本地服务与凭据；`connect` 才登记联系。网页的 Agent 接入面板会显示最近联系时间。
+就绪任务的详情可以查看领取诊断；任务与执行面板均可复制本机链接，打开时仍需解锁工作空间。
 
 `watch` 与实际执行同时运行，只维护租约，不会启动或终止 AI。出现 `STOP REQUIRED`、
 续租失败或停止请求时，外部执行端必须停止写入。模型和登录由外部 Agent 自己管理。

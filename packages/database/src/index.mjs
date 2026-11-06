@@ -133,6 +133,15 @@ export function openStore(file) {
         agentId,
         stage,
         planId,
+        statuses,
+        owner,
+        search,
+        hideChildren,
+        deadline,
+        tag,
+        sort,
+        direction,
+        newest = false,
         limit = 100,
         offset = 0,
       } = {},
@@ -152,14 +161,58 @@ export function openStore(file) {
           filters.push(`${col}=?`);
           params.push(val);
         }
+      if (statuses?.length) {
+        filters.push(`status IN (${statuses.map(() => "?").join(",")})`);
+        params.push(...statuses);
+      }
+      if (owner === "REQUEST") {
+        filters.push("json_extract(data,'$.kind')='REQUEST'");
+      } else if (owner) {
+        filters.push("json_extract(data,'$.executorType')=?");
+        params.push(owner);
+      }
+      if (search) {
+        filters.push("instr(lower(coalesce(json_extract(data,'$.title'),'') || ' ' || coalesce(json_extract(data,'$.description'),'')),lower(?))>0");
+        params.push(search);
+      }
+      if (hideChildren) filters.push("parent_id IS NULL");
+      const due = "json_extract(data,'$.dueDate')";
+      if (deadline?.missing) filters.push(`${due} IS NULL`);
+      if (deadline?.openOnly) filters.push("status NOT IN ('VERIFIED','DONE','CANCELLED')");
+      for (const [comparison, value] of [
+        [">=", deadline?.from], ["<=", deadline?.through], ["<", deadline?.before],
+      ]) {
+        if (value) {
+          filters.push(`${due}${comparison}?`);
+          params.push(value);
+        }
+      }
+      if (tag) {
+        filters.push("EXISTS (SELECT 1 FROM json_each(data,'$.tags') AS tag WHERE tag.value=?)");
+        params.push(tag);
+      }
       const where = filters.length ? ` WHERE ${filters.join(" AND ")}` : "";
       const total = Number(
         db.prepare(`SELECT count(*) AS n FROM ${table}${where}`).get(...params)
           .n,
       );
+      const taskSort = {
+        priority: "priority",
+        created: "created_at",
+        updated: "json_extract(data,'$.updatedAt')",
+        due,
+        title: "json_extract(data,'$.title') COLLATE NOCASE",
+      };
+      const order = table === "tasks" && Object.hasOwn(taskSort, sort)
+        ? `${taskSort[sort]} ${direction === "desc" ? "DESC" : "ASC"}${sort === "due" ? " NULLS LAST" : ""},created_at,id`
+        : newest
+          ? table === "runs" && parentId
+            ? "json_extract(data,'$.generation') DESC,id DESC"
+            : "created_at DESC,rowid DESC"
+          : "priority,created_at,id";
       const items = db
         .prepare(
-          `SELECT data FROM ${table}${where} ORDER BY priority,created_at,id LIMIT ? OFFSET ?`,
+          `SELECT data FROM ${table}${where} ORDER BY ${order} LIMIT ? OFFSET ?`,
         )
         .all(...params, limit, offset)
         .map((r) => JSON.parse(r.data));
@@ -172,6 +225,18 @@ export function openStore(file) {
     },
     all(table, filters = {}) {
       return api.list(table, { ...filters, limit: 1_000_000 }).items;
+    },
+    childProgress(parentId, planId) {
+      return db.prepare(
+        `SELECT count(*) AS total, count(*) FILTER (WHERE status IN ('VERIFIED','DONE')) AS verified
+         FROM tasks WHERE parent_id=? AND json_extract(data,'$.planId')=? AND status!='CANCELLED'`,
+      ).get(parentId, planId);
+    },
+    taskTags(projectId) {
+      return db.prepare(
+        `SELECT DISTINCT tag.value FROM tasks CROSS JOIN json_each(tasks.data,'$.tags') AS tag
+         WHERE tasks.project_id=? AND tag.type='text' ORDER BY tag.value COLLATE NOCASE,tag.value`,
+      ).all(projectId).map(({ value }) => value);
     },
     activeRuns() {
       return db
@@ -221,7 +286,7 @@ export function openStore(file) {
         .get(id);
       return r ? { seq: Number(r.seq), ...JSON.parse(r.data) } : null;
     },
-    events({ after = 0, limit = 100, projectId, entityId } = {}) {
+    events({ after = 0, limit = 100, projectId, entityId, newest = false } = {}) {
       let q = "seq>?",
         args = [after];
       if (projectId) {
@@ -233,7 +298,7 @@ export function openStore(file) {
         args.push(entityId);
       }
       return db
-        .prepare(`SELECT * FROM events WHERE ${q} ORDER BY seq LIMIT ?`)
+        .prepare(`SELECT * FROM events WHERE ${q} ORDER BY seq ${newest ? "DESC" : "ASC"} LIMIT ?`)
         .all(...args, limit)
         .map((r) => ({
           seq: Number(r.seq),

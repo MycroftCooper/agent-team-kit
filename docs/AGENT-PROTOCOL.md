@@ -16,6 +16,7 @@ Base URL: `http://127.0.0.1:1421/api/agent/v1`.
 
 | Method and path            | Purpose                                                      |
 | -------------------------- | ------------------------------------------------------------ |
+| `GET /identity`            | Verify the current credential without updating contact time  |
 | `POST /connect`            | Report identity online; get heartbeat/lease intervals        |
 | `POST /heartbeat`          | Idle identity heartbeat                                      |
 | `POST /claims`             | Atomically claim eligible planning, execution or review work |
@@ -29,11 +30,22 @@ Base URL: `http://127.0.0.1:1421/api/agent/v1`.
 | `GET /runs/:id/artifact`   | Read authorized project output on demand                     |
 | `GET /plans/:id`           | Read an authorized previous plan during revision             |
 
+`atk-agent doctor` first probes the local ATK health endpoint without a token,
+then verifies the configured credential with `GET /identity`. It does not claim
+work, update contact time, or renew a lease. Run `atk-agent connect` to report
+contact; the browser can then show the last check-in. Recent contact does not
+prove that the agent is polling for tasks.
+
 Claims accept `{projectId?,taskId?,stage?,files?,waitMs?}`. `waitMs` is 0–30000.
 Stage is checked against the identity: ORCHESTRATOR/PLANNING, WORKER/EXECUTION,
 REVIEWER/REVIEW. Optional `files` must exactly match the approved full scope.
 Without it the server uses that approved scope. No eligible work returns
 `{run:null,waiting:[...],retryAfterMs:1000}`. Prefer another long poll, not a hot loop.
+
+For an approved AGENT task, a human can reserve execution for a specific worker.
+Only that identity can claim the execution stage until the assignment is cleared.
+The same role, project, capacity, dependency and file-lock checks still apply.
+This does not affect the independent reviewer or change the claim response format.
 
 A successful claim contains `{run,spec,generation,leaseUntil}`. Follow `spec`:
 it freezes the task/plan versions, function instructions, project root, file

@@ -4,8 +4,34 @@ import {
   requiredString,
   requireThat,
   integer,
+  TASK_TAG_LENGTH,
+  TASK_TAG_LIMIT,
 } from "../../contracts/src/index.mjs";
 import { dependencyCycle } from "../../scheduler-core/src/index.mjs";
+export function normalizeDueDate(value) {
+  if (value === null) return null;
+  requireThat(
+    typeof value === "string" && /^(?!0000)\d{4}-\d{2}-\d{2}$/.test(value),
+    "INVALID_DUE_DATE", "Use a calendar date in YYYY-MM-DD format",
+  );
+  const day = new Date(value + "T00:00:00Z");
+  requireThat(
+    Number.isFinite(day.getTime()) && day.toISOString().slice(0, 10) === value,
+    "INVALID_DUE_DATE", "The deadline must be a valid calendar date",
+  );
+  return value;
+}
+export function normalizeTaskTag(value) {
+  const tag = requiredString(value, "tag", TASK_TAG_LENGTH).normalize("NFC");
+  requireThat(tag.length <= TASK_TAG_LENGTH && !/[\u0000-\u001f\u007f]/.test(tag),
+    "INVALID_TASK_TAG", "Tags must be single-line text");
+  return tag;
+}
+export function normalizeTaskTags(values) {
+  requireThat(Array.isArray(values) && values.length <= TASK_TAG_LIMIT,
+    "INVALID_TASK_TAG", `Use up to ${TASK_TAG_LIMIT} tags`);
+  return [...new Set(values.map(normalizeTaskTag))];
+}
 export function relativeScope(value) {
   requireThat(
     typeof value === "string" && value === value.trim(),

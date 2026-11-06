@@ -17,6 +17,17 @@ export const STAGES = Object.freeze([
   "REVIEW",
   "HUMAN",
 ]);
+export const TASK_BOARD_COLUMNS = Object.freeze([
+  { key: "queue", statuses: ["DRAFT", "READY"] },
+  { key: "running", statuses: ["RUNNING"] },
+  { key: "review", statuses: ["REVIEWING"] },
+  { key: "acceptance", statuses: ["VERIFIED", "AWAITING_ACCEPTANCE"] },
+  { key: "blocked", statuses: ["BLOCKED"] },
+  { key: "closed", statuses: ["DONE", "CANCELLED"] },
+]);
+export const TASK_BOARD_OWNERS = Object.freeze(["HUMAN", "AGENT", "REQUEST"]);
+export const TASK_TAG_LIMIT = 12;
+export const TASK_TAG_LENGTH = 40;
 export const LEASE_MS = 30_000;
 export const HEARTBEAT_MS = 10_000;
 export const MAX_ATTEMPTS = 3;

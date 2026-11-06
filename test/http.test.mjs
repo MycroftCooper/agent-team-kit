@@ -22,9 +22,9 @@ async function serverFixture(t) {
   }).then((r) =>
     r.json(),
   );
-  async function human(route, body) {
+  async function human(route, body, method = body === undefined ? "GET" : "POST") {
     const r = await fetch(info.url + "/api/v1" + route, {
-      method: body === undefined ? "GET" : "POST",
+      method,
       headers: {
         "content-type": "application/json",
         "x-atk-token": session.token,
@@ -85,6 +85,193 @@ test("browser session and CSRF are distinct from agent credentials", async (t) =
   assert.ok(!JSON.stringify(agents.body).includes(f.pm.credential));
   assert.ok(!JSON.stringify(agents.body).includes("credentialHash"));
 });
+
+test("human assignment reserves execution for one eligible worker without bypassing dependencies", async (t) => {
+  const f = await serverFixture(t);
+  const { tasks } = plan(f, [
+    node("human", { executorType: "HUMAN", files: [] }),
+    node("worker", { deps: ["human"], reviewPolicy: "INDEPENDENT", reviewRoleId: "role-qa" }),
+  ]);
+  const manual = tasks[0], task = tasks[1], route = "/tasks/" + task.id + "/assignment";
+  const other = f.app.createAgent({ name: "Second worker", roleId: "role-dev", teamId: "team-default" });
+  const team = f.app.createTeam({ name: "Other team", roleIds: ["role-dev"] });
+  const outsider = f.app.createAgent({ name: "Outside worker", roleId: "role-dev", teamId: team.id });
+  const options = await f.human(route);
+  assert.deepEqual(new Set(options.body.choices.map((a) => a.id)), new Set([f.dev.agent.id, other.agent.id]));
+  for (const agentId of [f.pm.agent.id, f.qa.agent.id, outsider.agent.id]) {
+    const response = await f.human(route, { version: task.version, agentId }, "PATCH");
+    assert.equal(response.body.error.code, "ASSIGNEE_FORBIDDEN");
+  }
+  const unauthorized = await fetch(f.url + "/api/v1" + route, {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${f.dev.credential}`, "content-type": "application/json" },
+    body: JSON.stringify({ version: task.version, agentId: f.dev.agent.id }),
+  });
+  assert.equal(unauthorized.status, 401);
+  const assigned = await f.human(route, { version: task.version, agentId: f.dev.agent.id }, "PATCH");
+  assert.equal(assigned.status, 200);
+  assert.equal(assigned.body.assignedAgentId, f.dev.agent.id);
+  assert.equal((await f.human(route, { version: task.version, agentId: null }, "PATCH")).body.error.code, "VERSION_CONFLICT");
+  assert.equal(f.app.claim(other.agent.id, { taskId: task.id }).run, null);
+  assert.equal(f.app.claim(f.dev.agent.id, { taskId: task.id }).waiting[0].reason, "DEPENDENCIES");
+  f.app.startHuman(manual.id, { version: manual.version });
+  f.app.finishHuman(manual.id, { stopped: true, outcome: "COMPLETED", summary: "Ready", checks: [] });
+  assert.equal(f.app.claim(other.agent.id, { taskId: task.id }).run, null);
+  const run = f.app.claim(f.dev.agent.id, { taskId: task.id });
+  assert.equal(run.run.agentId, f.dev.agent.id);
+  const busy = await f.human(route, { version: f.app.get("tasks", task.id).version, agentId: other.agent.id }, "PATCH");
+  assert.equal(busy.body.error.code, "TASK_BUSY");
+  f.app.finishRun(f.dev.agent.id, run.run.id, {
+    generation: run.generation, idempotencyKey: "assigned-delivery",
+    stopped: true, outcome: "COMPLETED", summary: "Assigned work done", checks: [],
+  });
+  assert.equal(f.app.claim(f.qa.agent.id, { taskId: task.id }).run.agentId, f.qa.agent.id);
+  assert.equal(f.app.store.events({ entityId: task.id }).filter((e) => e.type === "task.assignment_changed").length, 1);
+});
+
+test("revoked assignment waits for a human to clear it; no other agent takes over automatically", async (t) => {
+  const f = await serverFixture(t);
+  const { tasks: [task] } = plan(f, [node("reserved")]);
+  const other = f.app.createAgent({ name: "Available worker", roleId: "role-dev", teamId: "team-default" });
+  const route = "/tasks/" + task.id + "/assignment";
+  const assigned = (await f.human(route, { version: task.version, agentId: f.dev.agent.id }, "PATCH")).body;
+  f.app.revokeAgent(f.dev.agent.id);
+  assert.equal(f.app.claim(other.agent.id, { taskId: task.id }).run, null);
+  assert.equal(f.app.taskDispatch(task.id).code, "ASSIGNEE_UNAVAILABLE");
+  const cleared = await f.human(route, { version: assigned.version, agentId: null }, "PATCH");
+  assert.equal(cleared.status, 200);
+  assert.equal(cleared.body.assignedAgentId, null);
+  assert.equal(f.app.claim(other.agent.id, { taskId: task.id }).run.agentId, other.agent.id);
+});
+
+test("board counts the whole project and paginates each column independently", async (t) => {
+  const f = await serverFixture(t);
+  const { tasks } = plan(f, [node("manual", { executorType: "HUMAN", files: [] }), node("worker")]);
+  for (let i = 0; i < 23; i++)
+    f.app.createDraft({ projectId: f.p.id, title: "Queue item " + i, description: "Pending planning" });
+  const route = "/tasks/board?projectId=" + f.p.id;
+  const { body: first } = await f.human(route);
+  assert.equal(first.columns[0].total, 26);
+  assert.equal(first.columns[0].items.length, 20);
+  assert.equal(first.columns[0].nextCursor, 20);
+  const { body: later } = await f.human(route + "&cursor.queue=20");
+  assert.equal(later.columns[0].items.length, 6);
+  assert.equal(later.columns[0].previousCursor, 0);
+  assert.equal(later.columns[1].offset, 0);
+  const { body: owners } = await f.human(route + "&group=owner");
+  assert.deepEqual(owners.columns.map((c) => c.total), [1, 1, 24]);
+  assert.deepEqual(owners.columns[0].items.map((task) => task.id), [tasks[0].id]);
+  const { body: filtered } = await f.human(route + "&group=owner&owner=REQUEST&q=Queue%20item%2022");
+  assert.equal(filtered.columns.length, 1);
+  assert.equal(filtered.columns[0].total, 1);
+  const { body: view } = await f.human(route + "&group=swimlane&hidden=closed&cursor.REQUEST.queue=10&progress=1");
+  assert.deepEqual(view.lanes.map((lane) => lane.key), ["HUMAN", "AGENT", "REQUEST"]);
+  assert.equal(view.lanes[0].columns[0].items[0].id, tasks[0].id);
+  assert.equal(view.lanes[0].columns[0].offset, 0);
+  assert.equal(view.lanes[2].columns[0].offset, 10);
+  assert.ok(view.lanes.every((lane) => !lane.columns.some((column) => column.key === "closed")));
+  const { body: parents } = await f.human(route + "&children=0&q=Feature&progress=1");
+  assert.equal(parents.columns[0].total, 1);
+  assert.deepEqual(parents.columns[0].items[0].subtaskProgress, { total: 2, verified: 0 });
+  const { body: sorted } = await f.human(`/tasks?projectId=${f.p.id}&children=0&sort=title&direction=desc&q=Queue%20item&limit=3`);
+  assert.equal(sorted.total, 23);
+  assert.deepEqual(sorted.items.map((task) => task.title), ["Queue item 9", "Queue item 8", "Queue item 7"]);
+});
+
+test("doctor validates credentials without checking in or claiming work", async (t) => {
+  const f = await serverFixture(t);
+  const { agent, credential } = f.app.createAgent({
+    name: "Unconnected worker", roleId: "role-dev", teamId: "team-default",
+  });
+  const before = f.app.get("agents", agent.id);
+  const client = createAgentClient({ baseUrl: f.url, credential });
+  const result = await client.doctor();
+  assert.equal(result.identity.id, agent.id);
+  assert.equal(result.identity.lastSeen, null);
+  assert.equal(JSON.stringify(result).includes(credential), false);
+  assert.deepEqual(f.app.get("agents", agent.id), before);
+  assert.equal(f.app.list("runs").total, 0);
+  await assert.rejects(createAgentClient({ baseUrl: f.url, credential: "wrong" }).doctor(), { code: "UNAUTHENTICATED" });
+  await assert.rejects(createAgentClient({
+    baseUrl: f.url, credential, fetchImpl: () => Promise.reject(new TypeError("Connection refused")),
+  }).doctor(), { code: "SERVICE_UNREACHABLE" });
+  await client.connect();
+  assert.ok((await client.doctor()).identity.lastSeen);
+  f.app.revokeAgent(agent.id);
+  await assert.rejects(client.doctor(), { code: "UNAUTHENTICATED" });
+});
+
+test("task deadlines and tags are versioned, filter together, and do not change execution", async (t) => {
+  const f = await serverFixture(t);
+  const { plan: approved, tasks: [task] } = plan(f, [node("deadline")]);
+  const run = f.app.claim(f.dev.agent.id, { taskId: task.id });
+  const route = "/tasks/" + task.id + "/metadata?projectId=" + f.p.id;
+  const running = f.app.get("tasks", task.id);
+  assert.equal((await f.human(route, { version: running.version, dueDate: "2026-02-30" }, "PATCH")).body.error.code, "INVALID_DUE_DATE");
+  const { body: updated, status } = await f.human(route, {
+    version: running.version, dueDate: "2026-11-06", tags: ["UI", " UI ", "人工"],
+  }, "PATCH");
+  assert.equal(status, 200);
+  assert.deepEqual(updated.tags, ["UI", "人工"]);
+  assert.equal(updated.status, "RUNNING");
+  assert.equal(f.app.get("plans", approved.id).version, approved.version);
+  assert.equal(f.app.list("locks").total, 1);
+  assert.equal((await f.human(route, { version: running.version, tags: [] }, "PATCH")).body.error.code, "VERSION_CONFLICT");
+
+  const prefix = "?projectId=" + f.p.id;
+  const { body: tags } = await f.human("/tasks/tags" + prefix);
+  assert.deepEqual(tags.items, ["UI", "人工"]);
+  const { body: matching } = await f.human("/tasks" + prefix + "&due=overdue&day=2026-11-07&tag=UI");
+  assert.deepEqual(matching.items.map((item) => item.id), [task.id]);
+  const { body: board } = await f.human("/tasks/board" + prefix + "&group=swimlane&due=on&day=2026-11-06&tag=UI");
+  assert.deepEqual(board.lanes.find((lane) => lane.key === "AGENT").columns.find((col) => col.key === "running").items.map((item) => item.id), [task.id]);
+  const { body: week } = await f.human("/tasks" + prefix + "&due=week&day=2026-10-31");
+  assert.deepEqual(week.items.map((item) => item.id), [task.id]);
+  assert.equal((await f.human("/tasks" + prefix + "&due=overdue")).status, 400);
+  assert.equal((await f.human("/tasks" + prefix + "&due=none&tag=UI")).body.total, 0);
+  f.app.finishRun(f.dev.agent.id, run.run.id, {
+    generation: run.generation, idempotencyKey: "metadata-during-execution", stopped: true,
+    outcome: "COMPLETED", summary: "Execution still completes", checks: [],
+  });
+  assert.equal((await f.human("/tasks" + prefix + "&due=overdue&day=2026-11-07")).body.total, 0);
+  const latest = f.app.get("tasks", task.id);
+  const { body: cleared } = await f.human(route, { version: latest.version, dueDate: null, tags: [] }, "PATCH");
+  assert.equal(cleared.dueDate, null);
+  assert.deepEqual(cleared.tags, []);
+  assert.deepEqual((await f.human("/tasks/tags" + prefix)).body.items, []);
+});
+
+test("claim diagnostics distinguish readiness, locks, missing contact and capacity without making a claim", async (t) => {
+  const f = await serverFixture(t);
+  plan(f, [
+    node("first"),
+    node("second"),
+    node("same", { files: ["first.txt"] }),
+    node("dependent", { deps: ["first"] }),
+  ]);
+  const tasks = f.app.list("tasks").items;
+  const route = (name) => "/tasks/" + tasks.find((task) => task.title === "Task " + name).id;
+  const diagnostic = async (name) => (await f.human(route(name) + "/dispatch")).body;
+  const worker = f.app.createAgent({ name: "Other worker", roleId: "role-dev", teamId: "team-default" });
+  f.app.revokeAgent(f.dev.agent.id);
+  assert.equal((await diagnostic("dependent")).code, "DEPENDENCIES");
+  assert.equal((await diagnostic("second")).code, "NO_RECENT_AGENT");
+  f.app.connect(worker.agent.id);
+  assert.equal((await diagnostic("second")).code, "WAITING_FOR_CLAIM");
+  const first = tasks.find((task) => task.title === "Task first");
+  const claim = f.app.claim(worker.agent.id, { taskId: first.id });
+  assert.equal((await diagnostic("same")).code, "FILE_LOCKED");
+  const before = f.app.list("runs").total;
+  assert.equal((await diagnostic("second")).code, "AGENT_CAPACITY");
+  assert.equal(f.app.list("runs").total, before);
+  assert.equal((await f.human(route("second"))).body.waiting, null);
+  assert.equal((await f.human(route("second") + "?projectId=wrong")).status, 404);
+  assert.equal((await f.human("/runs/" + claim.run.id + "/artifact?projectId=wrong")).status, 404);
+  f.app.revokeAgent(worker.agent.id);
+  assert.equal((await diagnostic("second")).code, "NO_MATCHING_AGENT");
+  assert.equal(f.app.list("locks").total, 1);
+});
+
 test("HTTP clients race atomically, report receipts and replay idempotently", async (t) => {
   const f = await serverFixture(t);
   plan(f, [node("a")]);

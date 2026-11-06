@@ -12,11 +12,16 @@ import {
   LEASE_MS,
   HEARTBEAT_MS,
   MAX_ATTEMPTS,
+  TASK_STATUSES,
+  TASK_BOARD_COLUMNS,
+  TASK_BOARD_OWNERS,
 } from "../../../packages/contracts/src/index.mjs";
 import {
+  normalizeDueDate,
   normalizePlan,
   normalizeRole,
   normalizeScopes,
+  normalizeTaskTags,
   scopeContains,
   validateEvidence,
 } from "../../../packages/domain/src/index.mjs";
@@ -42,6 +47,9 @@ const active = (r) =>
   ["RUNNING", "STOP_REQUESTED", "QUARANTINED"].includes(r.status);
 const uid = (prefix) => `${prefix}_${crypto.randomUUID()}`;
 const safeAgent = ({ credentialHash, ...agent }) => agent;
+const recentlySeen = (agent, now) =>
+  !agent.revoked && agent.lastSeen !== null && now - agent.lastSeen < LEASE_MS;
+const OWNER_COLUMNS = TASK_BOARD_OWNERS.map((owner) => ({ key: owner, owner }));
 const runSummary = ({ spec, before, artifact, ...run }) => ({
   ...run,
   title: spec?.title,
@@ -135,6 +143,13 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       );
   }
   function taskProjection(task, existingLocks) {
+    if (task.assignedAgentId) {
+      const assignee = store.get("agents", task.assignedAgentId);
+      task = {
+        ...task,
+        assignee: { id: task.assignedAgentId, name: assignee?.name ?? null, revoked: !assignee || assignee.revoked },
+      };
+    }
     if (task.kind !== "WORK" || task.status !== "READY") return task;
     const unmet = task.deps
       .map((id) => get("tasks", id))
@@ -161,6 +176,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
             holders: held.map((l) => ({
               runId: l.runId,
               taskId: l.taskId,
+              projectId: l.projectId,
               agentId: l.agentId,
               agentName: store.get("agents", l.agentId)?.name ?? "HUMAN",
               file: l.relative,
@@ -215,6 +231,18 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       p.teamId === t.id &&
       (t.projectIds.length === 0 || t.projectIds.includes(p.id))
     );
+  }
+  function eligibleWorker(agent, role, team, project, plan, task) {
+    return agent && !agent.revoked && agent.id !== plan.authorAgentId &&
+      role.function === "WORKER" && agent.roleId === task.roleId &&
+      agent.teamId === team.id && allowed(agent, team, project);
+  }
+  function assignmentBlock(task) {
+    if (task.kind !== "WORK" || task.executorType !== "AGENT") return "ASSIGNMENT_NOT_APPLICABLE";
+    if (working().some((r) => r.taskId === task.id)) return "TASK_BUSY";
+    if (!["READY", "BLOCKED"].includes(task.status)) return "ASSIGNMENT_NOT_APPLICABLE";
+    if (get("plans", task.planId).status !== "APPROVED") return "PLAN_NOT_APPROVED";
+    return null;
   }
   function validRun(agentId, runId, body, { allowStopped = false } = {}) {
     const r = get("runs", runId);
@@ -568,7 +596,9 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
                 }))
               : table === "tasks"
                 ? page.items.map((t) => taskProjection(t, currentLocks))
-                : page.items,
+                : table === "acceptances" && filters.summary
+                  ? page.items.map(({ id, planId, status, updatedAt }) => ({ id, planId, status, updatedAt }))
+                  : page.items,
       };
     },
     get(table, id) {
@@ -578,6 +608,158 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         : table === "tasks"
           ? taskProjection(r)
           : r;
+    },
+    taskBoard(projectId, {
+      group, status, owner, search, sort, direction, hideChildren, progress,
+      deadline, tag, hidden = [], offsets = {},
+    } = {}) {
+      requireThat(projectId, "VALIDATION_ERROR", "A project is required for the board");
+      get("projects", projectId);
+      requireThat(!status || TASK_STATUSES.includes(status), "VALIDATION_ERROR", "Invalid task status");
+      requireThat(!owner || TASK_BOARD_OWNERS.includes(owner), "VALIDATION_ERROR", "Invalid execution type");
+      const byOwner = OWNER_COLUMNS.filter((column) =>
+        (!owner || column.owner === owner) && (!hideChildren || column.owner === "REQUEST"),
+      );
+      const columns = (group === "owner" ? byOwner
+        : TASK_BOARD_COLUMNS.filter((column) => !status || column.statuses.includes(status)))
+        .filter((column) => !hidden.includes(column.key));
+      const locks = store.all("locks"), parents = new Map();
+      const pageColumn = (column, lane) => {
+        const filter = {
+          projectId, status, statuses: column.statuses, owner: lane ?? column.owner ?? owner,
+          search, sort, direction, hideChildren, deadline, tag, limit: lane ? 10 : 20,
+        };
+        const cursorKey = lane ? `${lane}.${column.key}` : column.key;
+        let offset = integer(offsets[cursorKey], 0, 0, 1_000_000);
+        let page = store.list("tasks", { ...filter, offset });
+        if (offset >= page.total && offset !== 0) {
+          offset = Math.max(0, Math.floor((page.total - 1) / filter.limit) * filter.limit);
+          page = store.list("tasks", { ...filter, offset });
+        }
+        return {
+          key: column.key, offset,
+          previousCursor: offset ? Math.max(0, offset - filter.limit) : null,
+          ...page,
+          items: page.items.map((task) => {
+            if (task.parentId && !parents.has(task.parentId))
+              parents.set(task.parentId, store.get("tasks", task.parentId)?.title);
+            return {
+              ...taskProjection(task, locks),
+              parentTitle: parents.get(task.parentId),
+              subtaskProgress: progress && task.kind === "REQUEST" && task.planId
+                ? store.childProgress(task.id, task.planId)
+                : undefined,
+            };
+          }),
+        };
+      };
+      if (group === "swimlane")
+        return { columns: [], lanes: byOwner.map(({ key }) => ({
+          key, columns: columns.map((column) => pageColumn(column, key)),
+        })) };
+      return { columns: columns.map((column) => pageColumn(column)) };
+    },
+    taskTags(projectId) {
+      requireThat(projectId, "VALIDATION_ERROR", "A project is required for task tags");
+      get("projects", projectId);
+      return { items: store.taskTags(projectId) };
+    },
+    updateTaskMetadata(id, body) {
+      return store.tx(() => {
+        const task = get("tasks", id);
+        expected(task, body.version);
+        requireThat(!get("projects", task.projectId).archived, "PROJECT_ARCHIVED", "Project is archived", 409);
+        const editDate = Object.hasOwn(body, "dueDate"), editTags = Object.hasOwn(body, "tags");
+        requireThat(editDate || editTags, "VALIDATION_ERROR", "Provide a deadline or tags");
+        const dueDate = editDate ? normalizeDueDate(body.dueDate) : task.dueDate ?? null;
+        const tags = editTags ? normalizeTaskTags(body.tags) : task.tags ?? [];
+        if (dueDate === (task.dueDate ?? null) && JSON.stringify(tags) === JSON.stringify(task.tags ?? []))
+          return taskProjection(task);
+        const next = put("tasks", { ...task, dueDate, tags });
+        emit("task.metadata_updated", task.projectId, task.id, { actor: "HUMAN" });
+        return taskProjection(next);
+      });
+    },
+    taskAssignment(id) {
+      const task = taskProjection(get("tasks", id));
+      const block = assignmentBlock(task);
+      const result = {
+        id, title: task.title, version: task.version, roleId: task.roleId,
+        assignee: task.assignee ?? null, block, choices: [],
+      };
+      if (block) return result;
+      const p = get("projects", task.projectId);
+      if (p.archived) return { ...result, block: "PROJECT_ARCHIVED" };
+      const plan = get("plans", task.planId), role = get("roles", task.roleId), team = get("teams", p.teamId);
+      return {
+        ...result,
+        choices: store.all("agents")
+          .filter((a) => eligibleWorker(a, role, team, p, plan, task))
+          .map((a) => ({ id: a.id, name: a.name, recent: recentlySeen(a, now()) }))
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      };
+    },
+    assignTask(id, body) {
+      return store.tx(() => {
+        const task = get("tasks", id);
+        expected(task, body.version);
+        const block = assignmentBlock(task);
+        requireThat(!block, block, "This task cannot be assigned now", 409);
+        const p = get("projects", task.projectId);
+        requireThat(!p.archived, "PROJECT_ARCHIVED", "Project is archived", 409);
+        const selected = body.agentId === null ? null : requiredString(body.agentId, "agentId", 128);
+        if (selected) {
+          const plan = get("plans", task.planId), role = get("roles", task.roleId), team = get("teams", p.teamId);
+          requireThat(
+            eligibleWorker(store.get("agents", selected), role, team, p, plan, task),
+            "ASSIGNEE_FORBIDDEN", "Choose an eligible worker with the approved role in the project team", 409,
+          );
+        }
+        if ((task.assignedAgentId ?? null) === selected) return taskProjection(task);
+        const next = put("tasks", { ...task, assignedAgentId: selected });
+        emit("task.assignment_changed", task.projectId, task.id, {
+          previousAgentId: task.assignedAgentId ?? null, agentId: selected, actor: "HUMAN",
+        });
+        return taskProjection(next);
+      });
+    },
+    taskDispatch(id) {
+      const task = get("tasks", id);
+      if (task.kind !== "WORK" || task.executorType !== "AGENT" || task.status !== "READY")
+        return null;
+      const waiting = taskProjection(task).waiting;
+      if (waiting) return { code: waiting.code, roleId: task.roleId };
+      const p = project(task.projectId), plan = get("plans", task.planId);
+      if (plan.status !== "APPROVED")
+        return { code: "PLAN_NOT_APPROVED", roleId: task.roleId };
+      const team = get("teams", p.teamId), role = get("roles", task.roleId);
+      try {
+        permittedScopes(p, task.files, plan.roleSnapshots?.[role.id] ?? role);
+        requireThat(canonical(p.docsRoot) === p.docsRoot, "PROJECT_DATA_MOVED");
+      } catch (error) {
+        return { code: error.code ?? "PROJECT_UNAVAILABLE", roleId: role.id };
+      }
+      const agents = store.all("agents");
+      const eligible = agents.filter(
+        (a) => eligibleWorker(a, role, team, p, plan, task) &&
+          (!task.assignedAgentId || a.id === task.assignedAgentId),
+      );
+      const runs = working(), used = new Map(), checkedAt = now();
+      for (const run of runs)
+        used.set(run.agentId, (used.get(run.agentId) ?? 0) + 1);
+      const inContact = eligible.filter((a) => recentlySeen(a, checkedAt));
+      const teamUsed = agents.filter((a) => a.teamId === team.id)
+        .reduce((total, a) => total + (used.get(a.id) ?? 0), 0);
+      const free = (a) => (used.get(a.id) ?? 0) < a.capacity;
+      const code = !eligible.length ? (task.assignedAgentId ? "ASSIGNEE_UNAVAILABLE" : "NO_MATCHING_AGENT")
+        : teamUsed >= team.maxConcurrent ? "TEAM_CAPACITY"
+        : !eligible.some(free) ? "AGENT_CAPACITY"
+        : !inContact.some(free) ? "NO_RECENT_AGENT"
+        : "WAITING_FOR_CLAIM";
+      return {
+        code, roleId: role.id, matching: eligible.length,
+        recent: inContact.length, teamUsed, teamCapacity: team.maxConcurrent,
+      };
     },
     createProject(body) {
       return store.tx(() => {
@@ -916,9 +1098,9 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           if (stage !== "PLANNING") {
             if (plan?.status !== "APPROVED" || plan.authorAgentId === a.id)
               continue;
-            if (
-              (stage === "REVIEW" ? task.reviewRoleId : task.roleId) !== role.id
-            )
+            if (stage === "EXECUTION"
+              ? !eligibleWorker(a, role, team, p, plan, task) || (task.assignedAgentId && task.assignedAgentId !== a.id)
+              : task.reviewRoleId !== role.id)
               continue;
             if (!taskMaps.has(p.id))
               taskMaps.set(
@@ -1870,8 +2052,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           .map((p) => ({ ...p, available: fs.existsSync(p.root) })),
         agents: store.all("agents").map((a) => ({
           ...safeAgent(a),
-          online:
-            !a.revoked && a.lastSeen !== null && now() - a.lastSeen < LEASE_MS,
+          online: recentlySeen(a, now()),
         })),
         activeRuns: runs.filter(active).length,
         locks: store.list("locks", { ...filter, limit: 100 }).items,

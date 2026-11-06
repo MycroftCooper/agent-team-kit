@@ -21,6 +21,15 @@ async function step(name, fn) {
   steps.push({ name, passed: true, at: new Date().toISOString() });
   console.log("PASS", name);
 }
+async function displayMenu(open) {
+  const current = await browser.evaluate("document.querySelector('[aria-controls=task-display-options]')?.getAttribute('aria-expanded') === 'true'");
+  if (current !== open) await browser.click("显示设置", { exact: true });
+}
+async function taskLayout(name) {
+  await displayMenu(true);
+  await browser.click(name, { exact: true, within: "document.querySelector('.task-layout-options')" });
+  await displayMenu(false);
+}
 try {
   browser = await openBrowser({ url: info.url, outputDir: output });
   await step("web access stays locked until opened with the private launcher link", async () => {
@@ -107,6 +116,19 @@ try {
       credential: credentials["role-qa"],
     });
   let submitted;
+  await step("agent connection guide distinguishes valid credentials from first contact", async () => {
+    await browser.click("Agent 与团队");
+    const card = "[...document.querySelectorAll('.agent-card')].find(r=>r.textContent.includes('Developer Browser'))";
+    await browser.wait("Boolean(" + card + ")");
+    await browser.click("接入说明", { within: card });
+    await browser.wait("document.querySelector('.contact-card')?.innerText.includes('尚未联系')");
+    assert.equal((await dev.doctor()).identity.lastSeen, null);
+    await dev.connect();
+    await browser.wait("document.querySelector('.contact-card')?.innerText.includes('最近已联系')");
+    assert.equal(await browser.evaluate("document.querySelector('.command-box pre').innerText.includes('<credential>')"), true);
+    await browser.screenshot("09-agent-connection");
+    await browser.click("关闭", { exact: true });
+  });
   await step("external PM pulls and submits a structured plan", async () => {
     const claim = await pm.claim({ projectId: project.id, waitMs: 0 });
     submitted = await pm.submit(claim.run.id, "plan", {
@@ -165,12 +187,47 @@ try {
     await browser.click("批准此版本并开放执行");
     await browser.wait("!document.querySelector('[role=dialog]')");
   });
-  await step("worker output updates the task list through SSE", async () => {
-    const claim = await dev.claim({ waitMs: 0 });
+  await step("board mixes human and agent work and lets a human reserve an agent task", async () => {
     await browser.click("任务", { exact: true });
-    await browser.wait(
-      "document.body.innerText.includes('Produce first output')",
-    );
+    await browser.wait("!!document.querySelector('.board-card[data-executor=HUMAN]') && !!document.querySelector('.board-card[data-executor=AGENT]')");
+    const agentCard = "[...document.querySelectorAll('.board-card')].find(card=>card.innerText.includes('Produce first output'))";
+    await browser.click("指派", { within: agentCard, exact: true });
+    await browser.wait("!!document.querySelector('[name=assignedAgent] option[value]:not([value=\"\"])')");
+    const assigned = (await dev.doctor()).identity.id;
+    await browser.fill("assignedAgent", assigned);
+    await browser.click("保存指派", { exact: true });
+    await browser.wait("!document.querySelector('[role=dialog]') && " + agentCard + "?.innerText.includes('Developer Browser')");
+    const task = server.app.list("tasks", { projectId: project.id }).items.find((row) => row.title === "Produce first output");
+    const competitor = server.app.createAgent({ name: "Another worker", roleId: "role-dev", teamId: "team-default" });
+    const client = createAgentClient({ baseUrl: info.url, credential: competitor.credential });
+    assert.equal((await client.claim({ taskId: task.id, waitMs: 0 })).run, null);
+    await displayMenu(true);
+    await browser.fill("taskGrouping", "owner");
+    await displayMenu(false);
+    await browser.wait("!!document.querySelector('[data-column=HUMAN] .board-card') && !!document.querySelector('[data-column=AGENT] .board-card')");
+    await browser.screenshot("13-board-by-executor");
+    await browser.fill("taskOwner", "HUMAN");
+    await browser.wait("document.querySelectorAll('.board-column').length === 1 && !!document.querySelector('[data-column=HUMAN]')");
+    await browser.fill("taskOwner", "");
+    await displayMenu(true);
+    await browser.fill("taskGrouping", "flow");
+    await displayMenu(false);
+    await browser.wait("document.querySelectorAll('.board-column').length === 6");
+    await browser.send("Emulation.setDeviceMetricsOverride", { width: 420, height: 900, deviceScaleFactor: 1, mobile: false });
+    assert.equal(await browser.evaluate("document.documentElement.scrollWidth > innerWidth"), false);
+    assert.equal(await browser.evaluate("document.querySelector('.board').scrollWidth > document.querySelector('.board').clientWidth"), true);
+    await browser.screenshot("15-board-narrow");
+    await browser.send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+  });
+  await step("worker output updates the task list through SSE", async () => {
+    await browser.click("任务", { exact: true });
+    await taskLayout("列表");
+    await browser.wait("[...document.querySelectorAll('.task-row')].some(row=>row.innerText.includes('Produce first output'))");
+    await browser.evaluate("[...document.querySelectorAll('.task-row')].find(row=>row.innerText.includes('Produce first output')).click()");
+    await browser.wait("document.querySelector('.dispatch-notice')?.innerText.includes('等待外部 Agent 领取')");
+    await browser.screenshot("12-task-claim-diagnostics");
+    await browser.click("关闭", { exact: true });
+    const claim = await dev.claim({ waitMs: 0 });
     fs.writeFileSync(
       path.join(projectRoot, "first.txt"),
       "Reviewed first output\n",
@@ -195,6 +252,9 @@ try {
     );
     steps.push({ name: "ui-refresh-latency", ms: performance.now() - start });
     await browser.screenshot("04-live-task-list");
+    await taskLayout("看板");
+    await browser.wait("document.querySelector('[data-column=review] .board-card')?.innerText.includes('Produce first output')");
+    await browser.screenshot("14-board-by-workflow");
   });
   await step("independent reviewer unlocks the human dependency", async () => {
     const r = await qa.claim({ waitMs: 0 });
@@ -205,11 +265,14 @@ try {
       verdict: "PASS",
       summary: "The frozen output meets the criteria.",
     });
+    const card = "[...document.querySelectorAll('.board-card[data-executor=HUMAN]')].find(row=>row.innerText.includes('Confirm the release content'))";
+    await browser.wait("Boolean(" + card + "?.querySelector('.board-card-footer button'))");
+    await browser.click("开始", { within: card, exact: true });
+    await browser.wait("document.querySelector('[data-column=running] .board-card[data-executor=HUMAN]')?.innerText.includes('Confirm the release content')");
     await browser.click("待我处理");
     await browser.wait(
       "document.body.innerText.includes('Confirm the release content')",
     );
-    await browser.click("开始处理");
     await browser.wait("document.body.innerText.includes('确认完成')");
     const heartbeatRoot = path.join(root, "heartbeat-workspace");
     fs.mkdirSync(heartbeatRoot);
@@ -227,7 +290,9 @@ try {
     await browser.fill("workspace", project.id);
     await browser.wait("document.body.innerText.includes('确认完成')");
     server.app.updateProject(heartbeatProject.id, { version: heartbeatProject.version, archived: true });
-    await browser.click("确认完成");
+    await browser.click("任务", { exact: true });
+    await browser.wait("Boolean(" + card + "?.querySelector('.board-card-footer button'))");
+    await browser.click("提交交付", { within: card, exact: true });
     await browser.fill("summary", "The release content is correct.");
     await browser.submit();
     await browser.wait("!document.querySelector('[role=dialog]')");
@@ -247,6 +312,7 @@ try {
         stopped: true,
         summary: "Final release ready",
       });
+      await browser.click("待我处理");
       await browser.wait("document.body.innerText.includes('查看交付')");
       await browser.click("查看交付");
       await browser.screenshot("05-plan-acceptance");
@@ -258,6 +324,125 @@ try {
       );
     },
   );
+  await step("task and run links keep delivery context and load receipts on demand", async () => {
+    const first = server.app.list("tasks", { projectId: project.id }).items.find((t) => t.title === "Produce first output");
+    await browser.click("任务", { exact: true });
+    await taskLayout("列表");
+    await browser.wait("[...document.querySelectorAll('.task-row')].some(row=>row.innerText.includes('Produce first output'))");
+    await browser.evaluate("[...document.querySelectorAll('.task-row')].find(row=>row.innerText.includes('Produce first output')).click()");
+    await browser.wait("document.querySelector('.attempt-row')?.innerText.includes('#2')");
+    const taskUrl = new URL(await browser.evaluate("location.href"));
+    assert.equal(taskUrl.searchParams.get("project"), project.id);
+    assert.equal(taskUrl.searchParams.get("task"), first.id);
+    assert.equal(taskUrl.hash, "");
+    await browser.wait("document.querySelector('.delivery-footer')?.innerText.includes('查看最终验收')");
+    await browser.screenshot("10-task-delivery");
+    await browser.evaluate("[...document.querySelectorAll('.attempt-row')].find(row=>row.innerText.includes('#1')).click()");
+    await browser.wait("document.querySelector('.detail-toolbar')?.innerText.includes('执行 #1')");
+    assert.equal(await browser.evaluate("document.querySelector('.evidence-section').innerText.includes('First output ready')"), false);
+    await browser.evaluate("document.querySelector('.evidence-section summary').click()");
+    await browser.wait("document.querySelector('.evidence-section').innerText.includes('First output ready')");
+    await browser.send("Page.reload");
+    await browser.wait("document.querySelector('.detail-toolbar')?.innerText.includes('执行 #1')");
+    assert.equal(await browser.evaluate("location.hash"), "");
+    await browser.evaluate("history.back()");
+    await browser.wait("document.querySelector('.attempt-row')?.innerText.includes('#2')");
+    assert.equal(await browser.evaluate("location.href"), taskUrl.href);
+    await browser.send("Emulation.setDeviceMetricsOverride", { width: 420, height: 900, deviceScaleFactor: 1, mobile: false });
+    assert.equal(await browser.evaluate("document.querySelector('.detail-pane').scrollWidth > document.querySelector('.detail-pane').clientWidth"), false);
+    await browser.screenshot("11-task-delivery-narrow");
+    await browser.send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+    await browser.click("关闭", { exact: true });
+  });
+  await step("display settings switch all task layouts and persist across reload", async () => {
+    await browser.click("任务", { exact: true });
+    await taskLayout("表格");
+    await browser.wait("document.querySelectorAll('.task-table tbody tr').length === 4");
+    await displayMenu(true);
+    await browser.fill("taskSort", "title");
+    await browser.click("切换为降序", { exact: true });
+    await browser.wait("document.querySelector('.task-table tbody tr')?.innerText.includes('Produce first output')");
+    await displayMenu(false);
+    await browser.screenshot("18-task-table");
+    await displayMenu(true);
+    await browser.click("显示子任务", { exact: true });
+    await browser.wait("document.querySelectorAll('.task-table tbody tr').length === 1");
+    await browser.send("Page.reload");
+    await browser.wait("!!document.querySelector('.nav-item[aria-label=任务]')");
+    await browser.click("任务", { exact: true });
+    await browser.wait("document.querySelectorAll('.task-table tbody tr').length === 1");
+    await displayMenu(true);
+    assert.equal(await browser.evaluate("document.querySelector('[name=taskSort]').value"), "title");
+    assert.equal(await browser.evaluate("document.querySelector('.task-display-sort button').getAttribute('aria-pressed')"), "true");
+    await browser.click("显示子任务", { exact: true });
+    await displayMenu(false);
+    await taskLayout("泳道");
+    await browser.wait("!!document.querySelector('[data-lane=HUMAN] .board-card') && !!document.querySelector('[data-lane=AGENT] .board-card')");
+    await browser.screenshot("17-task-swimlanes");
+    await taskLayout("看板");
+    await browser.wait("document.querySelectorAll('.board > .board-column').length === 6");
+    await displayMenu(true);
+    await browser.click("已结束", { exact: true, within: "document.querySelector('[aria-labelledby=task-columns-label]')" });
+    await browser.wait("document.querySelectorAll('.board > .board-column').length === 5 && !document.querySelector('.board > [data-column=closed]')");
+    await browser.click("已结束", { exact: true, within: "document.querySelector('[aria-labelledby=task-columns-label]')" });
+    await browser.click("描述", { exact: true, within: "document.querySelector('[aria-labelledby=task-card-fields-label]')" });
+    await browser.wait("[...document.querySelectorAll('.board-card-description')].some(node=>node.innerText.includes('Write first.txt'))");
+    await browser.screenshot("16-task-display-settings");
+    await browser.send("Emulation.setDeviceMetricsOverride", { width: 420, height: 900, deviceScaleFactor: 1, mobile: false });
+    assert.equal(await browser.evaluate("(()=>{ const r=document.querySelector('.task-display-menu').getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth; })()"), true);
+    await browser.send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+    await browser.click("描述", { exact: true, within: "document.querySelector('[aria-labelledby=task-card-fields-label]')" });
+    await browser.fill("taskSort", "priority");
+    await browser.click("切换为升序", { exact: true });
+    await displayMenu(false);
+    await taskLayout("列表");
+  });
+  await step("edit due date and tags, toggle their card properties, and filter across views", async () => {
+    const row = "[...document.querySelectorAll('.task-row')].find(row=>row.innerText.includes('Produce first output'))";
+    await browser.wait("Boolean(" + row + ")");
+    await browser.evaluate(row + ".click()");
+    await browser.click("编辑日期和标签", { exact: true });
+    await browser.fill("dueDate", "2031-04-05");
+    await browser.fill("tagInput", "回归");
+    await browser.click("添加标签", { exact: true });
+    await browser.click("保存日期和标签", { exact: true });
+    await browser.wait("document.querySelector('.task-metadata-summary')?.innerText.includes('2031-04-05') && document.querySelector('.task-metadata-summary')?.innerText.includes('回归')");
+    await browser.click("关闭", { exact: true });
+
+    await taskLayout("看板");
+    await browser.wait("document.querySelector('.board-card .task-deadline')?.innerText.includes('2031-04-05')");
+    await displayMenu(true);
+    const properties = "document.querySelector('[aria-labelledby=task-card-fields-label]')";
+    await browser.click("截止日期", { exact: true, within: properties });
+    await browser.click("标签", { exact: true, within: properties });
+    await browser.wait("!!document.querySelector('.board-card') && !document.querySelector('.board-card .task-deadline, .board-card .task-tags')");
+    await browser.click("截止日期", { exact: true, within: properties });
+    await browser.click("标签", { exact: true, within: properties });
+    await displayMenu(false);
+
+    await browser.click("日期和标签筛选", { exact: true });
+    await browser.fill("deadlineFilter", "on");
+    await browser.fill("deadlineDay", "2031-04-05");
+    await browser.wait("!!document.querySelector('[name=tagFilter] option[value=回归]')");
+    await browser.fill("tagFilter", "回归");
+    await browser.wait("document.querySelectorAll('.board-card').length === 1 && document.querySelector('.board-card')?.innerText.includes('Produce first output')");
+    await browser.screenshot("19-task-date-and-tag-filters");
+    await browser.click("日期和标签筛选", { exact: true });
+    await taskLayout("表格");
+    await browser.wait("document.querySelectorAll('.task-table tbody tr').length === 1 && document.querySelector('.task-table tbody tr')?.innerText.includes('回归')");
+    await browser.click("Produce first output", { exact: true, within: "document.querySelector('.task-table')" });
+    await browser.click("编辑日期和标签", { exact: true });
+    await browser.click("清除日期", { exact: true });
+    await browser.click("移除标签 回归", { exact: true });
+    await browser.click("保存日期和标签", { exact: true });
+    await browser.wait("document.querySelector('.task-metadata-summary')?.innerText.includes('未设截止日期') && !document.querySelector('.task-metadata-summary .task-tags')");
+    await browser.click("关闭", { exact: true });
+    await browser.click("日期和标签筛选", { exact: true });
+    await browser.click("清除日期和标签筛选", { exact: true });
+    await browser.click("日期和标签筛选", { exact: true });
+    await taskLayout("列表");
+    await browser.wait("document.querySelectorAll('.task-row').length === 4");
+  });
   await step(
     "language switch, keyboard navigation and 1280px layout",
     async () => {
@@ -412,6 +597,7 @@ try {
     await browser.fill("name", "Second Workspace");
     await browser.fill("root", otherRoot);
     await browser.submit();
+    await browser.wait("!document.querySelector('[role=dialog]') && [...document.querySelector('[name=workspace]').options].some(o=>o.textContent==='Second Workspace')");
     const other = server.app.list("projects").items.find((p) => p.name === "Second Workspace");
     await browser.wait(`document.querySelector('[name=workspace]').value === ${JSON.stringify(other.id)} && !document.querySelector('[role=dialog]')`);
     await browser.click("New request");

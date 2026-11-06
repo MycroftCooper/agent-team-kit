@@ -1,15 +1,32 @@
 import {
   useCallback,
   useEffect,
+  useRef,
   useState,
   createContext,
   useContext,
   type FormEvent,
   type ReactNode,
 } from "react";
-import type { Row, Page } from "@atk/contracts";
+import { LEASE_MS, type Row, type Page } from "@atk/contracts";
 import { api, authorize, useData, useLive } from "./api";
 import { label, reason, type Lang } from "./i18n";
+import {
+  TaskDisplayMenu,
+  columnLabels as boardLabels,
+  hiddenTaskColumns,
+  readTaskDisplay,
+  type CardProperty,
+  type TaskDisplay,
+} from "./task-display";
+import {
+  TaskDeadline,
+  TaskMetadataEditor,
+  TaskMetadataFilters,
+  TaskTags,
+  emptyTaskMetaFilters,
+  localDay,
+} from "./task-metadata";
 
 type View =
   | "overview"
@@ -21,16 +38,44 @@ type View =
   | "projects"
   | "settings";
 type Modal = { kind: string; item?: Row };
+type DetailLink = { kind: "task" | "run"; id: string; projectId: string };
+function readDetailLink(): DetailLink | null {
+  const query = new URLSearchParams(location.search);
+  const projectId = query.get("project"), task = query.get("task"), run = query.get("run");
+  if (!projectId || Boolean(task) === Boolean(run)) return null;
+  return { kind: task ? "task" : "run", id: (task || run)!, projectId };
+}
+function detailUrl(target: DetailLink | null) {
+  const url = new URL(location.href);
+  for (const key of ["project", "task", "run"]) url.searchParams.delete(key);
+  if (target) {
+    url.searchParams.set("project", target.projectId);
+    url.searchParams.set(target.kind, target.id);
+  }
+  url.hash = "";
+  return url;
+}
 const navs: [View, string, string, string][] = [
+  ["inbox", "待我处理", "My inbox", "◇"],
   ["overview", "概览", "Overview", "◈"],
   ["drafts", "预排池", "Intake", "▤"],
   ["tasks", "任务", "Tasks", "☷"],
-  ["inbox", "待我处理", "My inbox", "◇"],
   ["runs", "执行记录", "Runs", "↗"],
   ["team", "Agent 与团队", "Agents & teams", "⊞"],
   ["projects", "项目", "Projects", "▦"],
 ];
 const time = (v: string | number) => (v ? new Date(v).toLocaleString() : "—");
+function useRefreshTick(enabled: boolean, ms = 5000) {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!enabled) return;
+    const timer = setInterval(() => {
+      if (!document.hidden) setTick((n) => n + 1);
+    }, ms);
+    return () => clearInterval(timer);
+  }, [enabled, ms]);
+  return tick;
+}
 export function App() {
   const [authorized, setAuthorized] = useState(false),
     [loading, setLoading] = useState(true),
@@ -98,24 +143,31 @@ function WorkspaceApp() {
   const [lang, setLang] = useState<Lang>(() =>
       localStorage.getItem("atk-language") === "en" ? "en" : "zh",
     ),
-    [view, setView] = useState<View>("overview"),
+    [view, setView] = useState<View>(() => {
+      const target = readDetailLink();
+      return target?.kind === "task" ? "tasks" : target?.kind === "run" ? "runs" : "overview";
+    }),
     [selectedProjectId, selectProject] = useState(
       () => localStorage.getItem("atk-workspace") ?? "",
     ),
     [epoch, setEpoch] = useState(0),
-    [modal, setModal] = useState<Modal | null>(null),
+    [dialog, setModal] = useState<Modal | null>(null),
+    [detail, setDetail] = useState(readDetailLink),
     [error, setError] = useState<Row | null>(null),
     [busy, setBusy] = useState(false),
     [notice, setNotice] = useState("");
   const t = (zh: string, en: string) => (lang === "zh" ? zh : en);
+  const modal: Modal | null = dialog ?? (detail && { kind: detail.kind, item: detail });
+  const detailPane = modal?.kind === "task" || modal?.kind === "run";
   const refresh = useCallback(() => setEpoch((x) => x + 1), []),
     live = useLive(refresh);
   const projects = useData<Page>("/projects?limit=500", epoch),
     roles = useData<Page>("/roles?limit=500", epoch),
     teams = useData<Page>("/teams?limit=500", epoch);
   const activeProjects = projects.data?.items.filter((p) => !p.archived) ?? [],
+    linkedProject = detail && activeProjects.find((p) => p.id === detail.projectId),
     current =
-      activeProjects.find((p) => p.id === selectedProjectId) ?? activeProjects[0],
+      linkedProject || (activeProjects.find((p) => p.id === selectedProjectId) ?? activeProjects[0]),
     projectId = current?.id ?? "",
     scope = `?projectId=${encodeURIComponent(projectId)}`,
     overview = useData<Row>(projectId ? "/overview" + scope : null, epoch),
@@ -124,18 +176,38 @@ function WorkspaceApp() {
     humanWork = useData<Row>("/inbox", epoch);
   const allRoles = roles.data?.items ?? [],
     allTeams = teams.data?.items ?? [];
+  function clearDetail() {
+    if (!detail) return;
+    history.replaceState(null, "", detailUrl(null));
+    setDetail(null);
+  }
+  function closeModal() {
+    if (dialog) setModal(null);
+    else clearDetail();
+    setError(null);
+  }
   function setProject(id: string) {
     selectProject(id);
     setModal(null);
+    clearDetail();
     setError(null);
     setNotice("");
   }
   useEffect(() => {
-    if (!projects.data) return;
+    if (!projects.data || detail) return;
     selectProject(projectId);
     if (projectId) localStorage.setItem("atk-workspace", projectId);
     else localStorage.removeItem("atk-workspace");
-  }, [projects.data, projectId]);
+  }, [projects.data, projectId, detail]);
+  useEffect(() => {
+    function syncDetail() {
+      setModal(null);
+      setError(null);
+      setDetail(readDetailLink());
+    }
+    window.addEventListener("popstate", syncDetail);
+    return () => window.removeEventListener("popstate", syncDetail);
+  }, []);
   const badge = (value: string) => (
     <span className={`badge status-${value}`}>
       <span className="status-dot" />
@@ -144,7 +216,23 @@ function WorkspaceApp() {
   );
   function open(kind: string, item?: Row) {
     setError(null);
+    if ((kind === "task" || kind === "run") && item?.id) {
+      const target: DetailLink = { kind, id: item.id, projectId: item.projectId ?? projectId };
+      const url = detailUrl(target);
+      if (url.href !== location.href) history.pushState(null, "", url);
+      setDetail(target);
+      setModal(null);
+      return;
+    }
     setModal({ kind, item });
+  }
+  async function copyText(value: string, message: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setNotice(message);
+    } catch {
+      setNotice(t("无法访问剪贴板，请手动复制。", "Clipboard unavailable. Copy manually."));
+    }
   }
   async function act(
     route: string,
@@ -169,7 +257,7 @@ function WorkspaceApp() {
   }
   useEffect(() => {
     const listener = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setModal(null);
+      if (e.key === "Escape") closeModal();
       if (
         e.key === "n" &&
         !["INPUT", "TEXTAREA", "SELECT"].includes(
@@ -183,7 +271,7 @@ function WorkspaceApp() {
     };
     window.addEventListener("keydown", listener);
     return () => window.removeEventListener("keydown", listener);
-  }, [modal]);
+  }, [dialog, detail, modal, projectId]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 3000);
@@ -195,18 +283,18 @@ function WorkspaceApp() {
   useEffect(() => {
     if (!modal) return;
     const previous = document.activeElement as HTMLElement;
-    const frame = requestAnimationFrame(() =>
-      document
-        .querySelector<HTMLElement>("[role=dialog] button, [role=dialog] input")
-        ?.focus(),
-    );
+    const frame = requestAnimationFrame(() => {
+      const panel = document.querySelector<HTMLElement>("[role=dialog]");
+      panel?.scrollTo(0, 0);
+      panel?.querySelector<HTMLElement>("button, input")?.focus();
+    });
     const trap = (event: KeyboardEvent) => {
       if (event.key !== "Tab") return;
       const items = [
         ...document.querySelectorAll<HTMLElement>(
-          "[role=dialog] button:not(:disabled), [role=dialog] input, [role=dialog] select, [role=dialog] textarea",
+          "[role=dialog] button:not(:disabled), [role=dialog] input, [role=dialog] select, [role=dialog] textarea, [role=dialog] summary, [role=dialog] a[href]",
         ),
-      ];
+      ].filter((item) => item.getClientRects().length);
       const first = items[0],
         last = items[items.length - 1];
       if (event.shiftKey && document.activeElement === first) {
@@ -223,7 +311,7 @@ function WorkspaceApp() {
       document.removeEventListener("keydown", trap);
       previous?.focus();
     };
-  }, [modal?.kind]);
+  }, [modal?.kind, modal?.item?.id]);
   useEffect(() => {
     const running =
       humanWork.data?.humanTasks?.filter(
@@ -314,10 +402,12 @@ function WorkspaceApp() {
         projectName,
         roleName,
         countInbox,
+        copyText,
+        closeModal,
       }}
     >
       <div className="app">
-        <aside className="sidebar">
+        <aside className="sidebar" inert={Boolean(modal)}>
           <button className="brand" onClick={() => setView("overview")}>
             <span className="brand-mark">
               <i />
@@ -357,10 +447,10 @@ function WorkspaceApp() {
               ＋
             </button>
           </div>
-          <div className="nav-label">{t("工作空间", "WORKSPACE")}</div>
           <nav>
             {navs.map(([key, zh, en, icon]) => (
               <div key={key}>
+                {key === "overview" && <div className="nav-label">{t("工作", "WORK")}</div>}
                 {key === "team" && (
                   <div className="nav-label global-nav-label">
                     {t("全局管理", "GLOBAL MANAGEMENT")}
@@ -368,6 +458,7 @@ function WorkspaceApp() {
                 )}
                 <button
                   aria-label={t(zh, en)}
+                  aria-current={view === key ? "page" : undefined}
                   className={view === key ? "nav-item active" : "nav-item"}
                   onClick={() => {
                     setView(key);
@@ -384,15 +475,6 @@ function WorkspaceApp() {
             ))}
           </nav>
           <div className="sidebar-bottom">
-            <div className="sidebar-note">
-              <span>◇</span>
-              <p>
-                {t(
-                  "计划由你确认，执行交给团队。",
-                  "You approve the plan. Your team does the work.",
-                )}
-              </p>
-            </div>
             <button
               className={view === "settings" ? "nav-item active" : "nav-item"}
               onClick={() => setView("settings")}
@@ -413,7 +495,7 @@ function WorkspaceApp() {
             </div>
           </div>
         </aside>
-        <div className="main">
+        <div className="main" inert={Boolean(modal)}>
           <header className="topbar">
             <div className="breadcrumbs">
               <span className="workspace-breadcrumb" title={current?.root}>
@@ -445,9 +527,6 @@ function WorkspaceApp() {
           <main>
             <div className="page-heading">
               <div>
-                <span className="eyebrow">
-                  {view === "overview" ? "COMMAND CENTER" : view.toUpperCase()}
-                </span>
                 <h2>{t(titles[1], titles[2])}</h2>
               </div>
               {["team", "projects", "settings"].includes(view) && (
@@ -505,9 +584,9 @@ function WorkspaceApp() {
         )}
         {modal && (
           <div
-            className="modal-backdrop"
+            className={"modal-backdrop" + (detailPane ? " detail-backdrop" : "")}
             onMouseDown={(e) => {
-              if (e.target === e.currentTarget) setModal(null);
+              if (e.target === e.currentTarget) closeModal();
             }}
           >
             <section
@@ -515,7 +594,7 @@ function WorkspaceApp() {
                 "modal " +
                 (["task", "plan", "run", "acceptance"].includes(modal.kind)
                   ? "wide"
-                  : "")
+                  : "") + (detailPane ? " detail-pane" : "")
               }
               role="dialog"
               aria-modal="true"
@@ -524,14 +603,19 @@ function WorkspaceApp() {
               <button
                 className="modal-close"
                 aria-label={t("关闭", "Close")}
-                onClick={() => setModal(null)}
+                onClick={closeModal}
               >
                 ×
               </button>
               {errorPanel(error)}
-              {modal.kind === "task" && <Detail id={item!.id} />}
+              {detailPane && !linkedProject && (
+                <p role={projects.data ? "alert" : "status"}>
+                  {projects.data ? t("链接中的工作空间不可用。", "The workspace in this link is unavailable.") : t("正在加载工作空间…", "Loading workspace…")}
+                </p>
+              )}
+              {modal.kind === "task" && linkedProject && <Detail key={item!.id} id={item!.id} />}
               {modal.kind === "plan" && <PlanDetail id={item!.id} />}
-              {modal.kind === "run" && <RunDetail id={item!.id} />}
+              {modal.kind === "run" && linkedProject && <RunDetail key={item!.id} id={item!.id} />}
               {modal.kind === "draft" && (
                 <>
                   <span className="eyebrow">INTAKE</span>
@@ -949,52 +1033,16 @@ function WorkspaceApp() {
                   </div>
                 </>
               )}
-              {modal.kind === "connection" && (
-                <>
-                  <h2>{t("外部 Agent 接入", "Connect an external agent")}</h2>
-                  <p>
-                    {item?.name} · {roleName(item?.roleId)}
-                  </p>
-                  <ol className="connection-steps">
-                    <li>
-                      {t(
-                        "在项目外安装独立工具包，或使用任意 HTTP 客户端。",
-                        "Install the standalone package outside your project, or use any HTTP client.",
-                      )}
-                    </li>
-                    <li>
-                      {t(
-                        "设置 ATK_URL 与 ATK_AGENT_TOKEN，运行 atk-agent connect。",
-                        "Set ATK_URL and ATK_AGENT_TOKEN, then run atk-agent connect.",
-                      )}
-                    </li>
-                    <li>
-                      {t(
-                        "运行 atk-agent claim 领取任务，严格遵守返回的目录、文件范围与执行代次。",
-                        "Run atk-agent claim. Follow the returned root, file scope and generation.",
-                      )}
-                    </li>
-                    <li>
-                      {t(
-                        "执行期间运行 atk-agent watch 持续续租；出现 STOP REQUIRED 时停止写入。",
-                        "Run atk-agent watch while working; stop writes on STOP REQUIRED.",
-                      )}
-                    </li>
-                    <li>
-                      {t(
-                        "按阶段通过 submit plan、result 或 review 提交结构化结果。",
-                        "Submit structured results with submit plan, result or review.",
-                      )}
-                    </li>
-                  </ol>
-                  <pre>{`ATK_URL=${location.origin}\nATK_AGENT_TOKEN=<credential>\natk-agent connect\natk-agent claim\natk-agent watch <runId> --generation <generation>\natk-agent submit <runId> plan|result|review --file receipt.json`}</pre>
-                  <p className="muted">
-                    {t(
-                      "领取接口使用长轮询；无需插件，也不会启动或配置 AI。",
-                      "Claims use long polling. No plugin, agent launch, or model setup is involved.",
-                    )}
-                  </p>
-                </>
+              {modal.kind === "connection" && <AgentConnection id={item!.id} />}
+              {modal.kind === "assignment" && (
+                <TaskAssignment key={item!.id} id={item!.id} projectId={item!.projectId} />
+              )}
+              {modal.kind === "task-metadata" && (
+                <TaskMetadataEditor key={item!.id} task={item!} t={t} busy={busy}
+                  onSave={(body) => void act(
+                    `/tasks/${encodeURIComponent(item!.id)}/metadata?projectId=${encodeURIComponent(item!.projectId)}`,
+                    body, "PATCH",
+                  )} />
               )}
               {modal.kind === "human" && (
                 <>
@@ -1304,109 +1352,250 @@ function Field({
   );
 }
 
-function Detail({ id }: { id: string }) {
-  const { lang, t, epoch, badge, open, act, busy, projectName, roleName } =
-    useUI();
-
-  const task = useData<Row>("/tasks/" + id, epoch),
-    runs = useData<Page>("/runs?parentId=" + id + "&limit=100", epoch);
-  const row = task.data;
-  if (!row) return <p>{t("正在加载…", "Loading…")}</p>;
+function AgentConnection({ id }: { id: string }) {
+  const { t, epoch, roleName, copyText } = useUI();
+  const tick = useRefreshTick(true);
+  const { data: agent, error } = useData<Row>("/agents/" + encodeURIComponent(id), epoch + tick);
+  const command = `$env:ATK_URL = "${location.origin}"\n$env:ATK_AGENT_TOKEN = "<credential>"\natk-agent doctor`;
+  const recent = agent?.lastSeen != null && Date.now() - agent.lastSeen < LEASE_MS;
+  if (!agent) return <p role={error ? "alert" : "status"}>{error ? t("无法读取接入状态。", "Could not load connection status.") : t("正在加载…", "Loading…")}</p>;
+  const state = agent.revoked ? t("已撤销", "Revoked")
+    : recent ? t("最近已联系", "Recently seen")
+    : agent.lastSeen != null ? t("联系已过期", "Contact expired")
+    : t("尚未联系", "Not seen yet");
   return (
     <>
-      <div className="detail-top">
-        {badge(row.status)}
-        <span className="mono muted">{row.id}</span>
+      <h2>{t("接入外部 Agent", "Connect an external agent")}</h2>
+      <div className="contact-card">
+        <span className={"status-dot" + (recent && !agent.revoked ? " contact-live" : "")} />
+        <div><strong>{agent.name} · {state}</strong><small>{roleName(agent.roleId)} · {t("上次联系", "Last contact")}: {time(agent.lastSeen)}</small></div>
       </div>
-      <h2>{row.title}</h2>
-      <p className="prewrap">{row.description}</p>
-      <h4>{t("验收条件", "Acceptance criteria")}</h4>
-      <p className="prewrap">{row.acceptance || "—"}</p>
-      <div className="metadata">
-        <span>{t("项目", "Project")}</span>
-        <b>{projectName(row.projectId)}</b>
-        <span>{t("角色", "Role")}</span>
-        <b>
-          {row.executorType === "HUMAN"
-            ? t("人工", "Human")
-            : roleName(row.roleId)}
-        </b>
-        <span>{t("评审", "Review")}</span>
-        <b>
-          {row.reviewPolicy === "INDEPENDENT"
-            ? t("独立评审", "Independent reviewer")
-            : t("按检查结果验证", "Approved checks")}
-        </b>
-      </div>
-      <h4>{t("文件范围", "File scope")}</h4>
-      <div className="chips">
-        {row.files?.map((f: string) => (
-          <code key={f}>{f}</code>
-        ))}
-      </div>
-      <h4>{t("依赖", "Dependencies")}</h4>
-      {row.deps?.length ? (
-        row.deps.map((id: string) => (
-          <button
-            className="text-button"
-            key={id}
-            onClick={() => open("task", { id })}
-          >
-            {id}
-          </button>
-        ))
-      ) : (
-        <p className="muted">—</p>
+      {error && <p role="alert">{t("状态刷新失败，上面显示的是上次结果。", "Refresh failed; showing the previous result.")}</p>}
+      {agent.revoked ? <p>{t("该凭据已失效。请创建一个新身份。", "This credential is invalid. Create a new identity to continue.")}</p> : (
+        <ol className="setup-steps">
+          <li>
+            <strong>{t("验证服务和凭据", "Verify the service and credential")}</strong>
+            <p className="muted">{t("在外部 Agent 的 PowerShell 中运行。用你保存的凭据替换占位符。", "Run this in the external agent’s PowerShell. Replace the placeholder with your saved credential.")}</p>
+            <div className="command-box"><button className="quiet" onClick={() => copyText(command, t("已复制接入命令", "Setup commands copied"))}>{t("复制", "Copy")}</button><pre>{command}</pre></div>
+          </li>
+          <li>
+            <strong>{t("登记联系", "Report contact")}</strong>
+            <p><code>atk-agent connect</code> · {t("成功后，上方会显示最近联系；它不代表 Agent 正在领任务。", "On success, contact appears above. This does not mean the agent is polling.")}</p>
+          </li>
+          <li>
+            <strong>{t("领取并保持租约", "Claim work and renew the lease")}</strong>
+            <p><code>atk-agent claim</code> · {t("领到任务后运行 watch；收到 STOP REQUIRED 时停止写入，再按协议提交回执。", "Start watch after claiming. Stop writing on STOP REQUIRED and submit a receipt using the protocol.")}</p>
+          </li>
+        </ol>
       )}
-      {row.blockReason && (
-        <div className="warning">{reason(row.blockReason, lang)}</div>
-      )}
-      {row.waiting && (
-        <div className="warning">
-          <strong>{reason(row.waiting.code, lang)}</strong>
-          {row.waiting.holders?.map((holder: Row) => (
-            <p key={holder.runId + holder.file}>
-              <code>{holder.file}</code> · {holder.agentName}{" "}
-              <button onClick={() => open("run", { id: holder.runId })}>
-                {t("查看占用执行", "View blocking run")}
-              </button>
-            </p>
-          ))}
-          {row.waiting.tasks?.map((dep: Row) => (
-            <p key={dep.id}>
-              <button className="text-button" onClick={() => open("task", dep)}>
-                {dep.title}
-              </button>{" "}
-              {badge(dep.status)}
-            </p>
-          ))}
-        </div>
-      )}
-      {row.drift && <pre>{JSON.stringify(row.drift, null, 2)}</pre>}
-      {row.status === "BLOCKED" && row.kind === "WORK" && (
-        <button
-          className="primary"
-          disabled={busy}
-          onClick={() => act(`/tasks/${id}/retry`, { version: row.version })}
-        >
-          {t("重新开放执行", "Requeue task")}
-        </button>
-      )}
-      {row.kind === "REQUEST" && row.planId && (
-        <button onClick={() => open("plan", { id: row.planId })}>
-          {t("查看计划", "View plan")}
-        </button>
-      )}
-      <h4>{t("执行历史", "Run history")}</h4>
-      {runs.data?.items.map((run) => (
-        <div className="list-row" key={run.id}>
-          <div>
-            {badge(run.status)} <small>{label(run.stage, lang)}</small>
-            <p className="mono muted">{run.id}</p>
+    </>
+  );
+}
+
+function TaskAssignment({ id, projectId }: { id: string; projectId: string }) {
+  const { t, lang, epoch, act, busy, roleName, errorPanel } = useUI();
+  const route = "/tasks/" + encodeURIComponent(id) + "/assignment?projectId=" + encodeURIComponent(projectId);
+  const result = useData<Row>(route, epoch);
+  const [selected, setSelected] = useState<{ id: string; version: number } | null>(null);
+  const task = result.data;
+  if (!task) return result.error ? errorPanel(result.error) : <p role="status">{t("正在加载…", "Loading…")}</p>;
+  const previous = task.assignee?.id ?? "", agentId = selected?.id ?? previous;
+  const changed = selected !== null && selected.version !== task.version;
+  const chosen = task.choices.find((a: Row) => a.id === agentId);
+  const oldUnavailable = previous && !task.choices.some((a: Row) => a.id === previous);
+  return (
+    <>
+      <h2>{t("指派执行 Agent", "Assign execution agent")}</h2>
+      <p><strong>{task.title}</strong> · {roleName(task.roleId)}</p>
+      {task.block ? <p className="warning">{reason(task.block, lang)}</p> : (
+        <form onSubmit={(event) => {
+          event.preventDefault();
+          void act(route, { version: selected?.version ?? task.version, agentId: agentId || null }, "PATCH");
+        }}>
+          <label className="field">
+            <span>{t("执行者", "Executor")}</span>
+            <select name="assignedAgent" value={agentId} onChange={(event) => setSelected({ id: event.target.value, version: task.version })}>
+              <option value="">{t("由符合角色的 Agent 领取", "Any eligible agent")}</option>
+              {oldUnavailable && <option value={previous} disabled>{task.assignee.name ?? previous} · {t("当前指派不可用", "Current assignee unavailable")}</option>}
+              {task.choices.map((a: Row) => (
+                <option value={a.id} key={a.id}>{a.name} · {a.recent ? t("最近有联系", "Recently seen") : t("近期未联系", "Not seen recently")}</option>
+              ))}
+            </select>
+          </label>
+          <p className="muted">{t(
+            "指定后只有这个 Agent 能主动领取。计划审批、依赖、文件锁与评审要求照常生效。",
+            "Only the selected agent can claim this execution. Plan approval, dependencies, file locks and review still apply.",
+          )}</p>
+          {!task.choices.length && <p className="muted">{t("团队中还没有符合该角色的 Agent。", "No eligible agent in the project team has this role.")}</p>}
+          {changed && <p className="warning">{t("任务刚刚发生变化，请重新选择。", "The task changed. Select the executor again.")}{" "}
+            <button type="button" className="quiet" onClick={() => setSelected(null)}>{t("重置选择", "Reset selection")}</button>
+          </p>}
+          <div className="modal-actions">
+            <button className="primary" disabled={busy || changed || agentId === previous || (!!agentId && !chosen)}>{t("保存指派", "Save assignment")}</button>
           </div>
-          <button onClick={() => open("run", run)}>{t("查看", "Open")}</button>
-        </div>
+        </form>
+      )}
+    </>
+  );
+}
+
+function DispatchNotice({ row, dispatch }: { row: Row; dispatch: Row | null }) {
+  const { t, lang, badge, open, roleName, setView, closeModal } = useUI();
+  const code = row.waiting?.code ?? dispatch?.code;
+  if (!code) return null;
+  const next: Record<string, [string, string]> = {
+    NO_MATCHING_AGENT: ["在项目团队中为该角色添加有效身份。", "Add a valid identity for this role in the project team."],
+    ASSIGNEE_UNAVAILABLE: ["重新指派，或允许同角色的其他 Agent 领取。", "Reassign the task or allow any eligible agent to claim it."],
+    NO_RECENT_AGENT: ["确认外部 Agent 已接入并在主动领任务。", "Check that the external agent is connected and polling."],
+    AGENT_CAPACITY: ["等待已有执行结束，或为该角色增加一个可用身份。", "Wait for an active run to finish, or add another identity for this role."],
+    TEAM_CAPACITY: ["等待团队内已有执行结束。", "Wait for an active run in the team to finish."],
+    WAITING_FOR_CLAIM: ["已发现有余量且最近联系的身份；请确认外部 Agent 在主动领任务。", "An identity with free capacity checked in recently. Make sure it is polling for work."],
+  };
+  const advice = next[code];
+  return (
+    <section className={"dispatch-notice" + (code === "WAITING_FOR_CLAIM" ? " dispatch-neutral" : "")}>
+      <span className="detail-kicker">{t("领取诊断", "Claim diagnostics")}</span>
+      <strong>{reason(code, lang)}</strong>
+      {advice && <p>{t(...advice)}</p>}
+      {dispatch?.matching !== undefined && (
+        <small className="muted">
+          {roleName(dispatch.roleId)} · {dispatch.recent}/{dispatch.matching} {t("个身份最近有联系", "identities recently seen")} · {t("团队并发", "Team capacity")} {dispatch.teamUsed}/{dispatch.teamCapacity}
+        </small>
+      )}
+      {["NO_MATCHING_AGENT", "NO_RECENT_AGENT"].includes(code) && (
+        <button className="text-button" onClick={() => { closeModal(); setView("team"); }}>{t("查看 Agent 与团队", "Open agents & teams")} →</button>
+      )}
+      {row.waiting?.holders?.map((holder: Row) => (
+        <p key={holder.runId + holder.file}><code>{holder.file}</code> · {holder.agentName}{" "}
+          <button className="text-button" onClick={() => open("run", { id: holder.runId, projectId: holder.projectId })}>{t("查看占用执行", "View blocking run")}</button>
+        </p>
       ))}
+      {row.waiting?.tasks?.map((dep: Row) => (
+        <p key={dep.id}><button className="text-button" onClick={() => open("task", dep)}>{dep.title}</button>{" "}{badge(dep.status)}</p>
+      ))}
+    </section>
+  );
+}
+
+function Detail({ id }: { id: string }) {
+  const { lang, t, epoch, badge, open, act, busy, projectId, projectName, roleName, copyText, errorPanel, closeModal } = useUI();
+  const [cursor, setCursor] = useState(0);
+  const [acceptanceError, setAcceptanceError] = useState<Row | null>(null);
+  const projectQuery = "projectId=" + encodeURIComponent(projectId);
+  const route = "/tasks/" + encodeURIComponent(id);
+  const task = useData<Row>(route + "?" + projectQuery, epoch);
+  const row = task.data;
+  const ready = row?.status === "READY" && row?.executorType === "AGENT";
+  const tick = useRefreshTick(ready);
+  const dispatch = useData<Row>(ready ? route + "/dispatch?" + projectQuery : null, epoch + tick);
+  const runs = useData<Page>(row ? "/runs?" + projectQuery + "&parentId=" + encodeURIComponent(id) + "&order=newest&limit=10&cursor=" + cursor : null, epoch);
+  const acceptances = useData<Page>(row?.planId ? "/acceptances?" + projectQuery + "&planId=" + encodeURIComponent(row.planId) + "&order=newest&summary=1&limit=1" : null, epoch);
+  const children = useData<Page>(row?.kind === "REQUEST" && row.planId ? "/tasks?" + projectQuery + "&parentId=" + encodeURIComponent(id) + "&planId=" + encodeURIComponent(row.planId) + "&limit=200" : null, epoch);
+  if (!row) return task.error ? errorPanel(task.error) : <p role="status">{t("正在加载…", "Loading…")}</p>;
+  const acceptance = acceptances.data?.items[0];
+  return (
+    <>
+      <div className="detail-toolbar">
+        <span>{projectName(row.projectId)} / {row.kind === "REQUEST" ? t("需求", "Request") : t("任务", "Task")}</span>
+        <button className="quiet" onClick={() => copyText(detailUrl({ kind: "task", id, projectId }).href, t("已复制任务链接", "Task link copied"))}>{t("复制任务链接", "Copy task link")}</button>
+      </div>
+      <div className="detail-heading">{badge(row.status)}<h2>{row.title}</h2></div>
+      <div className="detail-layout">
+        <div className="detail-body">
+          <p className="detail-description prewrap">{row.description}</p>
+          {row.acceptance && <section className="detail-section"><h3>{t("验收条件", "Acceptance criteria")}</h3><p className="prewrap">{row.acceptance}</p></section>}
+          <DispatchNotice row={row} dispatch={dispatch.data} />
+          {dispatch.error && <p className="muted" role="status">{t("领取诊断暂不可用。", "Claim diagnostics are temporarily unavailable.")}</p>}
+          {row.blockReason && <div className="warning">{reason(row.blockReason, lang)}</div>}
+          {row.drift && <details><summary>{t("查看文件变化", "View file changes")}</summary><pre>{JSON.stringify(row.drift, null, 2)}</pre></details>}
+          {row.status === "BLOCKED" && row.kind === "WORK" && (
+            <button className="primary" disabled={busy} onClick={async () => {
+              if (await act(`/tasks/${id}/retry`, { version: row.version }, "POST", false)) closeModal();
+            }}>{t("重新开放执行", "Requeue task")}</button>
+          )}
+          {row.executorType === "HUMAN" && row.status === "READY" && !row.waiting && (
+            <button className="primary" disabled={busy} onClick={() => act(
+              `/tasks/${id}/human-start`, { version: row.version }, "POST", false,
+            )}>{t("开始人工任务", "Start human task")}</button>
+          )}
+          {row.executorType === "HUMAN" && row.status === "RUNNING" && (
+            <button className="primary" onClick={() => open("human", row)}>{t("提交人工交付", "Complete human task")}</button>
+          )}
+          {children.data && children.data.items.length > 0 && <section className="detail-section">
+            <h3>{t("计划任务", "Planned work")}</h3>
+            <div className="attempt-list">{children.data.items.map((child) => (
+              <button className="attempt-row" key={child.id} onClick={() => open("task", child)}>
+                <strong>{child.title}</strong>{badge(child.status)}<span aria-hidden="true">›</span>
+              </button>
+            ))}</div>
+          </section>}
+          <section className="detail-section">
+            <h3>{t("交付记录", "Delivery history")}</h3>
+            {runs.error && errorPanel(runs.error)}
+            {runs.data?.total === 0 && <p className="muted">{t("还没有执行尝试。", "No attempts yet.")}</p>}
+            <div className="attempt-list">
+              {runs.data?.items.map((run) => (
+                <button className="attempt-row" key={run.id} onClick={() => open("run", run)}>
+                  <div><strong>{label(run.stage, lang)} · #{run.generation}</strong><small>{time(run.startedAt)}</small></div>
+                  {badge(run.status)}<span aria-hidden="true">›</span>
+                </button>
+              ))}
+            </div>
+            {(cursor > 0 || runs.data?.nextCursor != null) && (
+              <div className="pagination">
+                <button disabled={!cursor} onClick={() => setCursor(Math.max(0, cursor - 10))}>{t("较新记录", "Newer")}</button>
+                <button disabled={runs.data?.nextCursor == null} onClick={() => setCursor(runs.data?.nextCursor ?? 0)}>{t("较早记录", "Older")}</button>
+              </div>
+            )}
+            {row.planId && <div className="delivery-footer">
+              <button className="text-button" onClick={() => open("plan", { id: row.planId })}>{t("查看计划", "View plan")}</button>
+              {acceptance && <>{badge(acceptance.status)}
+                <button className="text-button" onClick={() => {
+                  const detailHref = location.href;
+                  setAcceptanceError(null);
+                  api("/acceptances/" + encodeURIComponent(acceptance.id))
+                    .then((data) => { if (location.href === detailHref) open("acceptance", data); })
+                    .catch(setAcceptanceError);
+                }}>{t("查看最终验收", "View final acceptance")}</button></>}
+              {errorPanel(acceptanceError ?? acceptances.error)}
+            </div>}
+          </section>
+        </div>
+        <aside className="detail-properties">
+          <h3>{t("属性", "Properties")}</h3>
+          {row.kind === "WORK" && <>
+            <dl>
+              <dt>{t("角色", "Role")}</dt><dd>{row.executorType === "HUMAN" ? t("人工", "Human") : roleName(row.roleId)}</dd>
+              <dt>{t("执行者", "Executor")}</dt>
+              <dd>
+                {row.executorType === "HUMAN" ? t("由我处理", "Handled by me") : (
+                  row.assignee?.name ?? (row.assignedAgentId ? t("指派不可用", "Assignee unavailable") : t("同角色 Agent 可领取", "Any eligible agent"))
+                )}
+                {row.executorType === "AGENT" && ["READY", "BLOCKED"].includes(row.status) && (
+                  <button className="text-button property-link" onClick={() => open("assignment", row)}>
+                    {row.assignedAgentId ? t("更改指派", "Change assignee") : t("指派 Agent", "Assign agent")}
+                  </button>
+                )}
+              </dd>
+              <dt>{t("评审", "Review")}</dt><dd>{row.reviewPolicy === "INDEPENDENT" ? t("独立评审", "Independent reviewer") : t("按检查结果验证", "Approved checks")}</dd>
+            </dl>
+            {row.parentId && <button className="text-button" onClick={() => open("task", { id: row.parentId })}>{t("打开原始需求", "Open parent request")} ↗</button>}
+          </>}
+          {row.files?.length > 0 && <><h4>{t("文件范围", "File scope")}</h4><div className="chips">{row.files.map((f: string) => <code key={f}>{f}</code>)}</div></>}
+          {row.deps?.length > 0 && <><h4>{t("依赖", "Dependencies")}</h4>{row.deps.map((dep: string) => (
+            <button className="text-button property-link" key={dep} onClick={() => open("task", { id: dep })}>{row.waiting?.tasks?.find((task: Row) => task.id === dep)?.title ?? dep}</button>
+          ))}</>}
+          <section className="task-metadata-summary">
+            <h4>{t("日期和标签", "Due date and tags")}</h4>
+            {row.dueDate ? <TaskDeadline task={row} t={t} /> : <p className="muted">{t("未设截止日期", "No due date")}</p>}
+            <TaskTags tags={row.tags} />
+            <button className="text-button property-link" onClick={() => open("task-metadata", row)}>
+              {t("编辑日期和标签", "Edit date and tags")}
+            </button>
+          </section>
+          <details className="property-id"><summary>{t("任务 ID", "Task ID")}</summary><code>{row.id}</code></details>
+        </aside>
+      </div>
     </>
   );
 }
@@ -1617,11 +1806,13 @@ function PlanComparison({ before, after }: { before: Row; after: Row }) {
   );
 }
 function RunDetail({ id }: { id: string }) {
-  const { t, epoch, live, badge, open, act } = useUI();
-
-  const run = useData<Row>("/runs/" + id, epoch),
-    artifact = useData<Row>("/runs/" + id + "/artifact", epoch),
-    history = useData<Row>("/events?entityId=" + id + "&limit=100", epoch),
+  const { t, lang, epoch, live, badge, open, act, projectId, projectName, copyText, errorPanel } = useUI();
+  const [showEvidence, setShowEvidence] = useState(false);
+  const scope = "projectId=" + encodeURIComponent(projectId);
+  const route = "/runs/" + encodeURIComponent(id);
+  const run = useData<Row>(route + "?" + scope + "&summary=1", epoch),
+    artifact = useData<Row>(showEvidence && run.data ? route + "/artifact?" + scope : null, epoch),
+    history = useData<Row>(run.data ? "/events?" + scope + "&entityId=" + encodeURIComponent(id) + "&limit=100&order=newest" : null, epoch),
     r = run.data;
   const combined = [
     ...(history.data?.items ?? []),
@@ -1630,29 +1821,18 @@ function RunDetail({ id }: { id: string }) {
   const events = [...new Map(combined.map((e: Row) => [e.seq, e])).values()]
     .sort((a: Row, b: Row) => a.seq - b.seq)
     .slice(-100);
-  if (!r) return <p>{t("正在加载…", "Loading…")}</p>;
+  if (!r) return run.error ? errorPanel(run.error) : <p role="status">{t("正在加载…", "Loading…")}</p>;
   return (
     <>
-      <div className="detail-top">
-        {badge(r.status)}
-        {badge(r.stage)}
+      <div className="detail-toolbar">
+        <span>{projectName(r.projectId)} / {t("执行", "Run")} #{r.generation}</span>
+        <button className="quiet" onClick={() => copyText(detailUrl({ kind: "run", id, projectId }).href, t("已复制执行链接", "Run link copied"))}>{t("复制执行链接", "Copy run link")}</button>
       </div>
-      <h2>{r.spec?.title ?? id}</h2>
-      <p className="mono muted">{id}</p>
-      <div className="metadata">
-        <span>{t("开始", "Started")}</span>
-        <b>{time(r.startedAt)}</b>
-        <span>{t("结束", "Ended")}</span>
-        <b>{time(r.endedAt)}</b>
-        <span>Token</span>
-        <b>
-          {r.usage
-            ? `${r.usage.inputTokens ?? "—"} / ${r.usage.outputTokens ?? "—"}`
-            : t("未知 · 外部执行端未上报", "Unknown · not reported")}
-        </b>
-      </div>
+      <div className="detail-heading">{badge(r.status)}<h2>{r.title ?? id}</h2></div>
+      <div className="detail-layout">
+      <div className="detail-body">
       {r.status === "RUNNING" && (
-        <button className="danger" onClick={() => act(`/runs/${id}/stop`, {})}>
+        <button className="danger" onClick={() => act(`/runs/${id}/stop`, {}, "POST", false)}>
           {t("请求停止", "Request stop")}
         </button>
       )}
@@ -1661,42 +1841,24 @@ function RunDetail({ id }: { id: string }) {
           {t("确认执行已停止并释放锁", "Confirm stopped & release locks")}
         </button>
       )}
-      <h4>{t("实时事件", "Live events")}</h4>
-      <div className="timeline">
-        {events.map((e: Row) => (
-          <div key={e.seq}>
-            <span className="timeline-point" />
-            <small>{time(e.createdAt)}</small>
-            <strong>{e.type}</strong>
-            <p>{e.data.message ?? JSON.stringify(e.data)}</p>
-          </div>
-        ))}
-        {!events.length && (
-          <p className="muted">{t("暂无事件", "No events yet")}</p>
-        )}
-      </div>
-      <h4>{t("交付与评审", "Output & review")}</h4>
-      {artifact.data?.summary && <p>{artifact.data.summary}</p>}
+      <details className="detail-section evidence-section" onToggle={(e) => setShowEvidence(e.currentTarget.open)}>
+      <summary>{t("交付证据与评审", "Output evidence & review")}</summary>
+      {showEvidence && artifact.loading && !artifact.data && <p role="status">{t("正在读取回执…", "Loading receipt…")}</p>}
+      {artifact.error && errorPanel(artifact.error)}
+      {artifact.data && !artifact.data.summary && !artifact.data.review && <p className="muted">{t("这次运行尚无交付回执或评审结论。", "This run has no delivery receipt or review verdict yet.")}</p>}
+      {artifact.data?.summary && <p className="prewrap">{artifact.data.summary}</p>}
       {artifact.data?.checks?.map((c: Row) => (
         <details key={c.name}>
-          <summary>
-            {c.passed ? "✓" : "×"} {c.name}
-          </summary>
+          <summary>{c.passed ? "✓" : "×"} {c.name}</summary>
           <pre>{c.log}</pre>
         </details>
       ))}
       {artifact.data?.after &&
         Object.entries(artifact.data.after).map(([file, value]) => {
-          const v = value as Row,
-            before = artifact.data?.before?.[file];
+          const v = value as Row, before = artifact.data?.before?.[file];
           return (
             <details className="diff" key={file}>
-              <summary>
-                <code>{file}</code>
-                <span className="muted">
-                  {v.hash?.slice(0, 12) ?? t("已删除", "Deleted")}
-                </span>
-              </summary>
+              <summary><code>{file}</code><span className="muted">{v.hash?.slice(0, 12) ?? t("已删除", "Deleted")}</span></summary>
               <div className="diff-columns">
                 <pre>{before?.text ?? t("无文本快照", "No text snapshot")}</pre>
                 <pre>{v.text ?? t("无文本快照", "No text snapshot")}</pre>
@@ -1704,10 +1866,117 @@ function RunDetail({ id }: { id: string }) {
             </details>
           );
         })}
-      {artifact.data?.review && (
-        <pre>{JSON.stringify(artifact.data.review, null, 2)}</pre>
-      )}
+      {artifact.data?.review && <div className="review-result">
+        <strong>{label(artifact.data.review.verdict, lang)}</strong>
+        <p className="prewrap">{artifact.data.review.summary}</p>
+        {artifact.data.review.findings?.length > 0 && <details><summary>{t("评审发现", "Review findings")}</summary><pre>{JSON.stringify(artifact.data.review.findings, null, 2)}</pre></details>}
+      </div>}
+      </details>
+      <section className="detail-section">
+      <h3>{t("运行活动", "Run activity")}</h3>
+      {history.error && errorPanel(history.error)}
+      <div className="timeline">
+        {events.map((e: Row) => (
+          <div key={e.seq}>
+            <span className="timeline-point" />
+            <small>{time(e.createdAt)}</small>
+            <strong>{label(e.type, lang)}</strong>
+            {e.data.message && <p>{e.data.message}</p>}
+            {e.type === "run.completed" && e.data.outcome && <p>{label(e.data.outcome, lang)}</p>}
+          </div>
+        ))}
+        {!events.length && (
+          <p className="muted">{t("暂无事件", "No events yet")}</p>
+        )}
+      </div>
+      </section>
+      </div>
+      <aside className="detail-properties">
+        <h3>{t("属性", "Properties")}</h3>
+        <dl>
+          <dt>{t("阶段", "Stage")}</dt><dd>{label(r.stage, lang)}</dd>
+          <dt>{t("开始", "Started")}</dt><dd>{time(r.startedAt)}</dd>
+          <dt>{t("结束", "Ended")}</dt><dd>{time(r.endedAt)}</dd>
+          <dt>Token</dt><dd>{r.usage ? `${r.usage.inputTokens ?? "—"} / ${r.usage.outputTokens ?? "—"}` : t("未上报", "Not reported")}</dd>
+        </dl>
+        <button className="text-button" onClick={() => open("task", { id: r.taskId, projectId: r.projectId })}>{t("返回关联任务", "Open linked task")} ↗</button>
+        <details className="property-id"><summary>{t("执行 ID", "Run ID")}</summary><code>{r.id}</code></details>
+      </aside>
+      </div>
     </>
+  );
+}
+
+type BoardColumn = Page & { key: string; offset: number; previousCursor: number | null };
+type BoardView = { columns: BoardColumn[]; lanes?: { key: string; columns: BoardColumn[] }[] };
+
+function TaskOwner({ type }: { type: string }) {
+  const { t } = useUI();
+  return (
+    <span className={`task-owner owner-${type}`}>
+      <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
+        {type === "HUMAN" ? <><circle cx="8" cy="5" r="2.3" /><path d="M3.5 13c0-2.2 1.9-3.6 4.5-3.6s4.5 1.4 4.5 3.6" /></>
+          : type === "AGENT" ? <><rect x="2.5" y="5" width="11" height="8" rx="2" /><path d="M8 3v2M5.5 9h.5m4 0h.5" /></>
+          : <><rect x="4" y="2.5" width="8" height="11" rx="1.2" /><path d="M6 6h4M6 9h4" /></>}
+      </svg>
+      {t(...(boardLabels[type] ?? boardLabels.REQUEST))}
+    </span>
+  );
+}
+
+function BoardTaskCard({ task, fields }: { task: Row; fields: CardProperty[] }) {
+  const { t, lang, badge, open, roleName, act, busy, projectName } = useUI();
+  const owner = task.kind === "REQUEST" ? "REQUEST" : task.executorType;
+  const waiting = task.blockReason ?? task.waiting?.code ??
+    (task.assignee?.revoked && task.status === "READY" ? "ASSIGNEE_UNAVAILABLE" : null);
+  const waitingText = waiting ? reason(waiting, lang) : null;
+  const dependency = waiting === "DEPENDENCIES" ? task.waiting?.tasks?.[0]?.title : null;
+  const editable = owner === "AGENT" && ["READY", "BLOCKED"].includes(task.status);
+  const showFooter = owner !== "REQUEST" && (fields.includes("executor") || editable ||
+    owner === "HUMAN" && (task.status === "RUNNING" || (task.status === "READY" && !task.waiting)));
+  const progress = fields.includes("progress") ? task.subtaskProgress : null;
+  return (
+    <article className="board-card" data-executor={owner}>
+      <button className="board-card-main" onClick={() => open("task", task)}>
+        <span className="board-card-meta">
+          <TaskOwner type={owner} />
+          {fields.includes("priority") && <small className="priority" title={t("优先级", "Priority")}>P{task.priority}</small>}
+        </span>
+        <strong>{task.title}</strong>
+        {fields.includes("parent") && task.parentTitle && <small className="board-card-parent" title={task.parentTitle}>{task.parentTitle}</small>}
+        {fields.includes("description") && task.description && <small className="board-card-description">{task.description}</small>}
+        <span className="board-card-status">{badge(task.status === "READY" && waiting ? "WAITING" : task.status)}</span>
+        {waitingText && <small className="board-card-wait" title={dependency ? waitingText + " · " + dependency : waitingText}>{waitingText}{dependency && " · " + dependency}</small>}
+        {fields.includes("project") && <small className="board-card-parent">{t("项目", "Project")} · {projectName(task.projectId)}</small>}
+        {fields.includes("created") && <small className="board-card-parent">{t("创建", "Created")} · {time(task.createdAt)}</small>}
+        {fields.includes("updated") && <small className="board-card-parent">{t("更新", "Updated")} · {time(task.updatedAt)}</small>}
+        {fields.includes("due") && <TaskDeadline task={task} t={t} />}
+        {fields.includes("tags") && <TaskTags tags={task.tags} />}
+        {progress?.total > 0 && <span className="board-card-progress">
+          <progress value={progress.verified} max={progress.total} aria-label={t("子任务进度", "Subtask progress")} />
+          <small>{progress.verified}/{progress.total} {t("子任务已验证", "subtasks verified")}</small>
+        </span>}
+      </button>
+      {showFooter && (
+        <div className="board-card-footer">
+          {fields.includes("executor") && <span className="board-card-assignee" title={task.assignee?.name ?? undefined}>
+            {owner === "HUMAN" ? t("由我处理", "Handled by me")
+              : task.assignee?.name ?? (task.assignedAgentId ? t("指派不可用", "Assignee unavailable") : roleName(task.roleId))}
+          </span>}
+          {editable && <button className="quiet" onClick={() => open("assignment", task)}>
+            {task.assignedAgentId ? t("改派", "Reassign") : t("指派", "Assign")}
+          </button>}
+          {owner === "HUMAN" && task.status === "READY" && !task.waiting && (
+            <button className="quiet" disabled={busy} onClick={() =>
+              act(`/tasks/${task.id}/human-start`, { version: task.version }, "POST", false)
+            }>{t("开始", "Start")}</button>
+          )}
+          {owner === "HUMAN" && task.status === "RUNNING" && (
+            <button className="quiet" onClick={() => open("human", task)}>{t("提交交付", "Complete")}</button>
+          )}
+        </div>
+      )}
+    </article>
   );
 }
 
@@ -1729,21 +1998,58 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
   const [status, setStatus] = useState(drafts ? "DRAFT" : ""),
     [cursor, setCursor] = useState(0),
     [search, setSearch] = useState(""),
-    [board, setBoard] = useState(false);
+    [query, setQuery] = useState(""),
+    [owner, setOwner] = useState(""),
+    [metadata, setMetadata] = useState(emptyTaskMetaFilters),
+    [offsets, setOffsets] = useState<Record<string, number>>({});
+  const scope = `${projectId}:${drafts ? "intake" : "work"}`;
+  const storageKey = "atk-task-display:" + scope;
+  const [display, setDisplay] = useState(() => readTaskDisplay(
+    storageKey,
+    localStorage.getItem("atk-task-view:" + scope),
+    localStorage.getItem(`atk-task-group:${projectId}`),
+    drafts,
+  ));
+  const { layout, sort, direction, children, group } = display;
+  const columnLayout = layout === "board" || layout === "swimlane";
+  const hidden = hiddenTaskColumns(display).join(",");
+  const showProgress = display.card.includes("progress");
+  useRefreshTick(true, 60000);
+  const dueDay = metadata.due === "on" ? metadata.day
+    : ["overdue", "today", "week"].includes(metadata.due) ? localDay() : "";
+  const scrollLeft = useRef(0);
+  const restoreBoardScroll = useCallback((node: HTMLDivElement | null) => {
+    if (node) node.scrollLeft = scrollLeft.current;
+  }, []);
   useEffect(() => {
     setCursor(0);
-  }, [projectId, status]);
-  const route =
-    "/tasks?limit=50&cursor=" +
-    cursor +
-    (projectId ? "&projectId=" + projectId : "") +
-    (status ? "&status=" + status : "");
-  const data = useData<Page>(route, epoch);
-  const items = (data.data?.items ?? []).filter((r) =>
-    (r.title + " " + r.description)
-      .toLowerCase()
-      .includes(search.toLowerCase()),
-  );
+    setOffsets({});
+    scrollLeft.current = 0;
+  }, [projectId, status, owner, query, layout, group, sort, direction, children, hidden, metadata.due, metadata.tag, dueDay]);
+  useEffect(() => {
+    const timer = setTimeout(() => setQuery(search.trim()), 150);
+    return () => clearTimeout(timer);
+  }, [search]);
+  useEffect(() => {
+    localStorage.setItem(storageKey, JSON.stringify(display));
+  }, [display, storageKey]);
+  const filters = new URLSearchParams({ projectId, sort, direction, children: children ? "1" : "0" });
+  if (status) filters.set("status", status);
+  if (owner) filters.set("owner", owner);
+  if (query) filters.set("q", query);
+  if (metadata.tag) filters.set("tag", metadata.tag);
+  if (metadata.due && (metadata.due !== "on" || dueDay)) {
+    filters.set("due", metadata.due);
+    if (dueDay) filters.set("day", dueDay);
+  }
+  const boardQuery = new URLSearchParams(filters);
+  boardQuery.set("group", layout === "swimlane" ? "swimlane" : group);
+  if (hidden) boardQuery.set("hidden", hidden);
+  if (showProgress) boardQuery.set("progress", "1");
+  for (const [key, offset] of Object.entries(offsets)) if (offset) boardQuery.set("cursor." + key, String(offset));
+  const data = useData<Page>(columnLayout ? null : "/tasks?limit=50&cursor=" + cursor + "&" + filters, epoch);
+  const boardData = useData<BoardView>(columnLayout ? "/tasks/board?" + boardQuery : null, epoch);
+  const items = data.data?.items ?? [];
   const row = (r: Row) => (
     <div
       className="task-row"
@@ -1763,7 +2069,7 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
             ? t("需求", "Request")
             : r.executorType === "HUMAN"
               ? t("人工", "Human")
-              : roleName(r.roleId)}
+              : r.assignee?.name ?? roleName(r.roleId)}
           {r.blockReason
             ? " · " + reason(r.blockReason, lang)
             : r.waiting
@@ -1776,14 +2082,46 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
       <span className="muted priority">P{r.priority}</span>
     </div>
   );
+  function columnHeading(key: string, total: number) {
+    return <header className="board-column-header">
+      <span className={`board-column-dot board-dot-${key}`} />
+      <h3>{t(...boardLabels[key])}</h3>
+      <span className="board-column-count">{total}</span>
+    </header>;
+  }
+  function renderColumn(column: BoardColumn, lane?: string) {
+    const cursorKey = lane ? `${lane}.${column.key}` : column.key;
+    return <section key={column.key} className={"board-column" + (lane ? " swimlane-cell" : "")}
+      data-column={column.key} aria-label={t(...boardLabels[column.key])}>
+      {!lane && columnHeading(column.key, column.total)}
+      <div className="board-column-items">
+        {column.items.map((task) => <BoardTaskCard task={task} fields={display.card} key={task.id} />)}
+        {!column.total && <p className="board-empty">{lane ? "—" : t("暂无任务", "No tasks")}</p>}
+      </div>
+      {(column.previousCursor !== null || column.nextCursor !== null) && (
+        <footer className="board-column-pagination">
+          <small>{column.offset + 1}–{column.offset + column.items.length} / {column.total}</small>
+          <button className="quiet" aria-label={t("本列上一页", "Previous column page")} disabled={column.previousCursor === null}
+            onClick={() => setOffsets({ ...offsets, [cursorKey]: column.previousCursor ?? 0 })}>‹</button>
+          <button className="quiet" aria-label={t("本列下一页", "Next column page")} disabled={column.nextCursor === null}
+            onClick={() => setOffsets({ ...offsets, [cursorKey]: column.nextCursor ?? 0 })}>›</button>
+        </footer>
+      )}
+    </section>;
+  }
+  const boardView = boardData.data;
+  const lanes = boardView?.lanes ?? [];
+  const laneColumns = lanes[0]?.columns ?? [];
+  const onBoardScroll = (event: React.UIEvent<HTMLDivElement>) => { scrollLeft.current = event.currentTarget.scrollLeft; };
   return (
     <>
-      <div className="toolbar">
+      <div className="toolbar task-toolbar">
         <div className="search">
           <span>⌕</span>
           <input
-            aria-label={t("搜索当前页任务", "Search tasks on this page")}
-            placeholder={t("搜索当前页任务…", "Search this page…")}
+            aria-label={t("搜索工作空间任务", "Search workspace tasks")}
+            placeholder={t("搜索任务…", "Search tasks…")}
+            maxLength={200}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
@@ -1803,29 +2141,46 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
             "AWAITING_ACCEPTANCE",
             "DONE",
             "BLOCKED",
+            "CANCELLED",
           ].map((v) => (
             <option key={v} value={v}>
               {label(v, lang)}
             </option>
           ))}
         </select>
-        <div className="segmented">
-          <button
-            className={!board ? "selected" : ""}
-            onClick={() => setBoard(false)}
-          >
-            {t("列表", "List")}
-          </button>
-          <button
-            className={board ? "selected" : ""}
-            onClick={() => setBoard(true)}
-          >
-            {t("看板", "Board")}
-          </button>
-        </div>
+        <select name="taskOwner" aria-label={t("执行方筛选", "Executor filter")} value={owner} onChange={(e) => setOwner(e.target.value)}>
+          <option value="">{t("所有执行方", "All executors")}</option>
+          {["HUMAN", "AGENT", "REQUEST"].map((key) => <option value={key} key={key}>{t(...boardLabels[key])}</option>)}
+        </select>
+        <TaskDisplayMenu t={t} display={display} onChange={(changes: Partial<TaskDisplay>) =>
+          setDisplay((previous) => ({ ...previous, ...changes }))} />
+        <TaskMetadataFilters t={t} projectId={projectId} epoch={epoch} value={metadata} onChange={setMetadata} />
       </div>
-      {data.error && errorPanel(data.error as Row)}
-      {!items.length ? (
+      {errorPanel(columnLayout ? boardData.error : data.error)}
+      {columnLayout ? (
+        !boardView ? boardData.loading && <p role="status" className="muted">{t("正在加载任务视图…", "Loading task view…")}</p>
+        : layout === "board" && boardView.columns.length ? (
+          <div className="board" ref={restoreBoardScroll} onScroll={onBoardScroll} aria-label={t("工作空间看板", "Workspace board")} tabIndex={0}>
+            {boardView.columns.map((column) => renderColumn(column))}
+          </div>
+        ) : layout === "swimlane" && laneColumns.length ? (
+          <div className="swimlane-board" ref={restoreBoardScroll} onScroll={onBoardScroll} aria-label={t("工作空间泳道", "Workspace swimlanes")} tabIndex={0}>
+            <div className="swimlane-track" style={{ minWidth: laneColumns.length * 180 + (laneColumns.length - 1) * 10 }}>
+              <div className="swimlane-columns" style={{ gridTemplateColumns: `repeat(${laneColumns.length}, minmax(0, 1fr))` }}>
+                {laneColumns.map((column, index) => (
+                  <div key={column.key}>{columnHeading(column.key, lanes.reduce((count, lane) => count + (lane.columns[index]?.total ?? 0), 0))}</div>
+                ))}
+              </div>
+              {lanes.map((lane) => <section className="swimlane-lane" key={lane.key} data-lane={lane.key}>
+                <h3><TaskOwner type={lane.key} /> <span>{lane.columns.reduce((count, column) => count + column.total, 0)}</span></h3>
+                <div className="swimlane-columns" style={{ gridTemplateColumns: `repeat(${laneColumns.length}, minmax(0, 1fr))` }}>
+                  {lane.columns.map((column) => renderColumn(column, lane.key))}
+                </div>
+              </section>)}
+            </div>
+          </div>
+        ) : <p className="muted">{t("没有符合当前显示条件的列，请调整筛选或列设置。", "No visible columns match. Adjust filters or column settings.")}</p>
+      ) : !items.length && !data.loading && !data.error ? (
         empty(
           t("这里还没有任务", "No tasks here yet"),
           t(
@@ -1834,45 +2189,35 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
           ),
           newButton,
         )
-      ) : board ? (
-        <div className="board">
-          {[
-            "DRAFT",
-            "READY",
-            "RUNNING",
-            "REVIEWING",
-            "VERIFIED",
-            "AWAITING_ACCEPTANCE",
-            "DONE",
-            "BLOCKED",
-          ].map((s) => (
-            <section key={s}>
-              <h4>
-                {label(s, lang)}{" "}
-                <span>{items.filter((r) => r.status === s).length}</span>
-              </h4>
-              {items
-                .filter((r) => r.status === s)
-                .map((r) => (
-                  <button
-                    className="board-card"
-                    key={r.id}
-                    onClick={() => open("task", r)}
-                  >
-                    <strong>{r.title}</strong>
-                    <small>{projectName(r.projectId)}</small>
-                  </button>
-                ))}
-            </section>
-          ))}
+      ) : layout === "table" ? (
+        <div className="task-table-scroll" tabIndex={0} aria-label={t("工作空间任务表格", "Workspace task table")}>
+          <table className="task-table">
+            <thead><tr>
+              <th scope="col">{t("任务", "Task")}</th><th scope="col">{t("状态", "Status")}</th>
+              <th scope="col">{t("类型", "Type")}</th><th scope="col">{t("执行者", "Executor")}</th>
+              <th scope="col">{t("优先级", "Priority")}</th><th scope="col">{t("更新时间", "Updated")}</th>
+              <th scope="col">{t("截止日期", "Due date")}</th><th scope="col">{t("标签", "Tags")}</th>
+            </tr></thead>
+            <tbody>{items.map((task) => <tr key={task.id} data-task-id={task.id}>
+              <td><button className="text-button" onClick={() => open("task", task)}>{task.title}</button></td>
+              <td>{badge(task.status === "READY" && task.waiting ? "WAITING" : task.status)}
+                {(task.blockReason || task.waiting?.code) && <small className="muted">{reason(task.blockReason ?? task.waiting.code, lang)}</small>}
+              </td>
+              <td><TaskOwner type={task.kind === "REQUEST" ? "REQUEST" : task.executorType} /></td>
+              <td>{task.kind === "REQUEST" ? "—" : task.executorType === "HUMAN" ? t("由我处理", "Handled by me") : task.assignee?.name ?? roleName(task.roleId)}</td>
+              <td>P{task.priority}</td><td>{time(task.updatedAt)}</td>
+              <td>{task.dueDate ? <TaskDeadline task={task} t={t} /> : "—"}</td>
+              <td>{task.tags?.length ? <TaskTags tags={task.tags} /> : "—"}</td>
+            </tr>)}</tbody>
+          </table>
         </div>
       ) : (
         <div className="task-list">{items.map(row)}</div>
       )}
-      <div className="pagination">
+      {!columnLayout && <div className="pagination">
         <small>
           {t("共", "Total")} {data.data?.total ?? 0}{" "}
-          {t("项 · 看板显示当前页", "items · board shows current page")}
+          {t("项", "items")}
         </small>
         <button
           disabled={!cursor}
@@ -1886,7 +2231,7 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
         >
           →
         </button>
-      </div>
+      </div>}
     </>
   );
 }
@@ -1904,20 +2249,6 @@ function Overview() {
   const counts = o.counts ?? {};
   return (
     <>
-      <div className="intro">
-        <span className="eyebrow">
-          WORKSPACE / {current?.name}
-        </span>
-        <h1>
-          {t("让每一步交付，都清晰可见。", "A clear view of every delivery.")}
-        </h1>
-        <p>
-          {t(
-            "把需求交给团队，把关键决策留给你。",
-            "Give your team the work. Keep the important decisions.",
-          )}
-        </p>
-      </div>
       <div className="stats">
         {[
           [
@@ -2253,7 +2584,7 @@ function Runs() {
               <p className="mono muted">{l.path}</p>
             </div>
             {badge(l.status)}
-            <button onClick={() => open("run", { id: l.runId })}>
+            <button onClick={() => open("run", { id: l.runId, projectId: l.projectId })}>
               {t("查看占用者", "View holder")}
             </button>
           </div>

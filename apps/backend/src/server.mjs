@@ -22,6 +22,7 @@ import {
   requireThat,
   VERSION,
 } from "../../../packages/contracts/src/index.mjs";
+import { normalizeDueDate, normalizeTaskTag } from "../../../packages/domain/src/index.mjs";
 const DEFAULT_WEB = fileURLToPath(new URL("../../web/dist/", import.meta.url));
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -40,6 +41,32 @@ function number(value, fallback, min = 0, max = 500) {
     `Expected integer ${min}..${max}`,
   );
   return n;
+}
+function taskViewFilters(params) {
+  const mode = params.get("due"), tag = params.get("tag");
+  let deadline;
+  if (mode === "none") deadline = { missing: true };
+  else if (mode) {
+    requireThat(["overdue", "today", "week", "on"].includes(mode),
+      "VALIDATION_ERROR", "Unknown deadline filter");
+    const day = normalizeDueDate(params.get("day") ?? undefined);
+    if (mode === "overdue") deadline = { before: day, openOnly: true };
+    else if (mode === "week") {
+      const through = new Date(day + "T00:00:00Z");
+      through.setUTCDate(through.getUTCDate() + 6);
+      deadline = { from: day, through: through.getUTCFullYear() > 9999 ? "9999-12-31" : through.toISOString().slice(0, 10) };
+    } else deadline = { from: day, through: day };
+  }
+  return {
+    status: params.get("status") || undefined,
+    owner: params.get("owner") || undefined,
+    search: params.get("q")?.trim().slice(0, 200),
+    hideChildren: params.get("children") === "0",
+    sort: params.get("sort"),
+    direction: params.get("direction"),
+    deadline,
+    tag: tag ? normalizeTaskTag(tag) : undefined,
+  };
 }
 async function readBody(req) {
   let bytes = 0,
@@ -246,6 +273,8 @@ export function createServer({
         let result;
         if (method === "POST" && resource === "connect")
           result = app.connect(agent.id);
+        else if (method === "GET" && resource === "identity" && !id)
+          result = app.get("agents", agent.id);
         else if (method === "POST" && resource === "heartbeat")
           result = app.heartbeat(agent.id, null, body);
         else if (method === "POST" && resource === "claims")
@@ -348,11 +377,26 @@ export function createServer({
           result = app.overview(projectId);
         else if (method === "GET" && resource === "inbox")
           result = app.inbox(projectId);
+        else if (method === "GET" && resource === "tasks" && id === "tags" && !action)
+          result = app.taskTags(projectId);
+        else if (method === "GET" && resource === "tasks" && id === "board" && !action)
+          result = app.taskBoard(projectId, {
+            ...taskViewFilters(url.searchParams),
+            group: url.searchParams.get("group"),
+            hidden: url.searchParams.get("hidden")?.split(",") ?? [],
+            progress: url.searchParams.get("progress") === "1",
+            offsets: Object.fromEntries(
+              [...url.searchParams.entries()]
+                .filter(([key]) => key.startsWith("cursor."))
+                .map(([key, value]) => [key.slice(7), number(value, 0, 0, 1_000_000)]),
+            ),
+          });
         else if (method === "GET" && resource === "events")
           result = {
             items: app.store.events({
               projectId,
               entityId: url.searchParams.get("entityId") ?? undefined,
+              newest: url.searchParams.get("order") === "newest",
               after: number(
                 url.searchParams.get("after"),
                 0,
@@ -364,16 +408,31 @@ export function createServer({
             latestSeq: app.store.latestSeq(),
           };
         else if (method === "GET" && listables.includes(resource)) {
-          if (id)
+          if (id) {
+            if (projectId && ["tasks", "runs"].includes(resource))
+              requireThat(
+                app.store.get(resource, id)?.projectId === projectId,
+                "NOT_FOUND", "Item not found in this project", 404,
+              );
             result =
-              action === "artifact" && resource === "runs"
+              action === "dispatch" && resource === "tasks"
+                ? app.taskDispatch(id)
+                : action === "assignment" && resource === "tasks"
+                  ? app.taskAssignment(id)
+                : action === "artifact" && resource === "runs"
                 ? app.artifact(id)
-                : app.get(resource, id);
-          else
+                : resource === "runs" && url.searchParams.get("summary") === "1"
+                  ? app.runStatus(id)
+                  : app.get(resource, id);
+          } else
             result = app.list(resource, {
               projectId,
               status: url.searchParams.get("status") ?? undefined,
+              ...(resource === "tasks" ? taskViewFilters(url.searchParams) : {}),
               parentId: url.searchParams.get("parentId") ?? undefined,
+              planId: ["tasks", "acceptances"].includes(resource) ? url.searchParams.get("planId") ?? undefined : undefined,
+              newest: url.searchParams.get("order") === "newest",
+              summary: url.searchParams.get("summary") === "1",
               limit: number(url.searchParams.get("limit"), 100, 1, 500),
               offset: number(url.searchParams.get("cursor"), 0, 0, 1_000_000),
             });
@@ -407,6 +466,11 @@ export function createServer({
           result = app.revokeAgent(id);
         else if (method === "POST" && resource === "tasks" && !id)
           result = app.createDraft(body);
+        else if (method === "PATCH" && resource === "tasks" && id && ["assignment", "metadata"].includes(action)) {
+          if (projectId)
+            requireThat(app.store.get(resource, id)?.projectId === projectId, "NOT_FOUND", "Item not found in this project", 404);
+          result = action === "assignment" ? app.assignTask(id, body) : app.updateTaskMetadata(id, body);
+        }
         else if (
           method === "POST" &&
           resource === "plans" &&

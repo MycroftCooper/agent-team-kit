@@ -12,7 +12,7 @@ const args = argumentsOf(process.argv.slice(2)),
 async function main() {
   if (!command || command === "help" || args.help) {
     console.log(
-      "atk-agent connect\natk-agent claim [--project <id>] [--task <id>] [--wait 30000]\natk-agent watch <runId> --generation <n>\natk-agent heartbeat <runId> --generation <n>\natk-agent events <runId> --file <JSON> --generation <n>\natk-agent submit <runId> plan|result|review --file <JSON>\natk-agent stopped <runId> --generation <n>\natk-agent get <runId>\natk-agent replay\nEnvironment: ATK_URL, ATK_AGENT_TOKEN; no model credentials.",
+      "atk-agent doctor\natk-agent connect\natk-agent claim [--project <id>] [--task <id>] [--wait 30000]\natk-agent watch <runId> --generation <n>\natk-agent heartbeat <runId> --generation <n>\natk-agent events <runId> --file <JSON> --generation <n>\natk-agent submit <runId> plan|result|review --file <JSON>\natk-agent stopped <runId> --generation <n>\natk-agent get <runId>\natk-agent replay\nEnvironment: ATK_URL, ATK_AGENT_TOKEN; no model credentials.",
     );
     return;
   }
@@ -32,7 +32,8 @@ async function main() {
       ),
   });
   let result;
-  if (command === "connect") result = await client.connect();
+  if (command === "doctor") result = await client.doctor();
+  else if (command === "connect") result = await client.connect();
   else if (command === "claim")
     result = await client.claim({
       projectId: args.project,

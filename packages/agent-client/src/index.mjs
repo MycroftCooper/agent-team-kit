@@ -18,6 +18,7 @@ export function createAgentClient({
     route,
     body,
     method = body === undefined ? "GET" : "POST",
+    probe = false,
   ) {
     const response = await fetchImpl(
       `${baseUrl.replace(/\/$/, "")}/api/agent/v1${route}`,
@@ -28,7 +29,8 @@ export function createAgentClient({
           "content-type": "application/json",
         },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(35000),
+        signal: AbortSignal.timeout(probe ? 5000 : 35000),
+        ...(probe ? { redirect: "error" } : {}),
       },
     );
     const result = await response.json();
@@ -78,6 +80,36 @@ export function createAgentClient({
   }
   return {
     request,
+    async doctor() {
+      if (u.pathname !== "/" || u.search || u.hash || u.username || u.password)
+        throw Object.assign(new Error("Use the local service origin, such as http://127.0.0.1:1421"), { code: "INVALID_SERVICE_URL" });
+      let health;
+      try {
+        const response = await fetchImpl(new URL("/api/v1/system/health", u), {
+          signal: AbortSignal.timeout(5000),
+          redirect: "error",
+        });
+        if (response.ok) health = await response.json();
+      } catch {
+        throw Object.assign(new Error("Cannot reach the local ATK service; check ATK_URL and run atk status"), { code: "SERVICE_UNREACHABLE" });
+      }
+      if (!health?.ok || health.format !== "atk-next-1")
+        throw Object.assign(new Error("ATK_URL did not return an ATK health response"), { code: "SERVICE_MISMATCH" });
+      let agent;
+      try {
+        agent = await request("/identity", undefined, "GET", true);
+      } catch (error) {
+        if (error.code === "UNAUTHENTICATED")
+          throw Object.assign(new Error("ATK rejected this credential; verify the token or check whether the identity was revoked"), { code: "UNAUTHENTICATED" });
+        if (error.code === "NOT_FOUND")
+          throw Object.assign(new Error("This ATK service does not support doctor; update it or use atk-agent connect"), { code: "DOCTOR_UNSUPPORTED" });
+        throw error;
+      }
+      return {
+        ok: true, service: u.origin, version: health.version,
+        identity: { id: agent.id, name: agent.name, roleId: agent.roleId, teamId: agent.teamId, lastSeen: agent.lastSeen },
+      };
+    },
     connect: () => request("/connect", {}),
     claim: (body) => request("/claims", { waitMs: 30000, ...body }),
     heartbeat: (runId, generation) =>

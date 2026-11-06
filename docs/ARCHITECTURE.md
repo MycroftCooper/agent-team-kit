@@ -39,6 +39,11 @@ second production memory-store implementation.
   reasons, not successful completion. Human retry creates another generation.
 - A plan's author identity cannot execute/review its work. An execution author
   cannot review that candidate. These checks use credential-bound IDs.
+- A human may set or clear an execution assignee on an approved Agent task in
+  READY or BLOCKED, provided no active or uncertain run still owns the task.
+  The optional identity is saved on the task and checked in the same claim
+  transaction as dependencies and locks. It does not change the approved role,
+  start a run, or reserve the independent review.
 - Approved plans freeze role instructions. Editing a role does not silently alter
   an existing plan. Changing the function of a role with live identities requires
   a new role instead.
