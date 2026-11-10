@@ -8,9 +8,12 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react";
-import { LEASE_MS, type Row, type Page } from "@atk/contracts";
+import { LEASE_MS, TASK_STATUSES, type Row, type Page } from "@atk/contracts";
 import { api, authorize, useData, useLive } from "./api";
+import { AgentTeam, AgentTeamNavigation, agentCliSetup, agentTeamSectionTitle, useAgentTeam } from "./agent-team";
 import { label, reason, type Lang } from "./i18n";
+import { DesktopTitleBar, desktopWindow } from "./desktop-window";
+import { ThemeSettings, ThemeToggle } from "./theme";
 import {
   TaskDisplayMenu,
   columnLabels as boardLabels,
@@ -30,7 +33,6 @@ import {
 
 type View =
   | "overview"
-  | "drafts"
   | "tasks"
   | "inbox"
   | "runs"
@@ -55,15 +57,17 @@ function detailUrl(target: DetailLink | null) {
   url.hash = "";
   return url;
 }
-const navs: [View, string, string, string][] = [
-  ["inbox", "待我处理", "My inbox", "◇"],
+const navs = [
   ["overview", "概览", "Overview", "◈"],
-  ["drafts", "预排池", "Intake", "▤"],
+  ["work", "工作", "Work", "☷"],
+  ["team", "Agent 团队", "Agent team", "⊞"],
+  ["projects", "项目", "Projects", "▦"],
+] as const;
+const workPages = [
+  ["inbox", "待我处理", "My inbox", "◇"],
   ["tasks", "任务", "Tasks", "☷"],
   ["runs", "执行记录", "Runs", "↗"],
-  ["team", "Agent 与团队", "Agents & teams", "⊞"],
-  ["projects", "项目", "Projects", "▦"],
-];
+] as const;
 const time = (v: string | number) => (v ? new Date(v).toLocaleString() : "—");
 function useRefreshTick(enabled: boolean, ms = 5000) {
   const [tick, setTick] = useState(0);
@@ -76,11 +80,47 @@ function useRefreshTick(enabled: boolean, ms = 5000) {
   }, [enabled, ms]);
   return tick;
 }
+function AppFooter({ lang, setLang, connection }: {
+  lang: Lang;
+  setLang: (lang: Lang) => void;
+  connection?: ReturnType<typeof useLive>["connection"];
+}) {
+  const english = lang === "en";
+  const languageLabel = english ? "Switch to Chinese" : "切换到英文";
+  return (
+    <footer className="app-footer">
+      {connection && (
+        <span className="live-label" role="status">
+          <span className={`connection ${connection}`} aria-hidden="true" />
+          {connection === "live"
+            ? (english ? "Live" : "实时同步")
+            : (english ? "Reconnecting" : "重新连接中")}
+        </span>
+      )}
+      <button
+        type="button"
+        className="quiet"
+        aria-label={languageLabel}
+        title={languageLabel}
+        onClick={() => setLang(english ? "zh" : "en")}
+      >
+        {english ? "中文" : "EN"}
+      </button>
+      <ThemeToggle lang={lang} />
+    </footer>
+  );
+}
+
 export function App() {
+  const [lang, setLanguage] = useState<Lang>(() => localStorage.getItem("atk-language") === "en" ? "en" : "zh");
   const [authorized, setAuthorized] = useState(false),
     [loading, setLoading] = useState(true),
     [failed, setFailed] = useState(false);
-  const english = localStorage.getItem("atk-language") === "en";
+  const english = lang === "en";
+  function setLang(next: Lang) {
+    setLanguage(next);
+    localStorage.setItem("atk-language", next);
+  }
   useEffect(() => {
     const connect = () => {
       setLoading(true);
@@ -93,8 +133,9 @@ export function App() {
     window.addEventListener("hashchange", connect);
     return () => window.removeEventListener("hashchange", connect);
   }, []);
-  if (authorized) return <WorkspaceApp />;
-  return (
+  if (authorized) return <WorkspaceApp lang={lang} setLang={setLang} />;
+  return <>
+    <DesktopTitleBar lang={lang} />
     <main className="auth-shell">
       <section className="panel auth-panel">
         <span className="eyebrow">AGENT TEAM KIT</span>
@@ -137,13 +178,11 @@ export function App() {
         </form>
       </section>
     </main>
-  );
+    <AppFooter lang={lang} setLang={setLang} />
+  </>;
 }
-function WorkspaceApp() {
-  const [lang, setLang] = useState<Lang>(() =>
-      localStorage.getItem("atk-language") === "en" ? "en" : "zh",
-    ),
-    [view, setView] = useState<View>(() => {
+function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => void }) {
+  const [view, setView] = useState<View>(() => {
       const target = readDetailLink();
       return target?.kind === "task" ? "tasks" : target?.kind === "run" ? "runs" : "overview";
     }),
@@ -176,6 +215,8 @@ function WorkspaceApp() {
     humanWork = useData<Row>("/inbox", epoch);
   const allRoles = roles.data?.items ?? [],
     allTeams = teams.data?.items ?? [];
+  const teamView = view === "team";
+  const agentTeam = useAgentTeam(teamView, epoch, current?.teamId);
   function clearDetail() {
     if (!detail) return;
     history.replaceState(null, "", detailUrl(null));
@@ -370,10 +411,48 @@ function WorkspaceApp() {
       new FormData(event.currentTarget).entries(),
     ) as Record<string, string>;
   }
+  const workPage = workPages.find(([key]) => key === view);
+  const sidebarView = workPage ? "work" : view;
   const titles =
-    navs.find((n) => n[0] === view) ??
+    workPage ?? navs.find(([key]) => key === view) ??
     (["settings", "设置", "Settings", "⚙"] as const);
+  const sectionTitle = workPage ? t("工作", "Work") : teamView ? t("Agent 团队", "Agent team") : null;
+  const pageTitle = teamView ? agentTeamSectionTitle(agentTeam.section, t) : t(titles[1], titles[2]);
+  const globalView = teamView || view === "projects" || view === "settings";
   const item = modal?.item;
+  const agentRole = modal?.kind === "agent-role" ? allRoles.find((role) => role.id === item?.roleId) : undefined;
+  const workspaceSwitcher = (
+    <div className="workspace-switch" inert={Boolean(modal)}>
+      <span className="workspace-icon" aria-hidden="true">
+        {current?.name.slice(0, 1).toUpperCase() ?? "W"}
+      </span>
+      <select
+        aria-label={t("切换工作空间", "Switch workspace")}
+        name="workspace"
+        title={current ? `${current.name}\n${current.root}` : undefined}
+        value={projectId}
+        disabled={!activeProjects.length || busy}
+        onChange={(e) => setProject(e.target.value)}
+      >
+        {!activeProjects.length && (
+          <option value="">{t("尚未添加项目", "No projects yet")}</option>
+        )}
+        {activeProjects.map((p) => (
+          <option key={p.id} value={p.id}>{p.name}</option>
+        ))}
+      </select>
+      <button
+        type="button"
+        className="quiet workspace-add"
+        title={t("添加工作空间", "Add workspace")}
+        aria-label={t("添加工作空间", "Add workspace")}
+        disabled={busy}
+        onClick={() => open("project")}
+      >
+        ＋
+      </button>
+    </div>
+  );
   return (
     <UIContext.Provider
       value={{
@@ -406,130 +485,84 @@ function WorkspaceApp() {
         closeModal,
       }}
     >
-      <div className="app">
+      <DesktopTitleBar lang={lang} workspace={workspaceSwitcher} />
+      <div className={sectionTitle ? "app has-section-sidebar" : "app"}>
         <aside className="sidebar" inert={Boolean(modal)}>
-          <button className="brand" onClick={() => setView("overview")}>
-            <span className="brand-mark">
-              <i />
-              <i />
-              <i />
-            </span>
-            <strong>Agent Team Kit</strong>
-            <span className="alpha">α</span>
-          </button>
-          <div className="workspace-switch">
-            <span className="workspace-icon" aria-hidden="true">
-              {current?.name.slice(0, 1).toUpperCase() ?? "W"}
-            </span>
-            <label className="workspace-choice">
-              <span>{t("工作空间", "Workspace")}</span>
-              <select
-                aria-label={t("切换工作空间", "Switch workspace")}
-                name="workspace"
-                title={current ? `${current.name}\n${current.root}` : undefined}
-                value={projectId}
-                disabled={!activeProjects.length || busy}
-                onChange={(e) => setProject(e.target.value)}
-              >
-                {!activeProjects.length && (
-                  <option value="">{t("尚未添加项目", "No projects yet")}</option>
-                )}
-                {activeProjects.map((p) => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
-                ))}
-              </select>
-            </label>
-            <button
-              className="quiet workspace-add"
-              aria-label={t("添加工作空间", "Add workspace")}
-              onClick={() => open("project")}
-            >
-              ＋
-            </button>
-          </div>
-          <nav>
+          <nav aria-label={t("主导航", "Main navigation")}>
             {navs.map(([key, zh, en, icon]) => (
-              <div key={key}>
-                {key === "overview" && <div className="nav-label">{t("工作", "WORK")}</div>}
-                {key === "team" && (
-                  <div className="nav-label global-nav-label">
-                    {t("全局管理", "GLOBAL MANAGEMENT")}
-                  </div>
-                )}
                 <button
+                  key={key}
+                  type="button"
                   aria-label={t(zh, en)}
-                  aria-current={view === key ? "page" : undefined}
-                  className={view === key ? "nav-item active" : "nav-item"}
+                  title={t(zh, en)}
+                  aria-current={sidebarView === key ? "page" : undefined}
+                  className={sidebarView === key ? "nav-item active" : "nav-item"}
                   onClick={() => {
-                    setView(key);
+                    setView(key === "work" ? workPage?.[0] ?? "tasks" : key);
                     setError(null);
                   }}
                 >
-                  <span className="nav-icon">{icon}</span>
-                  {t(zh, en)}
-                  {key === "inbox" && countInbox > 0 && (
+                  <span className="nav-icon" aria-hidden="true">{icon}</span>
+                  {key === "team" ? t("团队", "Team") : t(zh, en)}
+                  {key === "work" && countInbox > 0 && (
                     <span className="nav-count">{countInbox}</span>
                   )}
                 </button>
-              </div>
             ))}
           </nav>
           <div className="sidebar-bottom">
             <button
+              type="button"
               className={view === "settings" ? "nav-item active" : "nav-item"}
+              aria-label={t("设置与运维", "Settings & operations")}
+              title={t("设置与运维", "Settings & operations")}
+              aria-current={view === "settings" ? "page" : undefined}
               onClick={() => setView("settings")}
             >
-              <span className="nav-icon">⚙</span>
-              {t("设置与运维", "Settings & operations")}
+              <span className="nav-icon" aria-hidden="true">⚙</span>
+              {t("设置", "Settings")}
             </button>
-            <div className="user">
+            <div className="user" title={t("你的工作台 · 本机单用户", "Your workspace · Local user")}>
               <span className="avatar small-avatar">Y</span>
-              <div>
-                <strong>{t("你的工作台", "Your workspace")}</strong>
-                <small>{t("本机单用户", "Local user")}</small>
-              </div>
-              <span
-                className={`connection ${live.connection}`}
-                title={live.connection}
-              />
             </div>
           </div>
         </aside>
+        {sectionTitle && <aside className={workPage ? "section-sidebar work-sidebar" : "section-sidebar agent-team-sidebar"} inert={Boolean(modal)}>
+          <h2>{sectionTitle}</h2>
+          {workPage ? <>
+            <p className="section-nav-label">{t("视图", "Views")}</p>
+            <nav className="section-nav work-nav" aria-label={t("工作页面", "Work pages")}>
+              {workPages.map(([key, zh, en, icon]) => <button
+                type="button" key={key} aria-label={t(zh, en)} title={t(zh, en)} aria-current={view === key ? "page" : undefined}
+                onClick={() => { setView(key); setError(null); }}
+              >
+                <span className="section-nav-icon" aria-hidden="true">{icon}</span>
+                <span className="section-nav-text">{t(zh, en)}</span>
+                {key === "inbox" && countInbox > 0 && <span className="section-nav-count">{countInbox}</span>}
+              </button>)}
+            </nav>
+          </> : <AgentTeamNavigation t={t} state={agentTeam} />}
+        </aside>}
         <div className="main" inert={Boolean(modal)}>
           <header className="topbar">
-            <div className="breadcrumbs">
-              <span className="workspace-breadcrumb" title={current?.root}>
-                {current?.name ?? t("工作空间", "Workspace")}
-              </span>
-              <span>/</span>
-              <strong>{t(titles[1], titles[2])}</strong>
+            <div className="topbar-left">
+              {!desktopWindow && workspaceSwitcher}
+              <div className="breadcrumbs">
+                {!desktopWindow && <span>/</span>}
+                {sectionTitle && <><span>{sectionTitle}</span><span>/</span></>}
+                <strong>{pageTitle}</strong>
+              </div>
             </div>
             <div className="top-actions">
-              <span className="live-label">
-                <span className={`connection ${live.connection}`} />
-                {live.connection === "live"
-                  ? t("实时同步", "Live")
-                  : t("重新连接中", "Reconnecting")}
-              </span>
-              <button
-                className="quiet"
-                onClick={() => {
-                  const l = lang === "zh" ? "en" : "zh";
-                  setLang(l);
-                  localStorage.setItem("atk-language", l);
-                }}
-              >
-                {lang === "zh" ? "EN" : "中文"}
-              </button>
               {newButton}
             </div>
           </header>
           <main>
             <div className="page-heading">
               <div>
-                <h2>{t(titles[1], titles[2])}</h2>
+                <h2 id="page-heading-title">{pageTitle}</h2>
               </div>
-              {["team", "projects", "settings"].includes(view) && (
+              {globalView && (
                 <span className="muted">
                   {t("全局管理 · 跨工作空间共享", "Global management · Shared across workspaces")}
                 </span>
@@ -537,8 +570,8 @@ function WorkspaceApp() {
             </div>
             {!modal && errorPanel(error)}
             {projects.error && errorPanel(projects.error as Row)}
-            <div key={projectId}>
-              {!projectId && !["team", "projects", "settings"].includes(view) ? (
+            <div key={globalView ? undefined : projectId}>
+              {!projectId && !globalView ? (
                 empty(
                   t("添加你的第一个工作空间", "Add your first workspace"),
                   t(
@@ -551,16 +584,15 @@ function WorkspaceApp() {
                 )
               ) : view === "overview" ? (
                 <Overview />
-              ) : view === "drafts" ? (
-                <TaskList key="drafts" drafts />
               ) : view === "tasks" ? (
-                <TaskList key="tasks" />
+                <TaskList />
               ) : view === "inbox" ? (
                 <Inbox />
               ) : view === "runs" ? (
                 <Runs />
               ) : view === "team" ? (
-                <Team />
+                <AgentTeam t={t} state={agentTeam} currentTeamId={current?.teamId} roles={allRoles} teams={allTeams}
+                  open={open} badge={badge} errorPanel={errorPanel} copyText={copyText} />
               ) : view === "projects" ? (
                 <Projects />
               ) : (
@@ -568,14 +600,7 @@ function WorkspaceApp() {
               )}
             </div>
           </main>
-          <footer>
-            <span>AGENT TEAM KIT</span>
-            <span>
-              {current?.name ?? t("独立工作空间", "Independent workspace")}{" "}
-              <span className="footer-dot">·</span>{" "}
-              {t("本地优先", "Local first")}
-            </span>
-          </footer>
+          <AppFooter lang={lang} setLang={setLang} connection={live.connection} />
         </div>
         {notice && (
           <div className="toast" role="status">
@@ -598,7 +623,7 @@ function WorkspaceApp() {
               }
               role="dialog"
               aria-modal="true"
-              aria-label={t("详情与操作", "Details and actions")}
+              aria-label={modal.kind === "agent-role" ? t("角色模板", "Role template") : t("详情与操作", "Details and actions")}
             >
               <button
                 className="modal-close"
@@ -618,12 +643,12 @@ function WorkspaceApp() {
               {modal.kind === "run" && linkedProject && <RunDetail key={item!.id} id={item!.id} />}
               {modal.kind === "draft" && (
                 <>
-                  <span className="eyebrow">INTAKE</span>
+                  <span className="eyebrow">{t("预排", "DRAFT")}</span>
                   <h2>{t("提交一个新需求", "Create a request")}</h2>
                   <p className="muted">
                     {t(
-                      "它会进入预排池，等待 PMAgent 规划。",
-                      "It enters the draft queue for your PM agent to plan.",
+                      "新需求会以「预排」状态出现在任务页，等待 PM Agent 规划。",
+                      "New requests appear in Tasks as Draft, ready for your PM agent to plan.",
                     )}
                   </p>
                   {!projects.data?.items.some((p) => !p.archived) ? (
@@ -682,7 +707,7 @@ function WorkspaceApp() {
                           {t("取消", "Cancel")}
                         </button>
                         <button className="primary" disabled={busy}>
-                          {t("提交到预排池", "Add to intake")}
+                          {t("创建需求", "Create request")}
                         </button>
                       </div>
                     </form>
@@ -761,17 +786,37 @@ function WorkspaceApp() {
                   </form>
                 </>
               )}
+              {modal.kind === "agent-role" && item && (
+                <>
+                  <h2>{t("角色模板", "Role template")}</h2>
+                  <p className="muted">{item.name}{agentRole && ` · ${agentRole.name}`}</p>
+                  {agentRole ? <>
+                    <dl className="role-template-details">
+                      <div><dt>{t("职能", "Function")}</dt><dd><code>{agentRole.function}</code></dd></div>
+                      <div><dt>{t("职责指令", "Instructions")}</dt><dd>{agentRole.instructions}</dd></div>
+                      <div><dt>{t("允许写入的范围", "Write scopes")}</dt><dd><code>{agentRole.files?.join("\n") || "—"}</code></dd></div>
+                      <div><dt>{t("输出要求", "Output requirements")}</dt><dd>{agentRole.output || "—"}</dd></div>
+                    </dl>
+                    <div className="modal-actions">
+                      <button type="button" onClick={() => open("role", agentRole)}>{t("编辑模板", "Edit template")}</button>
+                    </div>
+                  </> : errorPanel(roles.error) ?? <p className="muted" role="status">{roles.loading
+                    ? t("正在加载…", "Loading…")
+                    : t("暂时无法读取此 Agent 的角色模板。", "This agent’s role template is unavailable.")}</p>}
+                </>
+              )}
               {modal.kind === "role" && (
                 <>
                   <h2>
                     {item
-                      ? t("编辑角色", "Edit role")
+                      ? t("编辑角色模板", "Edit role template")
                       : t("新建角色模板", "New role template")}
                   </h2>
+                  {item && <p className="muted">{t("修改会应用到使用这份模板的所有 Agent。", "Changes apply to every agent using this template.")}</p>}
                   <form
-                    onSubmit={(e) => {
+                    onSubmit={async (e) => {
                       const v = formObject(e);
-                      void act(
+                      const saved = await act(
                         "/roles" + (item ? "/" + item.id : ""),
                         {
                           ...v,
@@ -782,7 +827,9 @@ function WorkspaceApp() {
                           version: item?.version,
                         },
                         item ? "PATCH" : "POST",
+                        false,
                       );
+                      if (saved) setModal((active) => active === dialog ? null : active);
                     }}
                   >
                     <Fields>
@@ -1356,7 +1403,7 @@ function AgentConnection({ id }: { id: string }) {
   const { t, epoch, roleName, copyText } = useUI();
   const tick = useRefreshTick(true);
   const { data: agent, error } = useData<Row>("/agents/" + encodeURIComponent(id), epoch + tick);
-  const command = `$env:ATK_URL = "${location.origin}"\n$env:ATK_AGENT_TOKEN = "<credential>"\natk-agent doctor`;
+  const command = agentCliSetup();
   const recent = agent?.lastSeen != null && Date.now() - agent.lastSeen < LEASE_MS;
   if (!agent) return <p role={error ? "alert" : "status"}>{error ? t("无法读取接入状态。", "Could not load connection status.") : t("正在加载…", "Loading…")}</p>;
   const state = agent.revoked ? t("已撤销", "Revoked")
@@ -1463,7 +1510,7 @@ function DispatchNotice({ row, dispatch }: { row: Row; dispatch: Row | null }) {
         </small>
       )}
       {["NO_MATCHING_AGENT", "NO_RECENT_AGENT"].includes(code) && (
-        <button className="text-button" onClick={() => { closeModal(); setView("team"); }}>{t("查看 Agent 与团队", "Open agents & teams")} →</button>
+        <button className="text-button" onClick={() => { closeModal(); setView("team"); }}>{t("查看 Agent 团队", "Open agent team")} →</button>
       )}
       {row.waiting?.holders?.map((holder: Row) => (
         <p key={holder.runId + holder.file}><code>{holder.file}</code> · {holder.agentName}{" "}
@@ -1980,7 +2027,7 @@ function BoardTaskCard({ task, fields }: { task: Row; fields: CardProperty[] }) 
   );
 }
 
-function TaskList({ drafts = false }: { drafts?: boolean }) {
+function TaskList() {
   const {
     lang,
     t,
@@ -1995,20 +2042,19 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
     roleName,
   } = useUI();
 
-  const [status, setStatus] = useState(drafts ? "DRAFT" : ""),
+  const [status, setStatus] = useState(""),
     [cursor, setCursor] = useState(0),
     [search, setSearch] = useState(""),
     [query, setQuery] = useState(""),
     [owner, setOwner] = useState(""),
     [metadata, setMetadata] = useState(emptyTaskMetaFilters),
     [offsets, setOffsets] = useState<Record<string, number>>({});
-  const scope = `${projectId}:${drafts ? "intake" : "work"}`;
+  const scope = `${projectId}:work`;
   const storageKey = "atk-task-display:" + scope;
   const [display, setDisplay] = useState(() => readTaskDisplay(
     storageKey,
     localStorage.getItem("atk-task-view:" + scope),
     localStorage.getItem(`atk-task-group:${projectId}`),
-    drafts,
   ));
   const { layout, sort, direction, children, group } = display;
   const columnLayout = layout === "board" || layout === "swimlane";
@@ -2127,22 +2173,13 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
           />
         </div>
         <select
+          name="taskStatus"
           aria-label={t("状态筛选", "Status filter")}
           value={status}
           onChange={(e) => setStatus(e.target.value)}
         >
           <option value="">{t("所有状态", "All statuses")}</option>
-          {[
-            "DRAFT",
-            "READY",
-            "RUNNING",
-            "REVIEWING",
-            "VERIFIED",
-            "AWAITING_ACCEPTANCE",
-            "DONE",
-            "BLOCKED",
-            "CANCELLED",
-          ].map((v) => (
+          {TASK_STATUSES.map((v) => (
             <option key={v} value={v}>
               {label(v, lang)}
             </option>
@@ -2594,106 +2631,6 @@ function Runs() {
   );
 }
 
-function Team() {
-  const { t, epoch, overview, allRoles, allTeams, badge, open, roleName } =
-    useUI();
-  const agents = useData<Page>("/agents?limit=500", epoch);
-  return (
-    <>
-      <div className="section-title">
-        <h3>{t("Agent 身份", "Agent identities")}</h3>
-        <button className="primary" onClick={() => open("agent")}>
-          ＋ {t("添加 Agent", "Add agent")}
-        </button>
-      </div>
-      <p className="page-description">
-        {t(
-          "这里配置身份、角色和权限。实际 Agent 在外部运行并主动领取任务。",
-          "Configure identities, roles and permissions. Actual agents run externally and pull work.",
-        )}
-      </p>
-      <div className="agent-grid">
-        {agents.data?.items.map((a) => (
-          <article className="agent-card" key={a.id}>
-            <div className="split">
-              <span className="avatar">{a.name.slice(0, 1).toUpperCase()}</span>
-              {badge(
-                a.revoked
-                  ? "REVOKED"
-                  : overview.data?.agents.find((x: Row) => x.id === a.id)
-                        ?.online
-                    ? "ONLINE"
-                    : "OFFLINE",
-              )}
-            </div>
-            <h3>{a.name}</h3>
-            <p>{roleName(a.roleId)}</p>
-            <small>
-              {allTeams.find((team: Row) => team.id === a.teamId)?.name}
-            </small>
-            <div className="card-actions">
-              <button disabled={a.revoked} onClick={() => open("agent", a)}>
-                {t("编辑", "Edit")}
-              </button>
-              <button onClick={() => open("connection", a)}>
-                {t("接入说明", "Connection guide")}
-              </button>
-              <button
-                disabled={a.revoked}
-                className="quiet"
-                onClick={() => open("revoke", a)}
-              >
-                {t("撤销", "Revoke")}
-              </button>
-            </div>
-          </article>
-        ))}
-      </div>
-      <div className="section-title">
-        <h3>{t("团队", "Teams")}</h3>
-        <button onClick={() => open("team")}>
-          ＋ {t("新建团队", "New team")}
-        </button>
-      </div>
-      <div className="task-list">
-        {allTeams.map((team: Row) => (
-          <div className="list-row" key={team.id}>
-            <div>
-              <strong>{team.name}</strong>
-              <p className="muted">
-                {team.roleIds.map(roleName).join(" · ")} ·{" "}
-                {t("并发", "Capacity")} {team.maxConcurrent}
-              </p>
-            </div>
-            <button onClick={() => open("team", team)}>
-              {t("编辑", "Edit")}
-            </button>
-          </div>
-        ))}
-      </div>
-      <div className="section-title">
-        <h3>{t("角色模板", "Role templates")}</h3>
-        <button onClick={() => open("role")}>
-          ＋ {t("新建角色", "New role")}
-        </button>
-      </div>
-      <div className="task-list">
-        {allRoles.map((role: Row) => (
-          <div className="list-row" key={role.id}>
-            <div>
-              <strong>{role.name}</strong> <code>{role.function}</code>
-              <p className="muted truncate">{role.instructions}</p>
-            </div>
-            <button onClick={() => open("role", role)}>
-              {t("编辑", "Edit")}
-            </button>
-          </div>
-        ))}
-      </div>
-    </>
-  );
-}
-
 function Projects() {
   const { t, projects, open, act, projectId, setProject, setView } = useUI();
   return (
@@ -2759,6 +2696,7 @@ function Settings() {
   const { lang, setLang, t, open } = useUI();
   return (
     <>
+      <ThemeSettings lang={lang} />
       <section className="panel settings-panel">
         <h3>{t("语言", "Language")}</h3>
         <p>
@@ -2769,10 +2707,7 @@ function Settings() {
         </p>
         <select
           value={lang}
-          onChange={(e) => {
-            setLang(e.target.value as Lang);
-            localStorage.setItem("atk-language", e.target.value);
-          }}
+          onChange={(e) => setLang(e.target.value as Lang)}
         >
           <option value="zh">简体中文</option>
           <option value="en">English</option>

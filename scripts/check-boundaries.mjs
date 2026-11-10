@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 const roots = {
   web: "apps/web",
+  desktop: "apps/desktop",
   backend: "apps/backend",
   launcher: "apps/launcher",
   "agent-cli": "apps/agent-cli",
@@ -15,6 +16,7 @@ const roots = {
 };
 const allowed = {
   web: ["contracts"],
+  desktop: ["web", "backend", "platform"],
   backend: [
     "contracts",
     "domain",

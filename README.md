@@ -7,6 +7,26 @@ model adapters, model gateway, automatic agent launch, or worktrees.
 
 ## Run
 
+**Windows x64 desktop development: double-click `dev.bat`.** It opens the ATK
+desktop window directly. The first launch downloads workspace dependencies and
+Electron using portable tools kept under `artifacts/desktop-dev/`; it needs an
+internet connection, but no system Node.js installation or prebuilt web UI.
+
+React and CSS changes use Vite hot updates. Close the window and relaunch after
+changing the backend or Electron main process. Closing the development window
+stops the backend, so stop active agents before restarting. The app uses the
+existing data directory configuration and Agent API (default `127.0.0.1:1421`).
+Stop any existing service using the same port or data directory first. Override
+the Agent and Vite ports with `ATK_PORT` and `ATK_DEV_PORT`, respectively. This is
+a development launcher; installers and macOS are outside this prototype.
+
+Switch or add workspaces in the custom title bar, and drag its empty area to move
+the desktop window. Its controls minimize, maximize or restore, and close it.
+The bottom bar shows sync status on the left and language and theme controls on the right.
+**Settings & operations → Appearance** also offers **Follow system**.
+
+### Existing web launcher
+
 Use Node.js 24. The release package contains the built web application and has
 no production dependencies. It installs outside the projects it manages.
 
@@ -47,7 +67,7 @@ loaded or upgraded. Register projects in the web UI; Git is optional.
 
 ## Workflow
 
-1. Create a DRAFT request in the browser.
+1. Create a request. It appears in **Work → Tasks** in the **Draft** column.
 2. An external ORCHESTRATOR claims the planning stage and submits a versioned plan.
 3. Approve that plan in the browser. WORKER tasks become eligible for claiming.
 4. External agents claim authorized tasks, obtain cooperative file locks, renew
@@ -66,8 +86,11 @@ discards project edits.
 
 ![Workspace](docs/screenshots/overview.png)
 
-Create roles, teams and agent identities in the UI. Save the issued credential;
-it is shown once. Agents can use HTTP or the package's machine CLI:
+Open **Agent team** and use its left sidebar to manage identities and squads. Select **Role template** on
+an agent's card to view or edit its assigned template. Create new roles under **Squads**. **Skills**,
+**MCP**, and **CLI** explain how to configure skills and tools and connect external agents.
+Save the credential when creating an agent identity; it is shown once. Agents
+can use HTTP or the package's machine CLI:
 
 ```sh
 # Set ATK_AGENT_TOKEN securely in the external agent's environment.

@@ -1,0 +1,52 @@
+:root {
+  color-scheme: light dark;
+  --bg: light-dark(#f7f8fb, #0b0c0e);
+  --surface: light-dark(#fff, #111214);
+  --sidebar: light-dark(#f1f3f8, #101113);
+  --chrome: light-dark(#f5f6fa, #0e0f11);
+  --panel: light-dark(#fff, #15171d);
+  --raised: light-dark(#eef0f6, #191a1e);
+  --input: light-dark(#f7f8fc, #101115);
+  --button: light-dark(#f3f4f9, #1b1c21);
+  --hover: light-dark(#eaedf5, #24252c);
+  --selected: light-dark(#e6e9f7, #262936);
+  --line: light-dark(#dce1eb, #25262b);
+  --line-strong: light-dark(#c2cadb, #373c49);
+  --line-hover: light-dark(#98a3ba, #484d63);
+  --text: light-dark(#171e2c, #eceef1);
+  --text-soft: light-dark(#38435a, #c4c7cf);
+  --muted: light-dark(#515c72, #a4abb8);
+  --subtle: light-dark(#5e6980, #828b9d);
+  --link: light-dark(#414fa7, #b2baf6);
+  --accent: light-dark(#505cc2, #8790ed);
+  --accent-bg: light-dark(#e9ecfc, #25283e);
+  --accent-line: light-dark(#c5cef3, #3a4059);
+  --primary: light-dark(#4655bb, #5e6ad2);
+  --primary-hover: light-dark(#3946a7, #6c77dc);
+  --on-primary: #fff;
+  --logo-bg: light-dark(#4858bd, #b9befb);
+  --logo-ink: light-dark(#fff, #303660);
+  --success: light-dark(#256346, #92c6a9);
+  --success-bg: light-dark(#edf7f1, #19251f);
+  --success-line: light-dark(#a9d2b9, #34473d);
+  --success-dot: light-dark(#28824e, #74af8a);
+  --warning: light-dark(#805317, #dbbf8a);
+  --warning-bg: light-dark(#fff5e5, #2b2419);
+  --warning-line: light-dark(#dec59d, #59482a);
+  --warning-dot: light-dark(#9c661d, #bd955d);
+  --danger: light-dark(#a33343, #efa2a8);
+  --danger-bg: light-dark(#fff0f0, #352127);
+  --danger-line: light-dark(#e2b8bc, #643b46);
+  --danger-dot: light-dark(#bb4553, #c37a7a);
+  --close-hover: light-dark(#b92d3b, #c42b3c);
+  --switch-knob: #fff;
+  --scrim: light-dark(#1d263b63, #000a);
+  --scrim-soft: light-dark(#1d263b34, #08090b65);
+  --shadow: light-dark(#202b482c, #0006);
+  --shadow-strong: light-dark(#202b4840, #0008);
+  --shadow-soft: light-dark(#202b4820, #0004);
+  --titlebar-height: 0px;
+}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-desktop] { --titlebar-height: 48px; }

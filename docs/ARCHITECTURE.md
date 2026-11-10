@@ -23,6 +23,13 @@ use relative package paths so the installed package needs no workspace links.
 The web build bundles React. Tests use throwaway SQLite files rather than a
 second production memory-store implementation.
 
+On Windows, `dev.bat` opens the same React UI in an Electron window. An
+Electron utility process runs the existing backend and a loopback Vite server;
+Vite proxies the human API and SSE, while external Agents still call the
+backend directly. The window has no Node integration. Vite refreshes renderer
+code without restarting the utility process; backend and desktop main changes
+require relaunching the development app.
+
 ## State and identity
 
 - REQUEST tasks start DRAFT. ORCHESTRATOR planning runs leave them DRAFT until

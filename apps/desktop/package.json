@@ -1,0 +1,10 @@
+{
+  "name": "@atk/desktop",
+  "version": "2.0.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs",
+  "devDependencies": {
+    "electron": "45.2.3"
+  }
+}

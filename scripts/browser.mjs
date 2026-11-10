@@ -56,6 +56,24 @@ export async function openBrowser({
     child.kill();
     throw new Error("Browser did not expose its test endpoint");
   }
+  const close = async () => {
+    child.kill();
+    await sleep(200);
+    if (process.platform === "win32" && child.pid)
+      spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+  };
+  try {
+    return await attachBrowser({ port, url, outputDir, width, height, close });
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+
+export async function attachBrowser({ port, url, outputDir, width = 1440, height = 1000, close }) {
   const tabs = await fetch(`http://127.0.0.1:${port}/json`).then((r) =>
     r.json(),
   );
@@ -105,7 +123,7 @@ export async function openBrowser({
     deviceScaleFactor: 1,
     mobile: false,
   });
-  await send("Page.navigate", { url });
+  if (url) await send("Page.navigate", { url });
   async function evaluate(expression) {
     const result = await send("Runtime.evaluate", {
       expression,
@@ -160,13 +178,7 @@ export async function openBrowser({
     },
     async close() {
       socket.close();
-      child.kill();
-      await sleep(200);
-      if (process.platform === "win32" && child.pid)
-        spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-          windowsHide: true,
-          stdio: "ignore",
-        });
+      await close?.();
     },
   };
 }

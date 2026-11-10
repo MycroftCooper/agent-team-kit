@@ -555,7 +555,7 @@ export function createServer({
         return json(res, 200, result);
       }
       requireThat(
-        ["GET", "HEAD"].includes(method),
+        webDist && ["GET", "HEAD"].includes(method),
         "NOT_FOUND",
         "Unknown route",
         404,

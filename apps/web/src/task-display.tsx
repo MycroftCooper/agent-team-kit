@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { TASK_BOARD_COLUMNS, TASK_BOARD_OWNERS } from "@atk/contracts";
 
 export const columnLabels: Record<string, [string, string]> = {
+  draft: ["预排", "Draft"],
   queue: ["待开始", "To do"],
   running: ["进行中", "In progress"],
   review: ["待评审", "In review"],
@@ -57,7 +58,7 @@ function validHidden(input: unknown, keys: readonly string[]) {
   const hidden = keys.filter((key) => input.includes(key));
   return hidden.length < keys.length ? hidden : [];
 }
-export function readTaskDisplay(storageKey: string, legacyLayout: string | null, legacyGroup: string | null, drafts: boolean): TaskDisplay {
+export function readTaskDisplay(storageKey: string, legacyLayout: string | null, legacyGroup: string | null): TaskDisplay {
   let saved: Partial<TaskDisplay> = {};
   try {
     saved = JSON.parse(localStorage.getItem(storageKey) ?? "null") ?? {};
@@ -66,7 +67,7 @@ export function readTaskDisplay(storageKey: string, legacyLayout: string | null,
   }
   const layout = saved.layout ?? legacyLayout;
   return {
-    layout: layout && Object.hasOwn(layouts, layout) ? layout as Layout : drafts ? "list" : "board",
+    layout: layout && Object.hasOwn(layouts, layout) ? layout as Layout : "board",
     group: (saved.group ?? legacyGroup) === "owner" ? "owner" : "flow",
     sort: saved.sort && Object.hasOwn(sortLabels, saved.sort) ? saved.sort : "priority",
     direction: saved.direction === "desc" ? "desc" : "asc",

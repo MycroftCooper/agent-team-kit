@@ -48,8 +48,9 @@ active executions require confirmed stopping before locks are released.
 
 ## Projects
 
-Each project is one workspace. Use **Switch workspace** at the top of the sidebar
-to change the overview, intake, tasks, inbox and run history together. The browser
+Each project is one workspace. Use **Switch workspace** in the title bar (or
+page header in a browser) to change the overview and all three pages in **Work**:
+**My inbox**, **Tasks** and **Runs**. The browser
 remembers the selected workspace across reloads. New requests always belong to
 the current workspace. Creating a project enters it automatically; archiving the
 current project selects another active workspace, or shows the setup screen if

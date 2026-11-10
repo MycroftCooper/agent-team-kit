@@ -144,18 +144,20 @@ test("revoked assignment waits for a human to clear it; no other agent takes ove
   assert.equal(f.app.claim(other.agent.id, { taskId: task.id }).run.agentId, other.agent.id);
 });
 
-test("board counts the whole project and paginates each column independently", async (t) => {
+test("board separates drafts from ready tasks and paginates each column independently", async (t) => {
   const f = await serverFixture(t);
   const { tasks } = plan(f, [node("manual", { executorType: "HUMAN", files: [] }), node("worker")]);
   for (let i = 0; i < 23; i++)
     f.app.createDraft({ projectId: f.p.id, title: "Queue item " + i, description: "Pending planning" });
   const route = "/tasks/board?projectId=" + f.p.id;
   const { body: first } = await f.human(route);
-  assert.equal(first.columns[0].total, 26);
+  assert.deepEqual(first.columns.slice(0, 2).map((c) => [c.key, c.total]), [["draft", 23], ["queue", 3]]);
   assert.equal(first.columns[0].items.length, 20);
+  assert.ok(first.columns[0].items.every((task) => task.status === "DRAFT"));
+  assert.ok(first.columns[1].items.every((task) => task.status === "READY"));
   assert.equal(first.columns[0].nextCursor, 20);
-  const { body: later } = await f.human(route + "&cursor.queue=20");
-  assert.equal(later.columns[0].items.length, 6);
+  const { body: later } = await f.human(route + "&cursor.draft=20");
+  assert.equal(later.columns[0].items.length, 3);
   assert.equal(later.columns[0].previousCursor, 0);
   assert.equal(later.columns[1].offset, 0);
   const { body: owners } = await f.human(route + "&group=owner");
@@ -164,15 +166,16 @@ test("board counts the whole project and paginates each column independently", a
   const { body: filtered } = await f.human(route + "&group=owner&owner=REQUEST&q=Queue%20item%2022");
   assert.equal(filtered.columns.length, 1);
   assert.equal(filtered.columns[0].total, 1);
-  const { body: view } = await f.human(route + "&group=swimlane&hidden=closed&cursor.REQUEST.queue=10&progress=1");
+  const { body: view } = await f.human(route + "&group=swimlane&hidden=closed&cursor.REQUEST.draft=10&progress=1");
   assert.deepEqual(view.lanes.map((lane) => lane.key), ["HUMAN", "AGENT", "REQUEST"]);
-  assert.equal(view.lanes[0].columns[0].items[0].id, tasks[0].id);
+  assert.equal(view.lanes[0].columns[1].items[0].id, tasks[0].id);
   assert.equal(view.lanes[0].columns[0].offset, 0);
   assert.equal(view.lanes[2].columns[0].offset, 10);
   assert.ok(view.lanes.every((lane) => !lane.columns.some((column) => column.key === "closed")));
   const { body: parents } = await f.human(route + "&children=0&q=Feature&progress=1");
-  assert.equal(parents.columns[0].total, 1);
-  assert.deepEqual(parents.columns[0].items[0].subtaskProgress, { total: 2, verified: 0 });
+  const readyParents = parents.columns.find((column) => column.key === "queue");
+  assert.equal(readyParents.total, 1);
+  assert.deepEqual(readyParents.items[0].subtaskProgress, { total: 2, verified: 0 });
   const { body: sorted } = await f.human(`/tasks?projectId=${f.p.id}&children=0&sort=title&direction=desc&q=Queue%20item&limit=3`);
   assert.equal(sorted.total, 23);
   assert.deepEqual(sorted.items.map((task) => task.title), ["Queue item 9", "Queue item 8", "Queue item 7"]);

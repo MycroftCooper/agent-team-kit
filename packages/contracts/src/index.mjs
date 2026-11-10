@@ -18,7 +18,8 @@ export const STAGES = Object.freeze([
   "HUMAN",
 ]);
 export const TASK_BOARD_COLUMNS = Object.freeze([
-  { key: "queue", statuses: ["DRAFT", "READY"] },
+  { key: "draft", statuses: ["DRAFT"] },
+  { key: "queue", statuses: ["READY"] },
   { key: "running", statuses: ["RUNNING"] },
   { key: "review", statuses: ["REVIEWING"] },
   { key: "acceptance", statuses: ["VERIFIED", "AWAITING_ACCEPTANCE"] },
