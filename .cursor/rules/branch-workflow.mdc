@@ -1,0 +1,7 @@
+---
+description: Use dev for day-to-day work and main for releases
+alwaysApply: true
+---
+
+Follow [the branch and release policy](../../docs/BRANCHING.md). Target `dev`
+for ordinary changes. Merge `dev` into `main` only when releasing a new version.
