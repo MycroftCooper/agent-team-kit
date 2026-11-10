@@ -90,8 +90,9 @@ atk backup --to <new-backup-directory>
 atk restore --from <backup-directory>
 ```
 
-The backup contains a consistent SQLite snapshot, project artifacts and a
-checksum manifest. Restore validates the manifest and saved project paths, makes
+The backup contains a consistent SQLite snapshot, project artifacts, team resources and a
+checksum manifest. Restoring a backup copies saved resources over matching files
+and leaves other resource files in place. Restore validates the manifest and saved project paths, makes
 a safety backup, then restores state and referenced artifacts. Project source
 files are **not** part of this backup and are never rolled back by restore.
 Use your own source control or file backup for project code.

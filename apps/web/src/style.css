@@ -1387,6 +1387,19 @@ main {
 .agent-team-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
 .agent-resource { max-width: 720px; padding: 18px; }
 .agent-resource h4 { margin: 0 0 8px; font-size: 14px; }
+.team-resources { margin-bottom: 12px; }
+.team-resource-header { flex-wrap: wrap; }
+.team-resource-header h4 { margin: 0; }
+.team-resource-path { overflow-wrap: anywhere; }
+.team-resource-form { display: grid; gap: 10px; margin: 12px 0; }
+.team-resource-form label { display: grid; gap: 5px; }
+.team-resource-group { margin-top: 16px; }
+.team-resource-list { list-style: none; margin: 12px 0 0; padding: 0; }
+.team-resource-list > li + li { border-top: 1px solid var(--line); }
+.team-resource-list .list-row { flex-wrap: wrap; overflow-wrap: anywhere; }
+.team-resource-preview { margin: 0 18px 12px; }
+.team-resource-preview pre { margin: 0; }
+.team-resource-notice { flex-wrap: wrap; gap: 8px; margin: 12px 0; }
 .agent-cli-commands { padding-left: 19px; margin: 16px 0 20px; }
 .agent-cli-commands li { margin: 7px 0; }
 .agent-grid {
@@ -1820,8 +1833,20 @@ main {
   font-size: 12px;
   color: var(--text-soft);
 }
-.field > span {
+.field > span,
+.project-folder-label {
   font-weight: 500;
+}
+.project-folder-input {
+  display: flex;
+  gap: 8px;
+}
+.project-folder-input input {
+  min-width: 0;
+}
+.project-folder-input button {
+  flex: none;
+  white-space: nowrap;
 }
 .field textarea {
   resize: vertical;

@@ -1,10 +1,14 @@
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 
-export async function startDevWeb({ backendUrl, port }) {
+export async function startDevWeb({ backendUrl, port, waitForBackend }) {
   const server = await createServer({
     root: fileURLToPath(new URL(".", import.meta.url)),
     define: { "import.meta.env.VITE_ATK_AGENT_URL": JSON.stringify(backendUrl) },
+    plugins: waitForBackend ? [{
+      name: "atk-backend-reload",
+      configureServer(server) { server.middlewares.use("/api/v1", waitForBackend); },
+    }] : [],
     server: {
       host: "127.0.0.1",
       port,

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { createServer } from "../apps/backend/src/server.mjs";
 import { createAgentClient } from "../packages/agent-client/src/index.mjs";
 import { openBrowser } from "./browser.mjs";
@@ -90,6 +91,53 @@ try {
     );
   });
   const overviewRailWidth = await browser.evaluate(primaryRailWidth);
+  await step("automation shows live progress, elapsed time, custom fields and logs", async () => {
+    fs.writeFileSync(path.join(projectRoot, "automation-check.mjs"), [
+      'import fs from "node:fs";',
+      'console.log(\'::atk::{"progress":40,"info":{"artifact":"demo.txt"}}\');',
+      'while (!fs.existsSync("automation-continue.txt")) await new Promise((resolve) => setTimeout(resolve, 50));',
+      'console.log("Local check passed");',
+    ].join("\n"));
+    await browser.click("自动化", { exact: true });
+    await browser.click("新建流程", { exact: true });
+    await browser.click("演示流程", { exact: true });
+    await browser.fill("stepCommand", '"' + process.execPath + '" automation-check.mjs');
+    await browser.fill("automationInfo", "Environment=local");
+    await browser.submit();
+    await browser.wait("!document.querySelector('[role=dialog]')");
+    await browser.click("运行", { exact: true, within: "[...document.querySelectorAll('.automation-row')].find(row=>row.textContent.includes('演示流程'))" });
+    await browser.wait("document.querySelector('.automation-progress progress')?.value === 20 && document.querySelector('.automation-run-meta strong')?.textContent !== '00:00:00' && document.querySelector('.automation-info')?.innerText.includes('demo.txt')");
+    await browser.screenshot("automation-running");
+    fs.writeFileSync(path.join(projectRoot, "automation-continue.txt"), "");
+    await browser.wait("document.querySelector('.automation-progress progress')?.value === 100 && document.querySelector('.automation-run .section-title .badge')?.dataset.status === 'SUCCEEDED' && document.querySelector('.automation-log')?.textContent.includes('Local check passed')");
+    assert.equal(await browser.evaluate("document.querySelector('.automation-info').innerText.includes('Environment')"), true);
+    await browser.click("概览", { exact: true, within: "document.querySelector('.sidebar')" });
+  });
+  await step("a built-in workflow can watch a project-specific Git branch from the UI", async () => {
+    const branch = "checks/browser";
+    const git = (...args) => execFileSync("git", [
+      "-c", "user.name=ATK Browser Test", "-c", "user.email=atk@example.test",
+      "-c", "commit.gpgsign=false", "-c", "core.hooksPath=.git/no-hooks", ...args,
+    ], { cwd: projectRoot, encoding: "utf8", windowsHide: true }).trim();
+    git("init", "-b", branch);
+    git("commit", "--allow-empty", "-m", "baseline");
+    await browser.click("自动化", { exact: true });
+    const nav = await browser.evaluate("[...document.querySelectorAll('.sidebar nav button')].map(button=>button.getAttribute('aria-label'))");
+    assert.deepEqual(nav.slice(1, 4), ["工作", "自动化", "Agent 团队"]);
+    const smoke = "[...document.querySelectorAll('.automation-row')].find(row=>row.textContent.includes('冒烟测试'))";
+    await browser.click("编辑", { exact: true, within: smoke });
+    assert.equal(await browser.evaluate("document.querySelector('[name=automationTrigger]').value"), "MANUAL");
+    await browser.click("移除此步骤", { exact: true, within: "document.querySelectorAll('.automation-step-editor')[1]" });
+    await browser.fill("stepCommand", "echo Git-triggered check passed");
+    await browser.fill("automationTrigger", "GIT_COMMIT");
+    await browser.fill("automationBranch", branch);
+    await browser.submit();
+    await browser.wait("(" + smoke + ")?.textContent.includes('checks/browser 有新提交')");
+    git("commit", "--allow-empty", "-m", "trigger");
+    const sha = git("rev-parse", "HEAD").slice(0, 8);
+    await browser.wait("document.querySelector('.automation-trigger')?.textContent.includes('" + sha + "') && document.querySelector('.automation-log')?.textContent.includes('Git-triggered check passed')");
+    await browser.click("概览", { exact: true, within: "document.querySelector('.sidebar')" });
+  });
   const credentials = {};
   await step(
     "create PM, worker and reviewer identities in the UI",
@@ -151,12 +199,43 @@ try {
     await browser.click("成员", { exact: true });
     await browser.wait(`${content}?.innerText.includes('本机用户')`);
     await browser.click("Skills", { exact: true });
-    await browser.wait(`${content}?.innerText.includes('在 Agent 客户端管理 Skills')`);
+    await browser.wait(`${content}?.innerText.includes('skill/atk-create-automation/SKILL.md')`);
+    assert.ok(await browser.evaluate(`${content}?.innerText.includes('skill/atk-create-skill/SKILL.md')`));
+    assert.equal(await browser.evaluate(`${content}?.querySelector('[aria-label="编辑 atk-create-skill"], [aria-label="删除 atk-create-skill"]')`), null);
+    await browser.click("查看 atk-create-skill", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent.includes('name: atk-create-skill')`);
+    await browser.click("收起 atk-create-skill", { exact: true, within: content });
     assert.equal(await browser.evaluate(`${content}.innerText.includes('角色模板')`), false);
+    await browser.click("新建资源", { exact: true });
+    await browser.fill("resourceName", "release-notes");
+    await browser.fill("resourceContent", "# Release notes\nCheck the delivered files.");
+    await browser.click("创建资源", { exact: true });
+    await browser.wait(`${content}?.innerText.includes('skill/release-notes/SKILL.md')`);
+    assert.equal(server.app.resources.read("skill", "release-notes").content, "# Release notes\nCheck the delivered files.");
+    await browser.click("编辑 release-notes", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('[name=resourceEditContent]')?.value.startsWith('# Release notes')`);
+    await browser.fill("resourceEditContent", "# Updated release notes");
+    await browser.click("保存修改", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent === '# Updated release notes'`);
+    await browser.click("删除 release-notes", { exact: true, within: content });
+    await browser.click("取消删除", { exact: true, within: content });
+    assert.equal(server.app.resources.read("skill", "release-notes").content, "# Updated release notes");
+    await browser.click("删除 release-notes", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-preview .danger')?.disabled === false`);
+    await browser.click("确认删除", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-notice') && !${content}?.innerText.includes('skill/release-notes/SKILL.md')`);
+    assert.throws(() => server.app.resources.read("skill", "release-notes"), { code: "RESOURCE_NOT_FOUND" });
+    await browser.click("Agent 模板", { exact: true });
+    await browser.wait(`${content}?.innerText.includes('AGENT.md')`);
     await browser.click("MCP", { exact: true });
     await browser.click("查看 CLI 接入");
     await browser.wait(`${content}?.querySelector('pre')?.textContent.includes('atk-agent connect')`);
     assert.equal(await browser.evaluate(`${content}.querySelector('pre').textContent.includes('<credential>')`), true);
+    await browser.wait(`${content}?.innerText.includes('自带 CLI') && ${content}?.querySelectorAll('.team-resource-list .badge').length === 2`);
+    await browser.click("查看 atk", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent.includes('atk backup')`);
+    await browser.click("查看 atk-agent", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent.includes('atk-agent claim')`);
     await browser.click("全部 Agent", { exact: true });
     await browser.send("Emulation.setDeviceMetricsOverride", { width: 420, height: 900, deviceScaleFactor: 1, mobile: false });
     const narrowRailWidth = await browser.evaluate(primaryRailWidth);
@@ -767,6 +846,35 @@ try {
     await browser.click("Accept this plan", { exact: true });
     await browser.wait("!document.querySelector('[role=dialog]')");
     assert.equal(server.app.get("tasks", draft.id).status, "DONE");
+  });
+  await step("report a bug, return the first fix, and accept the second in the UI", async () => {
+    await workPage("Bugs");
+    await browser.click("New bug");
+    await browser.fill("bugTitle", "Opening a widget fails");
+    await browser.fill("bugDescription", "Open the same widget twice; the second open fails.");
+    await browser.fill("bugFiles", "bug-demo.txt");
+    await browser.click("Create bug", { exact: true });
+    await browser.wait("!document.querySelector('[role=dialog]') && document.querySelector('.task-list')?.innerText.includes('To fix')");
+    const attempt = await dev.claim({ projectId: project.id, kind: "BUG", waitMs: 0 });
+    assert.equal(attempt.spec.taskKind, "BUG");
+    await browser.wait("document.querySelector('.task-list')?.innerText.includes('Fixing')");
+    const submitFix = async (claim, content) => {
+      fs.writeFileSync(path.join(projectRoot, "bug-demo.txt"), content);
+      await dev.submit(claim.run.id, "result", { generation: claim.generation, outcome: "COMPLETED", stopped: true, summary: content });
+    };
+    await submitFix(attempt, "Initial widget fix");
+    await workPage("My inbox");
+    await browser.click("Review bug fix", { exact: true });
+    await browser.click("Reject and return", { exact: true });
+    await browser.fill("bugRejectionReason", "Check repeated opens");
+    await browser.click("Return to repair queue", { exact: true });
+    await browser.wait("document.querySelector('.detail-heading')?.innerText.includes('To fix')");
+    const next = await dev.claim({ projectId: project.id, kind: "BUG", waitMs: 0 });
+    assert.equal(next.spec.rework.summary, "Check repeated opens");
+    await submitFix(next, "Repeated opens now work");
+    await browser.click("Accept and close", { exact: true });
+    await browser.wait("document.querySelector('.detail-heading')?.innerText.includes('Closed')");
+    await browser.click("Close", { exact: true });
   });
   await step("manual access-code unlock survives reload without exposing the code in the URL", async () => {
     await browser.evaluate("sessionStorage.clear()");

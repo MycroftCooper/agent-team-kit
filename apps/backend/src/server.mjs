@@ -115,9 +115,13 @@ export function createServer({
   }
   let session = createSession(),
     maintenance,
+    automationTimer,
     streamTimer;
   let port = 0;
-  let shutdownHandler;
+  let shutdownHandler, closing;
+  function requireServing() {
+    requireThat(!closing, "SERVICE_RESTARTING", "The service is restarting; retry shortly", 503);
+  }
   const json = (res, status, value) => {
     res.writeHead(status, {
       "content-type": "application/json; charset=utf-8",
@@ -169,6 +173,7 @@ export function createServer({
     const deadline = Date.now() + number(body.waitMs, 0, 0, 30000);
     let result;
     do {
+      requireServing();
       result = app.claim(agentId, body);
       if (result.run || Date.now() >= deadline || req.aborted) return result;
       await new Promise((resolve) => {
@@ -187,6 +192,7 @@ export function createServer({
     const started = performance.now();
     let url;
     try {
+      requireServing();
       requireThat(req.url.length < 8192, "URL_TOO_LONG", "URL too long", 414);
       requireThat(
         isLoopbackRemote(req.socket.remoteAddress) &&
@@ -265,6 +271,7 @@ export function createServer({
       const body = ["POST", "PATCH", "PUT"].includes(method)
         ? await readBody(req)
         : {};
+      requireServing();
       const segments = pathname.split("/").filter(Boolean),
         route = isAgent ? segments.slice(3) : segments.slice(2);
       const [resource, id, action] = route;
@@ -279,6 +286,10 @@ export function createServer({
           result = app.heartbeat(agent.id, null, body);
         else if (method === "POST" && resource === "claims")
           result = await waitClaim(agent.id, body, req);
+        else if (method === "GET" && resource === "resources" && route.length === 1)
+          result = app.resources.list(url.searchParams.get("kind") ?? undefined);
+        else if (method === "GET" && resource === "resources" && route.length === 3)
+          result = app.resources.read(id, action);
         else if (method === "GET" && resource === "plans" && id) {
           const plan = app.get("plans", id),
             p = app.get("projects", plan.projectId),
@@ -375,8 +386,42 @@ export function createServer({
         ];
         if (method === "GET" && resource === "overview")
           result = app.overview(projectId);
+        else if (resource === "automations" && !id && method === "GET")
+          result = app.automations.list(projectId, number(url.searchParams.get("cursor"), 0, 0, 1_000_000));
+        else if (resource === "automations" && !id && method === "POST")
+          result = await app.automations.configure(projectId, null, body);
+        else if (resource === "automations" && id && !action && method === "PATCH")
+          result = await app.automations.configure(projectId, id, body);
+        else if (resource === "automations" && id && !action && method === "DELETE")
+          result = app.automations.remove(projectId, id, Number(url.searchParams.get("version")));
+        else if (resource === "automations" && id && action === "run" && method === "POST")
+          result = app.automations.start(projectId, id, body);
+        else if (resource === "automation-runs" && id && !action && method === "GET")
+          result = app.automations.detail(projectId, id);
+        else if (resource === "automation-runs" && id && action === "stop" && method === "POST")
+          result = app.automations.stop(projectId, id);
+        else if (method === "GET" && resource === "resources" && route.length <= 2)
+          result = app.resources.list(id);
+        else if (method === "GET" && resource === "resources" && route.length === 3)
+          result = app.resources.read(id, action, { parseConfig: false });
+        else if (method === "POST" && resource === "resources" && route.length === 2)
+          result = app.resources.create(id, body);
+        else if (method === "PATCH" && resource === "resources" && route.length === 3)
+          result = app.resources.update(id, action, body);
+        else if (method === "DELETE" && resource === "resources" && route.length === 3)
+          result = app.resources.remove(id, action, url.searchParams.get("revision"));
         else if (method === "GET" && resource === "inbox")
           result = app.inbox(projectId);
+        else if (resource === "bugs" && !id && method === "GET")
+          result = app.listBugs(projectId, {
+            status: url.searchParams.get("status") ?? undefined,
+            limit: number(url.searchParams.get("limit"), 30, 1, 100),
+            offset: number(url.searchParams.get("cursor"), 0, 0, 1_000_000),
+          });
+        else if (resource === "bugs" && !id && method === "POST")
+          result = app.createBug(body);
+        else if (resource === "bugs" && id && action === "review" && method === "POST" && route.length === 3)
+          result = app.reviewBug(id, body, projectId);
         else if (method === "GET" && resource === "tasks" && id === "tags" && !action)
           result = app.taskTags(projectId);
         else if (method === "GET" && resource === "tasks" && id === "board" && !action)
@@ -619,6 +664,28 @@ export function createServer({
         );
     }
   });
+  function close() {
+    if (closing) return closing;
+    // Set the guard before aborting connections so an in-flight claim cannot
+    // dispatch new work after the reload's idle check.
+    closing = Promise.resolve().then(async () => {
+      clearInterval(maintenance);
+      clearInterval(automationTimer);
+      clearInterval(streamTimer);
+      const stopAutomations = app.automations.shutdown();
+      for (const c of streams) c.res.end();
+      streams.clear();
+      app.signals.off("change", pump);
+      try {
+        const stopHttp = new Promise((resolve) => server.close(resolve));
+        server.closeAllConnections();
+        await Promise.all([stopHttp, stopAutomations]);
+      } finally {
+        try { app.close(); } finally { ownership.release(); }
+      }
+    });
+    return closing;
+  }
   return {
     app,
     server,
@@ -645,6 +712,10 @@ export function createServer({
         }
       }, 1000);
       maintenance.unref();
+      const pollAutomations = () => void app.automations.poll().catch((error) => logger.error?.(error.message));
+      pollAutomations();
+      automationTimer = setInterval(pollAutomations, 2000);
+      automationTimer.unref();
       streamTimer = setInterval(() => {
         for (const c of streams) c.res.write(": heartbeat\n\n");
       }, 15000);
@@ -652,19 +723,11 @@ export function createServer({
       const url = `http://127.0.0.1:${port}`;
       return { url, browserUrl: browserUrl(url, browserAccess), port };
     },
-    async close() {
-      clearInterval(maintenance);
-      clearInterval(streamTimer);
-      for (const c of streams) c.res.end();
-      streams.clear();
-      app.signals.off("change", pump);
-      server.closeAllConnections();
-      await new Promise((resolve) => server.close(resolve));
-      try {
-        app.close();
-      } finally {
-        ownership.release();
-      }
+    close,
+    closeWhenIdle() {
+      if (closing) return closing;
+      if (app.store.activeRuns().length || app.automations.busy()) return null;
+      return close();
     },
   };
 }

@@ -13,6 +13,9 @@ const TABLES = [
   "locks",
   "acceptances",
   "materializations",
+  "automations",
+  "automation_runs",
+  "automation_trigger_states",
 ];
 export function openStore(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -134,6 +137,8 @@ export function openStore(file) {
         stage,
         planId,
         statuses,
+        kind,
+        excludeKind,
         owner,
         search,
         hideChildren,
@@ -156,6 +161,7 @@ export function openStore(file) {
         ["agent_id", agentId],
         ["stage", stage],
         ["json_extract(data,'$.planId')", planId],
+        ["json_extract(data,'$.kind')", kind],
       ])
         if (val !== undefined && val !== null) {
           filters.push(`${col}=?`);
@@ -164,6 +170,10 @@ export function openStore(file) {
       if (statuses?.length) {
         filters.push(`status IN (${statuses.map(() => "?").join(",")})`);
         params.push(...statuses);
+      }
+      if (excludeKind) {
+        filters.push("json_extract(data,'$.kind') IS NOT ?");
+        params.push(excludeKind);
       }
       if (owner === "REQUEST") {
         filters.push("json_extract(data,'$.kind')='REQUEST'");

@@ -13,6 +13,8 @@ const root = fs.mkdtempSync(path.join(output, "case-"));
 const data = path.join(root, "data"), profile = path.join(root, "profile");
 const project = path.join(root, "project");
 for (const dir of [profile, project]) fs.mkdirSync(dir);
+const backendProbeDir = path.join(profile, "backend-reload-probe");
+fs.mkdirSync(backendProbeDir);
 const logFile = path.join(root, "desktop.log");
 const log = fs.openSync(logFile, "w");
 const system = process.env.SystemRoot ?? "C:\\Windows";
@@ -101,6 +103,16 @@ try {
   await browser.wait("!document.querySelector('[role=dialog]') && document.body.innerText.includes('Desktop Proof')");
   await browser.wait("document.querySelector('.desktop-titlebar select[name=workspace]')?.selectedOptions[0]?.textContent === 'Desktop Proof'");
   pass("the title bar can add workspaces and displays the active workspace; the sidebar starts with navigation");
+  await browser.click("自动化", { exact: true });
+  await browser.click("新建流程", { exact: true });
+  await browser.click("演示流程", { exact: true });
+  await browser.submit();
+  await browser.wait("!document.querySelector('[role=dialog]')");
+  await browser.click("运行", { exact: true, within: "[...document.querySelectorAll('.automation-row')].find(row=>row.textContent.includes('演示流程'))" });
+  await browser.wait("document.querySelector('.automation-progress progress')?.value === 100 && document.querySelector('.automation-log')?.textContent.includes('Demo completed')");
+  await browser.screenshot("desktop-automation");
+  await browser.click("概览", { exact: true });
+  pass("the Electron backend executes a local workflow and shows its result without system Node.js on PATH");
   await browser.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
   await browser.click("切换到浅色主题", { exact: true, within: "document.querySelector('.app-footer')" });
   await browser.wait("getComputedStyle(document.querySelector('.desktop-titlebar')).backgroundColor === 'rgb(245, 246, 250)' && getComputedStyle(document.querySelector('.project-card')).backgroundColor === 'rgb(255, 255, 255)'");
@@ -157,11 +169,25 @@ try {
   await browser.wait("!document.querySelector('[role=dialog]')");
   const delivery = await agent(worker, "claim", "--wait", "0");
   assert.ok(delivery.run);
+  const readHealth = async () => (await fetch(`${baseUrl}/api/v1/system/health`)).json();
+  const oldBackend = (await readHealth()).instanceId;
+  const originalPage = await browser.evaluate("performance.timeOrigin");
+  fs.writeFileSync(path.join(backendProbeDir, "changed.mjs"), "export const changed = true;\n");
+  await until(async () => fs.readFileSync(logFile, "utf8").includes("ATK backend reload deferred"));
+  assert.equal((await readHealth()).instanceId, oldBackend, "a live execution must keep its backend");
   await agent(worker, "heartbeat", delivery.run.id, "--generation", String(delivery.generation));
   fs.writeFileSync(path.join(project, "output.txt"), "Desktop Agent delivery\n");
   assert.equal((await receipt(worker, delivery, "result", {
     outcome: "COMPLETED", stopped: true, summary: "Wrote output.txt",
   })).persisted, true);
+  const newBackend = await until(async () => {
+    const health = await readHealth();
+    return health.ok && health.instanceId !== oldBackend && health.instanceId;
+  });
+  await browser.wait(`fetch('/api/v1/system/health').then(r=>r.json()).then(r=>r.instanceId === ${JSON.stringify(newBackend)})`);
+  assert.equal(await browser.evaluate("performance.timeOrigin"), originalPage, "backend reload must keep the renderer page");
+  await browser.wait("document.querySelector('.app-footer')?.innerText.includes('实时同步')");
+  pass("a backend source save waits for the active lease and reloads on the same port without refreshing the renderer");
   await browser.click("查看交付");
   await browser.click("确认整份计划验收通过");
   await browser.wait("!document.querySelector('[role=dialog]')");
@@ -202,6 +228,7 @@ try {
   fs.writeFileSync(path.join(output, "report.json"), JSON.stringify({ passed, logFile }, null, 2));
 } catch (error) {
   console.error(fs.readFileSync(logFile, "utf8"));
+  if (browser) console.error("Desktop alerts:", await browser.evaluate("[...document.querySelectorAll('[role=alert]')].map(node=>node.textContent)").catch(() => []));
   throw error;
 } finally {
   await browser?.close();

@@ -11,7 +11,7 @@ import {
 } from "../../../packages/project-files/src/index.mjs";
 function idle(service) {
   requireThat(
-    service.store
+    !service.automations.busy() && service.store
       .all("runs")
       .every(
         (r) => !["RUNNING", "QUARANTINED", "STOP_REQUESTED"].includes(r.status),
@@ -42,6 +42,12 @@ function files(root, relative = "", out = {}) {
   }
   return out;
 }
+function resourceFiles(root) {
+  const stat = fs.lstatSync(root, { throwIfNoEntry: false });
+  requireThat(!stat || (stat.isDirectory() && !stat.isSymbolicLink()),
+    "BACKUP_SYMLINK", "Resource backup requires a real directory", 409);
+  return stat ? files(root, "", Object.create(null)) : {};
+}
 export function backup(service, destination) {
   idle(service);
   service.flushDocuments();
@@ -71,12 +77,14 @@ export function backup(service, destination) {
   for (const r of service.store.all("runs"))
     if (r.artifact) service.artifact(r.id);
   requireThat(
-    !projects.some((p) => inside(p.docsRoot, dest)),
+    !projects.some((p) => inside(p.docsRoot, dest)) && !inside(service.resources.root, dest),
     "INVALID_PATH",
-    "Backup must be outside project data directories",
+    "Backup must be outside project data and team resource directories",
   );
   fs.mkdirSync(dest, { recursive: true });
   service.store.snapshot(path.join(dest, "next.db"));
+  if (Object.keys(resourceFiles(service.resources.root)).length)
+    fs.cpSync(service.resources.root, path.join(dest, "resources"), { recursive: true });
   const entries = [];
   for (const p of projects) {
     const source = path.join(dest, "projects", p.id);
@@ -122,6 +130,10 @@ export function restore(service, source) {
       { path: rel },
     );
   }
+  const resourceSource = path.join(root, "resources"),
+    resources = resourceFiles(resourceSource);
+  requireThat(Object.entries(resources).every(([rel, hash]) => manifest.files[`resources/${rel}`] === hash),
+    "INVALID_BACKUP", "Backup contains unverified team resource files", 409);
   const check = new DatabaseSync(path.join(root, "next.db"), {
     readOnly: true,
   });
@@ -170,6 +182,8 @@ export function restore(service, source) {
       });
     }
   }
+  if (Object.keys(resources).length)
+    fs.cpSync(resourceSource, service.resources.root, { recursive: true });
   service.store.close();
   try {
     for (const suffix of ["-wal", "-shm"])
@@ -181,6 +195,7 @@ export function restore(service, source) {
   } finally {
     service.store.reopen();
   }
+  service.automations.seedAll();
   service.signals.emit("restore");
   return { restored: true, safetyBackup: safety.destination };
 }

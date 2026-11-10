@@ -29,6 +29,8 @@ Base URL: `http://127.0.0.1:1421/api/agent/v1`.
 | `POST /runs/:id/stopped`   | Confirm a requested/quarantined execution stopped            |
 | `GET /runs/:id/artifact`   | Read authorized project output on demand                     |
 | `GET /plans/:id`           | Read an authorized previous plan during revision             |
+| `GET /resources?kind=`    | List shared team resource entries; `kind` is optional        |
+| `GET /resources/:kind/:name` | Read a resource's entry or built-in CLI help; MCP entries include parsed settings |
 
 `atk-agent doctor` first probes the local ATK health endpoint without a token,
 then verifies the configured credential with `GET /identity`. It does not claim
@@ -36,9 +38,13 @@ work, update contact time, or renew a lease. Run `atk-agent connect` to report
 contact; the browser can then show the last check-in. Recent contact does not
 prove that the agent is polling for tasks.
 
-Claims accept `{projectId?,taskId?,stage?,files?,waitMs?}`. `waitMs` is 0–30000.
+Claims accept `{projectId?,taskId?,stage?,kind?,files?,waitMs?}`. `waitMs` is 0–30000.
 Stage is checked against the identity: ORCHESTRATOR/PLANNING, WORKER/EXECUTION,
 REVIEWER/REVIEW. Optional `files` must exactly match the approved full scope.
+Optional `kind` is `REQUEST`, `WORK`, or `BUG`; the CLI accepts `--kind bug` to
+limit a repair agent's claims to bugs. Bugs use the same execution result and
+heartbeat endpoints. Their spec has `taskKind: "BUG"`, a null `planId`, and
+`rework` with human feedback and the previous output reference after rejection.
 Without it the server uses that approved scope. No eligible work returns
 `{run:null,waiting:[...],retryAfterMs:1000}`. Prefer another long poll, not a hot loop.
 
@@ -51,6 +57,13 @@ A successful claim contains `{run,spec,generation,leaseUntil}`. Follow `spec`:
 it freezes the task/plan versions, function instructions, project root, file
 scopes, dependencies, check requirements and output contract. Do not read other
 projects or fetch entire histories as context.
+
+`connect` and successful agent claims advertise the shared library through
+`resources` and `spec.resources`, respectively. Follow its `ref` or run
+`atk-agent resources list` to discover resources on demand. Entries are shared
+across the local installation and reflect current files; they are not frozen
+with approved roles or plans. See [Team resources](TEAM-RESOURCES.md) for how to
+load a skill or template, run a CLI resource, or connect an MCP client.
 
 Renew every 10 seconds with `{generation}`; the lease lasts 30 seconds. Stop
 writing if renewal fails or returns `stopRequired:true`. Expired leases are not

@@ -10,6 +10,7 @@ import {
   browserUrl,
 } from "../../packages/platform/src/index.mjs";
 import { VERSION } from "../../packages/contracts/src/index.mjs";
+import { ATK_HELP } from "../../packages/platform/src/cli-help.mjs";
 const args = argumentsOf(process.argv.slice(2)),
   command = args._[0] ?? "help",
   dataDir = path.resolve(args.data ?? runtimePaths().root),
@@ -63,9 +64,7 @@ async function main() {
     return;
   }
   if (command === "help" || args.help) {
-    console.log(
-      "Agent Team Kit\n  atk start [--port 1421] [--data <directory>]\n  atk stop|status|logs [--data <directory>]\n  atk backup [--to <new directory>]\n  atk restore --from <backup directory>\n\nExternal agents use atk-agent. No target-project installation is needed.",
-    );
+    console.log(ATK_HELP);
     return;
   }
   if (command === "start") {

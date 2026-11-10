@@ -44,8 +44,10 @@ test("backup rejects live runs and restore preserves database and referenced art
   fs.writeFileSync(path.join(f.p.root, "a.txt"), "a");
   finish(f, r);
   f.app.flushDocuments();
+  const skill = f.app.resources.create("skill", { name: "release", content: "# Original release notes\n" });
   const target = path.join(f.root, "backup");
   backup(f.app, target);
+  fs.writeFileSync(skill.path, "changed after backup");
   const original = f.app.list("tasks").total;
   f.app.createDraft({
     projectId: f.p.id,
@@ -55,6 +57,7 @@ test("backup rejects live runs and restore preserves database and referenced art
   const restored = restore(f.app, target);
   assert.ok(restored.safetyBackup);
   assert.equal(f.app.list("tasks").total, original);
+  assert.equal(f.app.resources.read("skill", "release").content, "# Original release notes\n");
   assert.ok(
     fs.existsSync(path.join(f.p.docsRoot, "plans", p.plan.id + ".json")),
   );

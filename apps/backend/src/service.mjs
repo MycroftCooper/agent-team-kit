@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
+import { createAutomations } from "./automations.mjs";
+import { createResourceLibrary, resourceDiscovery } from "./resources.mjs";
 import { openStore } from "../../../packages/database/src/index.mjs";
 import {
   AppError,
@@ -67,7 +69,8 @@ const fileMetadata = (files) =>
     Object.entries(files).map(([file, { text, ...value }]) => [file, value]),
   );
 export function createService({ dataDir, now = () => Date.now() } = {}) {
-  const store = openStore(path.join(dataDir, "data", "next.db")),
+  const resources = createResourceLibrary(dataDir),
+    store = openStore(path.join(dataDir, "data", "next.db")),
     signals = new EventEmitter();
   signals.setMaxListeners(0);
   const at = () => new Date(now()).toISOString();
@@ -150,7 +153,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         assignee: { id: task.assignedAgentId, name: assignee?.name ?? null, revoked: !assignee || assignee.revoked },
       };
     }
-    if (task.kind !== "WORK" || task.status !== "READY") return task;
+    if (!["WORK", "BUG"].includes(task.kind) || task.status !== "READY") return task;
     const unmet = task.deps
       .map((id) => get("tasks", id))
       .filter((t) => !["VERIFIED", "DONE"].includes(t.status));
@@ -233,7 +236,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     );
   }
   function eligibleWorker(agent, role, team, project, plan, task) {
-    return agent && !agent.revoked && agent.id !== plan.authorAgentId &&
+    return agent && !agent.revoked && agent.id !== plan?.authorAgentId &&
       role.function === "WORKER" && agent.roleId === task.roleId &&
       agent.teamId === team.id && allowed(agent, team, project);
   }
@@ -418,6 +421,15 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       project: { id: p.id, name: p.name, root: p.root, docsRoot: p.docsRoot },
       lease: { heartbeatMs: HEARTBEAT_MS, leaseMs: LEASE_MS },
     };
+    if (stage !== "HUMAN") base.resources = resourceDiscovery;
+    if (task.kind === "BUG") {
+      base.taskKind = "BUG";
+      base.instructions += "\nReproduce and fix the reported bug within the leased scope. Describe how you verified the fix; a human will accept or return it for rework.";
+      if (task.bugReview?.decision === "REJECT") {
+        const { summary, targetHash, runId } = task.bugReview;
+        base.rework = { verdict: "CHANGES_REQUESTED", summary, targetHash, previousOutputRef: `/api/agent/v1/runs/${runId}/artifact` };
+      }
+    }
     if (stage === "PLANNING") {
       const team = get("teams", p.teamId);
       base.roles = team.roleIds.map((id) => get("roles", id));
@@ -573,15 +585,18 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         defaultReview: "NONE",
       });
     });
+  const automations = createAutomations({ store, get, make, put, project, expected, emit, at });
   const api = {
     store,
     signals,
     dataDir,
+    resources,
+    automations,
     list(table, filters = {}) {
-      const page = store.list(table, filters);
+      const page = store.list(table, table === "tasks" && !filters.kind ? { ...filters, excludeKind: "BUG" } : filters);
       const currentLocks =
         table === "tasks" &&
-        page.items.some((t) => t.kind === "WORK" && t.status === "READY")
+        page.items.some((t) => ["WORK", "BUG"].includes(t.kind) && t.status === "READY")
           ? store.all("locks")
           : undefined;
       return {
@@ -627,7 +642,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       const pageColumn = (column, lane) => {
         const filter = {
           projectId, status, statuses: column.statuses, owner: lane ?? column.owner ?? owner,
-          search, sort, direction, hideChildren, deadline, tag, limit: lane ? 10 : 20,
+          search, sort, direction, hideChildren, deadline, tag, excludeKind: "BUG", limit: lane ? 10 : 20,
         };
         const cursorKey = lane ? `${lane}.${column.key}` : column.key;
         let offset = integer(offsets[cursorKey], 0, 0, 1_000_000);
@@ -725,23 +740,23 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     },
     taskDispatch(id) {
       const task = get("tasks", id);
-      if (task.kind !== "WORK" || task.executorType !== "AGENT" || task.status !== "READY")
+      if (!["WORK", "BUG"].includes(task.kind) || task.executorType !== "AGENT" || task.status !== "READY")
         return null;
       const waiting = taskProjection(task).waiting;
       if (waiting) return { code: waiting.code, roleId: task.roleId };
-      const p = project(task.projectId), plan = get("plans", task.planId);
-      if (plan.status !== "APPROVED")
+      const p = project(task.projectId), plan = task.kind === "BUG" ? null : get("plans", task.planId);
+      if (plan && plan.status !== "APPROVED")
         return { code: "PLAN_NOT_APPROVED", roleId: task.roleId };
       const team = get("teams", p.teamId), role = get("roles", task.roleId);
       try {
-        permittedScopes(p, task.files, plan.roleSnapshots?.[role.id] ?? role);
+        permittedScopes(p, task.files, plan?.roleSnapshots?.[role.id] ?? role);
         requireThat(canonical(p.docsRoot) === p.docsRoot, "PROJECT_DATA_MOVED");
       } catch (error) {
         return { code: error.code ?? "PROJECT_UNAVAILABLE", roleId: role.id };
       }
       const agents = store.all("agents");
       const eligible = agents.filter(
-        (a) => eligibleWorker(a, role, team, p, plan, task) &&
+        (a) => (task.kind !== "BUG" || team.roleIds.includes(role.id)) && eligibleWorker(a, role, team, p, plan, task) &&
           (!task.assignedAgentId || a.id === task.assignedAgentId),
       );
       const runs = working(), used = new Map(), checkedAt = now();
@@ -781,6 +796,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           status: "AVAILABLE",
           archived: false,
         });
+        automations.seed(p.id);
         queueDoc(p, "project", p.id, {
           id: p.id,
           name: p.name,
@@ -795,7 +811,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         const p = get("projects", id);
         expected(p, body.version);
         requireThat(
-          !working().some((r) => r.projectId === id),
+          !working().some((r) => r.projectId === id) && !automations.busy(id),
           "PROJECT_BUSY",
           "Stop active and uncertain runs before changing the project",
           409,
@@ -1006,6 +1022,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           agent: safeAgent(next),
           heartbeatMs: HEARTBEAT_MS,
           leaseMs: LEASE_MS,
+          resources: resourceDiscovery,
         };
       });
     },
@@ -1030,6 +1047,61 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         queueDoc(p, "requests", t.id, t);
         emit("task.created", p.id, t.id);
         return t;
+      });
+    },
+    listBugs(projectId, { status, limit, offset } = {}) {
+      get("projects", requiredString(projectId, "projectId"));
+      requireThat(!status || ["READY", "RUNNING", "AWAITING_ACCEPTANCE", "DONE", "BLOCKED"].includes(status),
+        "VALIDATION_ERROR", "Invalid bug status");
+      return api.list("tasks", { projectId, kind: "BUG", status: status || undefined, limit, offset, newest: true });
+    },
+    createBug(body) {
+      return store.tx(() => {
+        const p = project(requiredString(body.projectId, "projectId"));
+        const role = get("roles", requiredString(body.roleId, "roleId"));
+        const team = get("teams", p.teamId);
+        requireThat(role.function === "WORKER" && team.roleIds.includes(role.id),
+          "INVALID_BUG_ROLE", "Choose a worker role from the project's squad");
+        const files = normalizeScopes(body.files ?? role.files);
+        requireThat(files.length > 0, "VALIDATION_ERROR", "A bug needs a writable file scope");
+        permittedScopes(p, files, role);
+        const bug = make("tasks", {
+          projectId: p.id, kind: "BUG", executorType: "AGENT", roleId: role.id, files,
+          title: requiredString(body.title, "title", 256),
+          description: requiredString(body.description, "description"),
+          acceptance: typeof body.acceptance === "string" ? body.acceptance.trim() : "",
+          status: "READY", priority: 2, parentId: null, planId: null, deps: [], checks: [],
+          latestRunId: null, resultHash: null, blockReason: null,
+        });
+        queueDoc(p, "bugs", bug.id, bug);
+        emit("task.created", p.id, bug.id);
+        return bug;
+      });
+    },
+    reviewBug(id, body, projectId) {
+      return store.tx(() => {
+        const bug = get("tasks", id);
+        requireThat(bug.kind === "BUG" && (!projectId || bug.projectId === projectId), "NOT_FOUND", "Bug not found", 404);
+        const p = project(bug.projectId);
+        expected(bug, body.version);
+        requireThat(bug.status === "AWAITING_ACCEPTANCE" && bug.resultHash && bug.resultHash === body.targetHash,
+          "APPROVAL_STALE", "The bug no longer has this fix awaiting acceptance", 409);
+        requireThat(["ACCEPT", "REJECT"].includes(body.decision), "VALIDATION_ERROR", "Choose accept or reject");
+        const accepted = body.decision === "ACCEPT";
+        const summary = accepted ? null : requiredString(body.reason, "reason", 8192);
+        if (accepted) {
+          const locks = conflicts(locksFor(bug.files, p));
+          requireThat(!locks.length, "FILE_LOCKED", "Wait for active writers before accepting", 409, { locks });
+          const receipt = api.artifact(bug.latestRunId);
+          const changes = currentDifferences(p, receipt.after, bug.files);
+          requireThat(!changes.length, "APPROVAL_STALE", "Fix files changed; return the bug to the repair queue", 409, { changes });
+        }
+        const next = put("tasks", { ...bug, status: accepted ? "DONE" : "READY",
+          bugReview: { decision: body.decision, summary, runId: bug.latestRunId, targetHash: bug.resultHash, reviewedAt: at() },
+        });
+        queueDoc(p, "bugs", id, next);
+        emit("task.updated", p.id, id, { bugDecision: body.decision });
+        return next;
       });
     },
     claim(agentId, body = {}) {
@@ -1066,7 +1138,10 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           "Stage does not match this identity",
           403,
         );
+        requireThat(body.kind === undefined || ["BUG", "WORK", "REQUEST"].includes(body.kind),
+          "VALIDATION_ERROR", "Use BUG, WORK or REQUEST for claim kind");
         const candidates = store.all("tasks", {
+          kind: body.kind,
           status:
             stage === "PLANNING"
               ? "DRAFT"
@@ -1086,16 +1161,20 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
             continue;
           }
           if (!allowed(a, team, p)) continue;
-          if (stage === "PLANNING" && task.kind !== "REQUEST") continue;
-          if (
-            stage !== "PLANNING" &&
-            (task.kind !== "WORK" || task.executorType !== "AGENT")
-          )
-            continue;
           if (activeRuns.some((r) => r.taskId === task.id)) continue;
           const plan = task.planId ? get("plans", task.planId) : null;
-          if (stage === "PLANNING" && plan?.status === "SUBMITTED") continue;
-          if (stage !== "PLANNING") {
+          if (task.kind === "BUG") {
+            if (stage !== "EXECUTION" || !team.roleIds.includes(role.id) || !eligibleWorker(a, role, team, p, null, task)) continue;
+            try { permittedScopes(p, task.files, role); }
+            catch (error) {
+              if (!(error instanceof AppError)) throw error;
+              waits.push({ taskId: task.id, reason: error.code });
+              continue;
+            }
+          } else if (stage === "PLANNING") {
+            if (task.kind !== "REQUEST" || plan?.status === "SUBMITTED") continue;
+          } else {
+            if (task.kind !== "WORK" || task.executorType !== "AGENT") continue;
             if (plan?.status !== "APPROVED" || plan.authorAgentId === a.id)
               continue;
             if (stage === "EXECUTION"
@@ -1515,7 +1594,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         });
         let status =
           body.outcome === "COMPLETED"
-            ? run.stage === "HUMAN"
+            ? task.kind === "BUG" ? "AWAITING_ACCEPTANCE" : run.stage === "HUMAN"
               ? "DONE"
               : task.reviewPolicy === "INDEPENDENT"
                 ? "REVIEWING"
@@ -1534,6 +1613,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         unlock(runId);
         invalidateTargets(p);
         if (run.planId) refreshSource(run.planId);
+        if (task.kind === "BUG") queueDoc(p, "bugs", task.id, updated);
         emit("task.updated", p.id, task.id);
         queueDoc(p, "receipts", runId, {
           runId,
@@ -1708,7 +1788,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         const task = get("tasks", taskId);
         expected(task, body.version);
         requireThat(
-          task.kind === "WORK" && task.status === "BLOCKED",
+          ["WORK", "BUG"].includes(task.kind) && task.status === "BLOCKED",
           "TASK_NOT_BLOCKED",
           "Only blocked execution tasks can be retried",
           409,
@@ -1719,21 +1799,18 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           "Confirm old execution is stopped",
           409,
         );
-        const plan = get("plans", task.planId);
-        requireThat(
-          plan.status === "APPROVED",
-          "PLAN_NOT_APPROVED",
-          "Plan needs approval",
-          409,
-        );
+        if (task.kind === "BUG") project(task.projectId);
+        else requireThat(get("plans", task.planId).status === "APPROVED", "PLAN_NOT_APPROVED", "Plan needs approval", 409);
         const next = put("tasks", {
           ...task,
           status: "READY",
           blockReason: null,
           drift: null,
         });
-        const source = get("tasks", task.parentId);
-        put("tasks", { ...source, status: "RUNNING", blockReason: null });
+        if (task.kind === "WORK") {
+          const source = get("tasks", task.parentId);
+          put("tasks", { ...source, status: "RUNNING", blockReason: null });
+        }
         emit("task.requeued", task.projectId, task.id);
         return next;
       });
@@ -2088,8 +2165,9 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
             (!projectId || r.projectId === projectId) && r.status !== "RUNNING",
         ),
         blockedTasks: [...byId.values()].filter(
-          (t) => t.kind === "WORK" && t.status === "BLOCKED",
+          (t) => ["WORK", "BUG"].includes(t.kind) && t.status === "BLOCKED",
         ),
+        bugs: [...byId.values()].filter((t) => t.kind === "BUG" && t.status === "AWAITING_ACCEPTANCE"),
         materializations: store.all("materializations", {
           ...filter,
           status: "FAILED",
@@ -2097,6 +2175,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       };
     },
     close() {
+      automations.close();
       store.close();
       signals.removeAllListeners();
     },

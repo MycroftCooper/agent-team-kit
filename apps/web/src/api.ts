@@ -38,24 +38,34 @@ export async function authorize(code?: string) {
   }
   return auth();
 }
+async function authorizedFetch(route: string, options: RequestInit = {}) {
+  function send({ token, csrf }: { token: string; csrf: string }) {
+    const headers = new Headers(options.headers);
+    headers.set("x-atk-token", token);
+    headers.set("x-atk-csrf", csrf);
+    return fetch("/api/v1" + route, { ...options, headers });
+  }
+  const original = auth(), cached = session;
+  const response = await send(await original);
+  if (response.status !== 401) return response;
+  // Authentication failed before the backend dispatched the request. Its
+  // in-memory session may have been replaced by a development reload.
+  if (session === cached) session = null;
+  await response.body?.cancel();
+  return send(await auth());
+}
 export async function api<T = Row>(
   route: string,
   body?: unknown,
   method?: string,
 ): Promise<T> {
-  const s = await auth();
-  const r = await fetch("/api/v1" + route, {
+  const r = await authorizedFetch(route, {
     method: method ?? (body === undefined ? "GET" : "POST"),
-    headers: {
-      "content-type": "application/json",
-      "x-atk-token": s.token,
-      "x-atk-csrf": s.csrf,
-    },
+    headers: { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await r.json();
   if (!r.ok) {
-    if (r.status === 401) session = null;
     const error = new Error(data.error?.message ?? r.statusText);
     Object.assign(error, {
       code: data.error?.code,
@@ -129,16 +139,11 @@ export function useLive(onChange: () => void) {
     async function connect() {
       controller = new AbortController();
       try {
-        const s = await auth();
-        const response = await fetch("/api/v1/events/stream", {
-          headers: {
-            "x-atk-token": s.token,
-            ...(seq === null ? {} : { "last-event-id": String(seq) }),
-          },
+        const response = await authorizedFetch("/events/stream", {
+          headers: seq === null ? {} : { "last-event-id": String(seq) },
           signal: controller.signal,
         });
         if (!response.ok || !response.body) {
-          if (response.status === 401) session = null;
           throw new Error("Stream unavailable");
         }
         setConnection("live");

@@ -10,25 +10,35 @@ API; they neither inherit a browser session nor choose their own function.
 Browser ── /api/v1 + SSE ── Backend ── SQLite (one global authority)
                               │
 External agents ─ /api/agent/v1┤
-                              └── project/.agent-team (documents + snapshots)
+                              ├── project/.agent-team (documents + snapshots)
+                              └── ATK data/resources (shared team resources)
 ```
 
 The backend uses pure domain and scheduling functions inside atomic claims.
 There is no resident scheduler worker, runtime host, provider SDK or model route.
 The launcher manages only the backend. The machine CLI handles HTTP, receipt
-retry and lease renewal, never AI process execution.
+retry and lease renewal. It can launch an explicitly requested team CLI script
+or stdio MCP server in the external client's process environment. The backend
+does not launch these resources, and ATK does not execute AI processes.
+
+Automation configuration uses the authenticated human API. Commands run in the
+registered project root, either on demand or when a configured local Git branch
+advances and has a clean checkout. The workflow, its Git cursor and run records
+are kept in SQLite. Lifecycle events use the existing SSE stream; live details
+and bounded log tails are fetched only in the run view.
 
 Node.js 24, built-in `node:sqlite`, React/TypeScript/Vite. Production Node modules
 use relative package paths so the installed package needs no workspace links.
 The web build bundles React. Tests use throwaway SQLite files rather than a
 second production memory-store implementation.
 
-On Windows, `dev.bat` opens the same React UI in an Electron window. An
-Electron utility process runs the existing backend and a loopback Vite server;
-Vite proxies the human API and SSE, while external Agents still call the
-backend directly. The window has no Node integration. Vite refreshes renderer
-code without restarting the utility process; backend and desktop main changes
-require relaunching the development app.
+On Windows, `dev.bat` opens the same React UI in an Electron window. Two
+utility processes run the backend and the loopback Vite server. Vite proxies the
+human API and SSE; external Agents call the backend directly. The renderer has
+no Node integration. Development source changes restart only the backend
+process on the same port, after active or uncertain tasks and automations have
+settled. The renderer reconnects over SSE without reloading the page. Electron
+main process and startup configuration changes require relaunching the app.
 
 ## State and identity
 
@@ -42,6 +52,10 @@ require relaunching the development app.
 - HUMAN work starts through the UI and completes through explicit human action.
   Its browser renews the lease across pages and workspace switches. A lost human lease uses
   the same conservative recovery rules as an agent lease.
+- BUG tasks are direct repair work and have no plan. The selected worker role
+  claims them under the same file locks and lease rules. A successful execution
+  goes to AWAITING_ACCEPTANCE. Human acceptance closes the bug; rejection
+  requeues it with feedback and a reference to the previous receipt.
 - Failed execution, content drift, review exhaustion and lease loss are BLOCKED
   reasons, not successful completion. Human retry creates another generation.
 - A plan's author identity cannot execute/review its work. An execution author

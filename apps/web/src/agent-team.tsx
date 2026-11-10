@@ -1,20 +1,22 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { LEASE_MS, type Page, type Row } from "@atk/contracts";
 import { useData } from "./api";
+import { TeamResources } from "./team-resources";
 
 type Translate = (zh: string, en: string) => string;
-type Section = "agents" | "mine" | "squads" | "members" | "skills" | "mcp" | "cli";
+type Section = "agents" | "mine" | "squads" | "members" | "agent-resources" | "skills" | "mcp" | "cli";
 type SectionItem = readonly [Section, string, string];
 const sections: ReadonlyArray<{ label: readonly [string, string]; items: readonly SectionItem[] }> = [
   { label: ["Agent", "Agents"], items: [["agents", "全部 Agent", "All agents"], ["mine", "我的 Agent", "My agents"]] },
   { label: ["小队与成员", "Squads & members"], items: [["squads", "小队", "Squads"], ["members", "成员", "Members"]] },
-  { label: ["资源", "Resources"], items: [["skills", "Skills", "Skills"], ["mcp", "MCP", "MCP"], ["cli", "CLI", "CLI"]] },
+  { label: ["资源", "Resources"], items: [["agent-resources", "Agent 模板", "Agent templates"], ["skills", "Skills", "Skills"], ["mcp", "MCP", "MCP"], ["cli", "CLI", "CLI"]] },
 ];
 const icon: Record<Section, string> = {
   agents: "M8 3v2M4 5h8a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2zM6 9h.1m3.9 0h.1",
   mine: "M8 3v2M5 5h6a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2zM6 9l1.5 1.5L10 8",
   squads: "M7 3H4a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h1m3-6h1a2 2 0 0 1 2 2v1m-3 0h4a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z",
   members: "M10.5 5a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0zM3 14v-1a5 5 0 0 1 10 0v1",
+  "agent-resources": "M4 2h5l3 3v9H4zM9 2v4h3M6 8h4m-4 3h4",
   skills: "M4 2h8a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1zM6 2v12m2-6h3M9.5 6.5v3",
   mcp: "M6 2v3m4-3v3M4 5h8v2a4 4 0 0 1-8 0V5zm4 6v3",
   cli: "M3 3h10a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zM5 6l2 2-2 2m4 0h2",
@@ -148,29 +150,33 @@ export function AgentTeam({ t, state, currentTeamId, roles, teams, open, badge, 
         <span className="badge">{t("本机用户", "Local user")}</span>
       </div></div>
     </>;
+    if (section === "agent-resources") return <>
+      {sectionHeader(t("在这里共享 Agent 的工作说明。模板供外部 Agent 按需读取，身份和角色仍在「全部 Agent」中管理。", "Share instructions that agents can read on demand. Manage registered identities and roles in All agents."))}
+      <TeamResources key="agent" kind="agent" t={t} errorPanel={errorPanel} copyText={copyText} />
+    </>;
     if (section === "skills") return <>
-      {sectionHeader(t("Skills 为 Agent 提供可重复使用的任务指引。", "Skills give agents reusable instructions for specific tasks."))}
-      <section className="panel agent-resource">
-        <h4>{t("在 Agent 客户端管理 Skills", "Manage skills in your agent client")}</h4>
-        <p className="muted">{t("在运行 Agent 的客户端中安装、启用或查看 Skills。ATK 目前不会读取客户端的 Skills 列表。", "Install, enable, or view skills in the client running the agent. ATK does not currently read the client’s skill list.")}</p>
-      </section>
+      {sectionHeader(t("共享可重复使用的技能。外部 Agent 领任务后可以查找并读取适用的 SKILL.md。", "Share reusable skills. External agents can find and read the relevant SKILL.md after claiming work."))}
+      <TeamResources key="skill" kind="skill" t={t} errorPanel={errorPanel} copyText={copyText} />
     </>;
     if (section === "mcp") return <>
       {sectionHeader(t("MCP 给外部 Agent 提供工具，例如读取文档或查询服务。", "MCP gives external agents tools for things like reading documents and querying services."))}
+      <TeamResources key="mcp" kind="mcp" t={t} errorPanel={errorPanel} copyText={copyText} />
       <section className="panel agent-resource">
         <h4>{t("在外部 Agent 中配置", "Configure in your external agent")}</h4>
         <ol className="setup-steps">
-          <li>{t("在 Agent 客户端中添加所需的 MCP 服务，并按该服务的要求完成授权。", "Add the MCP server in your agent client and follow the server’s authorization steps.")}</li>
+          <li>{t("查看资源中的 MCP 配置。HTTP 服务在客户端中填 URL；本地 stdio 服务可把下方命令设为客户端的启动命令。", "Read the MCP resource configuration. Use its URL in the client for HTTP, or configure the client to launch the command below for local stdio servers.")}</li>
           <li>{t("在客户端中试用该服务的工具，确认 Agent 能调用。", "Try a tool in the client to confirm the agent can use it.")}</li>
           <li>{t("通过 CLI 将 Agent 接入 ATK，以领取任务和提交交付。", "Connect the agent to ATK via CLI to claim tasks and submit results.")}</li>
         </ol>
-        <p className="muted">{t("ATK 当前不托管 MCP 服务。", "ATK does not currently host MCP servers.")}</p>
+        <pre>atk-agent resources serve-mcp mcp/&lt;name&gt;</pre>
+        <p className="muted">{t("MCP 客户端负责启动连接、授权和调用工具。", "Your MCP client opens the connection, authorizes it, and calls tools.")}</p>
         <button onClick={() => setSection("cli")}>{t("查看 CLI 接入", "Open CLI setup")} →</button>
       </section>
     </>;
     const command = `${agentCliSetup()}\natk-agent connect`;
     return <>
       {sectionHeader(t("用 ATK 自带的命令行工具接入外部 Agent。", "Connect an external agent using ATK’s command-line tools."))}
+      <TeamResources key="cli" kind="cli" t={t} errorPanel={errorPanel} copyText={copyText} />
       <section className="panel agent-resource">
         <h4>{t("接入命令 · PowerShell", "Setup commands · PowerShell")}</h4>
         <p className="muted">{t("安装 ATK 后，打开 PowerShell。把占位符换成添加 Agent 时保存的凭据，再运行命令。", "After installing ATK, open PowerShell and replace the placeholder with the credential saved when adding the agent.")}</p>
@@ -180,6 +186,8 @@ export function AgentTeam({ t, state, currentTeamId, roles, teams, open, badge, 
         </div>
         <ul className="agent-cli-commands">
           <li><code>atk-agent claim --wait 30000</code> · {t("领取任务", "Claim work")}</li>
+          <li><code>atk-agent resources list</code> · {t("发现团队资源", "Discover team resources")}</li>
+          <li><code>atk-agent resources run cli/&lt;name&gt; -- &lt;args&gt;</code> · {t("在当前目录运行团队脚本", "Run a team script in the current directory")}</li>
           <li><code>atk-agent watch &lt;runId&gt; --generation &lt;n&gt;</code> · {t("维持执行租约", "Keep the run lease alive")}</li>
           <li><code>atk-agent submit &lt;runId&gt; result --file result-receipt.json</code> · {t("提交交付回执", "Submit a delivery receipt")}</li>
           <li><code>atk-agent --help</code> · {t("查看全部命令", "List all commands")}</li>

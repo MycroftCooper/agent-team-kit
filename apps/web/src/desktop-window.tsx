@@ -6,6 +6,7 @@ declare global {
   interface Window {
     atkDesktop?: {
       getWindowState: () => Promise<WindowState>;
+      chooseProjectFolder: (currentPath: string) => Promise<string | null>;
       minimize: () => Promise<void>;
       toggleMaximize: () => Promise<void>;
       close: () => Promise<void>;

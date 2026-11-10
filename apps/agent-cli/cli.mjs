@@ -2,18 +2,37 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 import { createAgentClient } from "../../packages/agent-client/src/index.mjs";
+import { ATK_AGENT_HELP } from "../../packages/platform/src/cli-help.mjs";
 import {
   runtimePaths,
   argumentsOf,
 } from "../../packages/platform/src/index.mjs";
-const args = argumentsOf(process.argv.slice(2)),
+const argv = process.argv.slice(2),
+  separator = argv.indexOf("--"),
+  args = argumentsOf(separator === -1 ? argv : argv.slice(0, separator)),
+  toolArgs = separator === -1 ? [] : argv.slice(separator + 1),
   [command, runId, action] = args._;
+
+async function invokeResource(command, arguments_, cwd) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toUpperCase() !== "ATK_AGENT_TOKEN"));
+  const child = spawn(command === "node" ? process.execPath : command, arguments_, { cwd, env, stdio: "inherit", shell: false });
+  const forward = (signal) => child.kill(signal);
+  for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, forward);
+  try {
+    process.exitCode = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code) => resolve(code ?? 1));
+    });
+  } finally {
+    for (const signal of ["SIGINT", "SIGTERM"]) process.off(signal, forward);
+  }
+}
+
 async function main() {
   if (!command || command === "help" || args.help) {
-    console.log(
-      "atk-agent doctor\natk-agent connect\natk-agent claim [--project <id>] [--task <id>] [--wait 30000]\natk-agent watch <runId> --generation <n>\natk-agent heartbeat <runId> --generation <n>\natk-agent events <runId> --file <JSON> --generation <n>\natk-agent submit <runId> plan|result|review --file <JSON>\natk-agent stopped <runId> --generation <n>\natk-agent get <runId>\natk-agent replay\nEnvironment: ATK_URL, ATK_AGENT_TOKEN; no model credentials.",
-    );
+    console.log(ATK_AGENT_HELP);
     return;
   }
   const client = createAgentClient({
@@ -32,12 +51,32 @@ async function main() {
       ),
   });
   let result;
-  if (command === "doctor") result = await client.doctor();
+  if (command === "resources") {
+    if (runId === "list" && !action) {
+      result = await client.request(`/resources${args.kind ? `?kind=${encodeURIComponent(args.kind)}` : ""}`);
+    } else {
+      const [kind, name, extra] = (action ?? "").split("/");
+      if (!kind || !name || extra !== undefined || args._.length !== 3 ||
+        !(runId === "show" || (runId === "run" && kind === "cli") || (runId === "serve-mcp" && kind === "mcp")))
+        throw new Error("Use resources show <kind/name>, resources run cli/<name> or resources serve-mcp mcp/<name>");
+      const resource = await client.request(`/resources/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`);
+      if (runId === "run") {
+        if (resource.builtIn) throw new Error(`Run ${resource.name} directly; use ${resource.command} for usage.`);
+        return invokeResource(process.execPath, [resource.path, ...toolArgs]);
+      }
+      if (runId === "serve-mcp") {
+        if (resource.config.transport !== "stdio") throw new Error("Configure the MCP client with the HTTP URL from resources show");
+        return invokeResource(resource.config.command, resource.config.args, path.dirname(resource.path));
+      }
+      result = resource;
+    }
+  } else if (command === "doctor") result = await client.doctor();
   else if (command === "connect") result = await client.connect();
   else if (command === "claim")
     result = await client.claim({
       projectId: args.project,
       taskId: args.task,
+      kind: args.kind === undefined ? undefined : String(args.kind).toUpperCase(),
       waitMs: Number(args.wait ?? 30000),
     });
   else if (command === "get")

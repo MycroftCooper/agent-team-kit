@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useRef,
   useState,
   createContext,
@@ -11,6 +12,7 @@ import {
 import { LEASE_MS, TASK_STATUSES, type Row, type Page } from "@atk/contracts";
 import { api, authorize, useData, useLive } from "./api";
 import { AgentTeam, AgentTeamNavigation, agentCliSetup, agentTeamSectionTitle, useAgentTeam } from "./agent-team";
+import { AutomationEditor, Automations, type Workflow } from "./automations";
 import { label, reason, type Lang } from "./i18n";
 import { DesktopTitleBar, desktopWindow } from "./desktop-window";
 import { ThemeSettings, ThemeToggle } from "./theme";
@@ -34,10 +36,12 @@ import {
 type View =
   | "overview"
   | "tasks"
+  | "bugs"
   | "inbox"
   | "runs"
   | "team"
   | "projects"
+  | "automations"
   | "settings";
 type Modal = { kind: string; item?: Row };
 type DetailLink = { kind: "task" | "run"; id: string; projectId: string };
@@ -60,12 +64,14 @@ function detailUrl(target: DetailLink | null) {
 const navs = [
   ["overview", "概览", "Overview", "◈"],
   ["work", "工作", "Work", "☷"],
+  ["automations", "自动化", "Automations", "▷"],
   ["team", "Agent 团队", "Agent team", "⊞"],
   ["projects", "项目", "Projects", "▦"],
 ] as const;
 const workPages = [
   ["inbox", "待我处理", "My inbox", "◇"],
   ["tasks", "任务", "Tasks", "☷"],
+  ["bugs", "Bug 单", "Bugs", "⊘"],
   ["runs", "执行记录", "Runs", "↗"],
 ] as const;
 const time = (v: string | number) => (v ? new Date(v).toLocaleString() : "—");
@@ -307,12 +313,12 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
         !modal
       ) {
         e.preventDefault();
-        open("draft");
+        if (view !== "bugs" || projectId) open(view === "bugs" ? "new-bug" : "draft");
       }
     };
     window.addEventListener("keydown", listener);
     return () => window.removeEventListener("keydown", listener);
-  }, [dialog, detail, modal, projectId]);
+  }, [dialog, detail, modal, projectId, view]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 3000);
@@ -374,6 +380,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     (inbox.data?.plans?.length ?? 0) +
     (inbox.data?.humanTasks?.length ?? 0) +
     (inbox.data?.acceptances?.length ?? 0) +
+    (inbox.data?.bugs?.length ?? 0) +
     (inbox.data?.runs?.length ?? 0);
   const projectName = (id: string) =>
     projects.data?.items.find((p) => p.id === id)?.name ?? id;
@@ -554,7 +561,9 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
               </div>
             </div>
             <div className="top-actions">
-              {newButton}
+              {view === "bugs" ? projectId && <button className="primary" onClick={() => open("new-bug")}>
+                ＋ {t("新建 Bug 单", "New bug")} <kbd>N</kbd>
+              </button> : view !== "automations" && newButton}
             </div>
           </header>
           <main>
@@ -586,6 +595,8 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                 <Overview />
               ) : view === "tasks" ? (
                 <TaskList />
+              ) : view === "bugs" ? (
+                <BugList />
               ) : view === "inbox" ? (
                 <Inbox />
               ) : view === "runs" ? (
@@ -595,6 +606,9 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                   open={open} badge={badge} errorPanel={errorPanel} copyText={copyText} />
               ) : view === "projects" ? (
                 <Projects />
+              ) : view === "automations" ? (
+                <Automations t={t} lang={lang} projectId={projectId} epoch={epoch} busy={busy}
+                  edit={(workflow) => open("automation-editor", workflow)} act={act} />
               ) : (
                 <Settings />
               )}
@@ -714,6 +728,10 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                   )}
                 </>
               )}
+              {modal.kind === "new-bug" && <BugEditor />}
+              {modal.kind === "automation-editor" && (
+                <AutomationEditor t={t} projectId={projectId} workflow={item as Workflow | undefined} busy={busy} act={act} />
+              )}
               {modal.kind === "project" && (
                 <>
                   <h2>
@@ -741,18 +759,9 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                     }}
                   >
                     <Fields>
-                      <Field
-                        name="name"
-                        title={t("项目名称", "Project name")}
-                        value={item?.name}
-                        required
-                      />
-                      <Field
-                        name="root"
-                        title={t("项目绝对路径", "Absolute project path")}
-                        value={item?.root}
-                        required
-                        placeholder="E:\Projects\my-project"
+                      <ProjectIdentityFields
+                        key={item?.id ?? "new-project"}
+                        project={item}
                       />
                       <Field
                         name="docsRoot"
@@ -1358,6 +1367,58 @@ function useUI() {
 function Fields({ children }: { children: ReactNode }) {
   return <div className="fields">{children}</div>;
 }
+function ProjectIdentityFields({ project }: { project?: Row }) {
+  const { t } = useUI();
+  const id = useId();
+  const [path, setPath] = useState<string>(project?.root ?? "");
+  const [customName, setCustomName] = useState<string | null>(project?.name ?? null);
+  const [choosing, setChoosing] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const choose = desktopWindow?.chooseProjectFolder;
+  const folderName = path.trim().split(/[\\/]+/).filter(Boolean).at(-1) ?? "";
+
+  return (
+    <>
+      <div className="field">
+        <label className="project-folder-label" htmlFor={id}>
+          {t("项目绝对路径", "Absolute project path")}
+        </label>
+        <div className="project-folder-input">
+          <input id={id} name="root" required placeholder="E:\Projects\my-project"
+            value={path} onChange={(event) => setPath(event.target.value)} />
+          {choose && <button type="button" disabled={choosing} onClick={async () => {
+            setChoosing(true);
+            setFailed(false);
+            try {
+              const selected = await choose(path.trim());
+              if (selected !== null) setPath(selected);
+            } catch {
+              setFailed(true);
+            } finally {
+              setChoosing(false);
+            }
+          }}>{t("选择文件夹", "Choose folder")}</button>}
+        </div>
+        {failed && <span role="alert">{t(
+          "无法打开文件夹选择器。你可以手动输入路径。",
+          "Could not open the folder picker. Enter the path manually.",
+        )}</span>}
+      </div>
+      <Field name="name" title={t("项目名称", "Project name")}>
+        <input
+          name="name"
+          required
+          value={customName ?? folderName}
+          placeholder={t("默认使用文件夹名称", "Defaults to the folder name")}
+          onChange={(event) => setCustomName(event.target.value)}
+          onBlur={() => {
+            if (!project && customName?.trim() === "") setCustomName(null);
+          }}
+        />
+      </Field>
+    </>
+  );
+}
 function Field({
   name,
   title,
@@ -1397,6 +1458,111 @@ function Field({
         ))}
     </label>
   );
+}
+
+const bugStates: Record<string, [string, string]> = {
+  READY: ["待修复", "To fix"], RUNNING: ["修复中", "Fixing"],
+  AWAITING_ACCEPTANCE: ["待验收", "Awaiting acceptance"], DONE: ["已关闭", "Closed"],
+  BLOCKED: ["已阻塞", "Blocked"],
+};
+
+function BugBadge({ status }: { status: string }) {
+  const { t } = useUI();
+  return <span className={`badge status-${status}`}><span className="status-dot" />{t(...(bugStates[status] ?? [status, status]))}</span>;
+}
+
+function BugEditor() {
+  const { t, current, projectId, allRoles, allTeams, act, busy, closeModal } = useUI();
+  const team = allTeams.find((row: Row) => row.id === current?.teamId);
+  const roles = allRoles.filter((row: Row) => row.function === "WORKER" && team?.roleIds.includes(row.id) && row.files?.length);
+  const [selected, setSelected] = useState("");
+  const role = roles.find((row: Row) => row.id === selected) ?? roles[0];
+  return <>
+    <h2>{t("新建 Bug 单", "Report a bug")}</h2>
+    <p className="muted">{t("创建后直接进入待修复，由所选角色的 Agent 主动领取。", "The bug goes straight to the repair queue for an agent with the selected role.")}</p>
+    {!role ? <p role="status">{t("请先给当前小队添加一个有可写文件范围的执行角色。", "First add a worker role with writable file scopes to this squad.")}</p> :
+      <form onSubmit={(event) => {
+        event.preventDefault();
+        const fields = new FormData(event.currentTarget);
+        const files = String(fields.get("bugFiles") ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+        void act("/bugs", { projectId, title: fields.get("bugTitle"), description: fields.get("bugDescription"),
+          acceptance: fields.get("bugAcceptance"), roleId: role.id, ...(files.length ? { files } : {}) });
+      }}>
+        <Fields>
+          <Field name="bugTitle" title={t("Bug 标题", "Bug title")} required />
+          <Field name="bugDescription" title={t("Bug 描述", "Bug description")} required area
+            placeholder={t("复现步骤、实际结果和期望结果…", "Steps to reproduce, actual behavior, and expected behavior…")} />
+          <Field name="bugAcceptance" title={t("验收条件（可选）", "Acceptance criteria (optional)")} area />
+          <Field name="bugRole" title={t("修复角色", "Repair role")}>
+            <select name="bugRole" value={role.id} onChange={(event) => setSelected(event.target.value)}>
+              {roles.map((row: Row) => <option key={row.id} value={row.id}>{row.name}</option>)}
+            </select>
+          </Field>
+          <Field name="bugFiles" title={t("文件范围（每行一项，可留空）", "File scope (one per line, optional)")}>
+            <textarea key={role.id} name="bugFiles" rows={2} placeholder={role.files.join("\n")} />
+          </Field>
+          <small className="muted">{t("留空使用该角色的文件范围。知道涉及哪些文件时，建议填更小的范围。", "Leave blank to use the role's scope. Specify a narrower scope when you know the affected files.")}</small>
+        </Fields>
+        <div className="modal-actions">
+          <button type="button" onClick={closeModal}>{t("取消", "Cancel")}</button>
+          <button className="primary" disabled={busy}>{t("创建 Bug 单", "Create bug")}</button>
+        </div>
+      </form>}
+  </>;
+}
+
+function BugList() {
+  const { t, projectId, epoch, open, roleName, errorPanel, empty } = useUI();
+  const [status, setStatus] = useState("");
+  const [cursor, setCursor] = useState(0);
+  const query = new URLSearchParams({ projectId, status, cursor: String(cursor), limit: "30" });
+  const { data, loading, error } = useData<Page>(`/bugs?${query}`, epoch);
+  return <>
+    <div className="toolbar">
+      <label>{t("状态", "Status")} <select aria-label={t("Bug 状态", "Bug status")} value={status}
+        onChange={(event) => { setStatus(event.target.value); setCursor(0); }}>
+        <option value="">{t("全部状态", "All statuses")}</option>
+        {Object.entries(bugStates).map(([key, names]) => <option key={key} value={key}>{t(...names)}</option>)}
+      </select></label>
+    </div>
+    {errorPanel(error)}
+    {loading && !data && <p role="status">{t("正在加载…", "Loading…")}</p>}
+    {data?.items.length === 0 && empty(t("没有 Bug 单", "No bugs"),
+      status ? t("没有符合当前状态的 Bug 单。", "No bugs match this status.") : t("报一个 Bug，让修复角色的 Agent 领取。", "Report a bug for an agent with the repair role to claim."))}
+    {!!data?.items.length && <div className="task-list">{data.items.map((bug) => <div className="list-row" key={bug.id}>
+      <div className="grow"><button className="text-button" onClick={() => open("task", bug)}><strong>{bug.title}</strong></button>
+        <p className="muted">{roleName(bug.roleId)} · {time(bug.createdAt)}</p></div>
+      <BugBadge status={bug.status} />
+    </div>)}</div>}
+    {(cursor > 0 || data?.nextCursor != null) && <div className="pagination">
+      <button disabled={!cursor} onClick={() => setCursor(Math.max(0, cursor - 30))}>{t("上一页", "Previous")}</button>
+      <button disabled={data?.nextCursor == null} onClick={() => setCursor(data?.nextCursor ?? 0)}>{t("下一页", "Next")}</button>
+    </div>}
+  </>;
+}
+
+function BugAcceptance({ bug }: { bug: Row }) {
+  const { t, act, busy } = useUI();
+  const [rejecting, setRejecting] = useState(false);
+  const route = `/bugs/${encodeURIComponent(bug.id)}/review?projectId=${encodeURIComponent(bug.projectId)}`;
+  const candidate = { version: bug.version, targetHash: bug.resultHash };
+  return <section className="detail-section">
+    <h3>{t("修复验收", "Fix acceptance")}</h3>
+    {rejecting ? <form onSubmit={(event) => {
+      event.preventDefault();
+      const reason = new FormData(event.currentTarget).get("bugRejectionReason");
+      void act(route, { ...candidate, decision: "REJECT", reason }, "POST", false);
+    }}>
+      <Field name="bugRejectionReason" title={t("退回原因", "Reason for returning")} area required />
+      <div className="toolbar">
+        <button type="button" disabled={busy} onClick={() => setRejecting(false)}>{t("取消", "Cancel")}</button>
+        <button className="primary" disabled={busy}>{t("确认退回待修复", "Return to repair queue")}</button>
+      </div>
+    </form> : <div className="toolbar">
+      <button className="primary" disabled={busy} onClick={() => act(route, { ...candidate, decision: "ACCEPT" }, "POST", false)}>{t("验收通过并关闭", "Accept and close")}</button>
+      <button disabled={busy} onClick={() => setRejecting(true)}>{t("验收失败，退回", "Reject and return")}</button>
+    </div>}
+  </section>;
 }
 
 function AgentConnection({ id }: { id: string }) {
@@ -1540,25 +1706,30 @@ function Detail({ id }: { id: string }) {
   const children = useData<Page>(row?.kind === "REQUEST" && row.planId ? "/tasks?" + projectQuery + "&parentId=" + encodeURIComponent(id) + "&planId=" + encodeURIComponent(row.planId) + "&limit=200" : null, epoch);
   if (!row) return task.error ? errorPanel(task.error) : <p role="status">{t("正在加载…", "Loading…")}</p>;
   const acceptance = acceptances.data?.items[0];
+  const bug = row.kind === "BUG";
   return (
     <>
       <div className="detail-toolbar">
-        <span>{projectName(row.projectId)} / {row.kind === "REQUEST" ? t("需求", "Request") : t("任务", "Task")}</span>
+        <span>{projectName(row.projectId)} / {bug ? t("Bug 单", "Bug") : row.kind === "REQUEST" ? t("需求", "Request") : t("任务", "Task")}</span>
         <button className="quiet" onClick={() => copyText(detailUrl({ kind: "task", id, projectId }).href, t("已复制任务链接", "Task link copied"))}>{t("复制任务链接", "Copy task link")}</button>
       </div>
-      <div className="detail-heading">{badge(row.status)}<h2>{row.title}</h2></div>
+      <div className="detail-heading">{bug ? <BugBadge status={row.status} /> : badge(row.status)}<h2>{row.title}</h2></div>
       <div className="detail-layout">
         <div className="detail-body">
           <p className="detail-description prewrap">{row.description}</p>
           {row.acceptance && <section className="detail-section"><h3>{t("验收条件", "Acceptance criteria")}</h3><p className="prewrap">{row.acceptance}</p></section>}
+          {bug && row.bugReview?.decision === "REJECT" && <section className="detail-section">
+            <h3>{t("上次退回原因", "Last rejection")}</h3><p className="prewrap">{row.bugReview.summary}</p>
+          </section>}
+          {bug && row.status === "AWAITING_ACCEPTANCE" && <BugAcceptance key={row.resultHash} bug={row} />}
           <DispatchNotice row={row} dispatch={dispatch.data} />
           {dispatch.error && <p className="muted" role="status">{t("领取诊断暂不可用。", "Claim diagnostics are temporarily unavailable.")}</p>}
           {row.blockReason && <div className="warning">{reason(row.blockReason, lang)}</div>}
           {row.drift && <details><summary>{t("查看文件变化", "View file changes")}</summary><pre>{JSON.stringify(row.drift, null, 2)}</pre></details>}
-          {row.status === "BLOCKED" && row.kind === "WORK" && (
+          {row.status === "BLOCKED" && (row.kind === "WORK" || bug) && (
             <button className="primary" disabled={busy} onClick={async () => {
               if (await act(`/tasks/${id}/retry`, { version: row.version }, "POST", false)) closeModal();
-            }}>{t("重新开放执行", "Requeue task")}</button>
+            }}>{bug ? t("退回待修复", "Requeue bug") : t("重新开放执行", "Requeue task")}</button>
           )}
           {row.executorType === "HUMAN" && row.status === "READY" && !row.waiting && (
             <button className="primary" disabled={busy} onClick={() => act(
@@ -1610,6 +1781,7 @@ function Detail({ id }: { id: string }) {
         </div>
         <aside className="detail-properties">
           <h3>{t("属性", "Properties")}</h3>
+          {bug && <dl><dt>{t("修复角色", "Repair role")}</dt><dd>{roleName(row.roleId)}</dd></dl>}
           {row.kind === "WORK" && <>
             <dl>
               <dt>{t("角色", "Role")}</dt><dd>{row.executorType === "HUMAN" ? t("人工", "Human") : roleName(row.roleId)}</dd>
@@ -2504,6 +2676,13 @@ function Inbox() {
           <button onClick={() => open("acceptance", a)}>
             {t("查看交付", "Inspect output")}
           </button>
+        </div>
+      ))}
+      {(data.bugs ?? []).map((bug: Row) => (
+        <div className="inbox-row" key={bug.id}>
+          <div className="inbox-symbol">⊘</div>
+          <div><strong>{bug.title}</strong><p>{t("Bug 修复待验收", "Bug fix needs acceptance")}</p></div>
+          <button onClick={() => open("task", bug)}>{t("验收 Bug", "Review bug fix")}</button>
         </div>
       ))}
       {data.runs.map((r: Row) => (

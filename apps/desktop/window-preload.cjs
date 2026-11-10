@@ -1,9 +1,10 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 if (process.isMainFrame) {
-  const invoke = (action) => ipcRenderer.invoke("atk:window-control", action);
+  const invoke = (action, ...args) => ipcRenderer.invoke("atk:window-control", action, ...args);
   contextBridge.exposeInMainWorld("atkDesktop", {
     getWindowState: () => invoke("state"),
+    chooseProjectFolder: (currentPath) => invoke("choose-project-folder", currentPath),
     minimize: () => invoke("minimize"),
     toggleMaximize: () => invoke("toggle-maximize"),
     close: () => invoke("close"),

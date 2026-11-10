@@ -15,6 +15,7 @@ const npmCli = [
 ].find((p) => p && fs.existsSync(p));
 assert.ok(npmCli, "npm CLI must be installed with Node");
 const steps = [];
+const builtInSkills = ["agent", "skill", "mcp", "cli", "automation"].map((kind) => "atk-create-" + kind);
 let baseUrl, launcher, dataDir, accessKey;
 function command(file, args, cwd = process.cwd()) {
   const result = spawnSync(process.execPath, [file, ...args], {
@@ -69,6 +70,8 @@ try {
     const names = packed.files.map((f) => f.path);
     assert.ok(names.includes("apps/web/dist/index.html"));
     assert.ok(names.includes("apps/agent-cli/cli.mjs"));
+    for (const name of builtInSkills)
+      assert.ok(names.includes(`apps/backend/resources/skill/${name}/SKILL.md`));
     assert.ok(names.includes("apps/launcher/desktop.mjs"));
     assert.ok(names.includes("start.bat"));
     assert.ok(names.includes("stop.bat"));
@@ -193,6 +196,11 @@ try {
         baseUrl,
         credential: identity.credential,
       });
+      const skills = await client.request("/resources?kind=skill");
+      assert.deepEqual(skills.items.filter((item) => item.builtIn).map((item) => item.name), builtInSkills);
+      assert.ok((await client.request("/resources/skill/atk-create-mcp")).content.includes("serve-mcp"));
+      const bundledCli = (await client.request("/resources?kind=cli")).items;
+      assert.deepEqual(bundledCli.filter((item) => item.builtIn).map((item) => item.name), ["atk", "atk-agent"]);
       await client.connect();
       const draft = await human("/tasks", {
         projectId: first.id,

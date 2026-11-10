@@ -12,8 +12,10 @@ desktop window directly. The first launch downloads workspace dependencies and
 Electron using portable tools kept under `artifacts/desktop-dev/`; it needs an
 internet connection, but no system Node.js installation or prebuilt web UI.
 
-React and CSS changes use Vite hot updates. Close the window and relaunch after
-changing the backend or Electron main process. Closing the development window
+React and CSS changes use Vite hot updates. Saving backend source, bundled resources, or a
+shared backend package reloads the backend without refreshing the window. Reload waits until
+tasks and automations are idle, including runs awaiting stop confirmation. Relaunch manually
+after changing Electron's main process or startup configuration. Closing the development window
 stops the backend, so stop active agents before restarting. The app uses the
 existing data directory configuration and Agent API (default `127.0.0.1:1421`).
 Stop any existing service using the same port or data directory first. Override
@@ -84,11 +86,17 @@ discards project edits.
 
 ## Agent connection
 
+In **Work → Bugs**, report a bug and choose a worker role from the workspace's squad.
+The bug goes straight to that role's queue. After a worker submits a fix, accept it in
+**My inbox** or return it with feedback for another attempt. `atk-agent claim --kind bug`
+limits an agent's claims to bugs.
+
 ![Workspace](docs/screenshots/overview.png)
 
 Open **Agent team** and use its left sidebar to manage identities and squads. Select **Role template** on
-an agent's card to view or edit its assigned template. Create new roles under **Squads**. **Skills**,
-**MCP**, and **CLI** explain how to configure skills and tools and connect external agents.
+an agent's card to view or edit its assigned template. Create new roles under **Squads**.
+Use **Resources** to create or discover shared agent templates, skills, MCP configurations and CLI scripts.
+External agents can discover them with `atk-agent resources list`. See [Team resources](docs/TEAM-RESOURCES.md).
 Save the credential when creating an agent identity; it is shown once. Agents
 can use HTTP or the package's machine CLI:
 
