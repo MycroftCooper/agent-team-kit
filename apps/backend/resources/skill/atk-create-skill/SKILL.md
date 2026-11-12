@@ -5,6 +5,12 @@ description: Turn a repeatable workflow into an ATK Skill that agents can discov
 
 # Create an ATK Skill
 
+Choose the resource owner before importing. Commands without scope use the global
+library; add `--scope project --project <projectId>` to list/show for a project.
+Use `spec.resources.project.command` and its returned folders for project resources,
+which live in docsRoot/resources. Keep the same scope when verifying an import;
+same-named resources do not override or fall back across scopes.
+
 1. Identify the trigger, the inputs, and an observable successful result. Check `atk-agent resources list --kind skill` for overlap before adding a new skill. Use a short lowercase hyphenated name and match it to the folder name.
 2. Write `skill/<name>/SKILL.md` as UTF-8. Begin with YAML frontmatter between `---` lines, with `name` and a concise `description` that says when to use it. In the body, preserve the non-obvious workflow decisions, output expectations, and stop conditions. Keep supporting examples or files in the same resource folder; link to them by relative path only when the workflow needs them.
 3. Check the frontmatter and relative links, and walk through one representative request. Run any included helpers against disposable input when their behavior matters. Make sure the description would select this skill for that request and that the instructions lead to the expected result.

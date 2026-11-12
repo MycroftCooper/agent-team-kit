@@ -200,13 +200,20 @@ try {
     await browser.wait(`${content}?.innerText.includes('本机用户')`);
     await browser.click("Skills", { exact: true });
     await browser.wait(`${content}?.innerText.includes('skill/atk-create-automation/SKILL.md')`);
+    for (const name of ["linus-review", "linus-design-guard"]) {
+      assert.ok(await browser.evaluate(`${content}?.innerText.includes('skill/${name}/SKILL.md')`));
+      assert.equal(await browser.evaluate(`${content}?.querySelector('[aria-label="编辑 ${name}"], [aria-label="删除 ${name}"]')`), null);
+      await browser.click(`查看 ${name}`, { exact: true, within: content });
+      await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent.includes('name: ${name}')`);
+      await browser.click(`收起 ${name}`, { exact: true, within: content });
+    }
     assert.ok(await browser.evaluate(`${content}?.innerText.includes('skill/atk-create-skill/SKILL.md')`));
     assert.equal(await browser.evaluate(`${content}?.querySelector('[aria-label="编辑 atk-create-skill"], [aria-label="删除 atk-create-skill"]')`), null);
     await browser.click("查看 atk-create-skill", { exact: true, within: content });
     await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent.includes('name: atk-create-skill')`);
     await browser.click("收起 atk-create-skill", { exact: true, within: content });
     assert.equal(await browser.evaluate(`${content}.innerText.includes('角色模板')`), false);
-    await browser.click("新建资源", { exact: true });
+    await browser.click("新建全局资源", { exact: true });
     await browser.fill("resourceName", "release-notes");
     await browser.fill("resourceContent", "# Release notes\nCheck the delivered files.");
     await browser.click("创建资源", { exact: true });
@@ -245,6 +252,94 @@ try {
     await browser.wait("!document.querySelector('.section-sidebar')");
     assert.equal(await browser.evaluate(primaryRailWidth), narrowRailWidth);
     await browser.send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+  });
+  await step("project resource forms, same names and workspace switches stay scoped", async () => {
+    const primary = server.app.list("projects").items.find((p) => p.root === projectRoot);
+    const secondaryRoot = path.join(root, "resource-project");
+    fs.mkdirSync(secondaryRoot);
+    const secondary = server.app.createProject({ name: "Resource workspace", root: secondaryRoot, docsRoot: "atk-docs" });
+    server.app.resources.create("skill", { name: "project-notes", content: "# Global notes" });
+    server.app.resourceLibrary({ scope: "project", projectId: secondary.id }).create("skill", { name: "project-notes", content: "# Second project" });
+    await browser.click("Agent 团队", { exact: true });
+    await browser.click("Skills", { exact: true });
+    const shared = "document.querySelector('[data-resource-scope=global]')";
+    const local = "document.querySelector('[data-resource-scope=project]')";
+    await browser.wait(`${local}?.innerText.includes(${JSON.stringify(primary.docsRoot)}) && ${shared}?.innerText.includes('project-notes')`);
+    await browser.click("新建项目资源", { exact: true });
+    await browser.fill("resourceName", "project-notes");
+    await browser.fill("resourceContent", "# First project");
+    await browser.click("创建资源", { exact: true, within: local });
+    await browser.wait(`${local}?.innerText.includes('skill/project-notes/SKILL.md')`);
+    const library = server.app.resourceLibrary({ scope: "project", projectId: primary.id });
+    assert.equal(library.read("skill", "project-notes").content, "# First project");
+    await browser.click("编辑 project-notes", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('[name=resourceEditContent]')?.value === '# First project'`);
+    await browser.fill("resourceEditContent", "# Updated first project");
+    await browser.click("保存修改", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('.team-resource-preview pre')?.textContent === '# Updated first project'`);
+    assert.equal(server.app.resources.read("skill", "project-notes").content, "# Global notes");
+    await browser.click("编辑 project-notes", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('[name=resourceEditContent]')?.value === '# Updated first project'`);
+    await browser.fill("resourceEditContent", "Unsaved draft from first project");
+    await browser.wait(`[...document.querySelector('[name=workspace]').options].some(o=>o.value===${JSON.stringify(secondary.id)})`);
+    await browser.fill("workspace", secondary.id);
+    await browser.wait(`${local}?.innerText.includes(${JSON.stringify(secondary.docsRoot)}) && !${local}?.querySelector('[name=resourceEditContent]')`);
+    await browser.click("查看 project-notes", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('.team-resource-preview pre')?.textContent === '# Second project'`);
+    await browser.click("查看 project-notes", { exact: true, within: shared });
+    await browser.wait(`${shared}?.querySelector('.team-resource-preview pre')?.textContent === '# Global notes'`);
+    await browser.evaluate(`${local}.scrollIntoView({block:'center'})`);
+    await browser.screenshot("02-project-resources");
+    await browser.fill("workspace", primary.id);
+    await browser.wait(`${local}?.innerText.includes(${JSON.stringify(primary.docsRoot)}) && !${local}?.querySelector('.team-resource-preview')`);
+    await browser.click("删除 project-notes", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('.team-resource-preview .danger')?.disabled === false`);
+    await browser.click("确认删除", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('.team-resource-notice') && !${local}?.innerText.includes('skill/project-notes/SKILL.md')`);
+    assert.throws(() => library.read("skill", "project-notes"), { code: "RESOURCE_NOT_FOUND" });
+    assert.equal(server.app.resources.read("skill", "project-notes").content, "# Global notes");
+    assert.equal(server.app.resourceLibrary({ scope: "project", projectId: secondary.id }).read("skill", "project-notes").content, "# Second project");
+    const other = server.app.get("projects", secondary.id);
+    server.app.updateProject(other.id, { version: other.version, archived: true });
+    await browser.click("概览", { exact: true, within: "document.querySelector('.sidebar')" });
+  });
+  await step("project resource actions fail closed with an older or mismatched backend", async () => {
+    const shared = "document.querySelector('[data-resource-scope=global]')";
+    const local = "document.querySelector('[data-resource-scope=project]')";
+    const globalCount = server.app.resources.list("skill").items.length;
+    await browser.evaluate(`(() => {
+      window.resourceOriginalFetch = window.fetch;
+      window.resourceBackendMode = 'unsupported';
+      window.fetch = (input, init) => {
+        if (String(input).startsWith('/api/v1/project-resources/')) {
+          const unsupported = window.resourceBackendMode === 'unsupported';
+          const body = unsupported ? {error:{code:'NOT_FOUND',message:'Project resources unsupported'}}
+            : {scope:'global',folders:{skill:'wrong-library'},items:[{id:'skill/foreign-global',name:'foreign-global',scope:'global'}]};
+          return Promise.resolve(new Response(JSON.stringify(body), {status:unsupported ? 404 : 200,headers:{'content-type':'application/json'}}));
+        }
+        return window.resourceOriginalFetch(input, init);
+      };
+    })()`);
+    try {
+      await browser.click("Agent 团队", { exact: true });
+      await browser.click("Skills", { exact: true });
+      await browser.wait(`${local}?.querySelector('[role=alert]') && ${local}?.querySelector('.team-resource-header .primary')?.disabled === true`);
+      assert.equal(await browser.evaluate(`!!${local}?.querySelector('.team-resource-list')`), false);
+      await browser.click("新建全局资源", { exact: true });
+      await browser.wait(`!!${shared}?.querySelector('[name=resourceName]')`);
+      await browser.click("取消", { exact: true, within: shared });
+      await browser.evaluate("window.resourceBackendMode = 'mismatched'");
+      await browser.click("刷新", { exact: true, within: local });
+      await browser.wait(`${local}?.querySelector('[role=alert]')?.textContent.includes('未确认项目资源归属')`);
+      assert.equal(await browser.evaluate(`${local}?.innerText.includes('foreign-global')`), false);
+      assert.equal(await browser.evaluate(`${local}?.querySelector('.team-resource-header .primary')?.disabled`), true);
+    } finally {
+      await browser.evaluate("window.fetch = window.resourceOriginalFetch; delete window.resourceOriginalFetch; delete window.resourceBackendMode;");
+    }
+    await browser.click("刷新", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('.team-resource-path') && ${local}?.querySelector('.team-resource-header .primary')?.disabled === false`);
+    assert.equal(server.app.resources.list("skill").items.length, globalCount);
+    await browser.click("概览", { exact: true, within: "document.querySelector('.sidebar')" });
   });
   const project = server.app.list("projects").items[0];
   await step("work uses a secondary sidebar and new requests have their own draft column", async () => {

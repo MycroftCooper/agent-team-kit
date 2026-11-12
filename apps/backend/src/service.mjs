@@ -3,7 +3,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createAutomations } from "./automations.mjs";
-import { createResourceLibrary, resourceDiscovery } from "./resources.mjs";
+import { createResourceLibrary, resourceDiscovery, projectResourceDiscovery } from "./resources.mjs";
 import { openStore } from "../../../packages/database/src/index.mjs";
 import {
   AppError,
@@ -235,10 +235,31 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       (t.projectIds.length === 0 || t.projectIds.includes(p.id))
     );
   }
+  function requireResourceRoot(docsRoot, projectId) {
+    const root = lockKey(path.join(docsRoot, "resources"));
+    const others = [resources.root, ...store.all("projects").filter((other) => other.id !== projectId)
+      .map((other) => path.join(other.docsRoot, "resources"))];
+    requireThat(!others.some((other) => pathsOverlap(root, lockKey(other))),
+      "RESOURCE_PATH_CONFLICT", "Project resources must not overlap another resource library", 409);
+  }
+  function resourceLibrary({ scope = "global", projectId } = {}, agentId) {
+    requireThat(["global", "project"].includes(scope) && (scope === "project" ? typeof projectId === "string" && projectId.length > 0 : projectId === undefined),
+      "INVALID_RESOURCE_SCOPE", "Use global, or project with a project ID");
+    if (scope === "global") return resources;
+    const p = project(projectId);
+    if (agentId) {
+      const { agent, team } = agentContext(agentId);
+      requireThat(allowed(agent, team, p), "PROJECT_FORBIDDEN", "Project not authorized", 403);
+    }
+    requireThat(fs.existsSync(p.docsRoot) && fs.lstatSync(p.docsRoot).isDirectory() && canonical(p.docsRoot) === p.docsRoot,
+      "PROJECT_DATA_MOVED", "Project data path changed or is unavailable", 409);
+    requireResourceRoot(p.docsRoot, p.id);
+    return createResourceLibrary(p.docsRoot, { scope, projectId: p.id });
+  }
   function eligibleWorker(agent, role, team, project, plan, task) {
     return agent && !agent.revoked && agent.id !== plan?.authorAgentId &&
       role.function === "WORKER" && agent.roleId === task.roleId &&
-      agent.teamId === team.id && allowed(agent, team, project);
+      agent.teamId === team.id && team.roleIds.includes(role.id) && allowed(agent, team, project);
   }
   function assignmentBlock(task) {
     if (task.kind !== "WORK" || task.executorType !== "AGENT") return "ASSIGNMENT_NOT_APPLICABLE";
@@ -421,7 +442,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       project: { id: p.id, name: p.name, root: p.root, docsRoot: p.docsRoot },
       lease: { heartbeatMs: HEARTBEAT_MS, leaseMs: LEASE_MS },
     };
-    if (stage !== "HUMAN") base.resources = resourceDiscovery;
+    if (stage !== "HUMAN") base.resources = projectResourceDiscovery(p.id);
     if (task.kind === "BUG") {
       base.taskKind = "BUG";
       base.instructions += "\nReproduce and fix the reported bug within the leased scope. Describe how you verified the fix; a human will accept or return it for rework.";
@@ -591,6 +612,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     signals,
     dataDir,
     resources,
+    resourceLibrary,
     automations,
     list(table, filters = {}) {
       const page = store.list(table, table === "tasks" && !filters.kind ? { ...filters, excludeKind: "BUG" } : filters);
@@ -756,7 +778,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       }
       const agents = store.all("agents");
       const eligible = agents.filter(
-        (a) => (task.kind !== "BUG" || team.roleIds.includes(role.id)) && eligibleWorker(a, role, team, p, plan, task) &&
+        (a) => eligibleWorker(a, role, team, p, plan, task) &&
           (!task.assignedAgentId || a.id === task.assignedAgentId),
       );
       const runs = working(), used = new Map(), checkedAt = now();
@@ -788,6 +810,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           "Project is already registered",
           409,
         );
+        requireResourceRoot(paths.docsRoot);
         const team = get("teams", body.teamId ?? "team-default");
         const p = make("projects", {
           name: requiredString(body.name, "name", 128),
@@ -831,6 +854,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           "Project is already registered",
           409,
         );
+        if (body.root || body.docsRoot) requireResourceRoot(paths.docsRoot, id);
         if (body.teamId) get("teams", body.teamId);
         const next = put("projects", {
           ...p,
@@ -1108,6 +1132,12 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       api.maintenance({ documents: false, drift: false });
       return store.tx(() => {
         const { agent: a, role, team } = agentContext(agentId);
+        requireThat(
+          team.roleIds.includes(role.id),
+          "ROLE_FORBIDDEN",
+          "Role is not part of this team",
+          403,
+        );
         const activeRuns = working(),
           taskMaps = new Map(),
           projectCache = new Map();
@@ -1164,7 +1194,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           if (activeRuns.some((r) => r.taskId === task.id)) continue;
           const plan = task.planId ? get("plans", task.planId) : null;
           if (task.kind === "BUG") {
-            if (stage !== "EXECUTION" || !team.roleIds.includes(role.id) || !eligibleWorker(a, role, team, p, null, task)) continue;
+            if (stage !== "EXECUTION" || !eligibleWorker(a, role, team, p, null, task)) continue;
             try { permittedScopes(p, task.files, role); }
             catch (error) {
               if (!(error instanceof AppError)) throw error;

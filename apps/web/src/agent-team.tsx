@@ -62,10 +62,11 @@ export function AgentTeamNavigation({ t, state }: { t: Translate; state: AgentTe
   </nav>;
 }
 
-export function AgentTeam({ t, state, currentTeamId, roles, teams, open, badge, errorPanel, copyText }: {
+export function AgentTeam({ t, state, currentTeamId, projectId, roles, teams, open, badge, errorPanel, copyText }: {
   t: Translate;
   state: AgentTeamState;
   currentTeamId?: string;
+  projectId?: string;
   roles: Row[];
   teams: Row[];
   open: (kind: string, item?: Row) => void;
@@ -152,15 +153,15 @@ export function AgentTeam({ t, state, currentTeamId, roles, teams, open, badge, 
     </>;
     if (section === "agent-resources") return <>
       {sectionHeader(t("在这里共享 Agent 的工作说明。模板供外部 Agent 按需读取，身份和角色仍在「全部 Agent」中管理。", "Share instructions that agents can read on demand. Manage registered identities and roles in All agents."))}
-      <TeamResources key="agent" kind="agent" t={t} errorPanel={errorPanel} copyText={copyText} />
+      <TeamResources key="agent" kind="agent" projectId={projectId} t={t} errorPanel={errorPanel} copyText={copyText} />
     </>;
     if (section === "skills") return <>
       {sectionHeader(t("共享可重复使用的技能。外部 Agent 领任务后可以查找并读取适用的 SKILL.md。", "Share reusable skills. External agents can find and read the relevant SKILL.md after claiming work."))}
-      <TeamResources key="skill" kind="skill" t={t} errorPanel={errorPanel} copyText={copyText} />
+      <TeamResources key="skill" kind="skill" projectId={projectId} t={t} errorPanel={errorPanel} copyText={copyText} />
     </>;
     if (section === "mcp") return <>
       {sectionHeader(t("MCP 给外部 Agent 提供工具，例如读取文档或查询服务。", "MCP gives external agents tools for things like reading documents and querying services."))}
-      <TeamResources key="mcp" kind="mcp" t={t} errorPanel={errorPanel} copyText={copyText} />
+      <TeamResources key="mcp" kind="mcp" projectId={projectId} t={t} errorPanel={errorPanel} copyText={copyText} />
       <section className="panel agent-resource">
         <h4>{t("在外部 Agent 中配置", "Configure in your external agent")}</h4>
         <ol className="setup-steps">
@@ -176,7 +177,7 @@ export function AgentTeam({ t, state, currentTeamId, roles, teams, open, badge, 
     const command = `${agentCliSetup()}\natk-agent connect`;
     return <>
       {sectionHeader(t("用 ATK 自带的命令行工具接入外部 Agent。", "Connect an external agent using ATK’s command-line tools."))}
-      <TeamResources key="cli" kind="cli" t={t} errorPanel={errorPanel} copyText={copyText} />
+      <TeamResources key="cli" kind="cli" projectId={projectId} t={t} errorPanel={errorPanel} copyText={copyText} />
       <section className="panel agent-resource">
         <h4>{t("接入命令 · PowerShell", "Setup commands · PowerShell")}</h4>
         <p className="muted">{t("安装 ATK 后，打开 PowerShell。把占位符换成添加 Agent 时保存的凭据，再运行命令。", "After installing ATK, open PowerShell and replace the placeholder with the credential saved when adding the agent.")}</p>

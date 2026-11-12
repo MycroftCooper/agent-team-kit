@@ -10,11 +10,16 @@ API; they neither inherit a browser session nor choose their own function.
 Browser ── /api/v1 + SSE ── Backend ── SQLite (one global authority)
                               │
 External agents ─ /api/agent/v1┤
-                              ├── project/.agent-team (documents + snapshots)
-                              └── ATK data/resources (shared team resources)
+                              ├── project/docsRoot (documents + snapshots + resources/)
+                              └── ATK data/resources (global shared resources)
 ```
 
 The backend uses pure domain and scheduling functions inside atomic claims.
+Resources keep the same kind/name layout in global and project scope. Global
+requests retain their existing behavior; explicit project requests resolve only
+under that project's docsRoot/resources after authorization and real-path checks.
+Built-ins remain global and read-only. Same-named custom entries do not override
+or fall back across scopes, and project metadata remains outside task write scopes.
 There is no resident scheduler worker, runtime host, provider SDK or model route.
 The launcher manages only the backend. The machine CLI handles HTTP, receipt
 retry and lease renewal. It can launch an explicitly requested team CLI script

@@ -15,7 +15,8 @@ const npmCli = [
 ].find((p) => p && fs.existsSync(p));
 assert.ok(npmCli, "npm CLI must be installed with Node");
 const steps = [];
-const builtInSkills = ["agent", "skill", "mcp", "cli", "automation"].map((kind) => "atk-create-" + kind);
+const builtInSkills = ["agent", "skill", "mcp", "cli", "automation"].map((kind) => "atk-create-" + kind)
+  .concat(["linus-review", "linus-design-guard"]);
 let baseUrl, launcher, dataDir, accessKey;
 function command(file, args, cwd = process.cwd()) {
   const result = spawnSync(process.execPath, [file, ...args], {
@@ -199,6 +200,11 @@ try {
       const skills = await client.request("/resources?kind=skill");
       assert.deepEqual(skills.items.filter((item) => item.builtIn).map((item) => item.name), builtInSkills);
       assert.ok((await client.request("/resources/skill/atk-create-mcp")).content.includes("serve-mcp"));
+      for (const name of ["linus-review", "linus-design-guard"]) {
+        const skill = await client.request(`/resources/skill/${name}`);
+        assert.ok(skill.builtIn && skill.scope === "global");
+        assert.equal(skill.content, fs.readFileSync(path.join(installed, "apps/backend/resources/skill", name, "SKILL.md"), "utf8"));
+      }
       const bundledCli = (await client.request("/resources?kind=cli")).items;
       assert.deepEqual(bundledCli.filter((item) => item.builtIn).map((item) => item.name), ["atk", "atk-agent"]);
       await client.connect();

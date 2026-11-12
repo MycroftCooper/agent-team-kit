@@ -17,8 +17,9 @@ atk-agent submit <runId> plan|result|review --file <JSON>
 atk-agent stopped <runId> --generation <n>
 atk-agent get <runId>
 atk-agent replay
-atk-agent resources list [--kind agent|skill|mcp|cli]
-atk-agent resources show <kind/name>
-atk-agent resources run cli/<name> [-- <args>]
-atk-agent resources serve-mcp mcp/<name>
+atk-agent resources list [--kind agent|skill|mcp|cli] [--scope project --project <id>]
+atk-agent resources show <kind/name> [--scope project --project <id>]
+atk-agent resources run cli/<name> [--scope project --project <id>] [-- <args>]
+atk-agent resources serve-mcp mcp/<name> [--scope project --project <id>]
+Resources default to global (ATK built-ins and shared entries). Project scope never falls back to global.
 Environment: ATK_URL, ATK_AGENT_TOKEN; no model credentials.`;

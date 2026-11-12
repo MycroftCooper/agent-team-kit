@@ -95,8 +95,11 @@ limits an agent's claims to bugs.
 
 Open **Agent team** and use its left sidebar to manage identities and squads. Select **Role template** on
 an agent's card to view or edit its assigned template. Create new roles under **Squads**.
-Use **Resources** to create or discover shared agent templates, skills, MCP configurations and CLI scripts.
-External agents can discover them with `atk-agent resources list`. See [Team resources](docs/TEAM-RESOURCES.md).
+Use **Resources** for agent templates, skills, MCP configurations and CLI scripts, grouped into ATK built-ins,
+global shared entries and the current project's entries. Global resources stay under ATK's data directory;
+project resources live in docsRoot/resources (normally .agent-team/resources).
+Use `atk-agent resources list` for global entries or add `--scope project --project <id>` for a project.
+Same-named resources stay separate. See [Team resources](docs/TEAM-RESOURCES.md).
 Save the credential when creating an agent identity; it is shown once. Agents
 can use HTTP or the package's machine CLI:
 

@@ -272,10 +272,18 @@ export function createServer({
         ? await readBody(req)
         : {};
       requireServing();
-      const segments = pathname.split("/").filter(Boolean),
-        route = isAgent ? segments.slice(3) : segments.slice(2);
-      const [resource, id, action] = route;
+      const segments = pathname.split("/").filter(Boolean);
+      let route = isAgent ? segments.slice(3) : segments.slice(2);
       const projectId = url.searchParams.get("projectId") ?? undefined;
+      let resourceOptions = { scope: url.searchParams.get("scope") ?? undefined, projectId };
+      if (route[0] === "project-resources") {
+        requireThat(route[1] && (projectId === undefined || projectId === route[1]) &&
+          (resourceOptions.scope === undefined || resourceOptions.scope === "project"),
+          "INVALID_RESOURCE_SCOPE", "Project resource path and scope must agree");
+        resourceOptions = { scope: "project", projectId: route[1] };
+        route = ["resources", ...route.slice(2)];
+      }
+      const [resource, id, action] = route;
       if (isAgent) {
         let result;
         if (method === "POST" && resource === "connect")
@@ -287,9 +295,9 @@ export function createServer({
         else if (method === "POST" && resource === "claims")
           result = await waitClaim(agent.id, body, req);
         else if (method === "GET" && resource === "resources" && route.length === 1)
-          result = app.resources.list(url.searchParams.get("kind") ?? undefined);
+          result = app.resourceLibrary(resourceOptions, agent.id).list(url.searchParams.get("kind") ?? undefined);
         else if (method === "GET" && resource === "resources" && route.length === 3)
-          result = app.resources.read(id, action);
+          result = app.resourceLibrary(resourceOptions, agent.id).read(id, action);
         else if (method === "GET" && resource === "plans" && id) {
           const plan = app.get("plans", id),
             p = app.get("projects", plan.projectId),
@@ -401,15 +409,15 @@ export function createServer({
         else if (resource === "automation-runs" && id && action === "stop" && method === "POST")
           result = app.automations.stop(projectId, id);
         else if (method === "GET" && resource === "resources" && route.length <= 2)
-          result = app.resources.list(id);
+          result = app.resourceLibrary(resourceOptions).list(id);
         else if (method === "GET" && resource === "resources" && route.length === 3)
-          result = app.resources.read(id, action, { parseConfig: false });
+          result = app.resourceLibrary(resourceOptions).read(id, action, { parseConfig: false });
         else if (method === "POST" && resource === "resources" && route.length === 2)
-          result = app.resources.create(id, body);
+          result = app.resourceLibrary(resourceOptions).create(id, body);
         else if (method === "PATCH" && resource === "resources" && route.length === 3)
-          result = app.resources.update(id, action, body);
+          result = app.resourceLibrary(resourceOptions).update(id, action, body);
         else if (method === "DELETE" && resource === "resources" && route.length === 3)
-          result = app.resources.remove(id, action, url.searchParams.get("revision"));
+          result = app.resourceLibrary(resourceOptions).remove(id, action, url.searchParams.get("revision"));
         else if (method === "GET" && resource === "inbox")
           result = app.inbox(projectId);
         else if (resource === "bugs" && !id && method === "GET")

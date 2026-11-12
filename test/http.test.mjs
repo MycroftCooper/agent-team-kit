@@ -6,38 +6,7 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createServer } from "../apps/backend/src/server.mjs";
 import { createAgentClient } from "../packages/agent-client/src/index.mjs";
-import { fixture, node, plan, finish } from "./helpers.mjs";
-import { readBrowserAccess } from "../packages/platform/src/index.mjs";
-async function serverFixture(t) {
-  const f = fixture();
-  const server = createServer({
-    service: f.app,
-    logger: { error: console.error },
-  });
-  const info = await server.listen({ port: 0 });
-  t.after(async () => {
-    await server.close();
-    fs.rmSync(f.root, { recursive: true, force: true });
-  });
-  const session = await fetch(info.url + "/api/v1/session", {
-    headers: { "x-atk-access": readBrowserAccess(f.data) },
-  }).then((r) =>
-    r.json(),
-  );
-  async function human(route, body, method = body === undefined ? "GET" : "POST") {
-    const r = await fetch(info.url + "/api/v1" + route, {
-      method,
-      headers: {
-        "content-type": "application/json",
-        "x-atk-token": session.token,
-        "x-atk-csrf": session.csrf,
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    return { status: r.status, body: await r.json() };
-  }
-  return { ...f, server, ...info, session, human };
-}
+import { fixture, node, plan, finish, serverFixture } from "./helpers.mjs";
 test("team resources are created by humans and discovered, read and invoked by agents", async (t) => {
   const f = await serverFixture(t);
   const client = createAgentClient({ baseUrl: f.url, credential: f.dev.credential });
@@ -54,7 +23,8 @@ test("team resources are created by humans and discovered, read and invoked by a
   assert.equal((await fetch(`${f.url}/api/agent/v1/resources`)).status, 401);
   const listing = (await f.human("/resources")).body;
   assert.deepEqual(Object.keys(listing.folders), ["agent", "skill", "mcp", "cli"]);
-  const defaults = ["agent", "skill", "mcp", "cli", "automation"].map((kind) => `skill/atk-create-${kind}`);
+  const defaults = ["agent", "skill", "mcp", "cli", "automation"].map((kind) => `skill/atk-create-${kind}`)
+    .concat(["skill/linus-review", "skill/linus-design-guard"]);
   const builtIns = (await client.request("/resources?kind=skill")).items;
   assert.deepEqual(builtIns.map((item) => item.id), defaults);
   for (const item of builtIns) {
@@ -99,11 +69,17 @@ for await (const line of createInterface({ input: process.stdin })) {
   assert.equal(claimed.spec.resources.command, "atk-agent resources list");
   const items = JSON.parse(await run(["list"])).items;
   assert.deepEqual(items.map((item) => item.id), [...defaults, "skill/write-notes", "mcp/local-echo", "cli/atk", "cli/atk-agent", "cli/echo-args"]);
-  for (const [kind, name, entry] of [["skill", "atk-create-cli", "SKILL.md"], ["cli", "atk", "main.mjs"]]) {
+  for (const [kind, name, entry] of [
+    ["skill", "atk-create-cli", "SKILL.md"], ["skill", "linus-review", "SKILL.md"],
+    ["skill", "linus-design-guard", "SKILL.md"], ["cli", "atk", "main.mjs"],
+  ]) {
     const route = `/resources/${kind}/${name}`;
     const original = await f.human(route);
     assert.equal(original.status, 200);
     assert.equal(original.body.builtIn, true);
+    assert.equal(original.body.scope, "global");
+    if (name.startsWith("linus-"))
+      assert.equal(JSON.parse(await run(["show", `skill/${name}`])).content, original.body.content);
     const override = "Do not let this local file replace the bundled resource";
     const blocked = await f.human(`/resources/${kind}`, { name, content: override });
     assert.equal(blocked.status, 409);

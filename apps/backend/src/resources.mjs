@@ -12,10 +12,12 @@ const validName = (name) => typeof name === "string" && name.length <= 64 &&
 const bundledResources = new Map();
 function bundle(kind, name, content, metadata) {
   const id = `${kind}/${name}`;
-  bundledResources.set(id, { item: Object.freeze({ id, kind, name, builtIn: true, ...metadata }), content });
+  bundledResources.set(id, { item: Object.freeze({ id, kind, name, scope: "global", builtIn: true, ...metadata }), content });
 }
-for (const type of [...Object.keys(entries), "automation"]) {
-  const name = `atk-create-${type}`;
+for (const name of [
+  "atk-create-agent", "atk-create-skill", "atk-create-mcp", "atk-create-cli", "atk-create-automation",
+  "linus-review", "linus-design-guard",
+]) {
   const file = fileURLToPath(new URL(`../resources/skill/${name}/SKILL.md`, import.meta.url));
   const content = fs.readFileSync(file, "utf8");
   bundle("skill", name, content, { entry: "SKILL.md", path: file, description: /^description: ([^\r\n]+)/m.exec(content)?.[1] });
@@ -26,8 +28,21 @@ bundle("cli", "atk-agent", ATK_AGENT_HELP, { command: "atk-agent --help", descri
 export const resourceDiscovery = Object.freeze({
   ref: "/api/agent/v1/resources",
   command: "atk-agent resources list",
-  instructions: "Find relevant team resources when needed. For an Agent, Skill, MCP, CLI, or automation pipeline, look for its atk-create-* skill. Read entries with atk-agent resources show <kind/name>; run team scripts with atk-agent resources run cli/<name> -- <args>.",
+  instructions: "Find relevant team resources when needed. For an Agent, Skill, MCP, CLI, or automation pipeline, look for its atk-create-* skill. Use skill/linus-design-guard for structure decisions before coding and skill/linus-review for code or spec reviews. Read entries with atk-agent resources show <kind/name>; run team scripts with atk-agent resources run cli/<name> -- <args>.",
 });
+
+export function projectResourceDiscovery(projectId) {
+  return {
+    ...resourceDiscovery,
+    project: {
+      scope: "project", projectId,
+      ref: `/api/agent/v1/project-resources/${encodeURIComponent(projectId)}`,
+      command: `${resourceDiscovery.command} --scope project --project ${projectId}`,
+      instructions: "Query this project's resources as well as global resources. Pass --scope project --project " +
+        projectId + " to resources show, run or serve-mcp for a project entry. Names never fall back to another scope.",
+    },
+  };
+}
 
 function entryFor(kind) {
   requireThat(Object.hasOwn(entries, kind), "INVALID_RESOURCE_KIND", "Use agent, skill, mcp or cli");
@@ -92,7 +107,10 @@ function assertRealDirectory(dir) {
   requireThat(path.relative(dir, fs.realpathSync(dir)) === "", "UNSAFE_RESOURCE_PATH", "Resource path changed on disk", 409);
 }
 
-export function createResourceLibrary(dataDir) {
+export function createResourceLibrary(dataDir, { scope = "global", projectId } = {}) {
+  requireThat(["global", "project"].includes(scope) && (scope === "project" ? typeof projectId === "string" && projectId.length > 0 : projectId === undefined),
+    "INVALID_RESOURCE_SCOPE", "Use global, or project with a project ID");
+  const ownership = { scope, ...(scope === "project" && { projectId }) };
   fs.mkdirSync(dataDir, { recursive: true });
   const dataRoot = fs.realpathSync(dataDir), root = path.join(dataRoot, "resources");
   function folder(kind) {
@@ -108,7 +126,7 @@ export function createResourceLibrary(dataDir) {
     if (!statFor(dir, true)) return null;
     const stat = statFor(file);
     if (!stat || stat.size > maxBytes) return null;
-    return { id: `${kind}/${name}`, kind, name, entry, path: file };
+    return { id: `${kind}/${name}`, kind, name, ...ownership, entry, path: file };
   }
 
   function currentCustom(kind, name, revision) {
@@ -128,18 +146,21 @@ export function createResourceLibrary(dataDir) {
       const kinds = kind === undefined ? Object.keys(entries) : [kind];
       const folders = Object.fromEntries(kinds.map((type) => [type, folder(type)]));
       const items = Object.entries(folders).flatMap(([type, dir]) => {
-        const builtIns = Array.from(bundledResources.values(), ({ item }) => item).filter((item) => item.kind === type);
+        const builtIns = scope === "global"
+          ? Array.from(bundledResources.values(), ({ item }) => item).filter((item) => item.kind === type) : [];
         const local = fs.readdirSync(dir, { withFileTypes: true })
           .filter((entry) => entry.isDirectory() && validName(entry.name) && !bundledResources.has(`${type}/${entry.name}`))
           .sort((a, b) => a.name.localeCompare(b.name))
           .map((entry) => inspect(type, entry.name, dir)).filter(Boolean);
         return [...builtIns, ...local];
       });
-      return { root, folders, items };
+      return { root, folders, items, ...ownership };
     },
     read(kind, name, { parseConfig = true } = {}) {
       requireName(name);
-      const bundled = bundledResources.get(`${kind}/${name}`);
+      requireThat(scope === "global" || !bundledResources.has(`${kind}/${name}`),
+        "RESOURCE_NOT_FOUND", "Built-in resources are available in global scope only", 404);
+      const bundled = scope === "global" ? bundledResources.get(`${kind}/${name}`) : null;
       const item = bundled?.item ?? inspect(kind, name, folder(kind));
       requireThat(item, "RESOURCE_NOT_FOUND", "Resource entry is missing or cannot be read", 404);
       const entry = bundled ? { content: bundled.content } : readEntry(item.path);
@@ -160,12 +181,12 @@ export function createResourceLibrary(dataDir) {
         try { fs.rmdirSync(dir); } catch { /* preserve files placed there by another process */ }
         throw error;
       }
-      return { id: `${kind}/${name}`, kind, name, entry: entryFor(kind), path: file };
+      return { id: `${kind}/${name}`, kind, name, ...ownership, entry: entryFor(kind), path: file };
     },
     update(kind, name, { content, revision } = {}) {
       const item = currentCustom(kind, name, revision);
       validateContent(kind, content);
-      if (content === item.content) return { id: item.id };
+      if (content === item.content) return { id: item.id, ...ownership };
       const temp = path.join(path.dirname(item.path), `.${randomUUID()}.tmp`);
       const fd = fs.openSync(temp, "wx", fs.statSync(item.path).mode & 0o777);
       try {
@@ -178,7 +199,7 @@ export function createResourceLibrary(dataDir) {
       } finally {
         fs.rmSync(temp, { force: true });
       }
-      return { id: item.id };
+      return { id: item.id, ...ownership };
     },
     remove(kind, name, revision) {
       const item = currentCustom(kind, name, revision);
@@ -194,7 +215,7 @@ export function createResourceLibrary(dataDir) {
         try { fs.rmdirSync(bucket); } catch { /* do not remove contents added by another process */ }
         throw error;
       }
-      return { id: item.id, trashPath: destination };
+      return { id: item.id, ...ownership, trashPath: destination };
     },
   };
 }

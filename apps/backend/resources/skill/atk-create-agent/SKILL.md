@@ -5,6 +5,12 @@ description: Create an ATK Agent profile and, when requested, prepare its role, 
 
 # Create an ATK Agent
 
+Choose the resource owner before importing: global resources use the existing commands;
+project resources add `--scope project --project <projectId>` to list/show. Read
+`spec.resources.project` for the claimed project's discovery command. Use the returned
+folder for that scope; project profiles live in docsRoot/resources and do not override
+same-named global profiles. A task's approved write scope still applies.
+
 Distinguish the reusable profile, the registered ATK identity, and the client that actually runs the Agent. A profile in the resource library does not register an identity or start a process.
 
 1. Identify the Agent's job, inputs, expected outputs, and when it should hand work back. Use an existing role if it fits. For a new role, choose the actual stage: `ORCHESTRATOR` plans, `WORKER` executes, and `REVIEWER` reviews independently. State project access and allowed writes narrowly when configuring a worker role.

@@ -52,14 +52,27 @@ async function main() {
   });
   let result;
   if (command === "resources") {
+    const scope = args.scope ?? "global";
+    if (!["global", "project"].includes(scope) || (scope === "project" ? typeof args.project !== "string" || !args.project : args.project !== undefined))
+      throw new Error("Use --scope project --project <id> for project resources, or omit both for global resources");
+    const query = new URLSearchParams({ scope });
+    const resourcePath = scope === "project" ? `/project-resources/${encodeURIComponent(args.project)}` : "/resources";
+    const requestResource = async (route) => {
+      const result = await client.request(route);
+      const belongs = (item) => item?.scope === "project" && item.projectId === args.project;
+      if (scope === "project" && (!belongs(result) || (Array.isArray(result.items) && !result.items.every(belongs))))
+        throw new Error("RESOURCE_SCOPE_MISMATCH: The server did not confirm this project's resource ownership. Update the backend before using project resources.");
+      return result;
+    };
     if (runId === "list" && !action) {
-      result = await client.request(`/resources${args.kind ? `?kind=${encodeURIComponent(args.kind)}` : ""}`);
+      if (args.kind) query.set("kind", args.kind);
+      result = await requestResource(`${resourcePath}?${query}`);
     } else {
       const [kind, name, extra] = (action ?? "").split("/");
       if (!kind || !name || extra !== undefined || args._.length !== 3 ||
         !(runId === "show" || (runId === "run" && kind === "cli") || (runId === "serve-mcp" && kind === "mcp")))
         throw new Error("Use resources show <kind/name>, resources run cli/<name> or resources serve-mcp mcp/<name>");
-      const resource = await client.request(`/resources/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`);
+      const resource = await requestResource(`${resourcePath}/${encodeURIComponent(kind)}/${encodeURIComponent(name)}?${query}`);
       if (runId === "run") {
         if (resource.builtIn) throw new Error(`Run ${resource.name} directly; use ${resource.command} for usage.`);
         return invokeResource(process.execPath, [resource.path, ...toolArgs]);

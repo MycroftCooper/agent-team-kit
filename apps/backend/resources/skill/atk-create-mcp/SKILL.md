@@ -5,6 +5,12 @@ description: Package an existing MCP service for ATK or implement a new MCP serv
 
 # Create an ATK MCP resource
 
+Choose global or project ownership before importing. Global commands remain unchanged;
+add `--scope project --project <projectId>` to list/show/serve-mcp for project resources.
+Use the claimed task's `spec.resources.project.command` to find the project's folders.
+A project stdio client's launch arguments must include those scope and project flags.
+Same-named configurations never override or fall back across scopes.
+
 Decide whether to connect an existing service or implement new tools. For new tools, define their names, input schemas, result shapes, and side effects before implementing them with an SDK supported by the target runtime. Use [MCP's build guide](https://modelcontextprotocol.io/docs/develop/build-server) when you need SDK-specific instructions. A local stdio server should reserve stdout for protocol messages and send logs to stderr.
 
 Create `mcp/<name>/mcp.json` with one of these ATK forms:

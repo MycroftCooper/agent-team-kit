@@ -602,7 +602,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
               ) : view === "runs" ? (
                 <Runs />
               ) : view === "team" ? (
-                <AgentTeam t={t} state={agentTeam} currentTeamId={current?.teamId} roles={allRoles} teams={allTeams}
+                <AgentTeam t={t} state={agentTeam} currentTeamId={current?.teamId} projectId={projectId} roles={allRoles} teams={allTeams}
                   open={open} badge={badge} errorPanel={errorPanel} copyText={copyText} />
               ) : view === "projects" ? (
                 <Projects />

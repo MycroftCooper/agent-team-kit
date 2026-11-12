@@ -105,9 +105,11 @@ PM 不能执行或评审自己规划的任务；WORKER 不能自审；Agent 凭�
 
 打开「Agent 团队」，在左侧二级侧栏切换全部 Agent、当前工作空间的小队 Agent 和本机成员；
 点击 Agent 卡片上的「角色模板」，在弹窗中查看和编辑它绑定的模板；在「小队」新建角色、配置角色组成与并发。
-「资源」下的 Agent 模板、Skills、MCP 和 CLI 共用 ATK 数据目录中的 `resources/`。
-可以在网页新建，也可以复制资源文件夹进去。外部 Agent 领取任务后可用
-`atk-agent resources list` 发现资源。目录约定和调用方式见[团队资源](docs/TEAM-RESOURCES.md)。
+「资源」下的 Agent 模板、Skills、MCP 和 CLI 分为 ATK 自带、全局共享、当前项目专用。
+全局资源保留在 ATK 数据目录的 `resources/`；项目资源放在 `docsRoot/resources`，默认是
+`.agent-team/resources`。可以在网页分别新建，也可以复制完整资源文件夹进去。
+`atk-agent resources list` 仍查询全局；附加 `--scope project --project <id>` 查询项目资源，
+同名资源互不覆盖。目录约定和调用方式见[团队资源](docs/TEAM-RESOURCES.md)。
 创建 Agent 身份后，保存只展示一次的凭据。接入时通过外部环境
 变量 `ATK_AGENT_TOKEN` 提供凭据，`ATK_URL` 默认为 `http://127.0.0.1:1421`。
 
