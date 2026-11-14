@@ -85,6 +85,58 @@ it cannot alter a revised requirement or a newer delivery. Drift in a human-owne
 final output reopens that HUMAN task through BLOCKED and explicit retry, while
 legal downstream edits preserve the earlier human completion.
 
+### Task state machines
+
+The diagrams below show REQUEST, WORK and BUG task lifecycles, including review
+rework, blocked-task retries and acceptance. Plan and run statuses belong to
+separate lifecycles; waiting for dependencies or file locks leaves a task READY.
+
+[Editable draw.io file](diagrams/task-state-machine.drawio) contains all three
+diagrams as separate pages. Diagram labels and detailed transition notes are in
+Chinese.
+
+**REQUEST — requirement container**
+
+![REQUEST task state machine](diagrams/request-task.png)
+
+**WORK — planned execution task**
+
+![WORK task state machine](diagrams/work-task.png)
+
+**BUG — direct repair task**
+
+![BUG task state machine](diagrams/bug-task.png)
+
+### Agent and run state machines
+
+Agent identities are created OFFLINE. Successful contact through connect, claim
+or heartbeat writes ONLINE and refreshes `lastSeen`. Displayed contact status is
+computed from `revoked` and whether `lastSeen` is less than `LEASE_MS` (30 seconds)
+old; timeout does not write OFFLINE back to the database. Revocation writes
+REVOKED, invalidates the credential and requests that active runs stop. Revoked
+identities cannot be restored. Agent capacity usage is computed from active
+runs rather than an idle/busy identity status.
+
+Runs start RUNNING. STOP_REQUESTED and QUARANTINED remain active or uncertain,
+retaining their capacity reservation and existing file locks. Confirmation of
+stop transitions either state to INTERRUPTED. EXECUTION/HUMAN runs may also
+submit a stopped FAILED or INTERRUPTED receipt from these states. A running
+review is interrupted directly when its target changes. Review submission
+completes the run even when the verdict requests changes or blocks the task.
+Terminal runs are not restarted; another attempt creates a new run generation.
+
+[Editable Agent and Run draw.io file](diagrams/agent-run-state-machine.drawio)
+contains both diagrams as separate pages, with Chinese labels and transition
+notes. The Agent page separates stored status from derived contact status.
+
+**Agent — identity and contact status**
+
+![Agent identity and contact state machines](diagrams/agent-state-machine.png)
+
+**Run — individual execution lifecycle**
+
+![Run state machine](diagrams/run-state-machine.png)
+
 ## File coordination and evidence
 
 Claims transactionally check dependencies, team/agent capacity, identity, full
