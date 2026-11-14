@@ -151,7 +151,7 @@ try {
         ["Developer Browser", "role-dev"],
         ["Reviewer Browser", "role-qa"],
       ]) {
-        await browser.click("添加 Agent");
+        await browser.click("添加项目 Agent");
         await browser.fill("name", name);
         await browser.fill("roleId", role);
         await browser.submit();
@@ -168,10 +168,9 @@ try {
   );
   await step("agent team shows scoped agents, role dialogs and setup resources", async () => {
     const otherTeam = server.app.createTeam({ name: "Other squad", roleIds: ["role-dev"] });
-    server.app.createAgent({ name: "Outside squad agent", teamId: otherTeam.id, roleId: "role-dev" });
+    const outsideProject = server.app.createProject({ name: "Other squad project", teamId: otherTeam.id, root: fs.mkdtempSync(path.join(root, "outside-project-")) });
+    server.app.createAgent({ projectId: outsideProject.id, name: "Outside squad agent", roleId: "role-dev" });
     const content = "document.querySelector('.agent-team-content')";
-    await browser.wait(`${content}?.innerText.includes('Outside squad agent')`);
-    await browser.click("我的 Agent", { exact: true });
     await browser.wait(`${content}?.innerText.includes('Developer Browser') && !${content}?.innerText.includes('Outside squad agent')`);
     const template = "document.querySelector('[role=dialog][aria-label=角色模板]')";
     const cardLayout = "[...document.querySelectorAll('.agent-card')].map(card=>[card.offsetLeft,card.offsetTop,card.offsetWidth,card.offsetHeight])";
@@ -243,7 +242,7 @@ try {
     await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent.includes('atk backup')`);
     await browser.click("查看 atk-agent", { exact: true, within: content });
     await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent.includes('atk-agent claim')`);
-    await browser.click("全部 Agent", { exact: true });
+    await browser.click("项目 Agent", { exact: true });
     await browser.send("Emulation.setDeviceMetricsOverride", { width: 420, height: 900, deviceScaleFactor: 1, mobile: false });
     const narrowRailWidth = await browser.evaluate(primaryRailWidth);
     assert.equal(await browser.evaluate(leftSecondarySidebar), true);
@@ -463,7 +462,7 @@ try {
     await browser.click("保存指派", { exact: true });
     await browser.wait("!document.querySelector('[role=dialog]') && " + agentCard + "?.innerText.includes('Developer Browser')");
     const task = server.app.list("tasks", { projectId: project.id }).items.find((row) => row.title === "Produce first output");
-    const competitor = server.app.createAgent({ name: "Another worker", roleId: "role-dev", teamId: "team-default" });
+    const competitor = server.app.createAgent({ projectId: server.app.list("projects").items.find((p) => p.root === projectRoot).id, name: "Another worker", roleId: "role-dev", teamId: "team-default" });
     const client = createAgentClient({ baseUrl: info.url, credential: competitor.credential });
     assert.equal((await client.claim({ taskId: task.id, waitMs: 0 })).run, null);
     await displayMenu(true);
@@ -489,6 +488,8 @@ try {
     await taskLayout("列表");
     await browser.wait("[...document.querySelectorAll('.task-row')].some(row=>row.innerText.includes('Produce first output'))");
     await browser.evaluate("[...document.querySelectorAll('.task-row')].find(row=>row.innerText.includes('Produce first output')).click()");
+    await browser.wait("[...document.querySelectorAll('.detail-section summary')].some(s=>s.textContent==='交付记录')");
+    await browser.evaluate("[...document.querySelectorAll('.detail-section summary')].find(s=>s.textContent==='交付记录').parentElement.open=true");
     await browser.wait("document.querySelector('.dispatch-notice')?.innerText.includes('等待外部 Agent 领取')");
     await browser.screenshot("12-task-claim-diagnostics");
     await browser.click("关闭", { exact: true });
@@ -595,6 +596,8 @@ try {
     await taskLayout("列表");
     await browser.wait("[...document.querySelectorAll('.task-row')].some(row=>row.innerText.includes('Produce first output'))");
     await browser.evaluate("[...document.querySelectorAll('.task-row')].find(row=>row.innerText.includes('Produce first output')).click()");
+    await browser.wait("[...document.querySelectorAll('.detail-section summary')].some(s=>s.textContent==='交付记录')");
+    await browser.evaluate("[...document.querySelectorAll('.detail-section summary')].find(s=>s.textContent==='交付记录').parentElement.open=true");
     await browser.wait("document.querySelector('.attempt-row')?.innerText.includes('#2')");
     const taskUrl = new URL(await browser.evaluate("location.href"));
     assert.equal(taskUrl.searchParams.get("project"), project.id);
@@ -611,6 +614,8 @@ try {
     await browser.wait("document.querySelector('.detail-toolbar')?.innerText.includes('执行 #1')");
     assert.equal(await browser.evaluate("location.hash"), "");
     await browser.evaluate("history.back()");
+    await browser.wait("[...document.querySelectorAll('.detail-section summary')].some(s=>s.textContent==='交付记录')");
+    await browser.evaluate("[...document.querySelectorAll('.detail-section summary')].find(s=>s.textContent==='交付记录').parentElement.open=true");
     await browser.wait("document.querySelector('.attempt-row')?.innerText.includes('#2')");
     assert.equal(await browser.evaluate("location.href"), taskUrl.href);
     await browser.send("Emulation.setDeviceMetricsOverride", { width: 420, height: 900, deviceScaleFactor: 1, mobile: false });
@@ -732,6 +737,11 @@ try {
   await step(
     "keyboard dialog and form preservation during SSE refresh",
     async () => {
+      // The helper's synthetic click does not focus navigation as a real click would.
+      await browser.wait("!document.querySelector('[role=dialog]')");
+      await browser.send("Page.bringToFront");
+      await browser.evaluate("document.querySelector('.sidebar [aria-current=page]').focus()");
+      assert.equal(await browser.evaluate("document.activeElement.matches('.sidebar [aria-current=page]')"), true);
       await browser.send("Input.dispatchKeyEvent", {
         type: "keyDown",
         key: "n",

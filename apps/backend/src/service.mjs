@@ -146,8 +146,13 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       );
   }
   function taskProjection(task, existingLocks) {
+    task = { ...task, dependencies: (task.deps ?? []).map((id) => {
+      const dep = store.get("tasks", id);
+      return dep?.projectId === task.projectId ? { id, title: dep.title, status: dep.status } : { id };
+    }) };
     if (task.assignedAgentId) {
-      const assignee = store.get("agents", task.assignedAgentId);
+      const candidate = store.get("agents", task.assignedAgentId);
+      const assignee = candidate?.projectId === task.projectId ? candidate : null;
       task = {
         ...task,
         assignee: { id: task.assignedAgentId, name: assignee?.name ?? null, revoked: !assignee || assignee.revoked },
@@ -176,7 +181,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           ...task,
           waiting: {
             code: "FILE_LOCKED",
-            holders: held.map((l) => ({
+            holders: held.map((l) => l.projectId !== task.projectId ? { external: true, file: l.relative } : ({
               runId: l.runId,
               taskId: l.taskId,
               projectId: l.projectId,
@@ -199,10 +204,13 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       .all("locks")
       .filter((l) => scopes.some((s) => pathsOverlap(l.path, s.key)));
   }
+  function visibleLocks(locks, projectId) {
+    return locks.map((l) => l.projectId === projectId ? l : { external: true, status: l.status });
+  }
   function lock(run, p, scopes) {
     const found = conflicts(scopes);
     requireThat(!found.length, "FILE_LOCKED", "Files are occupied", 409, {
-      locks: found,
+      locks: visibleLocks(found, p.id),
     });
     for (const s of scopes)
       make("locks", {
@@ -226,11 +234,25 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     return {
       agent: a,
       role: get("roles", a.roleId),
-      team: get("teams", a.teamId),
+      team: get("teams", a.projectId ? get("projects", a.projectId).teamId : a.teamId),
     };
+  }
+  function agentProjects(a) {
+    const ids = new Set();
+    for (const r of store.all("runs", { agentId: a.id })) ids.add(r.projectId);
+    for (const p of store.all("plans")) if (p.authorAgentId === a.id) ids.add(p.projectId);
+    for (const t of store.all("tasks")) if (t.assignedAgentId === a.id) ids.add(t.projectId);
+    return [...ids].filter(Boolean);
+  }
+  function bindAgentProject(a, p) {
+    const next = put("agents", { ...a, projectId: p.id, teamId: p.teamId });
+    store.db.prepare("UPDATE events SET project_id=? WHERE entity_id=? AND type LIKE 'agent.%' AND project_id IS NULL").run(p.id, a.id);
+    emit("agent.updated", p.id, a.id);
+    return next;
   }
   function allowed(a, t, p) {
     return (
+      a.projectId === p.id &&
       p.teamId === t.id &&
       (t.projectIds.length === 0 || t.projectIds.includes(p.id))
     );
@@ -248,18 +270,17 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     if (scope === "global") return resources;
     const p = project(projectId);
     if (agentId) {
-      const { agent, team } = agentContext(agentId);
-      requireThat(allowed(agent, team, p), "PROJECT_FORBIDDEN", "Project not authorized", 403);
+      api.authorizeAgentProject(agentId, p.id);
     }
+    requireResourceRoot(p.docsRoot, p.id);
     requireThat(fs.existsSync(p.docsRoot) && fs.lstatSync(p.docsRoot).isDirectory() && canonical(p.docsRoot) === p.docsRoot,
       "PROJECT_DATA_MOVED", "Project data path changed or is unavailable", 409);
-    requireResourceRoot(p.docsRoot, p.id);
     return createResourceLibrary(p.docsRoot, { scope, projectId: p.id });
   }
   function eligibleWorker(agent, role, team, project, plan, task) {
     return agent && !agent.revoked && agent.id !== plan?.authorAgentId &&
       role.function === "WORKER" && agent.roleId === task.roleId &&
-      agent.teamId === team.id && team.roleIds.includes(role.id) && allowed(agent, team, project);
+      team.roleIds.includes(role.id) && allowed(agent, team, project);
   }
   function assignmentBlock(task) {
     if (task.kind !== "WORK" || task.executorType !== "AGENT") return "ASSIGNMENT_NOT_APPLICABLE";
@@ -270,6 +291,10 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
   }
   function validRun(agentId, runId, body, { allowStopped = false } = {}) {
     const r = get("runs", runId);
+    if (agentId) {
+      const a = get("agents", agentId);
+      requireThat(!a.projectId || a.projectId === r.projectId, "PROJECT_FORBIDDEN", "Run belongs to another project", 403);
+    }
     requireThat(
       r.agentId === agentId,
       "RUN_FORBIDDEN",
@@ -507,7 +532,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         blocked: true,
         reason: "FILE_LOCKED",
         taskId: task.id,
-        locks: found,
+        locks: visibleLocks(found, p.id),
       };
     const generation =
       store
@@ -615,6 +640,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     resourceLibrary,
     automations,
     list(table, filters = {}) {
+      if (table === "agents") requiredString(filters.projectId, "projectId");
       const page = store.list(table, table === "tasks" && !filters.kind ? { ...filters, excludeKind: "BUG" } : filters);
       const currentLocks =
         table === "tasks" &&
@@ -855,7 +881,11 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           409,
         );
         if (body.root || body.docsRoot) requireResourceRoot(paths.docsRoot, id);
-        if (body.teamId) get("teams", body.teamId);
+        if (body.teamId) {
+          get("teams", body.teamId);
+          requireThat(body.teamId === p.teamId || !store.all("agents", { projectId: id }).some((a) => !a.revoked),
+            "PROJECT_HAS_AGENTS", "Revoke project identities before changing its squad", 409);
+        }
         const next = put("projects", {
           ...p,
           ...paths,
@@ -960,8 +990,9 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     },
     createAgent(body) {
       return store.tx(() => {
-        const role = get("roles", body.roleId),
-          team = get("teams", body.teamId);
+        const p = project(requiredString(body.projectId, "projectId")),
+          role = get("roles", body.roleId), team = get("teams", p.teamId);
+        requireThat(!body.teamId || body.teamId === p.teamId, "PROJECT_FORBIDDEN", "The agent team is determined by its project", 403);
         requireThat(
           team.roleIds.includes(role.id),
           "ROLE_FORBIDDEN",
@@ -973,13 +1004,14 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           name: requiredString(body.name, "name", 128),
           roleId: role.id,
           teamId: team.id,
+          projectId: p.id,
           credentialHash: sha(credential),
           revoked: false,
           status: "OFFLINE",
           capacity: integer(body.capacity, 1, 1, 20),
           lastSeen: null,
         });
-        emit("agent.created", null, a.id);
+        emit("agent.created", p.id, a.id);
         return { agent: safeAgent(a), credential };
       });
     },
@@ -987,6 +1019,9 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       return store.tx(() => {
         const a = get("agents", id);
         expected(a, body.version);
+        const p = project(a.projectId);
+        requireThat((!body.projectId || body.projectId === a.projectId) && (!body.teamId || body.teamId === p.teamId),
+          "PROJECT_IMMUTABLE", "An agent cannot move to another project or squad", 409);
         requireThat(
           !working().some((r) => r.agentId === id),
           "AGENT_BUSY",
@@ -994,7 +1029,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           409,
         );
         const role = get("roles", body.roleId ?? a.roleId),
-          team = get("teams", body.teamId ?? a.teamId);
+          team = get("teams", p.teamId);
         requireThat(
           team.roleIds.includes(role.id),
           "ROLE_FORBIDDEN",
@@ -1008,7 +1043,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           teamId: team.id,
           capacity: integer(body.capacity, a.capacity, 1, 20),
         });
-        emit("agent.updated", null, id);
+        emit("agent.updated", a.projectId, id);
         return safeAgent(next);
       });
     },
@@ -1021,7 +1056,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         put("agents", { ...a, revoked: true, status: "REVOKED" });
         for (const r of working().filter((r) => r.agentId === id))
           api.requestStop(r.id);
-        emit("agent.revoked", null, id);
+        emit("agent.revoked", a.projectId ?? null, id);
         return { revoked: true };
       });
     },
@@ -1033,6 +1068,36 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       requireThat(a, "UNAUTHENTICATED", "Invalid agent credential", 401);
       return a;
     },
+    authorizeAgentProject(agentId, projectId, { runId, planId } = {}) {
+      const { agent, team } = agentContext(agentId), p = get("projects", projectId);
+      if (agent.projectId) {
+        requireThat(allowed(agent, team, p), "PROJECT_FORBIDDEN", "This credential belongs to another project", 403);
+        return;
+      }
+      // Unbound legacy credentials can settle their existing runs, never claim new work.
+      const ownRun = runId && store.get("runs", runId);
+      const existing = store.all("runs", { agentId }).some((r) => r.projectId === projectId &&
+        (active(r) || (planId && r.planId === planId)));
+      requireThat(existing || (ownRun?.agentId === agentId && ownRun.projectId === projectId),
+        "AGENT_PROJECT_REQUIRED", "Bind this legacy identity to a project before requesting new work", 409);
+    },
+    agentMigrations() {
+      return store.all("agents").filter((a) => !a.projectId && !a.revoked).map((a) => ({
+        ...safeAgent(a), projectIds: agentProjects(a),
+        activeRuns: working().filter((r) => r.agentId === a.id).map(runSummary),
+      }));
+    },
+    bindAgent(id, body) {
+      return store.tx(() => {
+        const a = get("agents", id), p = project(requiredString(body.projectId, "projectId"));
+        expected(a, body.version);
+        requireThat(!a.projectId && !a.revoked, "PROJECT_IMMUTABLE", "Only an unbound legacy identity can be assigned a project", 409);
+        requireThat(!working().some((r) => r.agentId === id), "AGENT_BUSY", "Confirm all old executions have stopped before binding", 409);
+        const team = get("teams", p.teamId);
+        requireThat(team.roleIds.includes(a.roleId), "ROLE_FORBIDDEN", "The project squad must include this role", 403);
+        return safeAgent(bindAgentProject(a, p));
+      });
+    },
     connect(agentId) {
       return store.tx(() => {
         const { agent } = agentContext(agentId);
@@ -1041,7 +1106,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           status: "ONLINE",
           lastSeen: now(),
         });
-        emit("agent.connected", null, agentId);
+        emit("agent.connected", agent.projectId ?? null, agentId);
         return {
           agent: safeAgent(next),
           heartbeatMs: HEARTBEAT_MS,
@@ -1115,7 +1180,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         const summary = accepted ? null : requiredString(body.reason, "reason", 8192);
         if (accepted) {
           const locks = conflicts(locksFor(bug.files, p));
-          requireThat(!locks.length, "FILE_LOCKED", "Wait for active writers before accepting", 409, { locks });
+          requireThat(!locks.length, "FILE_LOCKED", "Wait for active writers before accepting", 409, { locks: visibleLocks(locks, p.id) });
           const receipt = api.artifact(bug.latestRunId);
           const changes = currentDifferences(p, receipt.after, bug.files);
           requireThat(!changes.length, "APPROVAL_STALE", "Fix files changed; return the bug to the repair queue", 409, { changes });
@@ -1132,6 +1197,8 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       api.maintenance({ documents: false, drift: false });
       return store.tx(() => {
         const { agent: a, role, team } = agentContext(agentId);
+        requireThat(a.projectId, "AGENT_PROJECT_REQUIRED", "Assign this legacy identity to a project first", 409);
+        requireThat(!body.projectId || body.projectId === a.projectId, "PROJECT_FORBIDDEN", "This credential belongs to another project", 403);
         requireThat(
           team.roleIds.includes(role.id),
           "ROLE_FORBIDDEN",
@@ -1171,6 +1238,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         requireThat(body.kind === undefined || ["BUG", "WORK", "REQUEST"].includes(body.kind),
           "VALIDATION_ERROR", "Use BUG, WORK or REQUEST for claim kind");
         const candidates = store.all("tasks", {
+          projectId: a.projectId,
           kind: body.kind,
           status:
             stage === "PLANNING"
@@ -1947,7 +2015,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           "FILE_LOCKED",
           "Wait for active writers before accepting",
           409,
-          { locks: occupied },
+          { locks: visibleLocks(occupied, p.id) },
         );
         // BEGIN IMMEDIATE and the single backend writer reserve the validation
         // window against cooperative claims; unrelated editors remain detectable.
@@ -2157,7 +2225,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         projects: store
           .all("projects")
           .map((p) => ({ ...p, available: fs.existsSync(p.root) })),
-        agents: store.all("agents").map((a) => ({
+        agents: (projectId ? store.all("agents", { projectId }) : []).map((a) => ({
           ...safeAgent(a),
           online: recentlySeen(a, now()),
         })),
@@ -2174,11 +2242,62 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         latestSeq: store.latestSeq(),
       };
     },
+    collaboration(projectId, planId) {
+      const p = get("projects", requiredString(projectId, "projectId")), team = get("teams", p.teamId);
+      const agents = store.all("agents", { projectId }).map((a) => ({ ...safeAgent(a), online: recentlySeen(a, now()) }));
+      const activeRuns = working().filter((r) => r.projectId === projectId);
+      const plans = store.list("plans", { projectId, newest: true, limit: 100 }).items;
+      let selected = planId ? get("plans", planId) : plans.find((v) => v.status === "APPROVED" && get("tasks", v.sourceTaskId).status !== "DONE") ?? plans[0];
+      requireThat(!selected || selected.projectId === projectId, "NOT_FOUND", "Plan not found in this project", 404);
+      const taskRows = selected ? [...store.all("tasks", { planId: selected.id }), get("tasks", selected.sourceTaskId)]
+        : store.list("tasks", { projectId, newest: true, limit: 100 }).items;
+      const bugs = store.list("tasks", { projectId, kind: "BUG", newest: true, limit: 20 }).items;
+      const taskMap = new Map([...taskRows, ...bugs].map((t) => [t.id, t]));
+      for (const r of activeRuns) taskMap.set(r.taskId, get("tasks", r.taskId));
+      const events = store.events({ projectId, limit: 40, newest: true, excludeTypes: ["run.log", "run.usage"] });
+      const runMap = new Map(activeRuns.map((r) => [r.id, r]));
+      for (const e of events) {
+        if (e.type.startsWith("run.")) {
+          const r = store.get("runs", e.entityId);
+          if (r?.projectId === projectId) runMap.set(r.id, r);
+        }
+        const entity = e.type.startsWith("run.") ? store.get("runs", e.entityId)
+          : e.type.startsWith("plan.") ? store.get("plans", e.entityId) : store.get("tasks", e.entityId);
+        e.taskId = entity?.taskId ?? entity?.sourceTaskId ?? (entity?.kind ? entity.id : e.data.taskId ?? e.data.sourceTaskId);
+        if (e.taskId) {
+          const task = store.get("tasks", e.taskId);
+          if (task?.projectId === projectId) taskMap.set(task.id, task);
+        }
+      }
+      for (const t of taskMap.values()) for (const id of [t.latestRunId, t.reviewRunId]) {
+        const r = id && store.get("runs", id);
+        if (r?.projectId === projectId) runMap.set(r.id, r);
+      }
+      const progress = store.db.prepare("SELECT data,created_at FROM events WHERE entity_id=? AND type IN ('run.progress','run.blocked') ORDER BY seq DESC LIMIT 1");
+      const runs = [...runMap.values()].map((r) => {
+        const latest = active(r) ? progress.get(r.id) : null;
+        return { id: r.id, taskId: r.taskId, projectId: r.projectId, agentId: r.agentId, stage: r.stage, status: r.status, planId: r.planId, generation: r.generation, leaseUntil: r.leaseUntil, title: r.spec?.title, startedAt: r.startedAt, endedAt: r.endedAt,
+          latestProgress: latest ? { message: JSON.parse(latest.data).message?.slice(0, 240), at: latest.created_at } : null };
+      });
+      return {
+        serverNow: now(), latestSeq: store.latestSeq(), project: { id: p.id, name: p.name },
+        team: { id: team.id, name: team.name, maxConcurrent: team.maxConcurrent }, agents, runs,
+        roles: store.all("roles").filter((r) => team.roleIds.includes(r.id)).map(({ id, name, function: fn }) => ({ id, name, function: fn })),
+        plans: plans.map((v) => ({ ...planSummary(v), title: get("tasks", v.sourceTaskId).title })),
+        selectedPlanId: selected?.id ?? null,
+        tasks: [...taskMap.values()].map((t) => {
+          const projected = taskProjection(t);
+          const { id, title, kind, status, executorType, roleId, reviewRoleId, reviewPolicy, parentId, planId, deps, assignedAgentId, latestRunId, reviewRunId, blockReason, waiting } = projected;
+          return { id, title, kind, status, executorType, roleId, reviewRoleId, reviewPolicy, parentId, planId, deps, assignedAgentId, latestRunId, reviewRunId, blockReason, waiting };
+        }),
+        events: events.map((e) => ({ ...e, data: { stage: e.data.stage, outcome: e.data.outcome, verdict: e.data.verdict, agentId: e.data.agentId, message: e.data.message?.slice(0, 240) } })),
+      };
+    },
     inbox(projectId) {
       const filter = projectId ? { projectId } : {};
       const byId = new Map(store.all("tasks", filter).map((t) => [t.id, t]));
       return {
-        plans: store.all("plans", { ...filter, status: "SUBMITTED" }),
+        plans: store.all("plans", { ...filter, status: "SUBMITTED" }).map((v) => ({ ...v, sourceTitle: byId.get(v.sourceTaskId)?.title })),
         humanTasks: [...byId.values()].filter(
           (t) =>
             t.executorType === "HUMAN" &&
@@ -2189,7 +2308,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           .all("acceptances", filter)
           .filter(
             (a) => ["PENDING", "STALE"].includes(a.status) && currentAcceptance(a),
-          ),
+          ).map((v) => ({ ...v, sourceTitle: byId.get(v.sourceTaskId)?.title })),
         runs: working().filter(
           (r) =>
             (!projectId || r.projectId === projectId) && r.status !== "RUNNING",
@@ -2210,5 +2329,16 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       signals.removeAllListeners();
     },
   };
+  // Only migrate when both historical ownership and project eligibility are unambiguous.
+  store.tx(() => {
+    for (const a of store.all("agents").filter((a) => !a.projectId && !a.revoked)) {
+      const historical = agentProjects(a);
+      const candidates = historical.length ? historical.map((id) => store.get("projects", id)).filter(Boolean)
+        : store.all("projects").filter((p) => !p.archived && p.teamId === a.teamId);
+      if (historical.length > 1 || candidates.length !== 1) continue;
+      const p = candidates[0], team = store.get("teams", p.teamId);
+      if (team?.roleIds.includes(a.roleId)) bindAgentProject(a, p);
+    }
+  });
   return api;
 }

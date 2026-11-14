@@ -60,7 +60,7 @@ test("all four resource kinds keep global and project entries separate through C
     assert.equal((await f.human(scoped, { revision: before.revision, content: original }, "PATCH")).body.error.code, "RESOURCE_CHANGED");
     assert.equal((await f.human(`${scoped}&revision=${before.revision}`, undefined, "DELETE")).body.error.code, "RESOURCE_CHANGED");
     assert.equal((await client.request(route)).content, original);
-    assert.equal((await client.request(`${route}?${query(p2)}`)).content, original);
+    await assert.rejects(client.request(`${route}?${query(p2)}`), { code: "PROJECT_FORBIDDEN" });
     assert.equal(fs.readFileSync(support, "utf8"), "Keep this file");
     const current = await client.request(`${route}?${query(f.p)}`);
     await assert.rejects(client.request(scoped, { revision: current.revision, content: original }, "PATCH"), { code: "NOT_FOUND" });
@@ -79,7 +79,7 @@ test("project resource access validates scope, project grants and built-in reser
   const team = f.app.createTeam({ name: "Other squad", roleIds: ["role-dev"] });
   const p2 = secondProject(f, { teamId: team.id });
   const client = createAgentClient({ baseUrl: f.url, credential: f.dev.credential });
-  const outsider = f.app.createAgent({ name: "Other", roleId: "role-dev", teamId: team.id });
+  const outsider = f.app.createAgent({ projectId: p2.id, name: "Other", roleId: "role-dev", teamId: team.id });
   const otherClient = createAgentClient({ baseUrl: f.url, credential: outsider.credential });
   for (const suffix of ["scope=project", `projectId=${f.p.id}`, `scope=global&projectId=${f.p.id}`, "scope=unknown"]) {
     assert.equal((await f.human(`/resources/skill?${suffix}`)).body.error.code, "INVALID_RESOURCE_SCOPE");

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeScopes } from "../packages/domain/src/index.mjs";
-import { fixture, node, plan, finish } from "./helpers.mjs";
+import { fixture, node, plan, finish, projectForTeam } from "./helpers.mjs";
 test("Windows aliases, devices, wildcard scopes and metadata paths are refused", () => {
   for (const scope of [
     "a.txt:stream",
@@ -78,7 +78,7 @@ test("a team cannot claim another project's work", (t) => {
     roleIds: ["role-dev"],
     maxConcurrent: 2,
   });
-  const agent = f.app.createAgent({
+  const agent = f.app.createAgent({ projectId: projectForTeam(f, team.id).id,
     name: "Other",
     roleId: "role-dev",
     teamId: team.id,

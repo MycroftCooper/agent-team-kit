@@ -125,7 +125,7 @@ try {
   await browser.click("Agent 团队", { exact: true });
   await browser.wait("!!document.querySelector('.agent-team-sidebar .agent-team-nav')");
   for (const [role, name] of [["role-pm", "Desktop PM"], ["role-dev", "Desktop Worker"]]) {
-    await browser.click("添加 Agent");
+    await browser.click("添加项目 Agent");
     await browser.fill("name", name);
     await browser.fill("roleId", role);
     await browser.submit();

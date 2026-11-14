@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createServer } from "../apps/backend/src/server.mjs";
 import { createAgentClient } from "../packages/agent-client/src/index.mjs";
-import { fixture, node, plan, finish, serverFixture } from "./helpers.mjs";
+import { fixture, node, plan, finish, serverFixture, projectForTeam } from "./helpers.mjs";
 test("team resources are created by humans and discovered, read and invoked by agents", async (t) => {
   const f = await serverFixture(t);
   const client = createAgentClient({ baseUrl: f.url, credential: f.dev.credential });
@@ -161,7 +161,7 @@ test("a bug goes straight to its repair role, supports rework, and closes on hum
   const role = f.app.createRole({ name: "Bug fixer", function: "WORKER", instructions: "Reproduce and fix bugs", files: ["widget.txt"] });
   const team = f.app.get("teams", f.p.teamId);
   f.app.updateTeam(team.id, { version: team.version, roleIds: [...team.roleIds, role.id] });
-  const identity = f.app.createAgent({ name: "Fixer", roleId: role.id, teamId: team.id });
+  const identity = f.app.createAgent({ projectId: f.p.id, name: "Fixer", roleId: role.id, teamId: team.id });
   const fixer = createAgentClient({ baseUrl: f.url, credential: identity.credential });
   const body = { projectId: f.p.id, roleId: role.id, title: "Broken widget", description: "Opening a widget fails", acceptance: "Opening works" };
   assert.equal((await f.human("/bugs", { ...body, roleId: f.qa.agent.roleId })).body.error.code, "INVALID_BUG_ROLE");
@@ -269,7 +269,7 @@ test("browser session and CSRF are distinct from agent credentials", async (t) =
     body: "{}",
   });
   assert.equal(response.status, 401);
-  const agents = await f.human("/agents");
+  const agents = await f.human(`/agents?projectId=${f.p.id}`);
   assert.ok(!JSON.stringify(agents.body).includes(f.pm.credential));
   assert.ok(!JSON.stringify(agents.body).includes("credentialHash"));
 });
@@ -281,9 +281,9 @@ test("human assignment reserves execution for one eligible worker without bypass
     node("worker", { deps: ["human"], reviewPolicy: "INDEPENDENT", reviewRoleId: "role-qa" }),
   ]);
   const manual = tasks[0], task = tasks[1], route = "/tasks/" + task.id + "/assignment";
-  const other = f.app.createAgent({ name: "Second worker", roleId: "role-dev", teamId: "team-default" });
+  const other = f.app.createAgent({ projectId: f.p.id, name: "Second worker", roleId: "role-dev", teamId: "team-default" });
   const team = f.app.createTeam({ name: "Other team", roleIds: ["role-dev"] });
-  const outsider = f.app.createAgent({ name: "Outside worker", roleId: "role-dev", teamId: team.id });
+  const outsider = f.app.createAgent({ projectId: projectForTeam(f, team.id).id, name: "Outside worker", roleId: "role-dev", teamId: team.id });
   const options = await f.human(route);
   assert.deepEqual(new Set(options.body.choices.map((a) => a.id)), new Set([f.dev.agent.id, other.agent.id]));
   for (const agentId of [f.pm.agent.id, f.qa.agent.id, outsider.agent.id]) {
@@ -320,7 +320,7 @@ test("human assignment reserves execution for one eligible worker without bypass
 test("revoked assignment waits for a human to clear it; no other agent takes over automatically", async (t) => {
   const f = await serverFixture(t);
   const { tasks: [task] } = plan(f, [node("reserved")]);
-  const other = f.app.createAgent({ name: "Available worker", roleId: "role-dev", teamId: "team-default" });
+  const other = f.app.createAgent({ projectId: f.p.id, name: "Available worker", roleId: "role-dev", teamId: "team-default" });
   const route = "/tasks/" + task.id + "/assignment";
   const assigned = (await f.human(route, { version: task.version, agentId: f.dev.agent.id }, "PATCH")).body;
   f.app.revokeAgent(f.dev.agent.id);
@@ -371,7 +371,7 @@ test("board separates drafts from ready tasks and paginates each column independ
 
 test("doctor validates credentials without checking in or claiming work", async (t) => {
   const f = await serverFixture(t);
-  const { agent, credential } = f.app.createAgent({
+  const { agent, credential } = f.app.createAgent({ projectId: f.p.id,
     name: "Unconnected worker", roleId: "role-dev", teamId: "team-default",
   });
   const before = f.app.get("agents", agent.id);
@@ -443,7 +443,7 @@ test("claim diagnostics distinguish readiness, locks, missing contact and capaci
   const tasks = f.app.list("tasks").items;
   const route = (name) => "/tasks/" + tasks.find((task) => task.title === "Task " + name).id;
   const diagnostic = async (name) => (await f.human(route(name) + "/dispatch")).body;
-  const worker = f.app.createAgent({ name: "Other worker", roleId: "role-dev", teamId: "team-default" });
+  const worker = f.app.createAgent({ projectId: f.p.id, name: "Other worker", roleId: "role-dev", teamId: "team-default" });
   f.app.revokeAgent(f.dev.agent.id);
   assert.equal((await diagnostic("dependent")).code, "DEPENDENCIES");
   assert.equal((await diagnostic("second")).code, "NO_RECENT_AGENT");
@@ -466,7 +466,7 @@ test("claim diagnostics distinguish readiness, locks, missing contact and capaci
 test("HTTP clients race atomically, report receipts and replay idempotently", async (t) => {
   const f = await serverFixture(t);
   plan(f, [node("a")]);
-  const extra = f.app.createAgent({
+  const extra = f.app.createAgent({ projectId: f.p.id,
     name: "extra",
     roleId: "role-dev",
     teamId: "team-default",

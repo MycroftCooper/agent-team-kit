@@ -20,6 +20,7 @@ import {
 import {
   AppError,
   requireThat,
+  requiredString,
   VERSION,
 } from "../../../packages/contracts/src/index.mjs";
 import { normalizeDueDate, normalizeTaskTag } from "../../../packages/domain/src/index.mjs";
@@ -149,6 +150,7 @@ export function createServer({
         after: client.seq,
         limit: 200,
         projectId: client.projectId,
+        includeGlobal: true,
       });
       for (const e of events) {
         client.res.write(
@@ -299,29 +301,12 @@ export function createServer({
         else if (method === "GET" && resource === "resources" && route.length === 3)
           result = app.resourceLibrary(resourceOptions, agent.id).read(id, action);
         else if (method === "GET" && resource === "plans" && id) {
-          const plan = app.get("plans", id),
-            p = app.get("projects", plan.projectId),
-            team = app.get("teams", agent.teamId);
-          requireThat(
-            p.teamId === team.id &&
-              (team.projectIds.length === 0 || team.projectIds.includes(p.id)),
-            "PROJECT_FORBIDDEN",
-            "Project not authorized",
-            403,
-          );
+          const plan = app.get("plans", id);
+          app.authorizeAgentProject(agent.id, plan.projectId, { planId: id });
           result = plan;
         } else if (resource === "runs" && id) {
           const run = app.get("runs", id);
-          const targetProject = app.get("projects", run.projectId),
-            team = app.get("teams", agent.teamId);
-          requireThat(
-            targetProject.teamId === team.id &&
-              (team.projectIds.length === 0 ||
-                team.projectIds.includes(targetProject.id)),
-            "PROJECT_FORBIDDEN",
-            "Project is not assigned to this team",
-            403,
-          );
+          app.authorizeAgentProject(agent.id, run.projectId, { runId: id });
           if (method === "GET" && action === "artifact")
             result = app.artifact(id);
           else {
@@ -394,6 +379,12 @@ export function createServer({
         ];
         if (method === "GET" && resource === "overview")
           result = app.overview(projectId);
+        else if (method === "GET" && resource === "agent-migrations")
+          result = { items: app.agentMigrations() };
+        else if (method === "GET" && resource === "collaboration")
+          result = app.collaboration(projectId, url.searchParams.get("planId") ?? undefined);
+        else if (method === "POST" && resource === "agents" && id && action === "bind")
+          result = app.bindAgent(id, body);
         else if (resource === "automations" && !id && method === "GET")
           result = app.automations.list(projectId, number(url.searchParams.get("cursor"), 0, 0, 1_000_000));
         else if (resource === "automations" && !id && method === "POST")
@@ -461,6 +452,10 @@ export function createServer({
             latestSeq: app.store.latestSeq(),
           };
         else if (method === "GET" && listables.includes(resource)) {
+          if (resource === "agents") {
+            requiredString(projectId, "projectId");
+            if (id) requireThat(app.store.get("agents", id)?.projectId === projectId, "NOT_FOUND", "Agent not found in this project", 404);
+          }
           if (id) {
             if (projectId && ["tasks", "runs"].includes(resource))
               requireThat(
@@ -510,13 +505,19 @@ export function createServer({
         else if (method === "POST" && resource === "agents" && !id)
           result = app.createAgent(body);
         else if (method === "PATCH" && resource === "agents" && id)
-          result = app.updateAgent(id, body);
+          {
+            requireThat(projectId && app.store.get("agents", id)?.projectId === projectId, "NOT_FOUND", "Agent not found in this project", 404);
+            result = app.updateAgent(id, body);
+          }
         else if (
           method === "POST" &&
           resource === "agents" &&
           action === "revoke"
         )
-          result = app.revokeAgent(id);
+          {
+            requireThat(projectId && app.store.get("agents", id)?.projectId === projectId, "NOT_FOUND", "Agent not found in this project", 404);
+            result = app.revokeAgent(id);
+          }
         else if (method === "POST" && resource === "tasks" && !id)
           result = app.createDraft(body);
         else if (method === "PATCH" && resource === "tasks" && id && ["assignment", "metadata"].includes(action)) {

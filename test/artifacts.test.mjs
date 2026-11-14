@@ -59,7 +59,7 @@ test("same real file in nested registered projects shares one lock namespace", (
     innerPlan = plan({ ...f, p: inner }, [
       node("b", { files: ["shared.txt"] }),
     ]);
-  const other = f.app.createAgent({
+  const other = f.app.createAgent({ projectId: inner.id,
     name: "Other worker",
     roleId: "role-dev",
     teamId: "team-default",

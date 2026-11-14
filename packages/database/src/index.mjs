@@ -296,16 +296,20 @@ export function openStore(file) {
         .get(id);
       return r ? { seq: Number(r.seq), ...JSON.parse(r.data) } : null;
     },
-    events({ after = 0, limit = 100, projectId, entityId, newest = false } = {}) {
+    events({ after = 0, limit = 100, projectId, entityId, newest = false, includeGlobal = false, excludeTypes = [] } = {}) {
       let q = "seq>?",
         args = [after];
       if (projectId) {
-        q += " AND project_id=?";
+        q += includeGlobal ? " AND (project_id=? OR (project_id IS NULL AND type NOT LIKE 'agent.%') OR type IN ('project.created','project.updated'))" : " AND project_id=?";
         args.push(projectId);
       }
       if (entityId) {
         q += " AND entity_id=?";
         args.push(entityId);
+      }
+      if (excludeTypes.length) {
+        q += ` AND type NOT IN (${excludeTypes.map(() => "?").join(",")})`;
+        args.push(...excludeTypes);
       }
       return db
         .prepare(`SELECT * FROM events WHERE ${q} ORDER BY seq ${newest ? "DESC" : "ASC"} LIMIT ?`)

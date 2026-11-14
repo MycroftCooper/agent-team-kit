@@ -11,6 +11,7 @@ node scripts/check-boundaries.mjs
 node scripts/test.mjs
 node scripts/build-web.mjs
 node scripts/e2e.mjs
+node scripts/collaboration-e2e.mjs
 node scripts/smoke.mjs
 node scripts/benchmark.mjs
 ```
@@ -26,6 +27,19 @@ the UI, uses external HTTP clients for the PM/worker/reviewer, approves the plan
 observes SSE task updates, completes human work and accepts the final plan.
 Language switching and 1280px layout are also checked. Screenshots and JSON
 results are generated in `artifacts/e2e`.
+
+Collaboration E2E uses actual project-owned credentials and SSE events to check
+task motion, independent review, project roster isolation, human work, legacy
+identity assignment, and a single nonmodal task drawer across Work. Closing the
+drawer preserves filters; narrow layouts and reduced-motion settings are checked.
+Evidence is generated in `artifacts/collaboration-e2e`. Backend collaboration
+tests also cover same-squad cross-project access and safe legacy run recovery.
+
+The 2026-11-14 project-agent and collaboration implementation passed 71 backend
+tests, 30 browser workflow checks, 7 collaboration checks, 10 desktop checks and
+9 installed-package checks, plus the production web build and module boundary
+check. Backend tests ran with Node's `--test-isolation=none` in this local tool
+environment; the test cases and assertions were unchanged.
 
 The package smoke packs and installs into an isolated prefix, starts from a
 different working directory, checks the built UI and protocol CLI, registers

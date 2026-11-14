@@ -86,6 +86,16 @@ discards project edits.
 
 ## Agent connection
 
+Every agent identity is owned by one project, with its own credential. Choose the
+workspace before creating identities. Sharing a role template does not share an
+identity between projects. Unbound legacy identities can be assigned a project
+in Settings after unresolved runs have stopped.
+
+**Work → Collaboration** shows project agents, current runs and observed task
+transitions. Task names across Work open the same collapsible right drawer,
+preserving the underlying page and filters. See
+[Project agents and collaboration](docs/COLLABORATION.md).
+
 In **Work → Bugs**, report a bug and choose a worker role from the workspace's squad.
 The bug goes straight to that role's queue. After a worker submits a fix, accept it in
 **My inbox** or return it with feedback for another attempt. `atk-agent claim --kind bug`

@@ -1707,12 +1707,14 @@ main {
   justify-content: flex-end;
   align-items: stretch;
   padding: 0;
-  background: var(--scrim-soft);
+  background: transparent;
   backdrop-filter: none;
   overflow: hidden;
+  pointer-events: none;
 }
+.modal-backdrop.detail-backdrop { padding: 0; }
 .modal.detail-pane {
-  width: min(920px, 94vw);
+  width: min(560px, 94vw);
   max-height: 100%;
   border-width: 0 0 0 1px;
   border-color: var(--line);
@@ -1720,7 +1722,18 @@ main {
   padding: 0 30px 34px;
   background: var(--panel);
   box-shadow: -15px 0 50px var(--shadow-soft);
+  pointer-events: auto;
+  animation: detail-enter 180ms ease-out;
 }
+.modal.detail-pane.closing { animation: detail-exit 180ms ease-in forwards; }
+@keyframes detail-enter { from { transform: translateX(100%); } to { transform: translateX(0); } }
+@keyframes detail-exit { from { transform: translateX(0); } to { transform: translateX(100%); } }
+.detail-pane .detail-layout { display: flex; flex-direction: column; gap: 22px; }
+.detail-pane .detail-properties { border-left: 0; border-top: 1px solid var(--line); padding: 18px 0 0; width: 100%; }
+.detail-pane details.detail-section > summary { font-weight: 600; }
+.detail-pane details.detail-section > p { margin-top: 12px; }
+@media (prefers-reduced-motion: reduce) { .modal.detail-pane,.modal.detail-pane.closing { animation: none; } }
+@media (max-width: 680px) { .modal.detail-pane { width: 100%; padding-left: 18px; padding-right: 18px; } }
 .detail-pane > .modal-close {
   position: sticky;
   top: 10px;

@@ -35,6 +35,7 @@
     "smoke": "node scripts/smoke.mjs",
     "benchmark": "node scripts/benchmark.mjs",
     "test:e2e": "node scripts/e2e.mjs",
+    "test:collaboration": "node scripts/collaboration-e2e.mjs",
     "test:desktop": "node scripts/desktop-e2e.mjs",
     "prepack": "node scripts/build-web.mjs"
   },

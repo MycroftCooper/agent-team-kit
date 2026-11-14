@@ -47,6 +47,7 @@ export function fixture(t) {
     qa: "role-qa",
   })) {
     const value = app.createAgent({
+      projectId: p.id,
       name: key,
       roleId,
       teamId: "team-default",
@@ -78,14 +79,15 @@ export function node(key, more = {}) {
   };
 }
 export function plan(f, nodes, more = {}) {
+  const pm = f.pm.agent.projectId === f.p.id ? f.pm : f.app.createAgent({ projectId: f.p.id, name: "Project planner", roleId: "role-pm" });
   const draft = f.app.createDraft({
     projectId: f.p.id,
     title: "Feature",
     description: "Build a useful feature",
     ...more,
   });
-  const claim = f.app.claim(f.pm.agent.id, { taskId: draft.id });
-  const submitted = f.app.submitPlan(f.pm.agent.id, claim.run.id, {
+  const claim = f.app.claim(pm.agent.id, { taskId: draft.id });
+  const submitted = f.app.submitPlan(pm.agent.id, claim.run.id, {
     generation: claim.generation,
     idempotencyKey: crypto.randomUUID(),
     plan: { summary: "Implementation plan", nodes },
@@ -94,6 +96,10 @@ export function plan(f, nodes, more = {}) {
     version: submitted.plan.version,
   });
   return { draft, claim, ...approved };
+}
+export function projectForTeam(f, teamId) {
+  const existing = f.app.store.all("projects").find((p) => p.teamId === teamId);
+  return existing ?? f.app.createProject({ name: "Other project", teamId, root: fs.mkdtempSync(path.join(f.root, "other-project-")) });
 }
 export function finish(f, claim, more = {}) {
   return f.app.finishRun(claim.run.agentId, claim.run.id, {

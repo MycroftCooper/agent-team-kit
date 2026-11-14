@@ -5,10 +5,14 @@ model, launch an agent, forward a provider request or interpret terminal text.
 
 ## Authentication and lifecycle
 
-Create an identity in the browser, bind its role/team, and save its one-time
+Create an identity in the selected project's browser workspace, bind its role, and save its one-time
 credential outside the project. Requests use `Authorization: Bearer <credential>`.
 Agent endpoints reject browser-origin calls. Browser session/CSRF endpoints do
 not accept Agent credentials for human approvals.
+Each identity has an immutable `projectId`; the squad is determined by that
+project. The credential cannot claim work or read plans, artifacts or resources
+from another project, even if both projects share a squad. Separate identities
+and credentials are required when using the same role in different projects.
 The web interface additionally requires a private installation access code.
 It is not an Agent credential and must not be provided to execution clients.
 
@@ -39,8 +43,13 @@ then verifies the configured credential with `GET /identity`. It does not claim
 work, update contact time, or renew a lease. Run `atk-agent connect` to report
 contact; the browser can then show the last check-in. Recent contact does not
 prove that the agent is polling for tasks.
+The returned `identity.projectId` identifies the credential's fixed owner.
 
 Claims accept `{projectId?,taskId?,stage?,kind?,files?,waitMs?}`. `waitMs` is 0–30000.
+Omitting `projectId` uses the identity's owner; a different explicit project is
+rejected with `PROJECT_FORBIDDEN`. Unbound legacy identities must be assigned a
+project in Settings before claiming new work (`AGENT_PROJECT_REQUIRED`); their
+existing run recovery remains available. See [Collaboration](COLLABORATION.md).
 Stage is checked against the identity: ORCHESTRATOR/PLANNING, WORKER/EXECUTION,
 REVIEWER/REVIEW. Optional `files` must exactly match the approved full scope.
 Optional `kind` is `REQUEST`, `WORK`, or `BUG`; the CLI accepts `--kind bug` to
@@ -74,7 +83,7 @@ for project list/show/run/serve-mcp. Project HTTP paths are `/project-resources/
 and `/project-resources/<id>/<kind>/<name>`; older backends reject these paths.
 The original `/resources` endpoints also retain `scope=project&projectId=<id>`
 for existing callers. The CLI verifies response ownership before starting tools.
-Project access is checked against team binding and project grants before reading
+Project access is checked against fixed identity ownership, squad binding and project grants before reading
 or creating resource directories. Requests without scope remain global; project
 scope never falls back to a same-named global resource. Entries reflect current
 files and are not frozen with approved roles or plans. See [Team resources](TEAM-RESOURCES.md) for how to

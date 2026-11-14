@@ -47,6 +47,12 @@ main process and startup configuration changes require relaunching the app.
 
 ## State and identity
 
+- Agent identities have immutable project ownership. Project membership and the
+  credential bound to it are enforced for claims, assignments, plans, artifacts,
+  resources and project agent queries, even across projects sharing a squad.
+  Role templates and global resources may be shared. Unambiguous legacy owners
+  are backfilled; ambiguous identities can settle existing runs but cannot claim
+  new work until explicitly assigned in Settings.
 - REQUEST tasks start DRAFT. ORCHESTRATOR planning runs leave them DRAFT until
   the human approves a submitted plan version.
 - Approval atomically materializes WORK tasks. REQUESTs are containers and cannot
@@ -136,6 +142,28 @@ notes. The Agent page separates stored status from derived contact status.
 **Run — individual execution lifecycle**
 
 ![Run state machine](diagrams/run-state-machine.png)
+
+## Project collaboration and task details
+
+Work → Collaboration projects existing task, run and event records into a
+read-only project snapshot. It reports actual owners and reported progress,
+keeps the selected task stable and distinguishes contact from execution.
+SSE is scoped to the current project plus shared configuration and workspace
+metadata updates. Agent lifecycle events carry their owning project; other
+projects' agent events are excluded. Visible-page polling refreshes contact
+timestamps without requiring heartbeat events to be persisted.
+
+The UI animates new lifecycle changes, then reconciles authoritative snapshots.
+Initial load, reconnect, background resume and project switching reset the
+animation baseline. Motion never changes scheduling or invents completion.
+
+Tasks across Work use one nonmodal right drawer mounted above the individual
+pages. Closing it preserves the underlying view and filters; links retain task
+and project context. Human leases remain owned by the workspace shell rather
+than the currently selected page or drawer.
+
+See [Project agents and collaboration](COLLABORATION.md) for ownership migration,
+the user-facing workflow and snapshot API.
 
 ## File coordination and evidence
 

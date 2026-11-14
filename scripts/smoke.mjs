@@ -184,6 +184,7 @@ try {
     "external protocol client works from the installed package",
     async () => {
       const identity = await human("/agents", {
+        projectId: first.id,
         name: "Installed PM",
         roleId: "role-pm",
         teamId: "team-default",

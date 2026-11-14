@@ -152,7 +152,7 @@ export async function attachBrowser({ port, url, outputDir, width = 1440, height
     errors,
     async click(text, { exact = false, within = "document" } = {}) {
       const target = `[...(${within}).querySelectorAll('button')].find(e=>${exact ? "(e.getAttribute('aria-label')||e.textContent.trim())===" : "e.textContent.includes("}${JSON.stringify(text)}${exact ? "" : ")"})`;
-      await wait(`!!(${target}) && !(${target}).disabled`);
+      await wait(`!!(${within}) && !!(${target}) && !(${target}).disabled`);
       await evaluate(
         `(()=>{const el=${target};if(!el)throw new Error('Button not found');el.scrollIntoView({block:'center'});el.click();})()`,
       );

@@ -119,10 +119,14 @@ export function useData<T = Row>(route: string | null, epoch: number) {
   }, [route, epoch]);
   return sameRoute ? state : { data: null, error: null, loading: true };
 }
-export function useLive(onChange: () => void) {
+export function useLive(onChange: () => void, projectId: string) {
   const [connection, setConnection] = useState("connecting"),
-    [events, setEvents] = useState<Row[]>([]);
+    [events, setEvents] = useState<Row[]>([]),
+    [syncVersion, setSyncVersion] = useState(0);
   useEffect(() => {
+    setEvents([]);
+    setConnection("connecting");
+    if (!projectId) return;
     let disposed = false,
       controller: AbortController | null = null,
       seq: number | null = null,
@@ -139,7 +143,7 @@ export function useLive(onChange: () => void) {
     async function connect() {
       controller = new AbortController();
       try {
-        const response = await authorizedFetch("/events/stream", {
+        const response = await authorizedFetch("/events/stream?projectId=" + encodeURIComponent(projectId), {
           headers: seq === null ? {} : { "last-event-id": String(seq) },
           signal: controller.signal,
         });
@@ -147,6 +151,7 @@ export function useLive(onChange: () => void) {
           throw new Error("Stream unavailable");
         }
         setConnection("live");
+        setSyncVersion((v) => v + 1);
         attempt = 0;
         invalidate();
         const reader = response.body.getReader(),
@@ -180,6 +185,8 @@ export function useLive(onChange: () => void) {
                   .trim();
               if (type === "system.resync-required") {
                 seq = null;
+                setEvents([]);
+                setSyncVersion((v) => v + 1);
                 invalidate();
                 continue;
               }
@@ -219,6 +226,6 @@ export function useLive(onChange: () => void) {
       clearTimeout(refresh);
       window.removeEventListener("online", invalidate);
     };
-  }, [onChange]);
-  return { connection, events };
+  }, [onChange, projectId]);
+  return { connection, events, syncVersion };
 }

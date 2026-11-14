@@ -50,7 +50,7 @@ try {
     fs.mkdirSync(dir);
     projects.push(app.createProject({ name: `Benchmark ${i}`, root: dir }));
   }
-  const pm = app.createAgent({
+  const pm = app.createAgent({ projectId: projects[0].id,
       name: "Seed PM",
       roleId: "role-pm",
       teamId: "team-default",
@@ -105,7 +105,7 @@ try {
   });
   const clients = [];
   for (let i = 0; i < 20; i++) {
-    const a = app.createAgent({
+    const a = app.createAgent({ projectId: projects[0].id,
       name: `Benchmark Agent ${i}`,
       roleId: "role-dev",
       teamId: "team-default",

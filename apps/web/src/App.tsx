@@ -13,6 +13,8 @@ import { LEASE_MS, TASK_STATUSES, type Row, type Page } from "@atk/contracts";
 import { api, authorize, useData, useLive } from "./api";
 import { AgentTeam, AgentTeamNavigation, agentCliSetup, agentTeamSectionTitle, useAgentTeam } from "./agent-team";
 import { AutomationEditor, Automations, type Workflow } from "./automations";
+import { Collaboration } from "./collaboration";
+import { AgentMigrations } from "./agent-migrations";
 import { label, reason, type Lang } from "./i18n";
 import { DesktopTitleBar, desktopWindow } from "./desktop-window";
 import { ThemeSettings, ThemeToggle } from "./theme";
@@ -39,6 +41,7 @@ type View =
   | "bugs"
   | "inbox"
   | "runs"
+  | "collaboration"
   | "team"
   | "projects"
   | "automations"
@@ -72,6 +75,7 @@ const workPages = [
   ["inbox", "待我处理", "My inbox", "◇"],
   ["tasks", "任务", "Tasks", "☷"],
   ["bugs", "Bug 单", "Bugs", "⊘"],
+  ["collaboration", "协作实况", "Collaboration", "⇄"],
   ["runs", "执行记录", "Runs", "↗"],
 ] as const;
 const time = (v: string | number) => (v ? new Date(v).toLocaleString() : "—");
@@ -200,12 +204,14 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     [detail, setDetail] = useState(readDetailLink),
     [error, setError] = useState<Row | null>(null),
     [busy, setBusy] = useState(false),
-    [notice, setNotice] = useState("");
+    [notice, setNotice] = useState(""),
+    [detailClosing, setDetailClosing] = useState(false);
+  const detailCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const detailReturnFocus = useRef<HTMLElement | null>(null);
   const t = (zh: string, en: string) => (lang === "zh" ? zh : en);
   const modal: Modal | null = dialog ?? (detail && { kind: detail.kind, item: detail });
   const detailPane = modal?.kind === "task" || modal?.kind === "run";
-  const refresh = useCallback(() => setEpoch((x) => x + 1), []),
-    live = useLive(refresh);
+  const refresh = useCallback(() => setEpoch((x) => x + 1), []);
   const projects = useData<Page>("/projects?limit=500", epoch),
     roles = useData<Page>("/roles?limit=500", epoch),
     teams = useData<Page>("/teams?limit=500", epoch);
@@ -219,14 +225,21 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     inbox = useData<Row>(projectId ? "/inbox" + scope : null, epoch),
     // Human work keeps its lease even when its workspace is not being viewed.
     humanWork = useData<Row>("/inbox", epoch);
+  const live = useLive(refresh, projectId);
   const allRoles = roles.data?.items ?? [],
     allTeams = teams.data?.items ?? [];
   const teamView = view === "team";
-  const agentTeam = useAgentTeam(teamView, epoch, current?.teamId);
-  function clearDetail() {
+  const agentTeam = useAgentTeam(teamView, epoch, projectId);
+  function clearDetail(immediate = false) {
     if (!detail) return;
+    if (detailCloseTimer.current) clearTimeout(detailCloseTimer.current);
     history.replaceState(null, "", detailUrl(null));
-    setDetail(null);
+    const finish = () => {
+      setDetail(null); setDetailClosing(false); detailCloseTimer.current = null;
+      requestAnimationFrame(() => { if (detailReturnFocus.current?.isConnected) detailReturnFocus.current.focus({ preventScroll: true }); });
+    };
+    if (immediate || matchMedia("(prefers-reduced-motion: reduce)").matches) finish();
+    else { setDetailClosing(true); detailCloseTimer.current = setTimeout(finish, 180); }
   }
   function closeModal() {
     if (dialog) setModal(null);
@@ -236,7 +249,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
   function setProject(id: string) {
     selectProject(id);
     setModal(null);
-    clearDetail();
+    clearDetail(true);
     setError(null);
     setNotice("");
   }
@@ -248,6 +261,8 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
   }, [projects.data, projectId, detail]);
   useEffect(() => {
     function syncDetail() {
+      if (detailCloseTimer.current) clearTimeout(detailCloseTimer.current);
+      setDetailClosing(false);
       setModal(null);
       setError(null);
       setDetail(readDetailLink());
@@ -264,6 +279,9 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
   function open(kind: string, item?: Row) {
     setError(null);
     if ((kind === "task" || kind === "run") && item?.id) {
+      if (detailCloseTimer.current) clearTimeout(detailCloseTimer.current);
+      setDetailClosing(false);
+      if (!detail) detailReturnFocus.current = document.activeElement as HTMLElement;
       const target: DetailLink = { kind, id: item.id, projectId: item.projectId ?? projectId };
       const url = detailUrl(target);
       if (url.href !== location.href) history.pushState(null, "", url);
@@ -328,7 +346,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
   }, [lang]);
   useEffect(() => {
-    if (!modal) return;
+    if (!modal || detailPane) return;
     const previous = document.activeElement as HTMLElement;
     const frame = requestAnimationFrame(() => {
       const panel = document.querySelector<HTMLElement>("[role=dialog]");
@@ -358,7 +376,13 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
       document.removeEventListener("keydown", trap);
       previous?.focus();
     };
-  }, [modal?.kind, modal?.item?.id]);
+  }, [modal?.kind, modal?.item?.id, detailPane]);
+  useEffect(() => {
+    if (!detail || dialog) return;
+    const frame = requestAnimationFrame(() => document.querySelector<HTMLElement>(".detail-pane .modal-close")?.focus({ preventScroll: true }));
+    return () => cancelAnimationFrame(frame);
+  }, [Boolean(detail), Boolean(dialog)]);
+  useEffect(() => () => { if (detailCloseTimer.current) clearTimeout(detailCloseTimer.current); }, []);
   useEffect(() => {
     const running =
       humanWork.data?.humanTasks?.filter(
@@ -425,11 +449,11 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     (["settings", "设置", "Settings", "⚙"] as const);
   const sectionTitle = workPage ? t("工作", "Work") : teamView ? t("Agent 团队", "Agent team") : null;
   const pageTitle = teamView ? agentTeamSectionTitle(agentTeam.section, t) : t(titles[1], titles[2]);
-  const globalView = teamView || view === "projects" || view === "settings";
+  const globalView = (teamView && agentTeam.section !== "agents") || view === "projects" || view === "settings";
   const item = modal?.item;
   const agentRole = modal?.kind === "agent-role" ? allRoles.find((role) => role.id === item?.roleId) : undefined;
   const workspaceSwitcher = (
-    <div className="workspace-switch" inert={Boolean(modal)}>
+    <div className="workspace-switch" inert={Boolean(modal) && !detailPane}>
       <span className="workspace-icon" aria-hidden="true">
         {current?.name.slice(0, 1).toUpperCase() ?? "W"}
       </span>
@@ -494,7 +518,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     >
       <DesktopTitleBar lang={lang} workspace={workspaceSwitcher} />
       <div className={sectionTitle ? "app has-section-sidebar" : "app"}>
-        <aside className="sidebar" inert={Boolean(modal)}>
+        <aside className="sidebar" inert={Boolean(modal) && !detailPane}>
           <nav aria-label={t("主导航", "Main navigation")}>
             {navs.map(([key, zh, en, icon]) => (
                 <button
@@ -534,7 +558,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
             </div>
           </div>
         </aside>
-        {sectionTitle && <aside className={workPage ? "section-sidebar work-sidebar" : "section-sidebar agent-team-sidebar"} inert={Boolean(modal)}>
+        {sectionTitle && <aside className={workPage ? "section-sidebar work-sidebar" : "section-sidebar agent-team-sidebar"} inert={Boolean(modal) && !detailPane}>
           <h2>{sectionTitle}</h2>
           {workPage ? <>
             <p className="section-nav-label">{t("视图", "Views")}</p>
@@ -550,7 +574,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
             </nav>
           </> : <AgentTeamNavigation t={t} state={agentTeam} />}
         </aside>}
-        <div className="main" inert={Boolean(modal)}>
+        <div className="main" inert={Boolean(modal) && !detailPane}>
           <header className="topbar">
             <div className="topbar-left">
               {!desktopWindow && workspaceSwitcher}
@@ -601,6 +625,9 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                 <Inbox />
               ) : view === "runs" ? (
                 <Runs />
+              ) : view === "collaboration" ? (
+                <Collaboration key={projectId} projectId={projectId} epoch={epoch} live={live} lang={lang} t={t} open={open}
+                  manage={() => { setView("team"); agentTeam.setSection("agents"); }} />
               ) : view === "team" ? (
                 <AgentTeam t={t} state={agentTeam} currentTeamId={current?.teamId} projectId={projectId} roles={allRoles} teams={allTeams}
                   open={open} badge={badge} errorPanel={errorPanel} copyText={copyText} />
@@ -633,11 +660,11 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                 "modal " +
                 (["task", "plan", "run", "acceptance"].includes(modal.kind)
                   ? "wide"
-                  : "") + (detailPane ? " detail-pane" : "")
+                  : "") + (detailPane ? " detail-pane" + (detailClosing ? " closing" : "") : "")
               }
               role="dialog"
-              aria-modal="true"
-              aria-label={modal.kind === "agent-role" ? t("角色模板", "Role template") : t("详情与操作", "Details and actions")}
+              aria-modal={!detailPane}
+              aria-label={modal.kind === "task" ? t("任务详情", "Task details") : modal.kind === "run" ? t("执行详情", "Run details") : modal.kind === "agent-role" ? t("角色模板", "Role template") : t("详情与操作", "Details and actions")}
             >
               <button
                 className="modal-close"
@@ -998,9 +1025,10 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                     onSubmit={async (e) => {
                       const v = formObject(e);
                       const result = await act(
-                        "/agents" + (item ? "/" + item.id : ""),
+                        "/agents" + (item ? "/" + item.id + "?projectId=" + encodeURIComponent(item.projectId) : ""),
                         {
                           ...v,
+                          projectId: item?.projectId ?? projectId,
                           capacity: Number(v.capacity),
                           version: item?.version,
                         },
@@ -1019,18 +1047,10 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                         value={item?.name}
                         required
                       />
-                      <Field name="teamId" title={t("团队", "Team")}>
-                        <select name="teamId" defaultValue={item?.teamId}>
-                          {allTeams.map((team: Row) => (
-                            <option key={team.id} value={team.id}>
-                              {team.name}
-                            </option>
-                          ))}
-                        </select>
-                      </Field>
+                      <div className="field"><span>{t("所属项目（创建后固定）", "Project (fixed after creation)")}</span><strong>{projectName(item?.projectId ?? projectId)}</strong></div>
                       <Field name="roleId" title={t("角色", "Role")}>
                         <select name="roleId" defaultValue={item?.roleId}>
-                          {allRoles.map((role: Row) => (
+                          {allRoles.filter((role: Row) => allTeams.find((v: Row) => v.id === current?.teamId)?.roleIds.includes(role.id)).map((role: Row) => (
                             <option key={role.id} value={role.id}>
                               {role.name} · {role.function}
                             </option>
@@ -1297,7 +1317,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                   <div className="modal-actions">
                     <button
                       className="danger"
-                      onClick={() => act(`/agents/${item!.id}/revoke`, {})}
+                      onClick={() => act(`/agents/${item!.id}/revoke?projectId=${encodeURIComponent(item!.projectId)}`, {})}
                     >
                       {t("撤销凭据", "Revoke")}
                     </button>
@@ -1566,9 +1586,9 @@ function BugAcceptance({ bug }: { bug: Row }) {
 }
 
 function AgentConnection({ id }: { id: string }) {
-  const { t, epoch, roleName, copyText } = useUI();
+  const { t, epoch, roleName, copyText, projectId } = useUI();
   const tick = useRefreshTick(true);
-  const { data: agent, error } = useData<Row>("/agents/" + encodeURIComponent(id), epoch + tick);
+  const { data: agent, error } = useData<Row>("/agents/" + encodeURIComponent(id) + "?projectId=" + encodeURIComponent(projectId), epoch + tick);
   const command = agentCliSetup();
   const recent = agent?.lastSeen != null && Date.now() - agent.lastSeen < LEASE_MS;
   if (!agent) return <p role={error ? "alert" : "status"}>{error ? t("无法读取接入状态。", "Could not load connection status.") : t("正在加载…", "Loading…")}</p>;
@@ -1679,7 +1699,7 @@ function DispatchNotice({ row, dispatch }: { row: Row; dispatch: Row | null }) {
         <button className="text-button" onClick={() => { closeModal(); setView("team"); }}>{t("查看 Agent 团队", "Open agent team")} →</button>
       )}
       {row.waiting?.holders?.map((holder: Row) => (
-        <p key={holder.runId + holder.file}><code>{holder.file}</code> · {holder.agentName}{" "}
+        holder.external ? <p key={"external:" + holder.file}>{t("文件被其他项目占用。", "Files are occupied by another project.")}</p> : <p key={holder.runId + holder.file}><code>{holder.file}</code> · {holder.agentName}{" "}
           <button className="text-button" onClick={() => open("run", { id: holder.runId, projectId: holder.projectId })}>{t("查看占用执行", "View blocking run")}</button>
         </p>
       ))}
@@ -1716,8 +1736,8 @@ function Detail({ id }: { id: string }) {
       <div className="detail-heading">{bug ? <BugBadge status={row.status} /> : badge(row.status)}<h2>{row.title}</h2></div>
       <div className="detail-layout">
         <div className="detail-body">
-          <p className="detail-description prewrap">{row.description}</p>
-          {row.acceptance && <section className="detail-section"><h3>{t("验收条件", "Acceptance criteria")}</h3><p className="prewrap">{row.acceptance}</p></section>}
+          <details className="detail-section" open><summary>{t("任务说明", "Task description")}</summary><p className="detail-description prewrap">{row.description}</p></details>
+          {row.acceptance && <details className="detail-section"><summary>{t("验收条件", "Acceptance criteria")}</summary><p className="prewrap">{row.acceptance}</p></details>}
           {bug && row.bugReview?.decision === "REJECT" && <section className="detail-section">
             <h3>{t("上次退回原因", "Last rejection")}</h3><p className="prewrap">{row.bugReview.summary}</p>
           </section>}
@@ -1739,16 +1759,16 @@ function Detail({ id }: { id: string }) {
           {row.executorType === "HUMAN" && row.status === "RUNNING" && (
             <button className="primary" onClick={() => open("human", row)}>{t("提交人工交付", "Complete human task")}</button>
           )}
-          {children.data && children.data.items.length > 0 && <section className="detail-section">
-            <h3>{t("计划任务", "Planned work")}</h3>
+          {children.data && children.data.items.length > 0 && <details className="detail-section" open>
+            <summary>{t("计划任务", "Planned work")}</summary>
             <div className="attempt-list">{children.data.items.map((child) => (
               <button className="attempt-row" key={child.id} onClick={() => open("task", child)}>
                 <strong>{child.title}</strong>{badge(child.status)}<span aria-hidden="true">›</span>
               </button>
             ))}</div>
-          </section>}
-          <section className="detail-section">
-            <h3>{t("交付记录", "Delivery history")}</h3>
+          </details>}
+          <details className="detail-section">
+            <summary>{t("交付记录", "Delivery history")}</summary>
             {runs.error && errorPanel(runs.error)}
             {runs.data?.total === 0 && <p className="muted">{t("还没有执行尝试。", "No attempts yet.")}</p>}
             <div className="attempt-list">
@@ -1777,7 +1797,7 @@ function Detail({ id }: { id: string }) {
                 }}>{t("查看最终验收", "View final acceptance")}</button></>}
               {errorPanel(acceptanceError ?? acceptances.error)}
             </div>}
-          </section>
+          </details>
         </div>
         <aside className="detail-properties">
           <h3>{t("属性", "Properties")}</h3>
@@ -1802,7 +1822,7 @@ function Detail({ id }: { id: string }) {
           </>}
           {row.files?.length > 0 && <><h4>{t("文件范围", "File scope")}</h4><div className="chips">{row.files.map((f: string) => <code key={f}>{f}</code>)}</div></>}
           {row.deps?.length > 0 && <><h4>{t("依赖", "Dependencies")}</h4>{row.deps.map((dep: string) => (
-            <button className="text-button property-link" key={dep} onClick={() => open("task", { id: dep })}>{row.waiting?.tasks?.find((task: Row) => task.id === dep)?.title ?? dep}</button>
+            <button className="text-button property-link" key={dep} onClick={() => open("task", { id: dep })}>{row.dependencies?.find((task: Row) => task.id === dep)?.title ?? t("查看前置任务", "View dependency")}</button>
           ))}</>}
           <section className="task-metadata-summary">
             <h4>{t("日期和标签", "Due date and tags")}</h4>
@@ -2458,6 +2478,7 @@ function Overview() {
   const counts = o.counts ?? {};
   return (
     <>
+      <div className="collab-toolbar"><p className="page-description">{t("查看项目进展，或进入协作实况观察 Agent 正在处理什么。", "View project progress or observe agents in Collaboration.")}</p><button onClick={() => setView("collaboration")}>{t("查看协作实况", "Open collaboration")} →</button></div>
       <div className="stats">
         {[
           [
@@ -2629,6 +2650,7 @@ function Inbox() {
               {t("计划等待批准", "Plan needs approval")} · v{p.revision}
             </strong>
             <p>{p.summary}</p>
+            <button className="text-button" onClick={() => open("task", { id: p.sourceTaskId, projectId: p.projectId })}>{p.sourceTitle ?? t("查看原始需求", "View requirement")}</button>
             <small>{projectName(p.projectId)}</small>
           </div>
           <button className="primary" onClick={() => open("plan", p)}>
@@ -2640,7 +2662,7 @@ function Inbox() {
         <div className="inbox-row" key={task.id}>
           <div className="inbox-symbol">◇</div>
           <div>
-            <strong>{task.title}</strong>
+            <button className="text-button" onClick={() => open("task", task)}><strong>{task.title}</strong></button>
             <p>{task.acceptance}</p>
             {badge(task.status)}
           </div>
@@ -2667,6 +2689,7 @@ function Inbox() {
           <div className="inbox-symbol">✓</div>
           <div>
             <strong>{t("计划交付验收", "Plan acceptance")}</strong>
+            <button className="text-button" onClick={() => open("task", { id: a.sourceTaskId, projectId: a.projectId })}>{a.sourceTitle ?? t("查看原始需求", "View requirement")}</button>
             <p>
               {projectName(a.projectId)} · {a.results.length}{" "}
               {t("个任务", "tasks")}
@@ -2681,7 +2704,7 @@ function Inbox() {
       {(data.bugs ?? []).map((bug: Row) => (
         <div className="inbox-row" key={bug.id}>
           <div className="inbox-symbol">⊘</div>
-          <div><strong>{bug.title}</strong><p>{t("Bug 修复待验收", "Bug fix needs acceptance")}</p></div>
+          <div><button className="text-button" onClick={() => open("task", bug)}><strong>{bug.title}</strong></button><p>{t("Bug 修复待验收", "Bug fix needs acceptance")}</p></div>
           <button onClick={() => open("task", bug)}>{t("验收 Bug", "Review bug fix")}</button>
         </div>
       ))}
@@ -2689,7 +2712,7 @@ function Inbox() {
         <div className="inbox-row" key={r.id}>
           <div className="inbox-symbol danger-text">!</div>
           <div>
-            <strong>{r.spec?.title ?? r.id}</strong>
+            <button className="text-button" onClick={() => open("task", { id: r.taskId, projectId: r.projectId })}><strong>{r.spec?.title ?? t("查看关联任务", "View linked task")}</strong></button>
             <p>
               {t(
                 "请确认旧执行已经停止，再释放文件锁。",
@@ -2707,7 +2730,7 @@ function Inbox() {
         <div className="inbox-row" key={r.id}>
           <div className="inbox-symbol">⊘</div>
           <div>
-            <strong>{r.title}</strong>
+            <button className="text-button" onClick={() => open("task", r)}><strong>{r.title}</strong></button>
             <p>{reason(r.blockReason, lang)}</p>
           </div>
           <button onClick={() => open("task", r)}>
@@ -2752,16 +2775,16 @@ function Runs() {
       </p>
       <div className="task-list">
         {data.data?.items.map((r) => (
-          <button className="run-row" key={r.id} onClick={() => open("run", r)}>
+          <div className="run-row" key={r.id}>
             <span>{badge(r.stage)}</span>
             <div>
-              <strong>{r.title ?? r.spec?.title ?? r.taskId}</strong>
-              <small className="mono">{r.id}</small>
+              <button className="text-button" onClick={() => open("task", { id: r.taskId, projectId: r.projectId })}><strong>{r.title ?? t("查看关联任务", "View linked task")}</strong></button>
+              <small>{t("第", "Attempt ")}{r.generation}{t("次执行", "")}</small>
             </div>
             {badge(r.status)}
             <small>{time(r.startedAt)}</small>
-            <span>↗</span>
-          </button>
+            <button onClick={() => open("run", r)}>{t("查看执行", "View run")} ↗</button>
+          </div>
         ))}
       </div>
       {data.data?.total === 0 &&
@@ -2872,10 +2895,11 @@ function Projects() {
 }
 
 function Settings() {
-  const { lang, setLang, t, open } = useUI();
+  const { lang, setLang, t, open, epoch, projects, allTeams, busy, act } = useUI();
   return (
     <>
       <ThemeSettings lang={lang} />
+      <AgentMigrations epoch={epoch} projects={projects.data?.items ?? []} teams={allTeams} busy={busy} t={t} act={act} open={open} />
       <section className="panel settings-panel">
         <h3>{t("语言", "Language")}</h3>
         <p>

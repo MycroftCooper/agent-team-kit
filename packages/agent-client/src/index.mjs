@@ -107,7 +107,7 @@ export function createAgentClient({
       }
       return {
         ok: true, service: u.origin, version: health.version,
-        identity: { id: agent.id, name: agent.name, roleId: agent.roleId, teamId: agent.teamId, lastSeen: agent.lastSeen },
+        identity: { id: agent.id, name: agent.name, roleId: agent.roleId, teamId: agent.teamId, projectId: agent.projectId ?? null, lastSeen: agent.lastSeen },
       };
     },
     connect: () => request("/connect", {}),
