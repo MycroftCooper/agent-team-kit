@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createServer } from "../apps/backend/src/server.mjs";
 import { createAgentClient } from "../packages/agent-client/src/index.mjs";
-import { fixture, node, plan, finish, serverFixture, projectForTeam } from "./helpers.mjs";
+import { fixture, node, plan, finish, serverFixture, projectForTeam, completeHuman } from "./helpers.mjs";
 test("team resources are created by humans and discovered, read and invoked by agents", async (t) => {
   const f = await serverFixture(t);
   const client = createAgentClient({ baseUrl: f.url, credential: f.dev.credential });
@@ -303,7 +303,7 @@ test("human assignment reserves execution for one eligible worker without bypass
   assert.equal(f.app.claim(other.agent.id, { taskId: task.id }).run, null);
   assert.equal(f.app.claim(f.dev.agent.id, { taskId: task.id }).waiting[0].reason, "DEPENDENCIES");
   f.app.startHuman(manual.id, { version: manual.version });
-  f.app.finishHuman(manual.id, { stopped: true, outcome: "COMPLETED", summary: "Ready", checks: [] });
+  completeHuman(f, manual.id, { stopped: true, outcome: "COMPLETED", summary: "Ready", checks: [] });
   assert.equal(f.app.claim(other.agent.id, { taskId: task.id }).run, null);
   const run = f.app.claim(f.dev.agent.id, { taskId: task.id });
   assert.equal(run.run.agentId, f.dev.agent.id);

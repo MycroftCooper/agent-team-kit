@@ -158,11 +158,13 @@ export async function attachBrowser({ port, url, outputDir, width = 1440, height
       );
     },
     async fill(name, value) {
+      await wait(`!!document.querySelector('[name="'+${JSON.stringify(name)}+'"]') && !document.querySelector('[name="'+${JSON.stringify(name)}+'"]').disabled`);
       await evaluate(
         `(()=>{const el=document.querySelector('[name="'+${JSON.stringify(name)}+'"]');if(!el)throw new Error('Field not found');const p=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:el.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;Object.getOwnPropertyDescriptor(p,'value').set.call(el,${JSON.stringify(value)});el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));})()`,
       );
     },
     async submit() {
+      await wait("!!document.querySelector('[role=dialog] form') && [...document.querySelector('[role=dialog] form').querySelectorAll('button')].some(b=>b.type==='submit'&&!b.disabled)");
       await evaluate(
         "document.querySelector('[role=dialog] form').requestSubmit()",
       );

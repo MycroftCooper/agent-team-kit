@@ -49,13 +49,13 @@ active executions require confirmed stopping before locks are released.
 ## Projects
 
 Each project is one workspace. Use **Switch workspace** in the title bar (or
-page header in a browser) to change the overview and all three pages in **Work**:
-**My inbox**, **Tasks** and **Runs**. The browser
+page header in a browser) to change the overview and all five pages in **Work**:
+**My inbox**, **Tasks**, **Bugs**, **Collaboration** and **Runs**. The browser
 remembers the selected workspace across reloads. New requests always belong to
 the current workspace. Creating a project enters it automatically; archiving the
 current project selects another active workspace, or shows the setup screen if
-none remain. Project management, reusable agents/teams and operations settings
-are explicitly shared global administration. Switching workspace does not stop
+none remain. Agent identities belong to the selected project; squad/role
+configuration and operations settings are shared administration. Switching workspace does not stop
 running agents or interrupt human-task heartbeats.
 
 Register name, existing root and team in the UI. Git is not required. The default
@@ -68,6 +68,18 @@ Archive only disables scheduling. Relocation requires all active/uncertain runs
 to be reconciled. Move the project and its artifact directory together, then
 update both paths through the UI. No background disk scan or automatic deletion
 is performed. Failed document generation appears in My inbox and can be retried.
+
+Workflow boards and swimlanes expose drag handles and **Move to…** for eligible
+human actions. Start human work directly, fill delivery notes before completing,
+confirm retries, review a submitted plan before approval, and inspect the whole
+requirement before final acceptance. Disabled cards explain the missing
+condition. Executor grouping does not change execution types. See
+[Task board movement](TASK-BOARD-DRAG-DESIGN.md).
+
+Human completion requests now bind `version`, `runId` and `generation`. After
+upgrading, reload old web pages before submitting human work. If a form becomes
+stale, keep/copy the entered notes and reopen the current task; it must not finish
+a later restarted run.
 
 ## Stop, failure and recovery
 

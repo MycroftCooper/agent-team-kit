@@ -939,6 +939,7 @@ try {
     await browser.wait("[...document.querySelectorAll('.inbox-row')].some(r=>r.textContent.includes('Reconfirm manual output') && r.textContent.includes('Open task'))");
     await browser.click("Open task", { within: "[...document.querySelectorAll('.inbox-row')].find(r=>r.textContent.includes('Reconfirm manual output'))" });
     await browser.click("Requeue task");
+    await browser.click("Confirm requeue", { exact: true, within: "document.querySelector('[role=dialog]')" });
     await browser.wait("!document.querySelector('[role=dialog]')");
     await browser.click("Start", { exact: true });
     await browser.click("Complete", { exact: true });

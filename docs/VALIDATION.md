@@ -12,6 +12,7 @@ node scripts/test.mjs
 node scripts/build-web.mjs
 node scripts/e2e.mjs
 node scripts/collaboration-e2e.mjs
+node scripts/task-movement-e2e.mjs
 node scripts/smoke.mjs
 node scripts/benchmark.mjs
 ```
@@ -34,6 +35,22 @@ identity assignment, and a single nonmodal task drawer across Work. Closing the
 drawer preserves filters; narrow layouts and reduced-motion settings are checked.
 Evidence is generated in `artifacts/collaboration-e2e`. Backend collaboration
 tests also cover same-squad cross-project access and safe legacy run recovery.
+
+Task-movement E2E uses actual pointer events and isolated backend data for all
+five human moves, form cancellation, mandatory delivery evidence, stale human
+run bindings, plan approval, affected-child acceptance, uncertain-run barriers,
+SSE cancellation, keyboard-equivalent actions, executor grouping, swimlane
+ownership and narrow filtered views. Evidence is in `artifacts/task-movement-e2e`.
+The backend tests reject unbound or stale human completion forms and retain the
+existing file-drift and independent-review protections.
+
+The 2026-11-14 task-board movement implementation passed 77 backend tests,
+9 task-movement browser checks, 30 existing browser workflow checks,
+7 collaboration checks, 10 desktop checks and 9 installed-package checks.
+The production web build and module boundary check (12 modules, 19 edges,
+no cycles) also passed. All workflow tests used isolated data directories.
+Backend tests used `--test-isolation=none` in this local tool environment.
+This change did not repeat the performance soak recorded below.
 
 The 2026-11-14 project-agent and collaboration implementation passed 71 backend
 tests, 30 browser workflow checks, 7 collaboration checks, 10 desktop checks and

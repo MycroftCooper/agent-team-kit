@@ -15,6 +15,8 @@ import { AgentTeam, AgentTeamNavigation, agentCliSetup, agentTeamSectionTitle, u
 import { AutomationEditor, Automations, type Workflow } from "./automations";
 import { Collaboration } from "./collaboration";
 import { AgentMigrations } from "./agent-migrations";
+import { actionKey, actionReason, type HumanAction } from "./task-actions";
+import { TaskMovementContext, TaskMoveControl, TaskDropTarget, TaskMoveFeedback, useTaskMovement } from "./task-movement";
 import { label, reason, type Lang } from "./i18n";
 import { DesktopTitleBar, desktopWindow } from "./desktop-window";
 import { ThemeSettings, ThemeToggle } from "./theme";
@@ -205,7 +207,9 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     [error, setError] = useState<Row | null>(null),
     [busy, setBusy] = useState(false),
     [notice, setNotice] = useState(""),
-    [detailClosing, setDetailClosing] = useState(false);
+    [detailClosing, setDetailClosing] = useState(false),
+    [actionBusyIds, setActionBusyIds] = useState<string[]>([]);
+  const taskActionsInFlight = useRef(new Set<string>());
   const detailCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const detailReturnFocus = useRef<HTMLElement | null>(null);
   const t = (zh: string, en: string) => (lang === "zh" ? zh : en);
@@ -226,6 +230,8 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     // Human work keeps its lease even when its workspace is not being viewed.
     humanWork = useData<Row>("/inbox", epoch);
   const live = useLive(refresh, projectId);
+  const activeProject = useRef(projectId);
+  activeProject.current = projectId;
   const allRoles = roles.data?.items ?? [],
     allTeams = teams.data?.items ?? [];
   const teamView = view === "team";
@@ -319,6 +325,36 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     } finally {
       setBusy(false);
     }
+  }
+  async function performTaskAction(task: Row, action: HumanAction) {
+    if (!action || taskActionsInFlight.current.has(task.id)) return false;
+    taskActionsInFlight.current.add(task.id);
+    setActionBusyIds((ids) => [...ids, task.id]);
+    setError(null);
+    try {
+      const fresh = await api<Row>(`/tasks/${encodeURIComponent(task.id)}?projectId=${encodeURIComponent(task.projectId)}`);
+      if (activeProject.current !== task.projectId) return false;
+      const available = fresh.humanActions?.find((a: HumanAction) => a.type === action.type);
+      if (actionKey(fresh) !== actionKey(task) || !available?.enabled)
+        throw new Error(t("任务或操作条件已变化，请重新选择。", "The task or action changed. Please choose again."));
+      if (action.type === "START_HUMAN") {
+        await api(`/tasks/${task.id}/human-start?projectId=${encodeURIComponent(task.projectId)}`, { version: fresh.version });
+        refresh();
+        if (activeProject.current === task.projectId) setNotice(t("人工任务已开始；如不符合当前筛选，它会移出当前视图。", "Human work started; it may move outside the current filters."));
+      } else if (action.type === "COMPLETE_HUMAN") open("human", { ...fresh, moveTaskId: task.id });
+      else if (action.type === "RETRY_TASK") open("retry-task", { ...fresh, moveTaskId: task.id });
+      else if (action.type === "APPROVE_PLAN")
+        open("plan", { id: action.planId, guardVersion: action.planVersion, guardTaskVersion: fresh.version, moveTaskId: task.id });
+      else if (action.type === "ACCEPT_PLAN") {
+        const acceptance = await api<Row>(`/acceptances/${action.acceptanceId}`);
+        if (activeProject.current !== task.projectId) return false;
+        if (acceptance.version !== action.acceptanceVersion || acceptance.targetHash !== action.targetHash || acceptance.projectId !== task.projectId)
+          throw new Error(t("验收目标已变化，请重新核对。", "The acceptance target changed; review it again."));
+        open("acceptance", { ...acceptance, sourceTitle: fresh.title, moveTaskId: task.id });
+      }
+      return true;
+    } catch (e) { if (activeProject.current === task.projectId) setError(e as Row); refresh(); return false; }
+    finally { taskActionsInFlight.current.delete(task.id); setActionBusyIds((ids) => ids.filter((id) => id !== task.id)); }
   }
   useEffect(() => {
     const listener = (e: KeyboardEvent) => {
@@ -514,6 +550,10 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
         countInbox,
         copyText,
         closeModal,
+        closeTaskPanel: (id: string) => { setModal(null); if (detail?.id === id) clearDetail(); },
+        performTaskAction,
+        actionBusyIds,
+        pendingTaskId: dialog?.item?.moveTaskId,
       }}
     >
       <DesktopTitleBar lang={lang} workspace={workspaceSwitcher} />
@@ -680,7 +720,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                 </p>
               )}
               {modal.kind === "task" && linkedProject && <Detail key={item!.id} id={item!.id} />}
-              {modal.kind === "plan" && <PlanDetail id={item!.id} />}
+              {modal.kind === "plan" && <PlanDetail key={item!.id} id={item!.id} guard={item} />}
               {modal.kind === "run" && linkedProject && <RunDetail key={item!.id} id={item!.id} />}
               {modal.kind === "draft" && (
                 <>
@@ -1120,114 +1160,9 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                     body, "PATCH",
                   )} />
               )}
-              {modal.kind === "human" && (
-                <>
-                  <h2>{t("完成人工任务", "Complete human task")}</h2>
-                  <h3>{item!.title}</h3>
-                  <p>{item!.acceptance}</p>
-                  <form
-                    onSubmit={(e) => {
-                      const v = formObject(e);
-                      void act(`/tasks/${item!.id}/human-complete`, {
-                        summary: v.summary,
-                        checks: item!.checks.map((c: Row, i: number) => ({
-                          name: c.name,
-                          passed: v["passed" + i] === "on",
-                          exitCode: 0,
-                          log: v["log" + i],
-                        })),
-                      });
-                    }}
-                  >
-                    <Fields>
-                      <Field
-                        name="summary"
-                        title={t("完成说明", "Completion notes")}
-                        required
-                        area
-                      />
-                      {item!.checks.map((c: Row, i: number) => (
-                        <fieldset key={c.name}>
-                          <legend>{c.name}</legend>
-                          <code>{c.command}</code>
-                          <label className="checkbox">
-                            <input
-                              type="checkbox"
-                              name={"passed" + i}
-                              required
-                            />
-                            {t("已执行并通过", "Executed and passed")}
-                          </label>
-                          <Field
-                            name={"log" + i}
-                            title={t("检查输出", "Check output")}
-                            required
-                            area
-                          />
-                        </fieldset>
-                      ))}
-                    </Fields>
-                    <div className="modal-actions">
-                      <button className="primary" disabled={busy}>
-                        {t("确认完成", "Confirm complete")}
-                      </button>
-                    </div>
-                  </form>
-                </>
-              )}
-              {modal.kind === "acceptance" && (
-                <>
-                  <div className="detail-top">
-                    {badge(item!.status)}
-                    <code>{item!.targetHash.slice(0, 16)}</code>
-                  </div>
-                  <h2>{t("验收整份计划", "Accept the complete plan")}</h2>
-                  <p>
-                    {t(
-                      "确认计划交付达到预期。系统会再次校验文件与当前验收目标一致。",
-                      "Confirm the delivered plan meets expectations. Files are checked again against this target.",
-                    )}
-                  </p>
-                  <div className="task-list">
-                    {Object.entries(item!.files).map(([file, data]) => (
-                      <div className="list-row" key={file}>
-                        <code>{file}</code>
-                        <code className="muted">
-                          {(data as Row).hash?.slice(0, 16) ??
-                            t("已删除", "Deleted")}
-                        </code>
-                      </div>
-                    ))}
-                  </div>
-                  {item!.drift && (
-                    <pre>{JSON.stringify(item!.drift, null, 2)}</pre>
-                  )}
-                  <div className="modal-actions">
-                    <button onClick={() => open("plan", { id: item!.planId })}>
-                      {t("查看计划", "View plan")}
-                    </button>
-                    <button
-                      onClick={() =>
-                        act(`/acceptances/${item!.id}/revalidate`, {})
-                      }
-                    >
-                      {t("检查变化并标记重验", "Detect changes & revalidate")}
-                    </button>
-                    <button
-                      className="primary"
-                      disabled={busy || item!.status !== "PENDING"}
-                      onClick={() =>
-                        act(`/acceptances/${item!.id}/approve`, {
-                          version: item!.version,
-                          targetHash: item!.targetHash,
-                        })
-                      }
-                    >
-                      {t("确认整份计划验收通过", "Accept this plan")}
-                    </button>
-                  </div>
-                </>
-              )}
+              {modal.kind === "human" && <HumanCompletion key={item!.id} task={item!} />}
+              {modal.kind === "retry-task" && <RetryTaskConfirmation key={item!.id} task={item!} />}
+              {modal.kind === "acceptance" && <AcceptanceReview key={item!.id} acceptance={item!} />}
               {modal.kind === "revision" && (
                 <>
                   <h2>{t("要求修改计划", "Request a plan revision")}</h2>
@@ -1383,6 +1318,83 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
 const UIContext = createContext<any>(null);
 function useUI() {
   return useContext(UIContext);
+}
+
+function HumanCompletion({ task }: { task: Row }) {
+  const { t, epoch, busy, act, closeModal } = useUI();
+  const current = useData<Row>(`/tasks/${task.id}?projectId=${encodeURIComponent(task.projectId)}`, epoch);
+  const run = task.humanRun;
+  const stale = !run || !current.data || current.error || current.data.version !== task.version ||
+    current.data.humanRun?.id !== run.id || current.data.humanRun?.generation !== run.generation ||
+    !current.data.humanActions?.some((a: HumanAction) => a.type === "COMPLETE_HUMAN" && a.enabled);
+  return <>
+    <h2>{t("完成人工任务", "Complete human task")}</h2><h3>{task.title}</h3><p>{task.acceptance}</p>
+    {current.data && stale && <p role="alert" className="warning">{t("任务或运行已变化，请关闭后重新打开。填写内容不会被自动提交。", "The task or run changed. Close and reopen; your notes will not be submitted automatically.")}</p>}
+    {current.error && <p role="alert">{t("无法核对当前运行，请稍后重新打开。", "Cannot check the current run. Reopen it when connected.")}</p>}
+    <form onSubmit={(e) => {
+      e.preventDefault();
+      const v = Object.fromEntries(new FormData(e.currentTarget));
+      if (stale) return;
+      void act(`/tasks/${task.id}/human-complete?projectId=${encodeURIComponent(task.projectId)}`, {
+        version: task.version, runId: run.id, generation: run.generation, summary: v.summary,
+        checks: task.checks.map((c: Row, i: number) => ({ name: c.name, passed: v["passed" + i] === "on", exitCode: 0, log: v["log" + i] })),
+      });
+    }}>
+      <Fields><Field name="summary" title={t("完成说明", "Completion notes")} required area />
+        {task.checks.map((c: Row, i: number) => <fieldset key={c.name}><legend>{c.name}</legend><code>{c.command}</code>
+          <label className="checkbox"><input type="checkbox" name={"passed" + i} required />{t("已执行并通过", "Executed and passed")}</label>
+          <Field name={"log" + i} title={t("检查输出", "Check output")} required area />
+        </fieldset>)}
+      </Fields>
+      <div className="modal-actions"><button type="button" onClick={closeModal}>{t("取消", "Cancel")}</button>
+        <button className="primary" disabled={busy || Boolean(stale)}>{t("确认完成", "Confirm complete")}</button></div>
+    </form>
+  </>;
+}
+
+function RetryTaskConfirmation({ task }: { task: Row }) {
+  const { t, epoch, act, busy, closeModal, closeTaskPanel } = useUI();
+  const current = useData<Row>(`/tasks/${task.id}?projectId=${encodeURIComponent(task.projectId)}`, epoch);
+  const stale = !current.data || current.error || actionKey(current.data) !== actionKey(task);
+  return <><h2>{t("重新排队", "Requeue task")}</h2><h3>{task.title}</h3>
+    <p>{t("旧运行已停止。重新排队恢复领取资格；依赖或文件条件尚未满足时，任务会继续等待。", "The old run has stopped. Requeueing restores eligibility; dependencies or files may still require waiting.")}</p>
+    {current.data && stale && <p className="warning" role="alert">{t("任务条件已变化，请重新核对。", "Task conditions changed; review again.")}</p>}
+    {current.error && <p role="alert">{t("无法核对当前任务，请稍后重新打开。", "Cannot check the task; reopen when connected.")}</p>}
+    <div className="modal-actions"><button onClick={closeModal}>{t("取消", "Cancel")}</button>
+      <button className="primary" disabled={busy || Boolean(stale)} onClick={async () => { if (await act(`/tasks/${task.id}/retry?projectId=${encodeURIComponent(task.projectId)}`, { version: task.version })) closeTaskPanel(task.id); }}>{t("确认重新排队", "Confirm requeue")}</button></div>
+  </>;
+}
+
+function AcceptanceReview({ acceptance }: { acceptance: Row }) {
+  const { t, epoch, badge, open, act, busy, closeModal } = useUI();
+  const tasks = useData<Page>(`/tasks?projectId=${encodeURIComponent(acceptance.projectId)}&parentId=${encodeURIComponent(acceptance.sourceTaskId)}&planId=${encodeURIComponent(acceptance.planId)}&limit=500`, epoch);
+  const current = useData<Row>(`/acceptances/${acceptance.id}`, epoch);
+  const source = useData<Row>(`/tasks/${acceptance.sourceTaskId}?projectId=${encodeURIComponent(acceptance.projectId)}`, epoch);
+  const stale = !current.data || current.error || current.data.status !== "PENDING" || current.data.version !== acceptance.version || current.data.targetHash !== acceptance.targetHash;
+  return <>
+    <div className="detail-top">{badge(acceptance.status)}<code>{acceptance.targetHash.slice(0, 16)}</code></div>
+    <h2>{t("验收整份计划", "Accept the complete plan")}</h2>
+    <h3>{source.data?.title ?? acceptance.sourceTitle}</h3>
+    <p>{t("确认计划交付达到预期。系统会再次校验文件与当前验收目标一致。", "Confirm the delivered plan meets expectations. Files are checked again against this target.")}</p>
+    <section className="acceptance-impact"><h3>{t("本次验收影响的工作", "Work affected by this acceptance")}</h3>
+    <p className="muted">{t("验收通过会关闭整项需求，并同时关闭下列已验证工作。", "Acceptance closes the requirement and the verified work below.")}</p>
+    {tasks.error ? <p role="alert">{t("无法读取工作清单，请关闭后重新核对。", "Cannot load the work list. Close and review again.")}</p>
+      : tasks.data?.items.map((task: Row) => <p key={task.id}><strong>{task.title}</strong>{" "}{badge(task.status)}</p>)}
+    </section>
+    <div className="task-list">{Object.entries(acceptance.files).map(([file, data]) => <div className="list-row" key={file}>
+      <code>{file}</code><code className="muted">{(data as Row).hash?.slice(0, 16) ?? t("已删除", "Deleted")}</code>
+    </div>)}</div>
+    {acceptance.drift && <pre>{JSON.stringify(acceptance.drift, null, 2)}</pre>}
+    {current.data && stale && <p className="warning" role="alert">{t("验收状态或目标已变化，请重新核对。", "The acceptance state or target changed; review again.")}</p>}
+    {(current.error || source.error) && <p role="alert">{t("无法核对当前验收，请稍后重新打开。", "Cannot check current acceptance. Reopen when connected.")}</p>}
+    <div className="modal-actions">
+      <button onClick={closeModal}>{t("取消", "Cancel")}</button>
+      <button onClick={() => open("plan", { id: acceptance.planId })}>{t("查看计划", "View plan")}</button>
+      <button onClick={() => act(`/acceptances/${acceptance.id}/revalidate`, {})}>{t("检查变化并标记重验", "Detect changes & revalidate")}</button>
+      <button className="primary" disabled={busy || Boolean(stale) || !tasks.data || Boolean(tasks.error) || !source.data || Boolean(source.error)}
+        onClick={() => act(`/acceptances/${acceptance.id}/approve`, { version: acceptance.version, targetHash: acceptance.targetHash })}>{t("确认整份计划验收通过", "Accept this plan")}</button>
+    </div>
+  </>;
 }
 function Fields({ children }: { children: ReactNode }) {
   return <div className="fields">{children}</div>;
@@ -1711,7 +1723,7 @@ function DispatchNotice({ row, dispatch }: { row: Row; dispatch: Row | null }) {
 }
 
 function Detail({ id }: { id: string }) {
-  const { lang, t, epoch, badge, open, act, busy, projectId, projectName, roleName, copyText, errorPanel, closeModal } = useUI();
+  const { lang, t, epoch, badge, open, act, busy, projectId, projectName, roleName, copyText, errorPanel, closeModal, performTaskAction } = useUI();
   const [cursor, setCursor] = useState(0);
   const [acceptanceError, setAcceptanceError] = useState<Row | null>(null);
   const projectQuery = "projectId=" + encodeURIComponent(projectId);
@@ -1747,17 +1759,16 @@ function Detail({ id }: { id: string }) {
           {row.blockReason && <div className="warning">{reason(row.blockReason, lang)}</div>}
           {row.drift && <details><summary>{t("查看文件变化", "View file changes")}</summary><pre>{JSON.stringify(row.drift, null, 2)}</pre></details>}
           {row.status === "BLOCKED" && (row.kind === "WORK" || bug) && (
-            <button className="primary" disabled={busy} onClick={async () => {
+            <button className="primary" disabled={busy || !bug && !row.humanActions?.some((a: HumanAction) => a.type === "RETRY_TASK" && a.enabled)} title={!bug ? actionReason(row, t) : undefined} onClick={async () => {
+              if (!bug) { void performTaskAction(row, row.humanActions.find((a: HumanAction) => a.type === "RETRY_TASK")); return; }
               if (await act(`/tasks/${id}/retry`, { version: row.version }, "POST", false)) closeModal();
             }}>{bug ? t("退回待修复", "Requeue bug") : t("重新开放执行", "Requeue task")}</button>
           )}
           {row.executorType === "HUMAN" && row.status === "READY" && !row.waiting && (
-            <button className="primary" disabled={busy} onClick={() => act(
-              `/tasks/${id}/human-start`, { version: row.version }, "POST", false,
-            )}>{t("开始人工任务", "Start human task")}</button>
+            <button className="primary" disabled={busy || !row.humanActions?.some((a: HumanAction) => a.type === "START_HUMAN" && a.enabled)} onClick={() => performTaskAction(row, row.humanActions.find((a: HumanAction) => a.type === "START_HUMAN"))}>{t("开始人工任务", "Start human task")}</button>
           )}
           {row.executorType === "HUMAN" && row.status === "RUNNING" && (
-            <button className="primary" onClick={() => open("human", row)}>{t("提交人工交付", "Complete human task")}</button>
+            <button className="primary" disabled={!row.humanActions?.some((a: HumanAction) => a.type === "COMPLETE_HUMAN" && a.enabled)} title={actionReason(row, t)} onClick={() => performTaskAction(row, row.humanActions.find((a: HumanAction) => a.type === "COMPLETE_HUMAN"))}>{t("提交人工交付", "Complete human task")}</button>
           )}
           {children.data && children.data.items.length > 0 && <details className="detail-section" open>
             <summary>{t("计划任务", "Planned work")}</summary>
@@ -1839,7 +1850,7 @@ function Detail({ id }: { id: string }) {
   );
 }
 
-function PlanDetail({ id }: { id: string }) {
+function PlanDetail({ id, guard }: { id: string; guard?: Row }) {
   const { lang, t, epoch, badge, open, act, busy, roleName } = useUI();
 
   const data = useData<Row>("/plans/" + id, epoch),
@@ -1848,6 +1859,10 @@ function PlanDetail({ id }: { id: string }) {
       epoch,
     );
   const plan = data.data;
+  const firstVersion = useRef<number | null>(null);
+  if (plan && firstVersion.current === null) firstVersion.current = plan.version;
+  const stale = plan && (plan.version !== (guard?.guardVersion ?? firstVersion.current) ||
+    guard?.guardTaskVersion && (!source.data || source.data.version !== guard.guardTaskVersion));
   const versions = useData<Page>(
     plan ? "/plans?parentId=" + plan.sourceTaskId + "&limit=100" : null,
     epoch,
@@ -1929,7 +1944,7 @@ function PlanDetail({ id }: { id: string }) {
         {plan.status === "SUBMITTED" && (
           <button
             className="primary"
-            disabled={busy}
+            disabled={busy || Boolean(stale)}
             onClick={() =>
               act(`/plans/${id}/approve`, { version: plan.version })
             }
@@ -1944,6 +1959,7 @@ function PlanDetail({ id }: { id: string }) {
             </button>
           )}
       </div>
+      {stale && <p role="alert" className="warning">{t("计划或需求已更新，请关闭后重新审阅。", "The plan or requirement changed. Close and review again.")}</p>}
       <p className="muted small">
         {t(
           "批准后，外部 Agent 可主动领取符合分工的任务。工具不会启动 Agent 或调用模型。",
@@ -2164,7 +2180,7 @@ function TaskOwner({ type }: { type: string }) {
 }
 
 function BoardTaskCard({ task, fields }: { task: Row; fields: CardProperty[] }) {
-  const { t, lang, badge, open, roleName, act, busy, projectName } = useUI();
+  const { t, lang, badge, open, roleName, busy, projectName, performTaskAction, actionBusyIds } = useUI();
   const owner = task.kind === "REQUEST" ? "REQUEST" : task.executorType;
   const waiting = task.blockReason ?? task.waiting?.code ??
     (task.assignee?.revoked && task.status === "READY" ? "ASSIGNEE_UNAVAILABLE" : null);
@@ -2206,15 +2222,16 @@ function BoardTaskCard({ task, fields }: { task: Row; fields: CardProperty[] }) 
             {task.assignedAgentId ? t("改派", "Reassign") : t("指派", "Assign")}
           </button>}
           {owner === "HUMAN" && task.status === "READY" && !task.waiting && (
-            <button className="quiet" disabled={busy} onClick={() =>
-              act(`/tasks/${task.id}/human-start`, { version: task.version }, "POST", false)
+            <button className="quiet" disabled={busy || actionBusyIds.includes(task.id) || !task.humanActions?.some((a: HumanAction) => a.type === "START_HUMAN" && a.enabled)} onClick={() =>
+              performTaskAction(task, task.humanActions.find((a: HumanAction) => a.type === "START_HUMAN"))
             }>{t("开始", "Start")}</button>
           )}
           {owner === "HUMAN" && task.status === "RUNNING" && (
-            <button className="quiet" onClick={() => open("human", task)}>{t("提交交付", "Complete")}</button>
+            <button className="quiet" disabled={actionBusyIds.includes(task.id) || !task.humanActions?.some((a: HumanAction) => a.type === "COMPLETE_HUMAN" && a.enabled)} onClick={() => performTaskAction(task, task.humanActions.find((a: HumanAction) => a.type === "COMPLETE_HUMAN"))}>{t("提交交付", "Complete")}</button>
           )}
         </div>
       )}
+      <TaskMoveControl task={task} />
     </article>
   );
 }
@@ -2232,6 +2249,10 @@ function TaskList() {
     errorPanel,
     projectName,
     roleName,
+    performTaskAction,
+    pendingTaskId,
+    actionBusyIds,
+    live,
   } = useUI();
 
   const [status, setStatus] = useState(""),
@@ -2330,8 +2351,9 @@ function TaskList() {
   function renderColumn(column: BoardColumn, lane?: string) {
     const cursorKey = lane ? `${lane}.${column.key}` : column.key;
     return <section key={column.key} className={"board-column" + (lane ? " swimlane-cell" : "")}
-      data-column={column.key} aria-label={t(...boardLabels[column.key])}>
+      data-column={column.key} data-drop-column={column.key} data-drop-lane={lane ?? ""} aria-label={t(...boardLabels[column.key])}>
       {!lane && columnHeading(column.key, column.total)}
+      <TaskDropTarget column={column.key} lane={lane} />
       <div className="board-column-items">
         {column.items.map((task) => <BoardTaskCard task={task} fields={display.card} key={task.id} />)}
         {!column.total && <p className="board-empty">{lane ? "—" : t("暂无任务", "No tasks")}</p>}
@@ -2350,9 +2372,13 @@ function TaskList() {
   const boardView = boardData.data;
   const lanes = boardView?.lanes ?? [];
   const laneColumns = lanes[0]?.columns ?? [];
+  const visibleTasks = boardView ? [...boardView.columns, ...lanes.flatMap((lane) => lane.columns)].flatMap((column) => column.items) : [];
+  const movement = useTaskMovement({ tasks: visibleTasks, scope: boardQuery.toString(),
+    enabled: columnLayout && !(layout === "board" && group === "owner") && !boardData.error && live.connection === "live",
+    t, perform: performTaskAction, pendingTaskId, externalBusy: actionBusyIds });
   const onBoardScroll = (event: React.UIEvent<HTMLDivElement>) => { scrollLeft.current = event.currentTarget.scrollLeft; };
   return (
-    <>
+    <TaskMovementContext.Provider value={movement}>
       <div className="toolbar task-toolbar">
         <div className="search">
           <span>⌕</span>
@@ -2386,6 +2412,7 @@ function TaskList() {
         <TaskMetadataFilters t={t} projectId={projectId} epoch={epoch} value={metadata} onChange={setMetadata} />
       </div>
       {errorPanel(columnLayout ? boardData.error : data.error)}
+      <TaskMoveFeedback />
       {columnLayout ? (
         !boardView ? boardData.loading && <p role="status" className="muted">{t("正在加载任务视图…", "Loading task view…")}</p>
         : layout === "board" && boardView.columns.length ? (
@@ -2461,7 +2488,7 @@ function TaskList() {
           →
         </button>
       </div>}
-    </>
+    </TaskMovementContext.Provider>
   );
 }
 
@@ -2620,7 +2647,7 @@ function Overview() {
 }
 
 function Inbox() {
-  const { lang, t, inbox, badge, open, act, empty, projectName, countInbox } =
+  const { lang, t, inbox, badge, open, act, empty, projectName, countInbox, performTaskAction } =
     useUI();
   const data = inbox.data;
   if (!data) return <p>{t("正在加载…", "Loading…")}</p>;
@@ -2667,16 +2694,9 @@ function Inbox() {
             {badge(task.status)}
           </div>
           <button
-            onClick={() =>
-              task.status === "READY"
-                ? act(
-                    `/tasks/${task.id}/human-start`,
-                    { version: task.version },
-                    undefined,
-                    false,
-                  )
-                : open("human", task)
-            }
+            disabled={!task.humanActions?.some((a: HumanAction) => a.enabled)}
+            title={task.humanActions?.some((a: HumanAction) => a.enabled) ? undefined : actionReason(task, t)}
+            onClick={() => performTaskAction(task, task.humanActions.find((a: HumanAction) => a.enabled))}
           >
             {task.status === "READY"
               ? t("开始处理", "Start")

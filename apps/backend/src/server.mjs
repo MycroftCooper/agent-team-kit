@@ -377,6 +377,8 @@ export function createServer({
           "acceptances",
           "materializations",
         ];
+        if (resource === "tasks" && id && projectId && ["human-start", "human-complete", "retry"].includes(action))
+          requireThat(app.store.get("tasks", id)?.projectId === projectId, "NOT_FOUND", "Task not found in this project", 404);
         if (method === "GET" && resource === "overview")
           result = app.overview(projectId);
         else if (method === "GET" && resource === "agent-migrations")

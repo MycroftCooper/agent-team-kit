@@ -165,6 +165,23 @@ than the currently selected page or drawer.
 See [Project agents and collaboration](COLLABORATION.md) for ownership migration,
 the user-facing workflow and snapshot API.
 
+## Human moves on the task board
+
+Task projections include lightweight `humanActions` for starting human work,
+submitting human delivery, retrying stopped blocked work, approving a submitted
+plan and accepting a whole requirement. Board handles and “Move to” controls
+dispatch the existing commands; there is no generic status-assignment endpoint.
+Forms and confirmations keep the source card unchanged until success. Agent
+claims, delivery and independent review remain credential-bound operations.
+
+Human delivery binds `version`, `runId` and `generation` in one transaction.
+An old form cannot finish a later restarted execution. Plans and acceptance
+panels keep their reviewed version/target, and acceptance lists affected work.
+Visible state columns and same-owner swimlanes accept legal pointer drops;
+executor grouping is not a state target. SSE changes cancel stale gestures,
+while existing filters, sorting, drawer links and workspace human renewal remain.
+See [Task board movement](TASK-BOARD-DRAG-DESIGN.md) for the supported operations.
+
 ## File coordination and evidence
 
 Claims transactionally check dependencies, team/agent capacity, identity, full

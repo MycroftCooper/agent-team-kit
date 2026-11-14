@@ -96,6 +96,12 @@ transitions. Task names across Work open the same collapsible right drawer,
 preserving the underlying page and filters. See
 [Project agents and collaboration](docs/COLLABORATION.md).
 
+Workflow boards and swimlanes support drag handles and **Move to…** for the five
+human operations: start/complete human work, requeue stopped blocked work, approve
+a submitted plan and accept a whole requirement. Required forms and confirmation
+panels remain in place; agent delivery and review still advance through real
+receipts. See [Task board movement](docs/TASK-BOARD-DRAG-DESIGN.md).
+
 In **Work → Bugs**, report a bug and choose a worker role from the workspace's squad.
 The bug goes straight to that role's queue. After a worker submits a fix, accept it in
 **My inbox** or return it with feedback for another attempt. `atk-agent claim --kind bug`

@@ -3,6 +3,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createAutomations } from "./automations.mjs";
+import { humanTaskActions } from "./task-actions.mjs";
 import { createResourceLibrary, resourceDiscovery, projectResourceDiscovery } from "./resources.mjs";
 import { openStore } from "../../../packages/database/src/index.mjs";
 import {
@@ -145,7 +146,23 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         403,
       );
   }
-  function taskProjection(task, existingLocks) {
+  function taskProjection(task, existingLocks, runs = working()) {
+    const projected = taskStateProjection(task, existingLocks);
+    const p = get("projects", task.projectId), plan = task.planId && store.get("plans", task.planId);
+    const acceptance = task.kind === "REQUEST" && task.status === "AWAITING_ACCEPTANCE"
+      ? store.all("acceptances", { parentId: task.id }).find((a) => a.planId === plan?.id && a.status === "PENDING") : null;
+    let projectIssue = p.archived ? "PROJECT_ARCHIVED" : !fs.existsSync(p.root) ? "PROJECT_UNAVAILABLE" : null;
+    let acceptanceLocked = false;
+    if (acceptance && !projectIssue) {
+      try { acceptanceLocked = conflicts(locksFor(acceptance.scopes, p)).length > 0; }
+      catch (error) { projectIssue = error.code ?? "PROJECT_UNAVAILABLE"; }
+    }
+    const humanActions = humanTaskActions(task, { projectIssue, plan, acceptance, runs, waiting: projected.waiting, now: now(), acceptanceLocked });
+    const run = runs.find((r) => r.taskId === task.id && r.stage === "HUMAN");
+    return { ...projected, humanActions,
+      ...(task.executorType === "HUMAN" && run && { humanRun: { id: run.id, generation: run.generation, status: run.status, leaseUntil: run.leaseUntil } }) };
+  }
+  function taskStateProjection(task, existingLocks) {
     task = { ...task, dependencies: (task.deps ?? []).map((id) => {
       const dep = store.get("tasks", id);
       return dep?.projectId === task.projectId ? { id, title: dep.title, status: dep.status } : { id };
@@ -647,6 +664,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         page.items.some((t) => ["WORK", "BUG"].includes(t.kind) && t.status === "READY")
           ? store.all("locks")
           : undefined;
+      const activeRuns = table === "tasks" ? working() : [];
       return {
         ...page,
         items:
@@ -658,7 +676,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
                   title: spec?.title,
                 }))
               : table === "tasks"
-                ? page.items.map((t) => taskProjection(t, currentLocks))
+                ? page.items.map((t) => taskProjection(t, currentLocks, activeRuns))
                 : table === "acceptances" && filters.summary
                   ? page.items.map(({ id, planId, status, updatedAt }) => ({ id, planId, status, updatedAt }))
                   : page.items,
@@ -686,7 +704,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       const columns = (group === "owner" ? byOwner
         : TASK_BOARD_COLUMNS.filter((column) => !status || column.statuses.includes(status)))
         .filter((column) => !hidden.includes(column.key));
-      const locks = store.all("locks"), parents = new Map();
+      const locks = store.all("locks"), runs = working(), parents = new Map();
       const pageColumn = (column, lane) => {
         const filter = {
           projectId, status, statuses: column.statuses, owner: lane ?? column.owner ?? owner,
@@ -707,7 +725,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
             if (task.parentId && !parents.has(task.parentId))
               parents.set(task.parentId, store.get("tasks", task.parentId)?.title);
             return {
-              ...taskProjection(task, locks),
+              ...taskProjection(task, locks, runs),
               parentTitle: parents.get(task.parentId),
               subtaskProgress: progress && task.kind === "REQUEST" && task.planId
                 ? store.childProgress(task.id, task.planId)
@@ -1885,6 +1903,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       return store.tx(() => {
         const task = get("tasks", taskId);
         expected(task, body.version);
+        project(task.projectId);
         requireThat(
           ["WORK", "BUG"].includes(task.kind) && task.status === "BLOCKED",
           "TASK_NOT_BLOCKED",
@@ -1957,17 +1976,19 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       });
     },
     finishHuman(taskId, body) {
-      const task = get("tasks", taskId),
-        run = working().find(
+      return store.tx(() => {
+        const task = get("tasks", taskId);
+        expected(task, body.version);
+        const run = working().find(
           (r) => r.taskId === task.id && r.stage === "HUMAN",
         );
-      requireThat(run, "RUN_NOT_ACTIVE", "Start the human task first", 409);
-      return api.finishRun(null, run.id, {
-        ...body,
-        generation: run.generation,
-        outcome: "COMPLETED",
-        stopped: true,
-        idempotencyKey: body.idempotencyKey ?? `human-${run.id}`,
+        requireThat(run, "RUN_NOT_ACTIVE", "Start the human task first", 409);
+        requireThat(body.runId === run.id && body.generation === run.generation,
+          "STALE_HUMAN_RUN", "This form belongs to a different human execution. Reopen the task before submitting.", 409);
+        return api.finishRun(null, run.id, {
+          ...body, generation: run.generation, outcome: "COMPLETED", stopped: true,
+          idempotencyKey: body.idempotencyKey ?? `human-${run.id}`,
+        });
       });
     },
     heartbeatHuman(taskId) {
@@ -2303,7 +2324,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
             t.executorType === "HUMAN" &&
             ["READY", "RUNNING"].includes(t.status) &&
             dependenciesReady(t, byId),
-        ),
+        ).map((task) => taskProjection(task)),
         acceptances: store
           .all("acceptances", filter)
           .filter(

@@ -112,3 +112,7 @@ export function finish(f, claim, more = {}) {
     ...more,
   });
 }
+export function completeHuman(f, id, body = {}) {
+  const task = f.app.get("tasks", id);
+  return f.app.finishHuman(id, { ...body, version: task.version, runId: task.humanRun?.id, generation: task.humanRun?.generation });
+}
