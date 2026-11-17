@@ -615,6 +615,9 @@ main {
   margin: 0;
   font-size: 20px;
 }
+.task-page-heading, .bug-page-heading { gap: 16px; }
+.page-heading > .primary { flex: none; }
+.page-heading > .primary kbd { color: inherit; border-color: currentColor; opacity: .7; }
 .page-heading select {
   background: var(--panel);
   border: 1px solid var(--line-strong);
@@ -2034,7 +2037,8 @@ legend {
     gap: 8px;
   }
   .breadcrumbs,
-  .top-actions kbd {
+  .top-actions kbd,
+  .page-heading > .primary kbd {
     display: none;
   }
   .top-actions {

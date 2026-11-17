@@ -47,7 +47,7 @@ export function projectPaths(root, docsRoot) {
       : path.join(resolved, ".agent-team"),
   );
   requireThat(
-    docs !== resolved && !inside(docs, resolved),
+    docs !== resolved && !inside(docs, resolved) && !inside(path.join(resolved, ".atk"), docs) && !inside(docs, path.join(resolved, ".atk")),
     "INVALID_PATH",
     "Project data must not contain the project root",
   );
@@ -65,7 +65,8 @@ export function resolveScope(project, scope) {
     403,
   );
   requireThat(
-    !inside(project.docsRoot, absolute) &&
+    !rel.split("/").some(part => part.toLowerCase() === ".atk") && !inside(project.docsRoot, absolute) &&
+      !inside(path.join(project.root, ".atk"), absolute) &&
       !inside(path.join(project.root, ".git"), absolute),
     "MANAGED_PATH",
     "Managed metadata is not an agent write scope",
@@ -81,7 +82,7 @@ export function resolveScope(project, scope) {
       (fs.existsSync(absolute) && fs.statSync(absolute).isDirectory()),
   };
 }
-const ignored = new Set([".git", ".agent-team", "node_modules", ".pnpm-store"]);
+const ignored = new Set([".git", ".atk", ".agent-team", "node_modules", ".pnpm-store"]);
 export function capture(
   project,
   scopes,
@@ -97,7 +98,7 @@ export function capture(
       "A symlink points outside the project",
       403,
     );
-    if (inside(project.docsRoot, real)) return;
+    if (inside(project.docsRoot, real) || inside(path.join(project.root, ".atk"), real)) return;
     const rel = path.relative(project.root, file).replaceAll("\\", "/");
     if (!fs.existsSync(file)) {
       files[rel] = { hash: null, size: 0 };

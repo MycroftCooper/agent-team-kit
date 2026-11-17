@@ -83,6 +83,31 @@ a later restarted run.
 
 ## Stop, failure and recovery
 
+Project automation definitions live in `<root>/.atk/automations/`, independent of
+`docsRoot`. Create/edit them in Automations or with the project's Agent credential:
+`atk-agent automation apply --file workflow.json --create --project <id>`.
+Run using `automation run <workflowId> --revision <sha256> --project <id>`;
+use `--param name=value` or `--params-file`, and optionally `--wait`.
+The same runId appears in the UI. Definitions specify native `cli` and argv `args`;
+Windows .cmd/.bat tools require a project adapter. No shell is invoked implicitly.
+Old database workflows are not read or migrated; reconnect them as project files.
+Workflows may also declare project-owned `schedules` for one-time, multiple-date,
+finite-repeat or ongoing interval runs. See [CI scheduling](AUTOMATION-SCHEDULING.md)
+for missed/busy slot behavior, local cursor recovery and the Agent schedules API.
+
+Every run retains its definition/request, log.ndjson, events.ndjson, final result.json
+and collected exports in `.atk/runs/<runId>/`. Configure CI to use ATK_OUTPUT_DIR
+for fresh outputs; unchanged fixed-path files are refused as evidence. A declared
+atk-ci-result/v1 report must match this runId and stepId as well as the process exit.
+Full logs stay on disk; the UI displays recent text with incremental log fetching.
+No automatic history cleanup is performed. Runs exceeding 256 MiB of logs fail.
+
+After a crash, an uncertain command is RECOVERY_REQUIRED and prevents another run,
+relocation, complete backup and hot reload. Inspect/stop the old process tree,
+then use the UI's human-only confirmation with a reason. Agent disconnection does
+not cancel backend-owned CI; `automation stop <runId>` explicitly requests stopping.
+Git triggers observe new local commits only after establishing this machine's baseline.
+
 Stopping the service does not terminate external agents. Those agents must stop
 writing on lease/connection loss. Restart preserves active state and file locks;
 expired runs become QUARANTINED. Inspect the external environment, stop the old
@@ -102,13 +127,17 @@ atk backup --to <new-backup-directory>
 atk restore --from <backup-directory>
 ```
 
-The backup contains a consistent SQLite snapshot, project artifacts (including
-each docsRoot/resources library and supporting files), global resources and a
+The version-2 backup contains a consistent SQLite snapshot, project artifacts (including
+each docsRoot/resources library and supporting files), project .atk definitions/runs,
+global resources and a
 checksum manifest. Restoring a backup copies saved resources over matching files
 and leaves other resource files in place. Restore validates the manifest and saved project paths, makes
 a safety backup, then restores state and referenced artifacts. Project source
 files are **not** part of this backup and are never rolled back by restore.
 Use your own source control or file backup for project code.
+Automation owner locks and trigger cursors under `.atk/local/` are excluded and
+are not restored; a restored installation establishes a fresh Git baseline.
+Older backup formats are not accepted by this automation revision.
 
 Backups may contain private project content; store them accordingly. Restore
 uses the project locations recorded in that backup and requires those roots to

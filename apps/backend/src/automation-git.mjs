@@ -31,6 +31,7 @@ export async function localBranches(root) {
 }
 
 export async function checkout(root) {
+  if (!fs.existsSync(path.join(root, ".git"))) return null;
   const output = await git(root, ["status", "--porcelain=v2", "--branch", "--untracked-files=no"]);
   if (output === null) return null;
   const lines = output.split(/\r?\n/);

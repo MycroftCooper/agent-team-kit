@@ -13,9 +13,6 @@ const TABLES = [
   "locks",
   "acceptances",
   "materializations",
-  "automations",
-  "automation_runs",
-  "automation_trigger_states",
 ];
 export function openStore(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });

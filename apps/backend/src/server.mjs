@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { createService } from "./service.mjs";
 import { acquireInstance } from "./instance-lock.mjs";
+import { automationRoute } from "./automation-routes.mjs";
+import { strictJson } from "./automation-definition.mjs";
 import { backup, restore } from "./operations.mjs";
 import {
   createSession,
@@ -84,7 +86,8 @@ async function readBody(req) {
   }
   if (!bytes) return {};
   try {
-    const b = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const text = Buffer.concat(chunks).toString("utf8");
+    const b = /\/projects\/[^/]+\/automations/.test(req.url) ? strictJson(text, 512 * 1024) : JSON.parse(text);
     requireThat(
       b && typeof b === "object" && !Array.isArray(b),
       "VALIDATION_ERROR",
@@ -286,6 +289,7 @@ export function createServer({
         route = ["resources", ...route.slice(2)];
       }
       const [resource, id, action] = route;
+      if (await automationRoute({ app, route, method, body, agent, req, res, url, json })) return;
       if (isAgent) {
         let result;
         if (method === "POST" && resource === "connect")
@@ -387,20 +391,6 @@ export function createServer({
           result = app.collaboration(projectId, url.searchParams.get("planId") ?? undefined);
         else if (method === "POST" && resource === "agents" && id && action === "bind")
           result = app.bindAgent(id, body);
-        else if (resource === "automations" && !id && method === "GET")
-          result = app.automations.list(projectId, number(url.searchParams.get("cursor"), 0, 0, 1_000_000));
-        else if (resource === "automations" && !id && method === "POST")
-          result = await app.automations.configure(projectId, null, body);
-        else if (resource === "automations" && id && !action && method === "PATCH")
-          result = await app.automations.configure(projectId, id, body);
-        else if (resource === "automations" && id && !action && method === "DELETE")
-          result = app.automations.remove(projectId, id, Number(url.searchParams.get("version")));
-        else if (resource === "automations" && id && action === "run" && method === "POST")
-          result = app.automations.start(projectId, id, body);
-        else if (resource === "automation-runs" && id && !action && method === "GET")
-          result = app.automations.detail(projectId, id);
-        else if (resource === "automation-runs" && id && action === "stop" && method === "POST")
-          result = app.automations.stop(projectId, id);
         else if (method === "GET" && resource === "resources" && route.length <= 2)
           result = app.resourceLibrary(resourceOptions).list(id);
         else if (method === "GET" && resource === "resources" && route.length === 3)

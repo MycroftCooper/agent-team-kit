@@ -18,17 +18,17 @@ const steps = [];
 const builtInSkills = ["agent", "skill", "mcp", "cli", "automation"].map((kind) => "atk-create-" + kind)
   .concat(["linus-review", "linus-design-guard"]);
 let baseUrl, launcher, dataDir, accessKey;
-function command(file, args, cwd = process.cwd()) {
+function command(file, args, cwd = process.cwd(), env = {}) {
   const result = spawnSync(process.execPath, [file, ...args], {
     cwd,
     encoding: "utf8",
     windowsHide: true,
-    timeout: 60000,
-    env: { ...process.env, npm_config_cache: path.join(output, "npm-cache") },
+    timeout: args[0] === "install" ? 180000 : 60000,
+    env: { ...process.env, npm_config_cache: path.join(output, "npm-cache"), ...env },
   });
   if (result.status !== 0)
     throw new Error(
-      `Command failed: ${file}\n${result.stdout}\n${result.stderr}`,
+      `Command failed: ${file}\n${result.error?.message ?? ""}\n${result.stdout}\n${result.stderr}`,
     );
   return result.stdout;
 }
@@ -71,6 +71,9 @@ try {
     const names = packed.files.map((f) => f.path);
     assert.ok(names.includes("apps/web/dist/index.html"));
     assert.ok(names.includes("apps/agent-cli/cli.mjs"));
+    for (const file of ["apps/agent-cli/automation.mjs", "apps/backend/src/project-automations.mjs", "apps/backend/src/automation-job.ps1", "packages/platform/src/strict-json.mjs"])
+      assert.ok(names.includes(file), `Missing automation runtime asset: ${file}`);
+    assert.ok(!names.includes("apps/backend/src/automations.mjs"));
     for (const name of builtInSkills)
       assert.ok(names.includes(`apps/backend/resources/skill/${name}/SKILL.md`));
     assert.ok(names.includes("apps/launcher/desktop.mjs"));
@@ -238,6 +241,20 @@ try {
       assert.equal(plan.plan.status, "SUBMITTED");
     },
   );
+  await step("installed Agent CLI configures and runs project CI with archived reports", async () => {
+    const identity = await human("/agents", { projectId: first.id, name: "Installed CI", roleId: "role-dev", teamId: "team-default" });
+    const definition = { schemaVersion: 1, id: "package-ci", name: "Installed CI checks", steps: [{ id: "check", name: "Check", cli: "node", args: ["-e",
+      "console.log('::atk::{\"schemaVersion\":1,\"type\":\"progress\",\"percent\":50}');require('node:fs').writeFileSync(require('node:path').join(process.env.ATK_OUTPUT_DIR,'report.json'),JSON.stringify({schemaVersion:1,runId:process.env.ATK_RUN_ID,stepId:process.env.ATK_STEP_ID,status:'passed'}));console.log('Packaged CI passed')"],
+      exports: [{ id: "report", path: "${step.dir}/output/report.json", kind: "file", required: true }], result: { protocol: "atk-ci-result/v1", exportId: "report" } }] };
+    const file = path.join(runRoot, "ci.json"); fs.writeFileSync(file, JSON.stringify(definition));
+    const env = { ATK_URL: baseUrl, ATK_AGENT_TOKEN: identity.credential }, cli = path.join(installed, "apps/agent-cli/cli.mjs");
+    const flow = JSON.parse(command(cli, ["automation", "apply", "--file", file, "--create", "--project", first.id], outside, env));
+    const run = JSON.parse(command(cli, ["automation", "run", "package-ci", "--revision", flow.revision, "--wait", "--project", first.id], outside, env));
+    assert.equal(run.status, "SUCCEEDED"); assert.equal(run.steps[0].report.status, "passed");
+    assert.equal(run.requestedBy.agentId, identity.agent.id);
+    assert.ok(fs.existsSync(path.join(outside, run.runPath, "result.json")));
+    assert.ok(fs.existsSync(path.join(outside, run.runPath, run.steps[0].exports[0].files[0].path)));
+  });
   await step(
     "backup and restore both database and project artifacts",
     async () => {

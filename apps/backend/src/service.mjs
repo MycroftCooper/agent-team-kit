@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
-import { createAutomations } from "./automations.mjs";
+import { createAutomations } from "./project-automations.mjs";
 import { humanTaskActions } from "./task-actions.mjs";
 import { createResourceLibrary, resourceDiscovery, projectResourceDiscovery } from "./resources.mjs";
 import { openStore } from "../../../packages/database/src/index.mjs";
@@ -648,7 +648,20 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         defaultReview: "NONE",
       });
     });
-  const automations = createAutomations({ store, get, make, put, project, expected, emit, at });
+  const automations = createAutomations({ store, get, project, at });
+  function requireAutomationRoot(paths, projectId) {
+    const automationRoot = lockKey(path.join(paths.root, ".atk"));
+    const overlap = (a, b) => pathsOverlap(a, b);
+    const contains = (a, b) => b === a || b.startsWith(a + "/");
+    requireThat(!overlap(automationRoot, lockKey(paths.docsRoot)) && !overlap(automationRoot, lockKey(resources.root)),
+      "INVALID_PATH", "Automation data overlaps another managed directory", 409);
+    for (const other of store.all("projects")) {
+      if (other.id === projectId) continue;
+      requireThat(!contains(automationRoot, lockKey(other.root)) && !overlap(automationRoot, lockKey(other.docsRoot)) &&
+        !contains(lockKey(path.join(other.root, ".atk")), lockKey(paths.root)) && !overlap(lockKey(path.join(other.root, ".atk")), lockKey(paths.docsRoot)),
+      "INVALID_PATH", "Automation data overlaps another registered project", 409);
+    }
+  }
   const api = {
     store,
     signals,
@@ -846,6 +859,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       return store.tx(() => {
         object(body);
         const paths = projectPaths(body.root, body.docsRoot);
+        requireAutomationRoot(paths);
         requireThat(
           !store
             .all("projects")
@@ -863,7 +877,6 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           status: "AVAILABLE",
           archived: false,
         });
-        automations.seed(p.id);
         queueDoc(p, "project", p.id, {
           id: p.id,
           name: p.name,
@@ -899,6 +912,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           409,
         );
         if (body.root || body.docsRoot) requireResourceRoot(paths.docsRoot, id);
+        if (body.root || body.docsRoot) requireAutomationRoot(paths, id);
         if (body.teamId) {
           get("teams", body.teamId);
           requireThat(body.teamId === p.teamId || !store.all("agents", { projectId: id }).some((a) => !a.revoked),

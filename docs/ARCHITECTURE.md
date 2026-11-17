@@ -7,7 +7,7 @@ the only application database writer. External agents call a distinct authentica
 API; they neither inherit a browser session nor choose their own function.
 
 ```text
-Browser ── /api/v1 + SSE ── Backend ── SQLite (one global authority)
+Browser ── /api/v1 + SSE ── Backend ── SQLite (tasks, identity, project registry)
                               │
 External agents ─ /api/agent/v1┤
                               ├── project/docsRoot (documents + snapshots + resources/)
@@ -26,11 +26,16 @@ retry and lease renewal. It can launch an explicitly requested team CLI script
 or stdio MCP server in the external client's process environment. The backend
 does not launch these resources, and ATK does not execute AI processes.
 
-Automation configuration uses the authenticated human API. Commands run in the
-registered project root, either on demand or when a configured local Git branch
-advances and has a clean checkout. The workflow, its Git cursor and run records
-are kept in SQLite. Lifecycle events use the existing SSE stream; live details
-and bounded log tails are fetched only in the run view.
+Automation configuration and results belong to each project: `.atk/automations/*.json`
+is the definition authority, `.atk/runs/<runId>/` contains immutable request/configuration
+snapshots, logs, events, reports and collected exports; `.atk/local/` holds ownership
+and machine-local Git cursors. No automation bodies or events are written to SQLite.
+Human and Agent APIs share `/projects/:id/automations` and `/projects/:id/automation-runs`
+under their respective authenticated prefixes. The Agent CLI uses those APIs rather
+than spawning another CI executor. Progress uses per-run replayable SSE plus polling.
+Native argv execution is supervised with Windows kill-on-close Job Objects or POSIX
+process groups. Unconfirmed exits block the project in RECOVERY_REQUIRED until a human
+confirms the old tree stopped. See [the automation contract](AUTOMATION-PROJECT-DESIGN.md).
 
 Node.js 24, built-in `node:sqlite`, React/TypeScript/Vite. Production Node modules
 use relative package paths so the installed package needs no workspace links.

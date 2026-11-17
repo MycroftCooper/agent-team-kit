@@ -94,26 +94,27 @@ try {
   await step("automation shows live progress, elapsed time, custom fields and logs", async () => {
     fs.writeFileSync(path.join(projectRoot, "automation-check.mjs"), [
       'import fs from "node:fs";',
-      'console.log(\'::atk::{"progress":40,"info":{"artifact":"demo.txt"}}\');',
+      'console.log(\'::atk::{"schemaVersion":1,"type":"progress","percent":40,"current":"local-check"}\');',
+      'console.log(\'::atk::{"schemaVersion":1,"type":"info","values":{"artifact":"demo.txt"}}\');',
       'while (!fs.existsSync("automation-continue.txt")) await new Promise((resolve) => setTimeout(resolve, 50));',
       'console.log("Local check passed");',
     ].join("\n"));
     await browser.click("自动化", { exact: true });
     await browser.click("新建流程", { exact: true });
     await browser.click("演示流程", { exact: true });
-    await browser.fill("stepCommand", '"' + process.execPath + '" automation-check.mjs');
-    await browser.fill("automationInfo", "Environment=local");
+    await browser.fill("step-args", JSON.stringify(["automation-check.mjs"]));
     await browser.submit();
     await browser.wait("!document.querySelector('[role=dialog]')");
-    await browser.click("运行", { exact: true, within: "[...document.querySelectorAll('.automation-row')].find(row=>row.textContent.includes('演示流程'))" });
-    await browser.wait("document.querySelector('.automation-progress progress')?.value === 20 && document.querySelector('.automation-run-meta strong')?.textContent !== '00:00:00' && document.querySelector('.automation-info')?.innerText.includes('demo.txt')");
+    await browser.click("运行流程", { exact: true, within: "[...document.querySelectorAll('.automation-row')].find(row=>row.textContent.includes('演示流程'))" });
+    await browser.click("启动流程", { exact: true });
+    await browser.wait("document.querySelector('.automation-progress progress')?.value === 40 && document.querySelector('.automation-run-meta strong')?.textContent !== '00:00:00' && document.querySelector('.automation-info')?.textContent.includes('demo.txt')");
     await browser.screenshot("automation-running");
     fs.writeFileSync(path.join(projectRoot, "automation-continue.txt"), "");
     await browser.wait("document.querySelector('.automation-progress progress')?.value === 100 && document.querySelector('.automation-run .section-title .badge')?.dataset.status === 'SUCCEEDED' && document.querySelector('.automation-log')?.textContent.includes('Local check passed')");
-    assert.equal(await browser.evaluate("document.querySelector('.automation-info').innerText.includes('Environment')"), true);
+    assert.equal(await browser.evaluate("document.querySelector('.automation-info').textContent.includes('artifact')"), true);
     await browser.click("概览", { exact: true, within: "document.querySelector('.sidebar')" });
   });
-  await step("a built-in workflow can watch a project-specific Git branch from the UI", async () => {
+  await step("a file workflow can watch a project-specific Git branch from the UI", async () => {
     const branch = "checks/browser";
     const git = (...args) => execFileSync("git", [
       "-c", "user.name=ATK Browser Test", "-c", "user.email=atk@example.test",
@@ -124,18 +125,20 @@ try {
     await browser.click("自动化", { exact: true });
     const nav = await browser.evaluate("[...document.querySelectorAll('.sidebar nav button')].map(button=>button.getAttribute('aria-label'))");
     assert.deepEqual(nav.slice(1, 4), ["工作", "自动化", "Agent 团队"]);
-    const smoke = "[...document.querySelectorAll('.automation-row')].find(row=>row.textContent.includes('冒烟测试'))";
-    await browser.click("编辑", { exact: true, within: smoke });
-    assert.equal(await browser.evaluate("document.querySelector('[name=automationTrigger]').value"), "MANUAL");
-    await browser.click("移除此步骤", { exact: true, within: "document.querySelectorAll('.automation-step-editor')[1]" });
-    await browser.fill("stepCommand", "echo Git-triggered check passed");
-    await browser.fill("automationTrigger", "GIT_COMMIT");
+    const smoke = "[...document.querySelectorAll('.automation-row')].find(row=>row.textContent.includes('演示流程'))";
+    await browser.click("编辑流程", { exact: true, within: smoke });
+    assert.equal(await browser.evaluate("document.querySelector('[name=automationTrigger]').value"), "manual");
+    await browser.fill("step-args", JSON.stringify(["-e", "console.log('Git-triggered check passed')"]));
+    await browser.fill("automationTrigger", "git-commit");
     await browser.fill("automationBranch", branch);
     await browser.submit();
-    await browser.wait("(" + smoke + ")?.textContent.includes('checks/browser 有新提交')");
+    await browser.wait("!document.querySelector('[role=dialog]') && !!(" + smoke + ")");
+    await server.app.automations.poll();
     git("commit", "--allow-empty", "-m", "trigger");
     const sha = git("rev-parse", "HEAD").slice(0, 8);
-    await browser.wait("document.querySelector('.automation-trigger')?.textContent.includes('" + sha + "') && document.querySelector('.automation-log')?.textContent.includes('Git-triggered check passed')");
+    await browser.wait("document.querySelector('.automation-history')?.textContent.includes('Git · checks/browser')");
+    await browser.evaluate("document.querySelector('.automation-history').click()");
+    await browser.wait("document.querySelector('.automation-run-body')?.textContent.includes('" + sha + "') && document.querySelector('.automation-log')?.textContent.includes('Git-triggered check passed')");
     await browser.click("概览", { exact: true, within: "document.querySelector('.sidebar')" });
   });
   const credentials = {};
@@ -342,6 +345,7 @@ try {
   });
   const project = server.app.list("projects").items[0];
   await step("work uses a secondary sidebar and new requests have their own draft column", async () => {
+    await workPage("任务");
     await browser.click("新建需求");
     await browser.fill("title", "Build the release summary");
     await browser.fill(
@@ -737,6 +741,7 @@ try {
   await step(
     "keyboard dialog and form preservation during SSE refresh",
     async () => {
+      await workPage("Tasks");
       // The helper's synthetic click does not focus navigation as a real click would.
       await browser.wait("!document.querySelector('[role=dialog]')");
       await browser.send("Page.bringToFront");
@@ -877,6 +882,7 @@ try {
     await browser.wait("!document.querySelector('[role=dialog]') && [...document.querySelector('[name=workspace]').options].some(o=>o.textContent==='Second Workspace')");
     const other = server.app.list("projects").items.find((p) => p.name === "Second Workspace");
     await browser.wait(`document.querySelector('[name=workspace]').value === ${JSON.stringify(other.id)} && !document.querySelector('[role=dialog]')`);
+    await workPage("Tasks");
     await browser.click("New request");
     assert.equal(await browser.evaluate("document.querySelector('[name=projectId]').value"), other.id);
     assert.equal(await browser.evaluate("!!document.querySelector('select[name=projectId]')"), false);

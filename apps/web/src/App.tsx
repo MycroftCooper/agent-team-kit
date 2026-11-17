@@ -12,7 +12,7 @@ import {
 import { LEASE_MS, TASK_STATUSES, type Row, type Page } from "@atk/contracts";
 import { api, authorize, useData, useLive } from "./api";
 import { AgentTeam, AgentTeamNavigation, agentCliSetup, agentTeamSectionTitle, useAgentTeam } from "./agent-team";
-import { AutomationEditor, Automations, type Workflow } from "./automations";
+import { AutomationEditor, AutomationNavigation, Automations, useAutomationNavigation, type Workflow } from "./automations";
 import { Collaboration } from "./collaboration";
 import { AgentMigrations } from "./agent-migrations";
 import { actionKey, actionReason, type HumanAction } from "./task-actions";
@@ -236,6 +236,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     allTeams = teams.data?.items ?? [];
   const teamView = view === "team";
   const agentTeam = useAgentTeam(teamView, epoch, projectId);
+  const automationNavigation = useAutomationNavigation(projectId, epoch, view === "automations");
   function clearDetail(immediate = false) {
     if (!detail) return;
     if (detailCloseTimer.current) clearTimeout(detailCloseTimer.current);
@@ -364,15 +365,15 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
         !["INPUT", "TEXTAREA", "SELECT"].includes(
           (e.target as HTMLElement)?.tagName,
         ) &&
-        !modal
+        !modal && !busy && projectId && (view === "tasks" || view === "bugs")
       ) {
         e.preventDefault();
-        if (view !== "bugs" || projectId) open(view === "bugs" ? "new-bug" : "draft");
+        open(view === "bugs" ? "new-bug" : "draft");
       }
     };
     window.addEventListener("keydown", listener);
     return () => window.removeEventListener("keydown", listener);
-  }, [dialog, detail, modal, projectId, view]);
+  }, [dialog, detail, modal, projectId, view, busy]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 3000);
@@ -468,7 +469,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     </div>
   );
   const newButton = (
-    <button className="primary" onClick={() => open("draft")}>
+    <button className="primary" disabled={busy || !projectId} onClick={() => open("draft")}>
       ＋ {t("新建需求", "New request")} <kbd>N</kbd>
     </button>
   );
@@ -483,8 +484,8 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
   const titles =
     workPage ?? navs.find(([key]) => key === view) ??
     (["settings", "设置", "Settings", "⚙"] as const);
-  const sectionTitle = workPage ? t("工作", "Work") : teamView ? t("Agent 团队", "Agent team") : null;
-  const pageTitle = teamView ? agentTeamSectionTitle(agentTeam.section, t) : t(titles[1], titles[2]);
+  const sectionTitle = workPage ? t("工作", "Work") : teamView ? t("Agent 团队", "Agent team") : view === "automations" ? t("自动化", "Automations") : null;
+  const pageTitle = teamView ? agentTeamSectionTitle(agentTeam.section, t) : view === "automations" ? automationNavigation.history ? t("全部运行记录", "All runs") : automationNavigation.workflow?.definition?.name ?? t("项目流程", "Project workflows") : t(titles[1], titles[2]);
   const globalView = (teamView && agentTeam.section !== "agents") || view === "projects" || view === "settings";
   const item = modal?.item;
   const agentRole = modal?.kind === "agent-role" ? allRoles.find((role) => role.id === item?.roleId) : undefined;
@@ -520,6 +521,10 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
       </button>
     </div>
   );
+  const bugButton = view === "bugs" && projectId ? <button className="primary" onClick={() => open("new-bug")}>
+    ＋ {t("新建 Bug 单", "New bug")} <kbd>N</kbd>
+  </button> : null;
+  const showTopbar = !sectionTitle || !desktopWindow;
   return (
     <UIContext.Provider
       value={{
@@ -543,7 +548,6 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
         act,
         busy,
         empty,
-        newButton,
         errorPanel,
         projectName,
         roleName,
@@ -557,7 +561,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
       }}
     >
       <DesktopTitleBar lang={lang} workspace={workspaceSwitcher} />
-      <div className={sectionTitle ? "app has-section-sidebar" : "app"}>
+      <div className={(sectionTitle ? "app has-section-sidebar" : "app") + (view === "automations" ? " automation-shell" : "")}>
         <aside className="sidebar" inert={Boolean(modal) && !detailPane}>
           <nav aria-label={t("主导航", "Main navigation")}>
             {navs.map(([key, zh, en, icon]) => (
@@ -598,7 +602,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
             </div>
           </div>
         </aside>
-        {sectionTitle && <aside className={workPage ? "section-sidebar work-sidebar" : "section-sidebar agent-team-sidebar"} inert={Boolean(modal) && !detailPane}>
+        {sectionTitle && <aside className={"section-sidebar " + (workPage ? "work-sidebar" : view === "automations" ? "automation-sidebar" : "agent-team-sidebar")} inert={Boolean(modal) && !detailPane}>
           <h2>{sectionTitle}</h2>
           {workPage ? <>
             <p className="section-nav-label">{t("视图", "Views")}</p>
@@ -612,26 +616,20 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                 {key === "inbox" && countInbox > 0 && <span className="section-nav-count">{countInbox}</span>}
               </button>)}
             </nav>
-          </> : <AgentTeamNavigation t={t} state={agentTeam} />}
+          </> : view === "automations" ? <AutomationNavigation state={automationNavigation} t={t} busy={busy || !projectId} create={() => open("automation-editor")} /> : <AgentTeamNavigation t={t} state={agentTeam} />}
         </aside>}
         <div className="main" inert={Boolean(modal) && !detailPane}>
-          <header className="topbar">
+          {showTopbar && <header className="topbar">
             <div className="topbar-left">
               {!desktopWindow && workspaceSwitcher}
-              <div className="breadcrumbs">
+              {!sectionTitle && <div className="breadcrumbs">
                 {!desktopWindow && <span>/</span>}
-                {sectionTitle && <><span>{sectionTitle}</span><span>/</span></>}
                 <strong>{pageTitle}</strong>
-              </div>
+              </div>}
             </div>
-            <div className="top-actions">
-              {view === "bugs" ? projectId && <button className="primary" onClick={() => open("new-bug")}>
-                ＋ {t("新建 Bug 单", "New bug")} <kbd>N</kbd>
-              </button> : view !== "automations" && newButton}
-            </div>
-          </header>
+          </header>}
           <main>
-            <div className="page-heading">
+            <div className={view === "tasks" ? "page-heading task-page-heading" : view === "bugs" ? "page-heading bug-page-heading" : "page-heading"} hidden={view === "automations"}>
               <div>
                 <h2 id="page-heading-title">{pageTitle}</h2>
               </div>
@@ -640,6 +638,8 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                   {t("全局管理 · 跨工作空间共享", "Global management · Shared across workspaces")}
                 </span>
               )}
+              {view === "tasks" && newButton}
+              {bugButton}
             </div>
             {!modal && errorPanel(error)}
             {projects.error && errorPanel(projects.error as Row)}
@@ -674,8 +674,8 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
               ) : view === "projects" ? (
                 <Projects />
               ) : view === "automations" ? (
-                <Automations t={t} lang={lang} projectId={projectId} epoch={epoch} busy={busy}
-                  edit={(workflow) => open("automation-editor", workflow)} act={act} />
+                <Automations key={projectId + (automationNavigation.history ? ":history" : ":" + automationNavigation.workflow?.id)} t={t} lang={lang} projectId={projectId} epoch={epoch} busy={busy}
+                  edit={(workflow) => open("automation-editor", workflow)} act={act} navigation={automationNavigation} />
               ) : (
                 <Settings />
               )}
@@ -2245,7 +2245,6 @@ function TaskList() {
     badge,
     open,
     empty,
-    newButton,
     errorPanel,
     projectName,
     roleName,
@@ -2443,7 +2442,6 @@ function TaskList() {
             "提交需求后，PMAgent 会领取并制定计划。",
             "Submit a request for your PM agent to plan.",
           ),
-          newButton,
         )
       ) : layout === "table" ? (
         <div className="task-table-scroll" tabIndex={0} aria-label={t("工作空间任务表格", "Workspace task table")}>

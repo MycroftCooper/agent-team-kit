@@ -80,6 +80,16 @@ export function createAgentClient({
   }
   return {
     request,
+    automation: {
+      list: projectId => request(`/projects/${encodeURIComponent(projectId)}/automations`),
+      show: (projectId, id) => request(`/projects/${encodeURIComponent(projectId)}/automations/${encodeURIComponent(id)}`),
+      schedules: (projectId, id) => request(`/projects/${encodeURIComponent(projectId)}/automations/${encodeURIComponent(id)}/schedules`),
+      validate: (projectId, definition) => request(`/projects/${encodeURIComponent(projectId)}/automations/validate`, { definition }),
+      apply: (projectId, definition, expectedRevision = null) => request(`/projects/${encodeURIComponent(projectId)}/automations/${encodeURIComponent(definition.id)}`, { definition, expectedRevision }, "PUT"),
+      run: (projectId, id, body) => request(`/projects/${encodeURIComponent(projectId)}/automations/${encodeURIComponent(id)}/runs`, { ...body, idempotencyKey: body.idempotencyKey ?? crypto.randomUUID() }),
+      status: (projectId, runId) => request(`/projects/${encodeURIComponent(projectId)}/automation-runs/${encodeURIComponent(runId)}`),
+      stop: (projectId, runId) => request(`/projects/${encodeURIComponent(projectId)}/automation-runs/${encodeURIComponent(runId)}/stop`, {}),
+    },
     async doctor() {
       if (u.pathname !== "/" || u.search || u.hash || u.username || u.password)
         throw Object.assign(new Error("Use the local service origin, such as http://127.0.0.1:1421"), { code: "INVALID_SERVICE_URL" });

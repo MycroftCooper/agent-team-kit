@@ -108,7 +108,8 @@ try {
   await browser.click("演示流程", { exact: true });
   await browser.submit();
   await browser.wait("!document.querySelector('[role=dialog]')");
-  await browser.click("运行", { exact: true, within: "[...document.querySelectorAll('.automation-row')].find(row=>row.textContent.includes('演示流程'))" });
+  await browser.click("运行流程", { exact: true, within: "[...document.querySelectorAll('.automation-row')].find(row=>row.textContent.includes('演示流程'))" });
+  await browser.click("启动流程", { exact: true });
   await browser.wait("document.querySelector('.automation-progress progress')?.value === 100 && document.querySelector('.automation-log')?.textContent.includes('Demo completed')");
   await browser.screenshot("desktop-automation");
   await browser.click("概览", { exact: true });
@@ -142,6 +143,8 @@ try {
   await browser.wait(`document.querySelector('.command-box pre')?.innerText.includes(${JSON.stringify(baseUrl)})`);
   await browser.click("关闭", { exact: true });
 
+  await browser.click("工作", { exact: true });
+  await browser.click("任务", { exact: true, within: "document.querySelector('.work-nav')" });
   await browser.click("新建需求");
   await browser.fill("title", "Desktop E2E request");
   await browser.fill("description", "Write a delivery file through the existing agent protocol.");

@@ -98,6 +98,10 @@ Agent 使用 `/api/agent/v1/project-resources/<projectId>?kind=<kind>` 列表，
 创建和编辑仍使用 `{name, content}` / `{revision, content}`，删除仍通过 `revision` 查询参数
 校验入口版本。Agent API 只读；普通任务文件范围仍禁止写入 `docsRoot`，包括其中的资源和回执。
 制作项目资源时可在批准的工作范围内准备资源包，再由用户导入或通过人类资源页创建。
+自动化使用独立的项目 API，不属于上述只读资源 API。项目 Agent 可以通过
+`atk-agent automation validate/apply/run --project <id>` 配置和启动 CI；配置保存到项目
+`.atk/automations/`，日志和结果保存到 `.atk/runs/`，不会写入资源库或中央数据库。
+普通任务也不能把 `.atk/` 声明为文件写入范围。详见[自动化协议](AUTOMATION-PROJECT-DESIGN.md)。
 
 项目资料目录必须可用且保持真实路径，资源目录不能与其他项目或全局资源库重叠。
 创建项目或修改路径时即拒绝冲突，避免保存新配置后影响已有项目；读取时仍检查路径变化。

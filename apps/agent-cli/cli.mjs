@@ -4,6 +4,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { createAgentClient } from "../../packages/agent-client/src/index.mjs";
+import { automationCommand } from "./automation.mjs";
 import { ATK_AGENT_HELP } from "../../packages/platform/src/cli-help.mjs";
 import {
   runtimePaths,
@@ -51,6 +52,7 @@ async function main() {
       ),
   });
   let result;
+  if (command === "automation") return automationCommand(argv.slice(1), client);
   if (command === "resources") {
     const scope = args.scope ?? "global";
     if (!["global", "project"].includes(scope) || (scope === "project" ? typeof args.project !== "string" || !args.project : args.project !== undefined))
@@ -141,5 +143,5 @@ main().catch((e) => {
       },
     }),
   );
-  process.exitCode = 1;
+  process.exitCode = command === "automation" ? 2 : 1;
 });

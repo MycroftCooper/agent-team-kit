@@ -86,6 +86,16 @@ discards project edits.
 
 ## Agent connection
 
+Project automations use versioned JSON in `.atk/automations/` and archive each run
+in `.atk/runs/<runId>/`. Humans and project Agents configure and trigger the same
+executor; the UI shows Agent-originated progress, logs and detailed CI results.
+Use `atk-agent automation ... --project <id>` or the Automations page. See the
+[project automation contract](docs/AUTOMATION-PROJECT-DESIGN.md). Automation data
+is not stored in the central database; old workflows must be reconnected.
+Automations support one-time runs, multiple dates, finite interval repeats and
+ongoing intervals. Configure them in the workflow's Schedules section or through
+the same Agent definition API; see [CI scheduling](docs/AUTOMATION-SCHEDULING.md).
+
 Every agent identity is owned by one project, with its own credential. Choose the
 workspace before creating identities. Sharing a role template does not share an
 identity between projects. Unbound legacy identities can be assigned a project

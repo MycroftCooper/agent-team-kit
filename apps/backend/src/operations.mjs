@@ -77,7 +77,7 @@ export function backup(service, destination) {
   for (const r of service.store.all("runs"))
     if (r.artifact) service.artifact(r.id);
   requireThat(
-    !projects.some((p) => inside(p.docsRoot, dest)) && !inside(service.resources.root, dest),
+    !projects.some((p) => inside(p.docsRoot, dest) || inside(path.join(p.root, ".atk"), dest)) && !inside(service.resources.root, dest),
     "INVALID_PATH",
     "Backup must be outside project data and team resource directories",
   );
@@ -93,6 +93,17 @@ export function backup(service, destination) {
       fs.mkdirSync(path.dirname(source), { recursive: true });
       fs.cpSync(p.docsRoot, source, { recursive: true });
     }
+    const automationRoot = path.join(p.root, ".atk");
+    requireThat(!fs.lstatSync(automationRoot, { throwIfNoEntry: false })?.isSymbolicLink(), "BACKUP_SYMLINK", "Automation root must be a real directory", 409);
+    const automationBackup = path.join(dest, "automations", p.id);
+    for (const name of ["automations", "runs", ".gitignore"]) {
+      const from = path.join(automationRoot, name);
+      if (!fs.existsSync(from)) continue;
+      requireThat(!fs.lstatSync(from).isSymbolicLink(), "BACKUP_SYMLINK", "Automation backup does not follow links", 409);
+      if (fs.statSync(from).isDirectory()) files(from);
+      fs.mkdirSync(automationBackup, { recursive: true });
+      fs.cpSync(from, path.join(automationBackup, name), { recursive: true });
+    }
     entries.push({
       id: p.id,
       root: p.root,
@@ -101,7 +112,7 @@ export function backup(service, destination) {
     });
   }
   const manifest = {
-    format: "atk-next-backup-1",
+    format: "atk-next-backup-2",
     createdAt: new Date().toISOString(),
     projects: entries,
     files: files(dest),
@@ -116,7 +127,7 @@ export function restore(service, source) {
       fs.readFileSync(path.join(root, "manifest.json"), "utf8"),
     );
   requireThat(
-    manifest.format === "atk-next-backup-1",
+    manifest.format === "atk-next-backup-2",
     "INVALID_BACKUP",
     "Invalid backup format",
   );
@@ -166,7 +177,15 @@ export function restore(service, source) {
   } finally {
     check.close();
   }
+  for (const p of manifest.projects) {
+    const source = path.join(root, "automations", p.id);
+    const entries = resourceFiles(source);
+    requireThat(Object.entries(entries).every(([rel, hash]) => manifest.files[`automations/${p.id}/${rel}`] === hash),
+      "INVALID_BACKUP", "Unverified automation files", 409);
+    resourceFiles(path.join(p.root, ".atk"));
+  }
   const safety = backup(service);
+  service.automations.refresh({ resetTriggers: true });
   for (const p of manifest.projects) {
     requireThat(
       fs.existsSync(p.root),
@@ -180,6 +199,14 @@ export function restore(service, source) {
       fs.cpSync(path.join(root, "projects", p.id), p.docsRoot, {
         recursive: true,
       });
+    }
+    const automationSource = path.join(root, "automations", p.id);
+    if (fs.existsSync(automationSource)) {
+      const automationTarget = path.join(p.root, ".atk");
+      requireThat(!fs.lstatSync(automationTarget, { throwIfNoEntry: false })?.isSymbolicLink(), "BACKUP_SYMLINK", "Automation target must be a real directory", 409);
+      const entries = files(automationSource);
+      requireThat(Object.entries(entries).every(([rel, hash]) => manifest.files[`automations/${p.id}/${rel}`] === hash), "INVALID_BACKUP", "Unverified automation files", 409);
+      fs.cpSync(automationSource, automationTarget, { recursive: true });
     }
   }
   if (Object.keys(resources).length)
@@ -195,7 +222,7 @@ export function restore(service, source) {
   } finally {
     service.store.reopen();
   }
-  service.automations.seedAll();
+  service.automations.refresh({ resetTriggers: true });
   service.signals.emit("restore");
   return { restored: true, safetyBackup: safety.destination };
 }

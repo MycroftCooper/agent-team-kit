@@ -75,6 +75,32 @@ export async function api<T = Row>(
   }
   return data;
 }
+export async function downloadFile(route: string, filename: string) {
+  const response = await authorizedFetch(route);
+  if (!response.ok) throw new Error((await response.json()).error?.message ?? response.statusText);
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url; link.download = filename; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+export async function streamEvents(route: string, signal: AbortSignal, onEvent: () => void) {
+  const response = await authorizedFetch(route, { signal });
+  if (!response.ok || !response.body) throw new Error("Event stream unavailable");
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  let partial = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      partial += decoder.decode(value, { stream: true });
+      let boundary;
+      while ((boundary = partial.indexOf("\n\n")) >= 0) {
+        const event = partial.slice(0, boundary); partial = partial.slice(boundary + 2);
+        if (event.includes("data:")) onEvent();
+      }
+    }
+  } finally { reader.releaseLock(); }
+}
 export function useData<T = Row>(route: string | null, epoch: number) {
   const previousRoute = useRef(route),
     sameRoute = previousRoute.current === route;

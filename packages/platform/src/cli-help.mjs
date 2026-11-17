@@ -17,6 +17,17 @@ atk-agent submit <runId> plan|result|review --file <JSON>
 atk-agent stopped <runId> --generation <n>
 atk-agent get <runId>
 atk-agent replay
+atk-agent automation list --project <id>
+atk-agent automation show <workflowId> --project <id>
+atk-agent automation schedules <workflowId> --project <id>
+atk-agent automation validate --file <definition.json> --project <id>
+atk-agent automation apply --file <definition.json> (--create|--revision <sha256>) --project <id>
+atk-agent automation remove <workflowId> --revision <sha256> --project <id>
+atk-agent automation run <workflowId> --revision <sha256> [--param name=value|--params-file <JSON>] [--request-id <uuid>] [--wait] --project <id>
+atk-agent automation runs [--limit 20] [--cursor <cursor>] --project <id>
+atk-agent automation status <runId> --project <id>
+atk-agent automation logs <runId> [--follow] [--json] --project <id>
+atk-agent automation stop <runId> --project <id>
 atk-agent resources list [--kind agent|skill|mcp|cli] [--scope project --project <id>]
 atk-agent resources show <kind/name> [--scope project --project <id>]
 atk-agent resources run cli/<name> [--scope project --project <id>] [-- <args>]

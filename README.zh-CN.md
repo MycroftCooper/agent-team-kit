@@ -99,10 +99,14 @@ PM 不能执行或评审自己规划的任务；WORKER 不能自审；Agent 凭�
 - 修改直接发生在项目目录，失败、停止和取消不会自动回滚代码。
 - 这是协议层的协作锁，不能阻止编辑器和不遵守协议的进程写入文件。
 
-全局 SQLite 保存权威状态。项目资料默认写入各自 `.agent-team/`，包括计划、
+全局 SQLite 保存任务、身份和项目登记状态。自动化配置和运行记录归项目所有：`.atk/automations/` 保存可提交的 JSON，`.atk/runs/` 保存逐次日志、结果和产物。项目资料默认写入各自 `.agent-team/`，包括计划、
 执行前后快照、检查证据和验收记录。资料生成失败会显示在网页并可重试。
 
 ## 外部 Agent
+
+自动化支持单次定时、多个指定时间、指定次数重复和持续循环。选择流程后点击
+「添加定时 / 管理定时」，也可以由 Agent 配置同一份项目 JSON。
+详见 [CI 定时计划](docs/AUTOMATION-SCHEDULING.md)。
 
 ![网页工作台](docs/screenshots/overview.png)
 
@@ -135,7 +139,7 @@ atk-agent submit <runId> review --file review-receipt.json
 ## 文档与验证
 
 - [架构与状态机](docs/ARCHITECTURE.md)
-- [自动化流程、日志和自定义进度](docs/AUTOMATIONS.md)
+- [自动化接入、Agent CLI/API、进度和结果归档](docs/AUTOMATION-PROJECT-DESIGN.md)
 - [完整 Agent 协议及样例](docs/AGENT-PROTOCOL.md)
 - [启动、备份、恢复](docs/OPERATIONS.md)
 - [模块处置及阶段验收](docs/REFACTOR.md)

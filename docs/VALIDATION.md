@@ -13,6 +13,8 @@ node scripts/build-web.mjs
 node scripts/e2e.mjs
 node scripts/collaboration-e2e.mjs
 node scripts/task-movement-e2e.mjs
+node scripts/automation-e2e.mjs
+node scripts/automation-schedule-e2e.mjs
 node scripts/smoke.mjs
 node scripts/benchmark.mjs
 ```
@@ -21,6 +23,93 @@ The backend tests cover PM approval, identity constraints, review configuration,
 human tasks, VERIFIED dependency progression, file/directory/case locking,
 generation fencing, duplicate events/results, content drift, quarantine/restart,
 project isolation, document retries and backup integrity.
+
+## 2026-11-17 isolated automation/UI commit verification
+
+The submitted automation/UI tree was exported from the Git index and tested
+independently of the separate cancellation/archive work remaining in the local
+workspace. It passed all 98 backend/protocol tests, 30 web workflow checks,
+10 automation browser checks, 8 scheduling browser checks and 10 installed-package
+smoke checks. Module boundaries and the production TypeScript/Vite build passed.
+The heading actions for Tasks and Bugs and the removal of secondary-page
+breadcrumbs are included in this version. Earlier counts below describe the
+wider development workspace at those points in time.
+
+Evidence is under `artifacts/push-check/artifacts/`: `push-backend-tests.log`,
+`push-web-build.log`, `push-web-e2e.log`, `push-automation-e2e.log`,
+`push-schedules-e2e.log` and `push-package-smoke.log`.
+
+## 2026-11-17 CI schedules
+
+The final backend/protocol suite passed all 110 tests with zero failures or skips,
+including seven schedule tests. The full run used `--test-concurrency=2` after an
+unrelated Agent health request timed out under unrestricted parallel test load.
+Coverage includes absolute timestamps, all four schedule modes, typed defaults,
+pause/resume, elapsed-time interval arithmetic, busy/missed slots, persisted
+deduplication, restart, dispatch crash recovery, clock rollback, invalid storage,
+manual CI availability and chronological history pagination.
+
+The dedicated scheduling browser suite passed eight scenarios with actual CI
+processes and the actual Agent CLI. It verifies human configuration, UTC
+conversion, false boolean defaults, pause/enable, scheduled origin and project
+archives, Agent configuration/status, JSON/form round trips, narrow/dark views,
+unchanged DST-fold instants, nonexistent DST-time rejection and invalid parameter
+drafts. Screenshots are under `artifacts/automation-schedule-e2e/`.
+
+The existing automation browser suite passed all 10 scenarios; the complete web
+suite passed all 30 scenarios and the Windows desktop suite all 10 checks.
+TypeScript/Vite build, module boundaries and whitespace checks passed. Local logs:
+`artifacts/automation-schedules-full-tests.log`,
+`artifacts/automation-schedules-ui.log`,
+`artifacts/automation-schedules-automation-regression.log`,
+`artifacts/automation-schedules-web-regression.log` and
+`artifacts/automation-schedules-desktop-regression.log`.
+
+## 2026-11-17 project automation implementation
+
+The automation UI subsequently gained a shared secondary sidebar with project
+workflows and all-run history, per-workflow history pagination, and separate log,
+result and export tabs. This revision passed 17 automation backend tests, 10
+automation browser scenarios, all 30 web scenarios and all 10 Windows desktop
+checks. The TypeScript/Vite build and module-boundary check also passed. Browser
+coverage includes workflow selection clearing the previous run, empty histories,
+false boolean defaults, keyboard tab navigation, dark mode and widths of 1024,
+768, 600 and 390 pixels. The live P4Deck workflows and parameter form were inspected
+without triggering CI. Local logs are `artifacts/automation-ui-backend-tests.log`,
+`artifacts/automation-ui-redesign.log`,
+`artifacts/automation-redesign-web-regression.log` and
+`artifacts/automation-redesign-desktop-regression.log`.
+
+The file-owned automation revision passed the complete backend/protocol suite:
+102 tests, zero failures and zero skipped, including 16 automation tests. Coverage
+includes strict definitions, typed parameters and literal argv, revision conflicts,
+Agent configuration/triggering, concurrent request idempotency, project ownership,
+credential stripping, progress and SSE replay, per-run report/export snapshots,
+log pagination, fresh directory exports, path/link boundaries, global capacity,
+detached-descendant termination, timeout, torn-log recovery, corrupt history,
+relocation and version-2 backup/restore. Automation tables and durable events are
+absent from the central database. Old workflows are not migrated or deleted.
+
+The dedicated automation browser test passed six scenarios using a real headless
+browser and the actual Agent CLI: Agent-created configuration appears in the UI;
+UI edits are read by the Agent with a new revision; Agent runs show progress and
+logs; detailed results and archived downloads are available; human parameter forms
+use the same executor; no browser exceptions or horizontal overflow occur.
+Evidence is in `artifacts/automation-e2e/`.
+
+The complete web workflow passed 30 scenarios, including the updated automation
+and Git-trigger forms. The Windows Electron test passed all 10 checks, including
+native CI execution without system Node.js on PATH, backend reload deferral,
+existing Agent workflows and React Fast Refresh. The production TypeScript/Vite
+build and module-boundary check passed (12 modules, 19 edges, no cycles).
+
+Raw local logs are `artifacts/automation-full-tests.log`,
+`artifacts/automation-web-regression.log`, and
+`artifacts/automation-desktop-regression.log`. Package installation and installed
+automation execution are verified by `node scripts/smoke.mjs`, with results in
+`artifacts/smoke/report.json` and `artifacts/automation-package-smoke.log`.
+The installed-package smoke passed all 10 checks, including configuration and
+CI execution from the installed Agent CLI and the packaged Windows supervisor.
 
 Browser E2E uses a real headless Chrome/Edge instance with a fresh local profile.
 It creates a project and Agent identities through forms, submits a DRAFT through
