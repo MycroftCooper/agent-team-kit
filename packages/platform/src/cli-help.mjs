@@ -8,6 +8,7 @@ export const ATK_HELP = `Agent Team Kit
 External agents use atk-agent. No target-project installation is needed.`;
 
 export const ATK_AGENT_HELP = `atk-agent doctor
+atk-agent run --task <bugId> [--engine codex|dsh] [--check <command>] [--codex <executable>|--dsh <CLI path>] [--dsh-patch <file>] [--state-dir <directory>]
 atk-agent connect
 atk-agent claim [--project <id>] [--task <id>] [--kind bug|work|request] [--wait 30000]
 atk-agent watch <runId> --generation <n>

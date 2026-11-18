@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createAutomations } from "./project-automations.mjs";
 import { humanTaskActions } from "./task-actions.mjs";
+import { createTaskLifecycle } from "./task-lifecycle.mjs";
 import { createResourceLibrary, resourceDiscovery, projectResourceDiscovery } from "./resources.mjs";
 import { openStore } from "../../../packages/database/src/index.mjs";
 import {
@@ -159,7 +160,9 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     }
     const humanActions = humanTaskActions(task, { projectIssue, plan, acceptance, runs, waiting: projected.waiting, now: now(), acceptanceLocked });
     const run = runs.find((r) => r.taskId === task.id && r.stage === "HUMAN");
+    const archiveParent = task.archivedAt && task.parentId ? store.get("tasks", task.parentId) : null;
     return { ...projected, humanActions,
+      ...(archiveParent && { archiveParent: { id: archiveParent.id, title: archiveParent.title, archived: Boolean(archiveParent.archivedAt) } }),
       ...(task.executorType === "HUMAN" && run && { humanRun: { id: run.id, generation: run.generation, status: run.status, leaseUntil: run.leaseUntil } }) };
   }
   function taskStateProjection(task, existingLocks) {
@@ -247,12 +250,18 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
   }
   function agentContext(agentId) {
     const a = get("agents", agentId);
+    requireThat(!a.deletedAt, "AGENT_DELETED", "Agent has been deleted", 403);
     requireThat(!a.revoked, "AGENT_REVOKED", "Agent is revoked", 403);
     return {
       agent: a,
       role: get("roles", a.roleId),
       team: get("teams", a.projectId ? get("projects", a.projectId).teamId : a.teamId),
     };
+  }
+  function requireIdleIdentity(agent) {
+    requireThat(!working().some(run => run.agentId === agent.id), "AGENT_BUSY", "Stop and confirm all active or uncertain executions first", 409);
+    const ci = agent.projectId && automations.runs(agent.projectId, { limit: 1 }).activeRun;
+    requireThat(!ci || ci.requestedBy?.type !== "agent" || ci.requestedBy.agentId !== agent.id, "AGENT_BUSY", "Stop this agent's CI run and confirm recovery first", 409);
   }
   function agentProjects(a) {
     const ids = new Set();
@@ -392,6 +401,11 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     const source = get("tasks", plan.sourceTaskId),
       tasks = tasksOf(planId);
     if (source.status === "DONE" || source.status === "CANCELLED") return;
+    if (tasks.some((t) => t.status === "CANCELLED")) {
+      put("tasks", { ...source, status: "BLOCKED", blockReason: "TASK_CANCELLED" });
+      emit("task.updated", source.projectId, source.id);
+      return;
+    }
     if (
       tasks.length &&
       tasks.every((t) => ["VERIFIED", "DONE"].includes(t.status))
@@ -662,6 +676,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       "INVALID_PATH", "Automation data overlaps another registered project", 409);
     }
   }
+  const lifecycle = createTaskLifecycle({ store, get, put, expected, working, emit, at, refreshSource });
   const api = {
     store,
     signals,
@@ -669,6 +684,12 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     resources,
     resourceLibrary,
     automations,
+    ...lifecycle,
+    taskHistory(projectId, filters = {}) {
+      get("projects", requiredString(projectId, "projectId"));
+      const runs = working(), page = store.list("tasks", { ...filters, projectId });
+      return { ...page, items: page.items.map((t) => taskProjection(t, undefined, runs)) };
+    },
     list(table, filters = {}) {
       if (table === "agents") requiredString(filters.projectId, "projectId");
       const page = store.list(table, table === "tasks" && !filters.kind ? { ...filters, excludeKind: "BUG" } : filters);
@@ -697,6 +718,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     },
     get(table, id) {
       const r = get(table, id);
+      if (table === "agents") requireThat(!r.deletedAt, "NOT_FOUND", "Agent not found", 404);
       return table === "agents"
         ? safeAgent(r)
         : table === "tasks"
@@ -721,7 +743,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       const pageColumn = (column, lane) => {
         const filter = {
           projectId, status, statuses: column.statuses, owner: lane ?? column.owner ?? owner,
-          search, sort, direction, hideChildren, deadline, tag, excludeKind: "BUG", limit: lane ? 10 : 20,
+          search, sort, direction, hideChildren, deadline, tag, archive: "active", excludeKind: "BUG", limit: lane ? 10 : 20,
         };
         const cursorKey = lane ? `${lane}.${column.key}` : column.key;
         let offset = integer(offsets[cursorKey], 0, 0, 1_000_000);
@@ -763,6 +785,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         const task = get("tasks", id);
         expected(task, body.version);
         requireThat(!get("projects", task.projectId).archived, "PROJECT_ARCHIVED", "Project is archived", 409);
+        requireThat(!task.archivedAt, "TASK_ARCHIVED", "Restore this task before editing it", 409);
         const editDate = Object.hasOwn(body, "dueDate"), editTags = Object.hasOwn(body, "tags");
         requireThat(editDate || editTags, "VALIDATION_ERROR", "Provide a deadline or tags");
         const dueDate = editDate ? normalizeDueDate(body.dueDate) : task.dueDate ?? null;
@@ -1050,6 +1073,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     updateAgent(id, body) {
       return store.tx(() => {
         const a = get("agents", id);
+        requireThat(!a.deletedAt, "NOT_FOUND", "Agent not found", 404);
         expected(a, body.version);
         const p = project(a.projectId);
         requireThat((!body.projectId || body.projectId === a.projectId) && (!body.teamId || body.teamId === p.teamId),
@@ -1082,14 +1106,29 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     runStatus(id) {
       return runSummary(get("runs", id));
     },
-    revokeAgent(id) {
+    recoverAgent(id, body) {
       return store.tx(() => {
-        const a = get("agents", id);
-        put("agents", { ...a, revoked: true, status: "REVOKED" });
-        for (const r of working().filter((r) => r.agentId === id))
-          api.requestStop(r.id);
-        emit("agent.revoked", a.projectId ?? null, id);
-        return { revoked: true };
+        const agent = get("agents", id);
+        requireThat(!agent.deletedAt, "NOT_FOUND", "Agent not found", 404);
+        expected(agent, body.version);
+        const p = project(agent.projectId), team = get("teams", p.teamId);
+        requireThat(store.get("roles", agent.roleId) && team.roleIds.includes(agent.roleId), "ROLE_FORBIDDEN", "Restore this agent's role in the project squad before reconnecting", 409);
+        requireIdleIdentity(agent);
+        const credential = crypto.randomBytes(32).toString("base64url");
+        const next = put("agents", { ...agent, credentialHash: sha(credential), revoked: false, status: "OFFLINE", lastSeen: null });
+        emit("agent.credentials-rotated", agent.projectId, id);
+        return { agent: safeAgent(next), credential };
+      });
+    },
+    deleteAgent(id, body) {
+      return store.tx(() => {
+        const agent = get("agents", id);
+        requireThat(!agent.deletedAt, "NOT_FOUND", "Agent not found", 404);
+        expected(agent, body.version);
+        requireIdleIdentity(agent);
+        put("agents", { ...agent, deletedAt: at(), credentialHash: null, revoked: true, status: "DELETED", lastSeen: null });
+        emit("agent.deleted", agent.projectId ?? null, id);
+        return { deleted: true, id };
       });
     },
     authenticate(credential) {
@@ -1172,9 +1211,9 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
     },
     listBugs(projectId, { status, limit, offset } = {}) {
       get("projects", requiredString(projectId, "projectId"));
-      requireThat(!status || ["READY", "RUNNING", "AWAITING_ACCEPTANCE", "DONE", "BLOCKED"].includes(status),
+      requireThat(!status || ["READY", "RUNNING", "AWAITING_ACCEPTANCE", "DONE", "BLOCKED", "CANCELLED"].includes(status),
         "VALIDATION_ERROR", "Invalid bug status");
-      return api.list("tasks", { projectId, kind: "BUG", status: status || undefined, limit, offset, newest: true });
+      return api.list("tasks", { projectId, kind: "BUG", status: status || undefined, archive: "active", limit, offset, newest: true });
     },
     createBug(body) {
       return store.tx(() => {
@@ -1546,6 +1585,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
           "This plan has been superseded",
           409,
         );
+        requireThat(!["DONE", "CANCELLED"].includes(source.status), "TASK_CLOSED", "The requirement is already closed", 409);
         normalizePlan(plan, store.all("roles"), get("teams", p.teamId));
         for (const node of plan.nodes)
           if (node.executorType === "AGENT")
@@ -1601,9 +1641,10 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
       return store.tx(() => {
         const plan = get("plans", id);
         expected(plan, body.version);
+        requireThat(!get("projects", plan.projectId).archived, "PROJECT_ARCHIVED", "Project is archived", 409);
         const source = get("tasks", plan.sourceTaskId);
         requireThat(
-          source.planId === id && source.status !== "DONE",
+          source.planId === id && !["DONE", "CANCELLED"].includes(source.status),
           "PLAN_STALE",
           "Cannot revise a completed or superseded plan",
           409,
@@ -1941,6 +1982,7 @@ export function createService({ dataDir, now = () => Date.now() } = {}) {
         if (task.kind === "WORK") {
           const source = get("tasks", task.parentId);
           put("tasks", { ...source, status: "RUNNING", blockReason: null });
+          if (tasksOf(task.planId).some((t) => t.status === "CANCELLED")) refreshSource(task.planId);
         }
         emit("task.requeued", task.projectId, task.id);
         return next;

@@ -112,9 +112,10 @@ export function AgentTeam({ t, state, currentTeamId, projectId, roles, teams, op
                 <small>{teamName(agent.teamId)}</small>
               </div>
               <div className="card-actions">
-                <button disabled={agent.revoked} onClick={() => open("agent", agent)}>{t("编辑", "Edit")}</button>
+                <button onClick={() => open("agent", agent)}>{t("编辑", "Edit")}</button>
                 <button onClick={() => open("connection", agent)}>{t("接入说明", "Connection guide")}</button>
-                <button disabled={agent.revoked} className="quiet" onClick={() => open("revoke", agent)}>{t("撤销", "Revoke")}</button>
+                <button onClick={() => open("agent-recover", agent)}>{t("恢复接入", "Reconnect")}</button>
+                <button className="quiet" onClick={() => open("agent-delete", agent)}>{t("删除", "Delete")}</button>
               </div>
             </article>)}
         </div>

@@ -110,7 +110,7 @@ export function createAgentClient({
         agent = await request("/identity", undefined, "GET", true);
       } catch (error) {
         if (error.code === "UNAUTHENTICATED")
-          throw Object.assign(new Error("ATK rejected this credential; verify the token or check whether the identity was revoked"), { code: "UNAUTHENTICATED" });
+          throw Object.assign(new Error("ATK rejected this credential; verify the token or check whether it was replaced or the identity was deleted"), { code: "UNAUTHENTICATED" });
         if (error.code === "NOT_FOUND")
           throw Object.assign(new Error("This ATK service does not support doctor; update it or use atk-agent connect"), { code: "DOCTOR_UNSUPPORTED" });
         throw error;
@@ -142,10 +142,10 @@ export function createAgentClient({
           `/runs/${encodeURIComponent(receipt.runId)}/${receipt.action}`,
           receipt.body,
         );
-        if (result.persisted === true) {
-          fs.unlinkSync(file);
-          results.push(result);
-        }
+        if (result.persisted !== true)
+          throw new Error("Result not durably acknowledged; retain receipt");
+        fs.unlinkSync(file);
+        results.push(result);
       }
       return results;
     },

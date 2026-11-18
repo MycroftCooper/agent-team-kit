@@ -32,6 +32,10 @@ async function invokeResource(command, arguments_, cwd) {
 }
 
 async function main() {
+  if (command === "run") {
+    const runner = await import("./agent-runner.mjs");
+    return runner.main(argv.slice(1));
+  }
   if (!command || command === "help" || args.help) {
     console.log(ATK_AGENT_HELP);
     return;

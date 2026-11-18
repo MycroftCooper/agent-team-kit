@@ -30,7 +30,7 @@ test("project-owned credentials cannot claim, inspect or be assigned work in ano
   assert.throws(() => f.app.assignTask(work.tasks[0].id, { version: work.tasks[0].version, agentId: other.agent.id }), { code: "ASSIGNEE_FORBIDDEN" });
   assert.equal((await f.human(`/agents?projectId=${f.p.id}`)).body.items.some((a) => a.id === other.agent.id), false);
   assert.equal((await f.human(`/agents/${other.agent.id}?projectId=${f.p.id}`)).status, 404);
-  assert.equal((await f.human(`/agents/${other.agent.id}/revoke?projectId=${f.p.id}`, {})).status, 404);
+  assert.equal((await f.human(`/agents/${other.agent.id}?projectId=${f.p.id}`, { version: other.agent.version }, "DELETE")).status, 404);
   assert.equal(f.app.get("agents", other.agent.id).revoked, false);
   assert.equal((await f.human("/agents")).status, 400);
   assert.equal((await f.human(`/agents/${f.dev.agent.id}?projectId=${f.p.id}`, { projectId: p2.id, version: f.app.get("agents", f.dev.agent.id).version }, "PATCH")).body.error.code, "PROJECT_IMMUTABLE");

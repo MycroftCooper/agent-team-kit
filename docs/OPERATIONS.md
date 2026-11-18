@@ -49,8 +49,9 @@ active executions require confirmed stopping before locks are released.
 ## Projects
 
 Each project is one workspace. Use **Switch workspace** in the title bar (or
-page header in a browser) to change the overview and all five pages in **Work**:
-**My inbox**, **Tasks**, **Bugs**, **Collaboration** and **Runs**. The browser
+page header in a browser) to change the overview and daily pages in **Work**:
+**My inbox**, **Tasks**, **Bugs**, **Collaboration** and **Runs**. **Archive history**
+also lets you select a project for historical browsing. The browser
 remembers the selected workspace across reloads. New requests always belong to
 the current workspace. Creating a project enters it automatically; archiving the
 current project selects another active workspace, or shows the setup screen if
@@ -107,6 +108,20 @@ relocation, complete backup and hot reload. Inspect/stop the old process tree,
 then use the UI's human-only confirmation with a reason. Agent disconnection does
 not cancel backend-owned CI; `automation stop <runId>` explicitly requests stopping.
 Git triggers observe new local commits only after establishing this machine's baseline.
+
+Task details provide **Cancel task…**, including a preview of unfinished
+downstream work or requirement subtasks, a mandatory reason and confirmation.
+Active/uncertain runs must be stopped and confirmed first; cancellation never
+releases a live writer's locks. Cancelling work leaves the requirement needing
+a plan revision; cancelling the requirement supersedes plans and pending
+acceptance, while completed work and existing files remain.
+
+Use **Archive task…** only for completed or cancelled records. Requirements
+archive their closed subtasks together. **Work → Archive history** offers search,
+details and restore; restoring preserves status and never starts execution.
+In **Projects**, **View task history** opens an archived project's tasks and
+receipts read-only, without restoring the project, including when no active
+projects remain. See [Task cancellation and archives](TASK-CANCELLATION-ARCHIVE.md).
 
 Stopping the service does not terminate external agents. Those agents must stop
 writing on lease/connection loss. Restart preserves active state and file locks;

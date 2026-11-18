@@ -13,6 +13,8 @@ node scripts/build-web.mjs
 node scripts/e2e.mjs
 node scripts/collaboration-e2e.mjs
 node scripts/task-movement-e2e.mjs
+node scripts/task-lifecycle-e2e.mjs
+node scripts/agent-identities-e2e.mjs
 node scripts/automation-e2e.mjs
 node scripts/automation-schedule-e2e.mjs
 node scripts/smoke.mjs
@@ -23,6 +25,39 @@ The backend tests cover PM approval, identity constraints, review configuration,
 human tasks, VERIFIED dependency progression, file/directory/case locking,
 generation fencing, duplicate events/results, content drift, quarantine/restart,
 project isolation, document retries and backup integrity.
+
+## 2026-11-18 removal of the separate Agent revoke operation
+
+The Agent card and connection UI offer deletion and recovery without a separate
+revoke button, dialog, service method or HTTP endpoint. The removed endpoint is
+tested to return 404 without changing identity state. Assignment, credential and
+locking tests now exercise deletion after confirmed stop. Existing disabled
+records can still recover their original identity.
+
+All 116 backend/protocol tests and five identity browser scenarios passed.
+The production TypeScript/Vite build, module boundaries and whitespace checks
+also passed. Logs are `artifacts/agent-delete-only-full-tests.log`,
+`artifacts/agent-delete-only-ui.log` and `artifacts/agent-delete-only-build.log`.
+
+## 2026-11-18 project Agent deletion and connection recovery
+
+All 116 backend/protocol tests passed with zero failures or skips using
+`--test-concurrency=2`, including six identity lifecycle cases. They cover
+credential rotation on the same ID, existing disabled identity recovery, credential
+invalidation, roster pagination, retained historical references, version and
+project scope, human-only management, and active/uncertain task and CI barriers.
+
+The dedicated browser suite passed five scenarios, including repeated reconnects
+without duplicate identities, credential reissue from the connection guide,
+blocked deletion retaining file locks, deletion after confirmed stop, cancellation
+and narrow-screen layout. All 30 existing web workflow checks also passed.
+The production TypeScript/Vite build, module boundaries (12 modules, 19 edges,
+no cycles) and whitespace checks passed. All mutations used isolated test data.
+
+Local evidence: `artifacts/agent-identities-tests.log`,
+`artifacts/agent-identities-full-tests.log`, `artifacts/agent-identities-ui.log`,
+`artifacts/agent-identities-web-regression.log` and screenshots/results under
+`artifacts/agent-identities-e2e/`.
 
 ## 2026-11-17 isolated automation/UI commit verification
 
@@ -132,6 +167,23 @@ SSE cancellation, keyboard-equivalent actions, executor grouping, swimlane
 ownership and narrow filtered views. Evidence is in `artifacts/task-movement-e2e`.
 The backend tests reject unbound or stale human completion forms and retain the
 existing file-drift and independent-review protections.
+
+The 2026-11-16 cancellation and archive implementation passed 89 backend tests,
+including 12 cancellation/archive cases, and 7 new browser scenarios. Existing
+30 browser workflow checks, 9 task-movement checks, 7 collaboration checks,
+10 desktop checks and 9 installed-package checks also passed. The production
+web build and module boundary check (12 modules, 19 edges, no cycles) passed.
+All tests used isolated data; backend tests used `--test-isolation=none` in this
+local tool environment. No new performance soak was run.
+
+The new browser suite checks dependency impact preview, cancellation reason and
+confirmation, SSE scope changes preserving notes, explicit stop reconciliation
+and lock retention, requirement archive/restore, history search, read-only
+archived-project evidence and dependency navigation, deep links without an active
+project, and narrow screens. Evidence is in `artifacts/task-lifecycle-e2e`.
+Backend cases also cover planning and downstream-run barriers, superseded
+acceptance, independent archive batches, Bug cancellation, history pagination
+and project/Agent permission boundaries.
 
 The 2026-11-14 task-board movement implementation passed 77 backend tests,
 9 task-movement browser checks, 30 existing browser workflow checks,

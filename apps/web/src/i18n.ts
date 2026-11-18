@@ -21,7 +21,7 @@ export const statusText: Record<string, [string, string]> = {
   INTERRUPTED: ["已中断", "Interrupted"],
   ONLINE: ["在线", "Online"],
   OFFLINE: ["离线", "Offline"],
-  REVOKED: ["已撤销", "Revoked"],
+  REVOKED: ["凭据已失效", "Credential invalid"],
   HELD: ["占用中", "Held"],
   AVAILABLE: ["可用", "Available"],
   PLANNING: ["需求规划", "Planning"],
@@ -67,6 +67,7 @@ export const reasonText: Record<string, [string, string]> = {
     "Final output changed; revalidation required",
   ],
   INTERRUPTED: ["上次执行已中断", "Previous execution interrupted"],
+  TASK_CANCELLED: ["部分工作已取消，请修改需求计划", "Some work was cancelled; revise the requirement plan"],
   REVIEW_BLOCKED: ["评审未通过", "Review did not pass"],
 };
 export function label(value: string, lang: Lang) {

@@ -57,18 +57,19 @@ test("plan revisions return to DRAFT and carry human feedback to the PM", (t) =>
   assert.equal(next.spec.revisionNote, "Add an accessibility check");
   assert.ok(next.spec.previousPlanRef);
 });
-test("revoking credentials stops new requests but retains active file locks", (t) => {
+test("deletion requires confirmed stop, retains uncertain locks and then invalidates credentials", (t) => {
   const f = fixture(t);
   plan(f, [node("a")]);
   const c = f.app.claim(f.dev.agent.id, {});
-  f.app.revokeAgent(f.dev.agent.id);
-  assert.throws(() => f.app.authenticate(f.dev.credential), {
-    code: "UNAUTHENTICATED",
-  });
+  f.app.requestStop(c.run.id);
+  assert.throws(() => f.app.deleteAgent(f.dev.agent.id, { version: f.app.get("agents", f.dev.agent.id).version }), { code: "AGENT_BUSY" });
+  assert.equal(f.app.authenticate(f.dev.credential).id, f.dev.agent.id);
   assert.equal(f.app.get("runs", c.run.id).status, "STOP_REQUESTED");
   assert.equal(f.app.list("locks").total, 1);
   f.app.confirmStopped(c.run.id, { confirmStopped: true });
   assert.equal(f.app.list("locks").total, 0);
+  f.app.deleteAgent(f.dev.agent.id, { version: f.app.get("agents", f.dev.agent.id).version });
+  assert.throws(() => f.app.authenticate(f.dev.credential), { code: "UNAUTHENTICATED" });
 });
 test("a team cannot claim another project's work", (t) => {
   const f = fixture(t);

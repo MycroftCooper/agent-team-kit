@@ -17,6 +17,7 @@ import { Collaboration } from "./collaboration";
 import { AgentMigrations } from "./agent-migrations";
 import { actionKey, actionReason, type HumanAction } from "./task-actions";
 import { TaskMovementContext, TaskMoveControl, TaskDropTarget, TaskMoveFeedback, useTaskMovement } from "./task-movement";
+import { ArchiveHistory, ArchiveTaskPanel, CancelTaskPanel, TaskRecordActions } from "./task-lifecycle";
 import { label, reason, type Lang } from "./i18n";
 import { DesktopTitleBar, desktopWindow } from "./desktop-window";
 import { ThemeSettings, ThemeToggle } from "./theme";
@@ -44,6 +45,7 @@ type View =
   | "inbox"
   | "runs"
   | "collaboration"
+  | "archives"
   | "team"
   | "projects"
   | "automations"
@@ -79,6 +81,7 @@ const workPages = [
   ["bugs", "Bug 单", "Bugs", "⊘"],
   ["collaboration", "协作实况", "Collaboration", "⇄"],
   ["runs", "执行记录", "Runs", "↗"],
+  ["archives", "归档记录", "Archive history", "▤"],
 ] as const;
 const time = (v: string | number) => (v ? new Date(v).toLocaleString() : "—");
 function useRefreshTick(enabled: boolean, ms = 5000) {
@@ -209,6 +212,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     [notice, setNotice] = useState(""),
     [detailClosing, setDetailClosing] = useState(false),
     [actionBusyIds, setActionBusyIds] = useState<string[]>([]);
+  const [archivesProjectId, setArchivesProjectId] = useState("");
   const taskActionsInFlight = useRef(new Set<string>());
   const detailCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const detailReturnFocus = useRef<HTMLElement | null>(null);
@@ -220,16 +224,18 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     roles = useData<Page>("/roles?limit=500", epoch),
     teams = useData<Page>("/teams?limit=500", epoch);
   const activeProjects = projects.data?.items.filter((p) => !p.archived) ?? [],
-    linkedProject = detail && activeProjects.find((p) => p.id === detail.projectId),
+    linkedProject = detail && projects.data?.items.find((p) => p.id === detail.projectId),
     current =
-      linkedProject || (activeProjects.find((p) => p.id === selectedProjectId) ?? activeProjects[0]),
+      (linkedProject && !linkedProject.archived ? linkedProject : null) || (activeProjects.find((p) => p.id === selectedProjectId) ?? activeProjects[0]),
     projectId = current?.id ?? "",
     scope = `?projectId=${encodeURIComponent(projectId)}`,
     overview = useData<Row>(projectId ? "/overview" + scope : null, epoch),
     inbox = useData<Row>(projectId ? "/inbox" + scope : null, epoch),
     // Human work keeps its lease even when its workspace is not being viewed.
     humanWork = useData<Row>("/inbox", epoch);
-  const live = useLive(refresh, projectId);
+  const observedProjectId = detail?.projectId || (view === "archives"
+    ? projects.data?.items.find((p) => p.id === archivesProjectId)?.id || projectId || projects.data?.items[0]?.id : projectId);
+  const live = useLive(refresh, observedProjectId ?? "");
   const activeProject = useRef(projectId);
   activeProject.current = projectId;
   const allRoles = roles.data?.items ?? [],
@@ -255,6 +261,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
   }
   function setProject(id: string) {
     selectProject(id);
+    setArchivesProjectId(id);
     setModal(null);
     clearDetail(true);
     setError(null);
@@ -266,6 +273,9 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
     if (projectId) localStorage.setItem("atk-workspace", projectId);
     else localStorage.removeItem("atk-workspace");
   }, [projects.data, projectId, detail]);
+  useEffect(() => {
+    if (detail && linkedProject?.archived) { setArchivesProjectId(linkedProject.id); setView("archives"); }
+  }, [detail?.id, linkedProject?.archived]);
   useEffect(() => {
     function syncDetail() {
       if (detailCloseTimer.current) clearTimeout(detailCloseTimer.current);
@@ -558,6 +568,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
         performTaskAction,
         actionBusyIds,
         pendingTaskId: dialog?.item?.moveTaskId,
+        showArchive: (id: string) => { setArchivesProjectId(id); setView("archives"); },
       }}
     >
       <DesktopTitleBar lang={lang} workspace={workspaceSwitcher} />
@@ -644,7 +655,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
             {!modal && errorPanel(error)}
             {projects.error && errorPanel(projects.error as Row)}
             <div key={globalView ? undefined : projectId}>
-              {!projectId && !globalView ? (
+              {!projectId && !globalView && view !== "archives" ? (
                 empty(
                   t("添加你的第一个工作空间", "Add your first workspace"),
                   t(
@@ -659,6 +670,9 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                 <Overview />
               ) : view === "tasks" ? (
                 <TaskList />
+              ) : view === "archives" ? (
+                <ArchiveHistory key={archivesProjectId || projectId} t={t} lang={lang} epoch={epoch} projects={projects.data?.items ?? []} projectId={projectId}
+                  selectedId={archivesProjectId} select={setArchivesProjectId} open={open} />
               ) : view === "bugs" ? (
                 <BugList />
               ) : view === "inbox" ? (
@@ -719,9 +733,11 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                   {projects.data ? t("链接中的工作空间不可用。", "The workspace in this link is unavailable.") : t("正在加载工作空间…", "Loading workspace…")}
                 </p>
               )}
-              {modal.kind === "task" && linkedProject && <Detail key={item!.id} id={item!.id} />}
+              {modal.kind === "task" && linkedProject && <Detail key={item!.id} id={item!.id} taskProjectId={linkedProject.id} projectReadOnly={Boolean(linkedProject.archived)} />}
               {modal.kind === "plan" && <PlanDetail key={item!.id} id={item!.id} guard={item} />}
-              {modal.kind === "run" && linkedProject && <RunDetail key={item!.id} id={item!.id} />}
+              {modal.kind === "run" && linkedProject && <RunDetail key={item!.id} id={item!.id} runProjectId={linkedProject.id} readOnly={Boolean(linkedProject.archived)} />}
+              {modal.kind === "cancel-task" && <CancelTaskPanel key={item!.id} task={item!} t={t} lang={lang} epoch={epoch} busy={busy} act={act} open={open} close={closeModal} />}
+              {modal.kind === "archive-task" && <ArchiveTaskPanel key={item!.id} task={item!} t={t} epoch={epoch} busy={busy} act={act} close={() => { setModal(null); if (detail?.id === item!.id) clearDetail(); }} />}
               {modal.kind === "draft" && (
                 <>
                   <span className="eyebrow">{t("预排", "DRAFT")}</span>
@@ -1117,6 +1133,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
               {modal.kind === "credential" && (
                 <>
                   <h2>{t("保存接入凭据", "Save your credential")}</h2>
+                  {item!.recovered && <p>{t("已为原 Agent 重新签发凭据，身份和历史保持不变。", "Issued a new credential for the same agent; its identity and history are preserved.")}<br /><code>{item!.agent.id}</code></p>}
                   <p className="warning">
                     {t(
                       "只展示这一次。关闭后无法再次查看；不要将它提交到项目或日志。",
@@ -1150,6 +1167,7 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                 </>
               )}
               {modal.kind === "connection" && <AgentConnection id={item!.id} />}
+              {(modal.kind === "agent-recover" || modal.kind === "agent-delete") && <AgentIdentityAction id={item!.id} projectId={item!.projectId} action={modal.kind === "agent-recover" ? "recover" : "delete"} />}
               {modal.kind === "assignment" && (
                 <TaskAssignment key={item!.id} id={item!.id} projectId={item!.projectId} />
               )}
@@ -1237,26 +1255,6 @@ function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => 
                       </button>
                     </div>
                   </form>
-                </>
-              )}
-              {modal.kind === "revoke" && (
-                <>
-                  <h2>{t("撤销 Agent 凭据", "Revoke agent credential")}</h2>
-                  <p>{item!.name}</p>
-                  <p className="muted">
-                    {t(
-                      "正在执行的任务将要求停止，文件锁会保留到确认停止。",
-                      "Active executions will require stopping; locks remain until confirmed.",
-                    )}
-                  </p>
-                  <div className="modal-actions">
-                    <button
-                      className="danger"
-                      onClick={() => act(`/agents/${item!.id}/revoke?projectId=${encodeURIComponent(item!.projectId)}`, {})}
-                    >
-                      {t("撤销凭据", "Revoke")}
-                    </button>
-                  </div>
                 </>
               )}
               {["backup", "restore"].includes(modal.kind) && (
@@ -1366,11 +1364,12 @@ function RetryTaskConfirmation({ task }: { task: Row }) {
 }
 
 function AcceptanceReview({ acceptance }: { acceptance: Row }) {
-  const { t, epoch, badge, open, act, busy, closeModal } = useUI();
+  const { t, epoch, badge, open, act, busy, closeModal, projects } = useUI();
   const tasks = useData<Page>(`/tasks?projectId=${encodeURIComponent(acceptance.projectId)}&parentId=${encodeURIComponent(acceptance.sourceTaskId)}&planId=${encodeURIComponent(acceptance.planId)}&limit=500`, epoch);
   const current = useData<Row>(`/acceptances/${acceptance.id}`, epoch);
   const source = useData<Row>(`/tasks/${acceptance.sourceTaskId}?projectId=${encodeURIComponent(acceptance.projectId)}`, epoch);
   const stale = !current.data || current.error || current.data.status !== "PENDING" || current.data.version !== acceptance.version || current.data.targetHash !== acceptance.targetHash;
+  const readOnly = acceptance.readOnly || source.data?.archivedAt || projects.data?.items.find((p: Row) => p.id === acceptance.projectId)?.archived;
   return <>
     <div className="detail-top">{badge(acceptance.status)}<code>{acceptance.targetHash.slice(0, 16)}</code></div>
     <h2>{t("验收整份计划", "Accept the complete plan")}</h2>
@@ -1389,10 +1388,10 @@ function AcceptanceReview({ acceptance }: { acceptance: Row }) {
     {(current.error || source.error) && <p role="alert">{t("无法核对当前验收，请稍后重新打开。", "Cannot check current acceptance. Reopen when connected.")}</p>}
     <div className="modal-actions">
       <button onClick={closeModal}>{t("取消", "Cancel")}</button>
-      <button onClick={() => open("plan", { id: acceptance.planId })}>{t("查看计划", "View plan")}</button>
-      <button onClick={() => act(`/acceptances/${acceptance.id}/revalidate`, {})}>{t("检查变化并标记重验", "Detect changes & revalidate")}</button>
-      <button className="primary" disabled={busy || Boolean(stale) || !tasks.data || Boolean(tasks.error) || !source.data || Boolean(source.error)}
-        onClick={() => act(`/acceptances/${acceptance.id}/approve`, { version: acceptance.version, targetHash: acceptance.targetHash })}>{t("确认整份计划验收通过", "Accept this plan")}</button>
+      <button onClick={() => open("plan", { id: acceptance.planId, readOnly })}>{t("查看计划", "View plan")}</button>
+      {!readOnly && <button onClick={() => act(`/acceptances/${acceptance.id}/revalidate`, {})}>{t("检查变化并标记重验", "Detect changes & revalidate")}</button>}
+      {!readOnly && <button className="primary" disabled={busy || Boolean(stale) || !tasks.data || Boolean(tasks.error) || !source.data || Boolean(source.error)}
+        onClick={() => act(`/acceptances/${acceptance.id}/approve`, { version: acceptance.version, targetHash: acceptance.targetHash })}>{t("确认整份计划验收通过", "Accept this plan")}</button>}
     </div>
   </>;
 }
@@ -1496,6 +1495,7 @@ const bugStates: Record<string, [string, string]> = {
   READY: ["待修复", "To fix"], RUNNING: ["修复中", "Fixing"],
   AWAITING_ACCEPTANCE: ["待验收", "Awaiting acceptance"], DONE: ["已关闭", "Closed"],
   BLOCKED: ["已阻塞", "Blocked"],
+  CANCELLED: ["已取消", "Cancelled"],
 };
 
 function BugBadge({ status }: { status: string }) {
@@ -1597,14 +1597,34 @@ function BugAcceptance({ bug }: { bug: Row }) {
   </section>;
 }
 
+function AgentIdentityAction({ id, projectId, action }: { id: string; projectId: string; action: "recover" | "delete" }) {
+  const { t, epoch, busy, act, open, closeModal } = useUI();
+  const tick = useRefreshTick(true);
+  const route = `/agents/${encodeURIComponent(id)}?projectId=${encodeURIComponent(projectId)}`;
+  const { data: agent, error } = useData<Row>(route, epoch + tick);
+  const recovering = action === "recover";
+  return <><h2>{recovering ? t("恢复 Agent 接入", "Reconnect agent") : t("删除项目 Agent", "Delete project agent")}</h2>
+    {agent ? <><h3>{agent.name}</h3><p className="muted mono">{agent.id}</p>
+      <p>{recovering ? t("为这个 Agent 重新签发凭据，原 ID、项目、角色和历史记录不变。旧凭据立即失效，新凭据只展示一次。", "Issue a new credential for this agent, preserving its ID, project, role and history. The old credential becomes invalid; the new one is shown once.") : t("从项目 Agent 列表移除，并让凭据失效。历史任务和运行记录保留；仍指派给它的任务需要改派。", "Remove this agent from the project list and invalidate its credential. Task and run history is preserved; tasks assigned to it will need reassignment.")}</p>
+      <p className="muted">{t("如有活动或不确定的任务、CI 执行，请先停止并确认结束。", "Stop and confirm any active or uncertain task or CI execution first.")}</p>
+    </> : <p role={error ? "alert" : "status"}>{error ? t("无法读取 Agent，请关闭后重试。", "Cannot load the agent. Close and retry.") : t("正在加载…", "Loading…")}</p>}
+    <div className="modal-actions"><button type="button" onClick={closeModal}>{t("取消", "Cancel")}</button>
+      <button className={recovering ? "primary" : "danger"} disabled={busy || !agent || Boolean(error)} onClick={async () => {
+        if (!agent) return;
+        const result = await act(recovering ? `/agents/${encodeURIComponent(id)}/recover?projectId=${encodeURIComponent(projectId)}` : route, { version: agent.version }, recovering ? "POST" : "DELETE", false);
+        if (result) { if (recovering) open("credential", { ...result, recovered: true }); else closeModal(); }
+      }}>{recovering ? t("重新签发凭据", "Issue new credential") : t("确认删除", "Delete agent")}</button></div>
+  </>;
+}
+
 function AgentConnection({ id }: { id: string }) {
-  const { t, epoch, roleName, copyText, projectId } = useUI();
+  const { t, epoch, roleName, copyText, projectId, open } = useUI();
   const tick = useRefreshTick(true);
   const { data: agent, error } = useData<Row>("/agents/" + encodeURIComponent(id) + "?projectId=" + encodeURIComponent(projectId), epoch + tick);
   const command = agentCliSetup();
   const recent = agent?.lastSeen != null && Date.now() - agent.lastSeen < LEASE_MS;
   if (!agent) return <p role={error ? "alert" : "status"}>{error ? t("无法读取接入状态。", "Could not load connection status.") : t("正在加载…", "Loading…")}</p>;
-  const state = agent.revoked ? t("已撤销", "Revoked")
+  const state = agent.revoked ? t("凭据已失效", "Credential invalid")
     : recent ? t("最近已联系", "Recently seen")
     : agent.lastSeen != null ? t("联系已过期", "Contact expired")
     : t("尚未联系", "Not seen yet");
@@ -1616,7 +1636,7 @@ function AgentConnection({ id }: { id: string }) {
         <div><strong>{agent.name} · {state}</strong><small>{roleName(agent.roleId)} · {t("上次联系", "Last contact")}: {time(agent.lastSeen)}</small></div>
       </div>
       {error && <p role="alert">{t("状态刷新失败，上面显示的是上次结果。", "Refresh failed; showing the previous result.")}</p>}
-      {agent.revoked ? <p>{t("该凭据已失效。请创建一个新身份。", "This credential is invalid. Create a new identity to continue.")}</p> : (
+      {agent.revoked ? <p>{t("该凭据已失效。使用“恢复接入”为这个 Agent 重新签发凭据。", "This credential is invalid. Use Reconnect to issue a new credential for this agent.")}</p> : (
         <ol className="setup-steps">
           <li>
             <strong>{t("验证服务和凭据", "Verify the service and credential")}</strong>
@@ -1633,6 +1653,7 @@ function AgentConnection({ id }: { id: string }) {
           </li>
         </ol>
       )}
+      <div className="modal-actions"><button onClick={() => open("agent-recover", agent)}>{t("恢复接入", "Reconnect")}</button></div>
     </>
   );
 }
@@ -1716,14 +1737,15 @@ function DispatchNotice({ row, dispatch }: { row: Row; dispatch: Row | null }) {
         </p>
       ))}
       {row.waiting?.tasks?.map((dep: Row) => (
-        <p key={dep.id}><button className="text-button" onClick={() => open("task", dep)}>{dep.title}</button>{" "}{badge(dep.status)}</p>
+        <p key={dep.id}><button className="text-button" onClick={() => open("task", { ...dep, projectId: row.projectId })}>{dep.title}</button>{" "}{badge(dep.status)}</p>
       ))}
     </section>
   );
 }
 
-function Detail({ id }: { id: string }) {
-  const { lang, t, epoch, badge, open, act, busy, projectId, projectName, roleName, copyText, errorPanel, closeModal, performTaskAction } = useUI();
+function Detail({ id, taskProjectId, projectReadOnly = false }: { id: string; taskProjectId?: string; projectReadOnly?: boolean }) {
+  const { lang, t, epoch, badge, open, act, busy, projectId: selectedProjectId, projectName, roleName, copyText, errorPanel, closeModal, performTaskAction } = useUI();
+  const projectId = taskProjectId ?? selectedProjectId;
   const [cursor, setCursor] = useState(0);
   const [acceptanceError, setAcceptanceError] = useState<Row | null>(null);
   const projectQuery = "projectId=" + encodeURIComponent(projectId);
@@ -1739,6 +1761,7 @@ function Detail({ id }: { id: string }) {
   if (!row) return task.error ? errorPanel(task.error) : <p role="status">{t("正在加载…", "Loading…")}</p>;
   const acceptance = acceptances.data?.items[0];
   const bug = row.kind === "BUG";
+  const readOnly = projectReadOnly || Boolean(row.archivedAt);
   return (
     <>
       <div className="detail-toolbar">
@@ -1749,25 +1772,28 @@ function Detail({ id }: { id: string }) {
       <div className="detail-layout">
         <div className="detail-body">
           <details className="detail-section" open><summary>{t("任务说明", "Task description")}</summary><p className="detail-description prewrap">{row.description}</p></details>
+          {row.cancellation && <section className="detail-section"><h3>{t("取消原因", "Cancellation reason")}</h3><p className="prewrap">{row.cancellation.reason}</p><small className="muted">{time(row.cancellation.at)}</small></section>}
+          {row.archivedAt && <p className="muted">{t("已归档", "Archived")} · {time(row.archivedAt)}</p>}
+          <TaskRecordActions task={row} projectReadOnly={projectReadOnly} t={t} busy={busy} open={open} />
           {row.acceptance && <details className="detail-section"><summary>{t("验收条件", "Acceptance criteria")}</summary><p className="prewrap">{row.acceptance}</p></details>}
           {bug && row.bugReview?.decision === "REJECT" && <section className="detail-section">
             <h3>{t("上次退回原因", "Last rejection")}</h3><p className="prewrap">{row.bugReview.summary}</p>
           </section>}
-          {bug && row.status === "AWAITING_ACCEPTANCE" && <BugAcceptance key={row.resultHash} bug={row} />}
+          {!readOnly && bug && row.status === "AWAITING_ACCEPTANCE" && <BugAcceptance key={row.resultHash} bug={row} />}
           <DispatchNotice row={row} dispatch={dispatch.data} />
           {dispatch.error && <p className="muted" role="status">{t("领取诊断暂不可用。", "Claim diagnostics are temporarily unavailable.")}</p>}
           {row.blockReason && <div className="warning">{reason(row.blockReason, lang)}</div>}
           {row.drift && <details><summary>{t("查看文件变化", "View file changes")}</summary><pre>{JSON.stringify(row.drift, null, 2)}</pre></details>}
-          {row.status === "BLOCKED" && (row.kind === "WORK" || bug) && (
+          {!readOnly && row.status === "BLOCKED" && (row.kind === "WORK" || bug) && (
             <button className="primary" disabled={busy || !bug && !row.humanActions?.some((a: HumanAction) => a.type === "RETRY_TASK" && a.enabled)} title={!bug ? actionReason(row, t) : undefined} onClick={async () => {
               if (!bug) { void performTaskAction(row, row.humanActions.find((a: HumanAction) => a.type === "RETRY_TASK")); return; }
               if (await act(`/tasks/${id}/retry`, { version: row.version }, "POST", false)) closeModal();
             }}>{bug ? t("退回待修复", "Requeue bug") : t("重新开放执行", "Requeue task")}</button>
           )}
-          {row.executorType === "HUMAN" && row.status === "READY" && !row.waiting && (
+          {!readOnly && row.executorType === "HUMAN" && row.status === "READY" && !row.waiting && (
             <button className="primary" disabled={busy || !row.humanActions?.some((a: HumanAction) => a.type === "START_HUMAN" && a.enabled)} onClick={() => performTaskAction(row, row.humanActions.find((a: HumanAction) => a.type === "START_HUMAN"))}>{t("开始人工任务", "Start human task")}</button>
           )}
-          {row.executorType === "HUMAN" && row.status === "RUNNING" && (
+          {!readOnly && row.executorType === "HUMAN" && row.status === "RUNNING" && (
             <button className="primary" disabled={!row.humanActions?.some((a: HumanAction) => a.type === "COMPLETE_HUMAN" && a.enabled)} title={actionReason(row, t)} onClick={() => performTaskAction(row, row.humanActions.find((a: HumanAction) => a.type === "COMPLETE_HUMAN"))}>{t("提交人工交付", "Complete human task")}</button>
           )}
           {children.data && children.data.items.length > 0 && <details className="detail-section" open>
@@ -1790,6 +1816,10 @@ function Detail({ id }: { id: string }) {
                 </button>
               ))}
             </div>
+            {!readOnly && runs.data?.items.filter((r: Row) => ["RUNNING", "STOP_REQUESTED", "QUARANTINED"].includes(r.status)).map((r: Row) => <p key={r.id}>
+              {r.status === "RUNNING" && <button className="danger" disabled={busy} onClick={() => act(`/runs/${r.id}/stop?projectId=${encodeURIComponent(projectId)}`, {}, "POST", false)}>{t("请求停止当前执行", "Request stop for current run")}</button>}{" "}
+              <button onClick={() => open("run", { id: r.id, projectId })}>{t("查看运行并处理停止", "Open run and resolve stopping")}</button>
+            </p>)}
             {(cursor > 0 || runs.data?.nextCursor != null) && (
               <div className="pagination">
                 <button disabled={!cursor} onClick={() => setCursor(Math.max(0, cursor - 10))}>{t("较新记录", "Newer")}</button>
@@ -1797,13 +1827,13 @@ function Detail({ id }: { id: string }) {
               </div>
             )}
             {row.planId && <div className="delivery-footer">
-              <button className="text-button" onClick={() => open("plan", { id: row.planId })}>{t("查看计划", "View plan")}</button>
+              <button className="text-button" onClick={() => open("plan", { id: row.planId, readOnly })}>{t("查看计划", "View plan")}</button>
               {acceptance && <>{badge(acceptance.status)}
                 <button className="text-button" onClick={() => {
                   const detailHref = location.href;
                   setAcceptanceError(null);
                   api("/acceptances/" + encodeURIComponent(acceptance.id))
-                    .then((data) => { if (location.href === detailHref) open("acceptance", data); })
+                    .then((data) => { if (location.href === detailHref) open("acceptance", { ...data, readOnly }); })
                     .catch(setAcceptanceError);
                 }}>{t("查看最终验收", "View final acceptance")}</button></>}
               {errorPanel(acceptanceError ?? acceptances.error)}
@@ -1821,7 +1851,7 @@ function Detail({ id }: { id: string }) {
                 {row.executorType === "HUMAN" ? t("由我处理", "Handled by me") : (
                   row.assignee?.name ?? (row.assignedAgentId ? t("指派不可用", "Assignee unavailable") : t("同角色 Agent 可领取", "Any eligible agent"))
                 )}
-                {row.executorType === "AGENT" && ["READY", "BLOCKED"].includes(row.status) && (
+                {!readOnly && row.executorType === "AGENT" && ["READY", "BLOCKED"].includes(row.status) && (
                   <button className="text-button property-link" onClick={() => open("assignment", row)}>
                     {row.assignedAgentId ? t("更改指派", "Change assignee") : t("指派 Agent", "Assign agent")}
                   </button>
@@ -1829,19 +1859,19 @@ function Detail({ id }: { id: string }) {
               </dd>
               <dt>{t("评审", "Review")}</dt><dd>{row.reviewPolicy === "INDEPENDENT" ? t("独立评审", "Independent reviewer") : t("按检查结果验证", "Approved checks")}</dd>
             </dl>
-            {row.parentId && <button className="text-button" onClick={() => open("task", { id: row.parentId })}>{t("打开原始需求", "Open parent request")} ↗</button>}
+            {row.parentId && <button className="text-button" onClick={() => open("task", { id: row.parentId, projectId })}>{t("打开原始需求", "Open parent request")} ↗</button>}
           </>}
           {row.files?.length > 0 && <><h4>{t("文件范围", "File scope")}</h4><div className="chips">{row.files.map((f: string) => <code key={f}>{f}</code>)}</div></>}
           {row.deps?.length > 0 && <><h4>{t("依赖", "Dependencies")}</h4>{row.deps.map((dep: string) => (
-            <button className="text-button property-link" key={dep} onClick={() => open("task", { id: dep })}>{row.dependencies?.find((task: Row) => task.id === dep)?.title ?? t("查看前置任务", "View dependency")}</button>
+            <button className="text-button property-link" key={dep} onClick={() => open("task", { id: dep, projectId })}>{row.dependencies?.find((task: Row) => task.id === dep)?.title ?? t("查看前置任务", "View dependency")}</button>
           ))}</>}
           <section className="task-metadata-summary">
             <h4>{t("日期和标签", "Due date and tags")}</h4>
             {row.dueDate ? <TaskDeadline task={row} t={t} /> : <p className="muted">{t("未设截止日期", "No due date")}</p>}
             <TaskTags tags={row.tags} />
-            <button className="text-button property-link" onClick={() => open("task-metadata", row)}>
+            {!readOnly && <button className="text-button property-link" onClick={() => open("task-metadata", row)}>
               {t("编辑日期和标签", "Edit date and tags")}
-            </button>
+            </button>}
           </section>
           <details className="property-id"><summary>{t("任务 ID", "Task ID")}</summary><code>{row.id}</code></details>
         </aside>
@@ -1851,7 +1881,7 @@ function Detail({ id }: { id: string }) {
 }
 
 function PlanDetail({ id, guard }: { id: string; guard?: Row }) {
-  const { lang, t, epoch, badge, open, act, busy, roleName } = useUI();
+  const { lang, t, epoch, badge, open, act, busy, roleName, projects } = useUI();
 
   const data = useData<Row>("/plans/" + id, epoch),
     source = useData<Row>(
@@ -1871,6 +1901,7 @@ function PlanDetail({ id, guard }: { id: string; guard?: Row }) {
     .filter((p) => p.revision < plan?.revision)
     .sort((a, b) => b.revision - a.revision)[0];
   if (!plan || plan.id !== id) return <p>{t("正在加载…", "Loading…")}</p>;
+  const readOnly = guard?.readOnly || source.data?.archivedAt || projects.data?.items.find((p: Row) => p.id === plan.projectId)?.archived;
   return (
     <>
       <div className="detail-top">
@@ -1887,7 +1918,7 @@ function PlanDetail({ id, guard }: { id: string; guard?: Row }) {
           <select
             aria-label={t("计划版本", "Plan version")}
             value={plan.id}
-            onChange={(event) => open("plan", { id: event.target.value })}
+            onChange={(event) => open("plan", { id: event.target.value, readOnly })}
           >
             {versions.data?.items.map((version) => (
               <option key={version.id} value={version.id}>
@@ -1941,7 +1972,7 @@ function PlanDetail({ id, guard }: { id: string; guard?: Row }) {
         ))}
       </div>
       <div className="modal-actions">
-        {plan.status === "SUBMITTED" && (
+        {!readOnly && plan.status === "SUBMITTED" && (
           <button
             className="primary"
             disabled={busy || Boolean(stale)}
@@ -1952,8 +1983,8 @@ function PlanDetail({ id, guard }: { id: string; guard?: Row }) {
             {t("批准此版本并开放执行", "Approve this version & release tasks")}
           </button>
         )}
-        {!["SUPERSEDED"].includes(plan.status) &&
-          source.data?.status !== "DONE" && (
+        {!readOnly && !["SUPERSEDED"].includes(plan.status) &&
+          !["DONE", "CANCELLED"].includes(source.data?.status) && (
             <button onClick={() => open("revision", plan)}>
               {t("要求修改计划", "Request revision")}
             </button>
@@ -2060,8 +2091,9 @@ function PlanComparison({ before, after }: { before: Row; after: Row }) {
     </details>
   );
 }
-function RunDetail({ id }: { id: string }) {
-  const { t, lang, epoch, live, badge, open, act, projectId, projectName, copyText, errorPanel } = useUI();
+function RunDetail({ id, runProjectId, readOnly = false }: { id: string; runProjectId?: string; readOnly?: boolean }) {
+  const { t, lang, epoch, live, badge, open, act, projectId: selectedProjectId, projectName, copyText, errorPanel } = useUI();
+  const projectId = runProjectId ?? selectedProjectId;
   const [showEvidence, setShowEvidence] = useState(false);
   const scope = "projectId=" + encodeURIComponent(projectId);
   const route = "/runs/" + encodeURIComponent(id);
@@ -2086,12 +2118,12 @@ function RunDetail({ id }: { id: string }) {
       <div className="detail-heading">{badge(r.status)}<h2>{r.title ?? id}</h2></div>
       <div className="detail-layout">
       <div className="detail-body">
-      {r.status === "RUNNING" && (
+      {!readOnly && r.status === "RUNNING" && (
         <button className="danger" onClick={() => act(`/runs/${id}/stop`, {}, "POST", false)}>
           {t("请求停止", "Request stop")}
         </button>
       )}
-      {["QUARANTINED", "STOP_REQUESTED"].includes(r.status) && (
+      {!readOnly && ["QUARANTINED", "STOP_REQUESTED"].includes(r.status) && (
         <button className="danger" onClick={() => open("stopped", r)}>
           {t("确认执行已停止并释放锁", "Confirm stopped & release locks")}
         </button>
@@ -2852,7 +2884,7 @@ function Runs() {
 }
 
 function Projects() {
-  const { t, projects, open, act, projectId, setProject, setView } = useUI();
+  const { t, projects, open, act, projectId, setProject, setView, showArchive } = useUI();
   return (
     <>
       <p className="page-description">
@@ -2875,6 +2907,7 @@ function Projects() {
             {p.archived && (
               <span className="badge">{t("已归档", "Archived")}</span>
             )}
+            {p.archived && <button onClick={() => showArchive(p.id)}>{t("查看历史任务", "View task history")}</button>}
             {!p.archived && (
               <button
                 disabled={p.id === projectId}

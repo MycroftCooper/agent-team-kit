@@ -24,7 +24,10 @@ There is no resident scheduler worker, runtime host, provider SDK or model route
 The launcher manages only the backend. The machine CLI handles HTTP, receipt
 retry and lease renewal. It can launch an explicitly requested team CLI script
 or stdio MCP server in the external client's process environment. The backend
-does not launch these resources, and ATK does not execute AI processes.
+does not launch these resources or AI processes. The optional external
+`atk-agent run` client launches the local Codex CLI or DSH headless CLI for one selected bug, renews
+its lease, supervises the process tree, runs checks and submits the result.
+It preserves the same claim and human-acceptance boundaries; see [Codex runner](CODEX-RUNNER.md).
 
 Automation configuration and results belong to each project: `.atk/automations/*.json`
 is the definition authority, `.atk/runs/<runId>/` contains immutable request/configuration
@@ -106,6 +109,13 @@ separate lifecycles; waiting for dependencies or file locks leaves a task READY.
 diagrams as separate pages. Diagram labels and detailed transition notes are in
 Chinese.
 
+Human cancellation additionally moves unfinished REQUEST, WORK and BUG tasks to
+`CANCELLED`, after all affected runs are confirmed stopped. The impact includes
+unfinished request children or transitive work dependents; completed work is
+preserved. Archiving is visibility metadata, not a new lifecycle state. See
+[Cancellation and archive history](TASK-CANCELLATION-ARCHIVE.md) for these commands
+and their dependency, approval and acceptance effects.
+
 **REQUEST — requirement container**
 
 ![REQUEST task state machine](diagrams/request-task.png)
@@ -123,9 +133,16 @@ Chinese.
 Agent identities are created OFFLINE. Successful contact through connect, claim
 or heartbeat writes ONLINE and refreshes `lastSeen`. Displayed contact status is
 computed from `revoked` and whether `lastSeen` is less than `LEASE_MS` (30 seconds)
-old; timeout does not write OFFLINE back to the database. Revocation writes
-REVOKED, invalidates the credential and requests that active runs stop. Revoked
-identities cannot be restored. Agent capacity usage is computed from active
+old; timeout does not write OFFLINE back to the database. Agent management offers
+deletion and connection recovery, with no separate revoke operation. Existing
+disabled identities can be reconnected by a human reissuing their credential, preserving
+the original ID, project, role and history. The old credential is invalidated;
+the replacement is shown once and the identity returns to OFFLINE until contact.
+Deleting an idle identity records `deletedAt` and DELETED, invalidates access and
+hides it from project rosters, overview and collaboration, while retaining the
+record for historical references. Recovery and deletion are project-scoped and
+versioned; active or uncertain task/CI runs block both operations. Agent clients
+cannot issue these human-only actions. Agent capacity usage is computed from active
 runs rather than an idle/busy identity status.
 
 Runs start RUNNING. STOP_REQUESTED and QUARANTINED remain active or uncertain,
@@ -186,6 +203,25 @@ Visible state columns and same-owner swimlanes accept legal pointer drops;
 executor grouping is not a state target. SSE changes cancel stale gestures,
 while existing filters, sorting, drawer links and workspace human renewal remain.
 See [Task board movement](TASK-BOARD-DRAG-DESIGN.md) for the supported operations.
+
+## Cancellation and historical records
+
+Cancellation previews bind a task version and `impactHash` computed from the
+affected tasks, source requirement and active runs. The command recomputes that
+scope inside the write transaction. RUNNING, STOP_REQUESTED and QUARANTINED runs
+all block cancellation; existing stop acknowledgement and explicit human
+confirmation remain responsible for releasing locks. A cancelled work node
+blocks its requirement for revision and invalidates pending acceptance. Whole
+requirement cancellation supersedes its plans and preserves completed children.
+
+Optional task fields `cancellation`, `archivedAt` and `archiveBatchId` extend the
+existing JSON records. Closed requirements archive unarchived children as a
+batch; restore only affects that batch and never changes execution status.
+Daily queries exclude archived rows, while evidence relationships and internal
+workflow reads retain them. A project-scoped history endpoint includes work,
+requests and bugs. Shared detail panels use the record's project ID explicitly,
+allowing archived-project history without restoring or scheduling that project.
+See [Task cancellation and archives](TASK-CANCELLATION-ARCHIVE.md).
 
 ## File coordination and evidence
 

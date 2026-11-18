@@ -5,6 +5,11 @@ A local web workspace for coordinating external agents across multiple projects.
 **2.0.0-alpha.1** is a breaking rebuild: no legacy task import, software plugins,
 model adapters, model gateway, automatic agent launch, or worktrees.
 
+An optional external client, `atk-agent run --task <bugId> --check '<command>'`,
+uses the locally installed Codex CLI (default) or DSH (`--engine dsh`) to repair
+one selected bug, run checks, and submit delivery for human acceptance.
+See [Codex / DSH runner](docs/CODEX-RUNNER.md).
+
 ## Run
 
 **Windows x64 desktop development: double-click `dev.bat`.** It opens the ATK
@@ -111,6 +116,12 @@ human operations: start/complete human work, requeue stopped blocked work, appro
 a submitted plan and accept a whole requirement. Required forms and confirmation
 panels remain in place; agent delivery and review still advance through real
 receipts. See [Task board movement](docs/TASK-BOARD-DRAG-DESIGN.md).
+
+Task details also support cancellation with a reviewed impact list and explicit
+stop reconciliation for active runs. Closed tasks can be archived and restored
+from **Work → Archive history**. Archived projects have a **View task history**
+entry in **Projects**, with read-only access to tasks and delivery evidence.
+See [Cancellation and archive history](docs/TASK-CANCELLATION-ARCHIVE.md).
 
 In **Work → Bugs**, report a bug and choose a worker role from the workspace's squad.
 The bug goes straight to that role's queue. After a worker submits a fix, accept it in

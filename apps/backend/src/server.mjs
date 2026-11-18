@@ -60,7 +60,10 @@ function taskViewFilters(params) {
       deadline = { from: day, through: through.getUTCFullYear() > 9999 ? "9999-12-31" : through.toISOString().slice(0, 10) };
     } else deadline = { from: day, through: day };
   }
+  const archive = params.get("archive") ?? (params.has("parentId") || params.has("planId") ? "all" : "active");
+  requireThat(["active", "only", "all"].includes(archive), "VALIDATION_ERROR", "Unknown task archive filter");
   return {
+    archive,
     status: params.get("status") || undefined,
     owner: params.get("owner") || undefined,
     search: params.get("q")?.trim().slice(0, 200),
@@ -273,7 +276,7 @@ export function createServer({
             403,
           );
       }
-      const body = ["POST", "PATCH", "PUT"].includes(method)
+      const body = ["POST", "PATCH", "PUT", "DELETE"].includes(method)
         ? await readBody(req)
         : {};
       requireServing();
@@ -381,8 +384,10 @@ export function createServer({
           "acceptances",
           "materializations",
         ];
-        if (resource === "tasks" && id && projectId && ["human-start", "human-complete", "retry"].includes(action))
+        if (resource === "tasks" && id && projectId && ["human-start", "human-complete", "retry", "cancel", "archive"].includes(action))
           requireThat(app.store.get("tasks", id)?.projectId === projectId, "NOT_FOUND", "Task not found in this project", 404);
+        if (resource === "runs" && id && projectId && ["stop", "confirm-stopped"].includes(action))
+          requireThat(app.store.get("runs", id)?.projectId === projectId, "NOT_FOUND", "Run not found in this project", 404);
         if (method === "GET" && resource === "overview")
           result = app.overview(projectId);
         else if (method === "GET" && resource === "agent-migrations")
@@ -415,6 +420,10 @@ export function createServer({
           result = app.reviewBug(id, body, projectId);
         else if (method === "GET" && resource === "tasks" && id === "tags" && !action)
           result = app.taskTags(projectId);
+        else if (method === "GET" && resource === "tasks" && id === "history" && !action)
+          result = app.taskHistory(projectId, { ...taskViewFilters(url.searchParams),
+            limit: number(url.searchParams.get("limit"), 50, 1, 500),
+            offset: number(url.searchParams.get("cursor"), 0, 0, 1_000_000) });
         else if (method === "GET" && resource === "tasks" && id === "board" && !action)
           result = app.taskBoard(projectId, {
             ...taskViewFilters(url.searchParams),
@@ -457,6 +466,8 @@ export function createServer({
             result =
               action === "dispatch" && resource === "tasks"
                 ? app.taskDispatch(id)
+                : action === "cancellation" && resource === "tasks"
+                  ? app.cancellation(id)
                 : action === "assignment" && resource === "tasks"
                   ? app.taskAssignment(id)
                 : action === "artifact" && resource === "runs"
@@ -496,22 +507,22 @@ export function createServer({
           result = app.updateTeam(id, body);
         else if (method === "POST" && resource === "agents" && !id)
           result = app.createAgent(body);
+        else if (resource === "agents" && id && ((method === "DELETE" && !action) || (method === "POST" && action === "recover"))) {
+          const target = app.store.get("agents", id);
+          requireThat(projectId && target?.projectId === projectId && !target.deletedAt, "NOT_FOUND", "Agent not found in this project", 404);
+          result = method === "DELETE" ? app.deleteAgent(id, body) : app.recoverAgent(id, body);
+        }
         else if (method === "PATCH" && resource === "agents" && id)
           {
             requireThat(projectId && app.store.get("agents", id)?.projectId === projectId, "NOT_FOUND", "Agent not found in this project", 404);
             result = app.updateAgent(id, body);
           }
-        else if (
-          method === "POST" &&
-          resource === "agents" &&
-          action === "revoke"
-        )
-          {
-            requireThat(projectId && app.store.get("agents", id)?.projectId === projectId, "NOT_FOUND", "Agent not found in this project", 404);
-            result = app.revokeAgent(id);
-          }
         else if (method === "POST" && resource === "tasks" && !id)
           result = app.createDraft(body);
+        else if (method === "POST" && resource === "tasks" && action === "cancel")
+          result = app.cancelTask(id, body);
+        else if (method === "POST" && resource === "tasks" && action === "archive")
+          result = app.archiveTask(id, body);
         else if (method === "PATCH" && resource === "tasks" && id && ["assignment", "metadata"].includes(action)) {
           if (projectId)
             requireThat(app.store.get(resource, id)?.projectId === projectId, "NOT_FOUND", "Item not found in this project", 404);

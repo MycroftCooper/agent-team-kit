@@ -197,6 +197,18 @@ body limit 512 KiB. Reuse the same event IDs when retrying a batch.
 
 ## Durable acknowledgements and recovery
 
+Connection recovery keeps the registered identity. `doctor` and `connect` never
+register a new Agent. When the credential is lost or invalid, a human uses the
+existing identity's **Reconnect** action to reissue it. The previous credential
+immediately stops working; the new one retains the original agent/project/role
+and historical references. Stop and confirm active or uncertain work first.
+Human APIs are `POST /api/v1/agents/:id/recover?projectId=:projectId` and
+`DELETE /api/v1/agents/:id?projectId=:projectId`, each with JSON `{ "version": N }`.
+Agent credentials cannot invoke these management actions. Deletion hides the
+identity and invalidates access, retaining historical records; deleted identities
+cannot be recovered. There is no separate revoke action or endpoint. For active
+work, request a stop and confirm it before deleting the identity.
+
 Only `{persisted:true}` acknowledges a final submission. Use the same submission
 key and generation after a lost response; query the run status if uncertain.
 Never assume a network failure means a result was rejected. Stop-confirmation
@@ -207,6 +219,6 @@ Useful error codes include FILE_LOCKED, DEPENDENCIES, SCOPE_MISMATCH,
 STALE_GENERATION, LEASE_EXPIRED, RUN_NOT_ACTIVE, REVIEW_STALE, APPROVAL_STALE and
 VERSION_CONFLICT. The JSON envelope is `{error:{code,message,details}}`.
 
-Clients must stop on revoked credentials, expired leases or uncertain ownership.
+Clients must stop on invalid credentials, expired leases or uncertain ownership.
 This protocol cannot forcibly stop an external writer. No provider credentials
 belong in events, check logs, receipts, generated documentation or application logs.

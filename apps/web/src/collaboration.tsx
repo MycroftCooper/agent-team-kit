@@ -76,7 +76,8 @@ function eventText(event: Row, task: Row | undefined, agents: Row[], runs: Row[]
     "review.invalidated": t("待检查产物发生变化", "Review target changed"), "acceptance.created": t("整项需求等待你验收", "Delivery awaiting acceptance"),
     "acceptance.invalidated": t("验收产物发生变化", "Acceptance target changed"),
     "agent.created": t("添加项目 Agent", "Project agent added"), "agent.updated": t("更新项目 Agent", "Project agent updated"),
-    "agent.connected": t("Agent 已登记联系", "Agent contact recorded"), "agent.revoked": t("撤销 Agent 凭据", "Agent credential revoked"),
+    "agent.connected": t("Agent 已登记联系", "Agent contact recorded"), "agent.revoked": t("Agent 凭据已失效", "Agent credential invalidated"),
+    "agent.credentials-rotated": t("恢复 Agent 接入", "Agent credential reissued"), "agent.deleted": t("删除项目 Agent", "Project agent deleted"),
   };
   const text = event.type === "run.progress" || event.type === "run.blocked" ? event.data.message : texts[event.type] ?? t("工作记录更新", "Work updated");
   return task ? `${task.title} · ${text}` : text;
@@ -132,7 +133,7 @@ export function Collaboration({ projectId, epoch, live, lang, t, open, manage }:
       <div className="collab-agents">{agents.map((a) => {
         const owned = activeRuns.filter((r) => r.agentId === a.id), role = data.roles.find((r: Row) => r.id === a.roleId), fn = role?.function as keyof typeof roleLabels;
         const assigned = tasks.filter((v) => v.assignedAgentId === a.id && v.status === "READY");
-        return <article className="collab-agent" key={a.id}><div className="split"><strong>{a.name}</strong><span className={inContact(a) ? "contact-recent" : "muted"}>{a.revoked ? t("凭据已撤销", "Credential revoked") : a.lastSeen == null ? t("尚未接入", "Not seen yet") : inContact(a) ? t("最近有联系", "Recently seen") : t("联系已过期", "Contact expired")}</span></div><p className="muted">{role?.name ?? t("角色已移除", "Role removed")} · {fn && roleLabels[fn] ? t(roleLabels[fn][0], roleLabels[fn][1]) : "—"}</p>
+        return <article className="collab-agent" key={a.id}><div className="split"><strong>{a.name}</strong><span className={inContact(a) ? "contact-recent" : "muted"}>{a.revoked ? t("凭据已失效", "Credential invalid") : a.lastSeen == null ? t("尚未接入", "Not seen yet") : inContact(a) ? t("最近有联系", "Recently seen") : t("联系已过期", "Contact expired")}</span></div><p className="muted">{role?.name ?? t("角色已移除", "Role removed")} · {fn && roleLabels[fn] ? t(roleLabels[fn][0], roleLabels[fn][1]) : "—"}</p>
           <small>{t("并发占用", "Capacity used")} {owned.length} / {a.capacity}</small>
           {!owned.length && <p className="muted">{t("当前没有平台任务", "No current platform work")}</p>}
           {owned.map((r) => <div className="collab-agent-work" key={r.id}><span className={r.status !== "RUNNING" ? "danger-text" : "muted"}>{r.status === "RUNNING" ? t(...(stageLabels[r.stage] ?? (["处理中", "Working"] as const))) : label(r.status, lang)}</span><button className="text-button" onClick={() => { const task = tasks.find((v) => v.id === r.taskId); if (task) openTask(task); }}>{r.title ?? tasks.find((v) => v.id === r.taskId)?.title ?? t("查看任务", "View task")}</button>{r.latestProgress && <p className="collab-progress">{t("最近上报", "Last report")}: {r.latestProgress.message}</p>}</div>)}

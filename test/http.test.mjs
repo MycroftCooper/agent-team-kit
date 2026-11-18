@@ -317,13 +317,13 @@ test("human assignment reserves execution for one eligible worker without bypass
   assert.equal(f.app.store.events({ entityId: task.id }).filter((e) => e.type === "task.assignment_changed").length, 1);
 });
 
-test("revoked assignment waits for a human to clear it; no other agent takes over automatically", async (t) => {
+test("deleted assignment waits for a human to clear it; no other agent takes over automatically", async (t) => {
   const f = await serverFixture(t);
   const { tasks: [task] } = plan(f, [node("reserved")]);
   const other = f.app.createAgent({ projectId: f.p.id, name: "Available worker", roleId: "role-dev", teamId: "team-default" });
   const route = "/tasks/" + task.id + "/assignment";
   const assigned = (await f.human(route, { version: task.version, agentId: f.dev.agent.id }, "PATCH")).body;
-  f.app.revokeAgent(f.dev.agent.id);
+  f.app.deleteAgent(f.dev.agent.id, { version: f.app.get("agents", f.dev.agent.id).version });
   assert.equal(f.app.claim(other.agent.id, { taskId: task.id }).run, null);
   assert.equal(f.app.taskDispatch(task.id).code, "ASSIGNEE_UNAVAILABLE");
   const cleared = await f.human(route, { version: assigned.version, agentId: null }, "PATCH");
@@ -388,7 +388,7 @@ test("doctor validates credentials without checking in or claiming work", async 
   }).doctor(), { code: "SERVICE_UNREACHABLE" });
   await client.connect();
   assert.ok((await client.doctor()).identity.lastSeen);
-  f.app.revokeAgent(agent.id);
+  f.app.deleteAgent(agent.id, { version: f.app.get("agents", agent.id).version });
   await assert.rejects(client.doctor(), { code: "UNAUTHENTICATED" });
 });
 
@@ -444,7 +444,7 @@ test("claim diagnostics distinguish readiness, locks, missing contact and capaci
   const route = (name) => "/tasks/" + tasks.find((task) => task.title === "Task " + name).id;
   const diagnostic = async (name) => (await f.human(route(name) + "/dispatch")).body;
   const worker = f.app.createAgent({ projectId: f.p.id, name: "Other worker", roleId: "role-dev", teamId: "team-default" });
-  f.app.revokeAgent(f.dev.agent.id);
+  f.app.deleteAgent(f.dev.agent.id, { version: f.app.get("agents", f.dev.agent.id).version });
   assert.equal((await diagnostic("dependent")).code, "DEPENDENCIES");
   assert.equal((await diagnostic("second")).code, "NO_RECENT_AGENT");
   f.app.connect(worker.agent.id);
@@ -458,9 +458,12 @@ test("claim diagnostics distinguish readiness, locks, missing contact and capaci
   assert.equal((await f.human(route("second"))).body.waiting, null);
   assert.equal((await f.human(route("second") + "?projectId=wrong")).status, 404);
   assert.equal((await f.human("/runs/" + claim.run.id + "/artifact?projectId=wrong")).status, 404);
-  f.app.revokeAgent(worker.agent.id);
-  assert.equal((await diagnostic("second")).code, "NO_MATCHING_AGENT");
+  f.app.requestStop(claim.run.id);
   assert.equal(f.app.list("locks").total, 1);
+  f.app.confirmStopped(claim.run.id, { confirmStopped: true });
+  f.app.deleteAgent(worker.agent.id, { version: f.app.get("agents", worker.agent.id).version });
+  assert.equal((await diagnostic("second")).code, "NO_MATCHING_AGENT");
+  assert.equal(f.app.list("locks").total, 0);
 });
 
 test("HTTP clients race atomically, report receipts and replay idempotently", async (t) => {

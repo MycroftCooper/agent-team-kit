@@ -139,6 +139,7 @@ export function openStore(file) {
         owner,
         search,
         hideChildren,
+        archive,
         deadline,
         tag,
         sort,
@@ -172,6 +173,7 @@ export function openStore(file) {
         filters.push("json_extract(data,'$.kind') IS NOT ?");
         params.push(excludeKind);
       }
+      if (table === "agents") filters.push("json_extract(data,'$.deletedAt') IS NULL");
       if (owner === "REQUEST") {
         filters.push("json_extract(data,'$.kind')='REQUEST'");
       } else if (owner) {
@@ -183,6 +185,8 @@ export function openStore(file) {
         params.push(search);
       }
       if (hideChildren) filters.push("parent_id IS NULL");
+      if (table === "tasks" && ["active", "only"].includes(archive))
+        filters.push(`json_extract(data,'$.archivedAt') IS ${archive === "only" ? "NOT " : ""}NULL`);
       const due = "json_extract(data,'$.dueDate')";
       if (deadline?.missing) filters.push(`${due} IS NULL`);
       if (deadline?.openOnly) filters.push("status NOT IN ('VERIFIED','DONE','CANCELLED')");
