@@ -7,16 +7,26 @@ import { runtimePaths } from "../../packages/platform/src/index.mjs";
 const parent = process.parentPort;
 let backend, started, stopping = false;
 
-function dataDirectory() {
+function dataDirectory(installMode) {
+  if (installMode === "desktop" || process.env.ATK_DATA_DIR) return runtimePaths().root;
   const config = new URL("../../atk.local.json", import.meta.url);
-  if (process.env.ATK_DATA_DIR || !fs.existsSync(config)) return runtimePaths().root;
+  if (!fs.existsSync(config)) return runtimePaths().root;
   const { dataDir } = JSON.parse(fs.readFileSync(config, "utf8"));
   if (typeof dataDir !== "string" || !dataDir.trim()) throw new Error("atk.local.json requires a non-empty dataDir.");
   return path.resolve(fileURLToPath(new URL("../../", import.meta.url)), dataDir);
 }
 
-async function main(backendPort) {
-  backend = createServer({ dataDir: dataDirectory(), webDist: null });
+async function main({ port: backendPort, webDist = null, installMode }) {
+  const updateOptions = installMode === "desktop"
+    ? {
+        installMode: "desktop",
+        desktopInstaller: ({ installerPath, version, sha256 }) => {
+          parent.postMessage({ type: "update-ready", installerPath, version, sha256 });
+          return { installed: true };
+        },
+      }
+    : undefined;
+  backend = createServer({ dataDir: dataDirectory(installMode), webDist, updateOptions });
   const info = await backend.listen({ port: backendPort }).catch((error) => {
     backend = undefined; // listen() already closes its database and instance lock.
     throw error;
@@ -30,7 +40,7 @@ function exitAfter(result) {
 
 parent.on("message", ({ data }) => {
   if (data.type === "start" && !started) {
-    started = main(data.port);
+    started = main(data);
     void started.catch(async (error) => {
       const busy = error.code === "EADDRINUSE" || error.code === "INSTANCE_ACTIVE";
       parent.postMessage({ type: "error", error: error.message + (busy ? "\nStop the other ATK service, or choose a free port and a separate ATK_DATA_DIR." : "") });

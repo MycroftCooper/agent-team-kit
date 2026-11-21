@@ -1,7 +1,11 @@
 import { useEffect, useState, type ReactNode } from "react";
 import type { Lang } from "./i18n";
 
-type WindowState = { maximized: boolean; minimized: boolean };
+type WindowState = {
+  maximized: boolean;
+  minimized: boolean;
+  mode?: "production" | "development";
+};
 declare global {
   interface Window {
     atkDesktop?: {
@@ -10,6 +14,7 @@ declare global {
       minimize: () => Promise<void>;
       toggleMaximize: () => Promise<void>;
       close: () => Promise<void>;
+      restartAndInstallUpdate?: () => Promise<boolean>;
       onWindowState: (callback: (state: WindowState) => void) => () => void;
     };
   }
@@ -18,10 +23,15 @@ export const desktopWindow = window.atkDesktop;
 
 export function DesktopTitleBar({ lang, workspace }: { lang: Lang; workspace?: ReactNode }) {
   const [maximized, setMaximized] = useState(false);
+  const [mode, setMode] = useState<"production" | "development" | null>(null);
   useEffect(() => {
     if (!desktopWindow) return;
     let mounted = true;
-    function update(state: WindowState) { if (mounted) setMaximized(state.maximized); }
+    function update(state: WindowState) {
+      if (!mounted) return;
+      setMaximized(state.maximized);
+      if (state.mode) setMode(state.mode);
+    }
     const unsubscribe = desktopWindow.onWindowState(update);
     void desktopWindow.getWindowState().then(update).catch(console.error);
     return () => { mounted = false; unsubscribe(); };
@@ -36,7 +46,7 @@ export function DesktopTitleBar({ lang, workspace }: { lang: Lang; workspace?: R
   return <header className="desktop-titlebar">
     <div className="desktop-title-brand">
       <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
-      <span>Agent Team Kit</span><span className="desktop-title-badge">DEV</span>
+      <span>Agent Team Kit</span>{mode === "development" && <span className="desktop-title-badge">DEV</span>}
     </div>
     {workspace}
     <div className="desktop-title-actions">

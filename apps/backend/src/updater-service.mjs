@@ -20,6 +20,7 @@ export function createUpdaterService(service, options = {}) {
   const installMode = options.installMode ?? detectInstallMode(options.packageRoot ?? PACKAGE_ROOT);
   const fetchImpl = options.fetchImpl ?? fetch;
   const installer = options.installer ?? installUpdateTarball;
+  const desktopInstaller = options.desktopInstaller ?? null;
 
   let activeCheck = null;
   let activeApply = null;
@@ -59,6 +60,7 @@ export function createUpdaterService(service, options = {}) {
           repo,
           apiBase,
           includePrerelease: Boolean(includePrerelease),
+          installMode,
           fetchImpl,
         });
         state = {
@@ -136,10 +138,19 @@ export function createUpdaterService(service, options = {}) {
           requireChecksum: options.requireChecksum !== false,
         });
         state = { ...state, status: "installing", downloadedPath: downloaded.filePath };
-        const installed = await installer({
-          tarballPath: downloaded.filePath,
-          prefix: options.installPrefix,
-        });
+        const installed =
+          installMode === "desktop"
+            ? desktopInstaller
+              ? await desktopInstaller({
+                  installerPath: downloaded.filePath,
+                  version: latest.latestVersion,
+                  sha256: downloaded.sha256,
+                })
+              : { installed: true }
+            : await installer({
+                tarballPath: downloaded.filePath,
+                prefix: options.installPrefix,
+              });
         state = {
           ...state,
           applying: false,

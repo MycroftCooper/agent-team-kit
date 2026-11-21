@@ -7,9 +7,16 @@ const files = fs
   .readdirSync("test")
   .filter((f) => f.endsWith(".test.mjs"))
   .map((f) => path.join("test", f));
+const concurrency =
+  process.env.ATK_TEST_CONCURRENCY ?? (process.platform === "win32" ? "4" : "");
 const child = spawn(
   process.execPath,
-  ["--test", "--test-reporter=tap", ...files],
+  [
+    "--test",
+    ...(concurrency ? [`--test-concurrency=${concurrency}`] : []),
+    "--test-reporter=tap",
+    ...files,
+  ],
   {
     stdio: "inherit",
     windowsHide: true,

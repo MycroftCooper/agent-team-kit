@@ -29,12 +29,30 @@ export function projectPaths(p) {
   const root = safe(p.root, path.join(p.root, ".atk"));
   return { root, configs: safe(p.root, path.join(root, "automations")), runs: safe(p.root, path.join(root, "runs")), local: safe(p.root, path.join(root, "local")) };
 }
+const sleepBuf = new Int32Array(new SharedArrayBuffer(4));
+function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (error) {
+      if (
+        process.platform !== "win32" ||
+        attempt >= 6 ||
+        !["EPERM", "EBUSY", "EACCES"].includes(error?.code)
+      ) {
+        throw error;
+      }
+      Atomics.wait(sleepBuf, 0, 0, 15 * (attempt + 1));
+    }
+  }
+}
 export function atomic(file, value, raw = false) {
   const tmp = file + "." + crypto.randomUUID() + ".tmp";
   const fd = fs.openSync(tmp, "wx", 0o600);
   try { fs.writeFileSync(fd, raw ? value : JSON.stringify(value, null, 2) + "\n"); fs.fsyncSync(fd); }
   finally { fs.closeSync(fd); }
-  try { fs.renameSync(tmp, file); }
+  try { renameWithRetry(tmp, file); }
   finally { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); }
 }
 export function readJson(file, limit = 32 * 1024 * 1024) {

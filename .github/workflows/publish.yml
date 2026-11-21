@@ -1,62 +1,46 @@
 name: publish
+# Releases are published locally: `pnpm run release:publish` (scripts/publish-release.mjs)
+# after `pnpm run ci:release` passes. That keeps the Windows .exe build on the machine
+# that already verified it, so no GitHub runner is needed for routine work.
+# This workflow is a manual fallback for environments without a local toolchain.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to package and publish (for example v0.0.1)
+        required: true
 permissions:
   contents: write
   id-token: write
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - uses: pnpm/action-setup@v4
         with:
           version: 11.6.0
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: pnpm
           registry-url: https://registry.npmjs.org
       - run: pnpm install --frozen-lockfile
-      - run: node scripts/check-boundaries.mjs
-      - run: node scripts/test.mjs
-      - run: node scripts/build-web.mjs
-      - run: node scripts/e2e.mjs
-      - run: node scripts/smoke.mjs
-      - name: Verify tag and prepare GitHub Release artifacts
+      - name: Verify tag matches package.json version
         shell: bash
         run: |
           version=$(node -p "JSON.parse(require('fs').readFileSync('package.json')).version")
-          test "$GITHUB_REF_NAME" = "v$version"
-          node scripts/prepare-release.mjs artifacts/release
+          test "${{ inputs.tag }}" = "v$version"
+      - run: node scripts/build-web.mjs
+      - run: node scripts/build-desktop.mjs --skip-smoke
+      - run: node scripts/prepare-release.mjs artifacts/release --require-desktop
       - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          version=$(node -p "JSON.parse(require('fs').readFileSync('package.json')).version")
-          tarball="artifacts/release/agent-team-kit-${version}.tgz"
-          prerelease_flag=""
-          case "$version" in *-*) prerelease_flag="--prerelease" ;; esac
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" \
-              "$tarball" \
-              artifacts/release/SHA256SUMS.txt \
-              artifacts/release/release-manifest.json \
-              --clobber
-            gh release edit "$GITHUB_REF_NAME" \
-              --title "$GITHUB_REF_NAME" \
-              --notes-file artifacts/release/RELEASE_NOTES.md \
-              $prerelease_flag
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              "$tarball" \
-              artifacts/release/SHA256SUMS.txt \
-              artifacts/release/release-manifest.json \
-              --title "$GITHUB_REF_NAME" \
-              --notes-file artifacts/release/RELEASE_NOTES.md \
-              $prerelease_flag
-          fi
+        run: node scripts/publish-release.mjs artifacts/release --allow-prerelease
       - name: Publish to npm (optional when NPM_TOKEN is configured)
         shell: bash
         run: |

@@ -192,6 +192,24 @@ export function currentDifferences(project, manifest, scopes = []) {
   }
   return changed;
 }
+const renameSleepBuf = new Int32Array(new SharedArrayBuffer(4));
+function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (error) {
+      if (
+        process.platform !== "win32" ||
+        attempt >= 6 ||
+        !["EPERM", "EBUSY", "EACCES"].includes(error?.code)
+      ) {
+        throw error;
+      }
+      Atomics.wait(renameSleepBuf, 0, 0, 15 * (attempt + 1));
+    }
+  }
+}
 export function atomicJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temp = file + `.tmp-${crypto.randomUUID()}`;
@@ -202,7 +220,11 @@ export function atomicJson(file, value) {
   } finally {
     fs.closeSync(fd);
   }
-  fs.renameSync(temp, file);
+  try {
+    renameWithRetry(temp, file);
+  } finally {
+    if (fs.existsSync(temp)) fs.unlinkSync(temp);
+  }
 }
 export function writeDocument(project, relative, content) {
   const target = canonical(path.resolve(project.docsRoot, relative));
@@ -215,6 +237,10 @@ export function writeDocument(project, relative, content) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   const temp = target + `.tmp-${crypto.randomUUID()}`;
   fs.writeFileSync(temp, content, { mode: 0o600 });
-  fs.renameSync(temp, target);
+  try {
+    renameWithRetry(temp, target);
+  } finally {
+    if (fs.existsSync(temp)) fs.unlinkSync(temp);
+  }
   return target;
 }

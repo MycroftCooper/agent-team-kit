@@ -7,7 +7,7 @@ export const DEFAULT_UPDATE_REPO = "MycroftCooper/agent-team-kit";
 export const DEFAULT_GITHUB_API = "https://api.github.com";
 
 const SEMVER_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
-const SAFE_ASSET_RE = /^[A-Za-z0-9._-]+\.tgz$/;
+const SAFE_ASSET_RE = /^[A-Za-z0-9._-]+\.(?:tgz|exe)$/;
 
 export function parseSemver(input) {
   if (typeof input !== "string") return null;
@@ -94,6 +94,35 @@ export function extractChangelogSection(changelogText, version) {
   return out.join("\n").trim();
 }
 
+export function validateBilingualChangelog(section) {
+  if (typeof section !== "string" || !section.trim()) {
+    return { ok: false, reason: "Changelog section for this version is empty." };
+  }
+  const zhHeading = /^###\s*(?:中文|简体中文|Chinese)(?:\s|$)/im.exec(section);
+  const enHeading = /^###\s*English(?:\s|$)/im.exec(section);
+  if (!zhHeading || !enHeading) {
+    return {
+      ok: false,
+      reason: "Release changelog must be bilingual with '### 中文' before '### English'.",
+    };
+  }
+  if (zhHeading.index >= enHeading.index) {
+    return {
+      ok: false,
+      reason: "Chinese section ('### 中文') must appear before English section ('### English').",
+    };
+  }
+  const zhBody = section.slice(zhHeading.index + zhHeading[0].length, enHeading.index).trim();
+  const enBody = section.slice(enHeading.index + enHeading[0].length).trim();
+  if (!/[\u4e00-\u9fff]/.test(zhBody)) {
+    return { ok: false, reason: "Chinese changelog section must contain Chinese text." };
+  }
+  if (!/[A-Za-z]{3,}/.test(enBody)) {
+    return { ok: false, reason: "English changelog section must contain English text." };
+  }
+  return { ok: true, zhBody, enBody };
+}
+
 function assertAllowedDownloadUrl(rawUrl) {
   const url = new URL(rawUrl);
   if (url.protocol === "https:") return url;
@@ -117,25 +146,37 @@ function releaseHeaders() {
   return headers;
 }
 
-function pickReleaseAsset(release, version) {
+function pickReleaseAsset(release, version, installMode = "package") {
   const assets = Array.isArray(release?.assets) ? release.assets : [];
-  const expectedName = `agent-team-kit-${version}.tgz`;
-  const tarball =
-    assets.find((a) => a?.name === expectedName) ??
-    assets.find((a) => typeof a?.name === "string" && /^agent-team-kit-.*\.tgz$/.test(a.name)) ??
-    assets.find((a) => typeof a?.name === "string" && a.name.endsWith(".tgz"));
-  if (!tarball || typeof tarball.browser_download_url !== "string") {
+  let chosen = null;
+  let kind = "tarball";
+  if (installMode === "desktop") {
+    const expectedExe = `Agent-Team-Kit-Setup-${version}.exe`;
+    chosen =
+      assets.find((a) => a?.name === expectedExe) ??
+      assets.find((a) => typeof a?.name === "string" && /^Agent-Team-Kit-Setup-.*\.exe$/i.test(a.name)) ??
+      assets.find((a) => typeof a?.name === "string" && a.name.toLowerCase().endsWith(".exe"));
+    kind = "win-exe";
+  } else {
+    const expectedName = `agent-team-kit-${version}.tgz`;
+    chosen =
+      assets.find((a) => a?.name === expectedName) ??
+      assets.find((a) => typeof a?.name === "string" && /^agent-team-kit-.*\.tgz$/.test(a.name)) ??
+      assets.find((a) => typeof a?.name === "string" && a.name.endsWith(".tgz"));
+  }
+  if (!chosen || typeof chosen.browser_download_url !== "string") {
     return null;
   }
-  if (!SAFE_ASSET_RE.test(tarball.name)) {
-    throw new Error(`Unsafe release asset name: ${tarball.name}`);
+  if (!SAFE_ASSET_RE.test(chosen.name)) {
+    throw new Error(`Unsafe release asset name: ${chosen.name}`);
   }
   const sha256Asset = assets.find((a) => a?.name === "SHA256SUMS.txt");
   const manifestAsset = assets.find((a) => a?.name === "release-manifest.json");
   return {
-    name: tarball.name,
-    url: tarball.browser_download_url,
-    size: typeof tarball.size === "number" ? tarball.size : null,
+    name: chosen.name,
+    kind,
+    url: chosen.browser_download_url,
+    size: typeof chosen.size === "number" ? chosen.size : null,
     sha256Url: typeof sha256Asset?.browser_download_url === "string" ? sha256Asset.browser_download_url : null,
     manifestUrl: typeof manifestAsset?.browser_download_url === "string" ? manifestAsset.browser_download_url : null,
   };
@@ -146,6 +187,7 @@ export async function checkForUpdate({
   repo = process.env.ATK_UPDATE_REPO || DEFAULT_UPDATE_REPO,
   apiBase = process.env.ATK_UPDATE_API_BASE || DEFAULT_GITHUB_API,
   includePrerelease = false,
+  installMode = "package",
   fetchImpl = fetch,
   timeoutMs = 15000,
 }) {
@@ -214,7 +256,7 @@ export async function checkForUpdate({
         ? release.html_url
         : `https://github.com/${repo}/releases/tag/${release.tag_name}`,
     notes: typeof release.body === "string" ? release.body.slice(0, 8000) : "",
-    asset: pickReleaseAsset(release, latestVersion),
+    asset: pickReleaseAsset(release, latestVersion, installMode),
     checkedAt: new Date().toISOString(),
   };
 }
@@ -236,6 +278,19 @@ async function resolveExpectedSha256(asset, fetchImpl, timeoutMs) {
       ) {
         return manifest.sha256.toLowerCase();
       }
+      const entries = Array.isArray(manifest?.assets)
+        ? manifest.assets
+        : manifest?.assets && typeof manifest.assets === "object"
+          ? Object.values(manifest.assets)
+          : [];
+      const matched = entries.find(
+        (entry) =>
+          entry &&
+          entry.name === asset.name &&
+          typeof entry.sha256 === "string" &&
+          /^[a-fA-F0-9]{64}$/.test(entry.sha256),
+      );
+      if (matched) return matched.sha256.toLowerCase();
     }
   }
   if (asset.sha256Url) {
@@ -261,7 +316,7 @@ export async function downloadAndVerifyRelease({
 }) {
   const asset = release?.asset;
   if (!asset || !asset.url || !SAFE_ASSET_RE.test(asset.name)) {
-    throw new Error("Release does not include a downloadable tarball asset.");
+    throw new Error("Release does not include a downloadable release asset.");
   }
   assertAllowedDownloadUrl(asset.url);
   const expectedSha = await resolveExpectedSha256(asset, fetchImpl, Math.min(timeoutMs, 15000));

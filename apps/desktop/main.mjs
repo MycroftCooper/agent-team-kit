@@ -1,8 +1,11 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme } from "electron";
-import { isAbsolute } from "node:path";
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from "electron";
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path, { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
-import { startDesktopRuntime } from "./dev-runtime.mjs";
+import { startProdRuntime } from "./prod-runtime.mjs";
 
+const isProd = app.isPackaged || process.env.ATK_DESKTOP_PROD === "1";
 const testProfile = process.env.ATK_DESKTOP_TEST;
 if (testProfile) {
   app.setPath("userData", testProfile);
@@ -15,8 +18,13 @@ if (!app.requestSingleInstanceLock()) {
   start();
 }
 
+function resolveWindowIcon() {
+  const candidate = fileURLToPath(new URL("./build/icon.ico", import.meta.url));
+  return fs.existsSync(candidate) ? candidate : undefined;
+}
+
 function start() {
-  let runtime, window, stopping = false, failed = false;
+  let runtime, window, stopping = false, failed = false, pendingUpdate = null, installingUpdate = false;
   app.on("second-instance", () => {
     if (!window || window.isDestroyed()) return;
     if (window.isMinimized()) window.restore();
@@ -44,17 +52,55 @@ function start() {
     else app.exit(1);
   }
 
-  app.whenReady().then(() => {
-    runtime = startDesktopRuntime({ onReady: openWindow, onError: fail });
+  async function launchUpdateInstaller() {
+    if (installingUpdate) return false;
+    const installerPath = pendingUpdate?.installerPath;
+    if (
+      typeof installerPath !== "string" ||
+      !installerPath.toLowerCase().endsWith(".exe") ||
+      !fs.existsSync(installerPath)
+    ) {
+      throw new Error("No verified desktop update installer is ready.");
+    }
+    installingUpdate = true;
+    stopping = true;
+    const active = runtime;
+    runtime = null;
+    if (active) {
+      await active.close().catch(console.error);
+    }
+    const installer = spawn(installerPath, ["/S", "--updated", "--force-run"], {
+      cwd: path.dirname(installerPath),
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    installer.unref();
+    app.exit(0);
+    return true;
+  }
+
+  app.whenReady().then(async () => {
+    if (isProd) {
+      runtime = startProdRuntime({
+        onReady: openWindow,
+        onError: fail,
+        onUpdateReady: (info) => { pendingUpdate = info; },
+      });
+    } else {
+      const { startDesktopRuntime } = await import("./dev-runtime.mjs");
+      runtime = startDesktopRuntime({ onReady: openWindow, onError: fail });
+    }
   }).catch((error) => fail(error.message));
 
   function openWindow(address) {
     if (stopping || failed || window) return;
     const url = new URL(address);
     if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port)
-      return fail("Refusing an unexpected development URL.");
+      return fail("Refusing an unexpected local workspace URL.");
     window = new BrowserWindow({
-      title: "Agent Team Kit · Dev",
+      title: isProd ? "Agent Team Kit" : "Agent Team Kit · Dev",
+      icon: resolveWindowIcon(),
       width: 1440,
       height: 960,
       minWidth: 900,
@@ -72,8 +118,16 @@ function start() {
         backgroundThrottling: false,
       },
     });
-    installWindowControls(window, url.origin);
-    window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    installWindowControls(window, url.origin, { isProd, launchUpdateInstaller });
+    window.webContents.setWindowOpenHandler(({ url: target }) => {
+      try {
+        const parsed = new URL(target);
+        if (parsed.protocol === "https:" && (parsed.hostname === "github.com" || parsed.hostname.endsWith(".github.com"))) {
+          void shell.openExternal(parsed.href);
+        }
+      } catch {}
+      return { action: "deny" };
+    });
     const restrictNavigation = (event) => {
       if (new URL(event.url).origin !== url.origin) event.preventDefault();
     };
@@ -82,15 +136,19 @@ function start() {
     window.loadURL(url.href).then(() => {
       if (!window.isDestroyed() && !testProfile) window.show();
     }).catch(() => {
-      if (!stopping && !window.isDestroyed()) fail("Could not load the local development UI.");
+      if (!stopping && !window.isDestroyed()) fail("Could not load the local workspace UI.");
     });
   }
 }
 
-function installWindowControls(window, origin) {
+function installWindowControls(window, origin, { isProd, launchUpdateInstaller }) {
   const channel = "atk:window-control";
   const contents = window.webContents;
-  const state = () => ({ maximized: window.isMaximized(), minimized: window.isMinimized() });
+  const state = () => ({
+    maximized: window.isMaximized(),
+    minimized: window.isMinimized(),
+    mode: isProd ? "production" : "development",
+  });
   function publish() {
     if (!contents.isDestroyed()) contents.send("atk:window-state", state());
   }
@@ -115,6 +173,8 @@ function installWindowControls(window, origin) {
         else window.maximize();
         break;
       case "close": window.close(); break;
+      case "install-update":
+        return launchUpdateInstaller();
       default: throw new Error("Unknown window action.");
     }
   });
