@@ -5,10 +5,14 @@ model, launch an agent, forward a provider request or interpret terminal text.
 
 ## Authentication and lifecycle
 
-Create an identity in the browser, bind its role/team, and save its one-time
+Create an identity in the selected project's browser workspace, bind its role, and save its one-time
 credential outside the project. Requests use `Authorization: Bearer <credential>`.
 Agent endpoints reject browser-origin calls. Browser session/CSRF endpoints do
 not accept Agent credentials for human approvals.
+Each identity has an immutable `projectId`; the squad is determined by that
+project. The credential cannot claim work or read plans, artifacts or resources
+from another project, even if both projects share a squad. Separate identities
+and credentials are required when using the same role in different projects.
 The web interface additionally requires a private installation access code.
 It is not an Agent credential and must not be provided to execution clients.
 
@@ -29,18 +33,36 @@ Base URL: `http://127.0.0.1:1421/api/agent/v1`.
 | `POST /runs/:id/stopped`   | Confirm a requested/quarantined execution stopped            |
 | `GET /runs/:id/artifact`   | Read authorized project output on demand                     |
 | `GET /plans/:id`           | Read an authorized previous plan during revision             |
+| `GET /resources?kind=`    | List shared team resource entries; `kind` is optional        |
+| `GET /resources/:kind/:name` | Read a resource's entry or built-in CLI help; MCP entries include parsed settings |
+| `GET /project-resources/:projectId?kind=` | List an authorized project's resources |
+| `GET /project-resources/:projectId/:kind/:name` | Read a project resource without global fallback |
 
 `atk-agent doctor` first probes the local ATK health endpoint without a token,
 then verifies the configured credential with `GET /identity`. It does not claim
 work, update contact time, or renew a lease. Run `atk-agent connect` to report
 contact; the browser can then show the last check-in. Recent contact does not
 prove that the agent is polling for tasks.
+The returned `identity.projectId` identifies the credential's fixed owner.
 
-Claims accept `{projectId?,taskId?,stage?,files?,waitMs?}`. `waitMs` is 0–30000.
+Claims accept `{projectId?,taskId?,stage?,kind?,files?,waitMs?}`. `waitMs` is 0–30000.
+Omitting `projectId` uses the identity's owner; a different explicit project is
+rejected with `PROJECT_FORBIDDEN`. Unbound legacy identities must be assigned a
+project in Settings before claiming new work (`AGENT_PROJECT_REQUIRED`); their
+existing run recovery remains available. See [Collaboration](COLLABORATION.md).
 Stage is checked against the identity: ORCHESTRATOR/PLANNING, WORKER/EXECUTION,
 REVIEWER/REVIEW. Optional `files` must exactly match the approved full scope.
+Optional `kind` is `REQUEST`, `WORK`, or `BUG`; the CLI accepts `--kind bug` to
+limit a repair agent's claims to bugs. Bugs use the same execution result and
+heartbeat endpoints. Their spec has `taskKind: "BUG"`, a null `planId`, and
+`rework` with human feedback and the previous output reference after rejection.
 Without it the server uses that approved scope. No eligible work returns
 `{run:null,waiting:[...],retryAfterMs:1000}`. Prefer another long poll, not a hot loop.
+
+Every claim checks that the identity's role is still part of its current team.
+Removing that role prevents new planning, execution, review and bug-repair
+claims with `ROLE_FORBIDDEN` (403), including work from approved plans. Adding
+the role back restores eligibility; approved role instructions remain frozen.
 
 For an approved AGENT task, a human can reserve execution for a specific worker.
 Only that identity can claim the execution stage until the assignment is cleared.
@@ -51,6 +73,21 @@ A successful claim contains `{run,spec,generation,leaseUntil}`. Follow `spec`:
 it freezes the task/plan versions, function instructions, project root, file
 scopes, dependencies, check requirements and output contract. Do not read other
 projects or fetch entire histories as context.
+
+`connect` and successful agent claims advertise the shared library through
+`resources` and `spec.resources`, respectively. Follow its `ref` or run
+`atk-agent resources list` to discover global resources on demand. Successful
+claims additionally advertise `spec.resources.project`, whose `ref` and `command`
+select only the current project's resources. Use `--scope project --project <id>`
+for project list/show/run/serve-mcp. Project HTTP paths are `/project-resources/<id>`
+and `/project-resources/<id>/<kind>/<name>`; older backends reject these paths.
+The original `/resources` endpoints also retain `scope=project&projectId=<id>`
+for existing callers. The CLI verifies response ownership before starting tools.
+Project access is checked against fixed identity ownership, squad binding and project grants before reading
+or creating resource directories. Requests without scope remain global; project
+scope never falls back to a same-named global resource. Entries reflect current
+files and are not frozen with approved roles or plans. See [Team resources](TEAM-RESOURCES.md) for how to
+load a skill or template, run a CLI resource, or connect an MCP client.
 
 Renew every 10 seconds with `{generation}`; the lease lasts 30 seconds. Stop
 writing if renewal fails or returns `stopRequired:true`. Expired leases are not
@@ -160,6 +197,18 @@ body limit 512 KiB. Reuse the same event IDs when retrying a batch.
 
 ## Durable acknowledgements and recovery
 
+Connection recovery keeps the registered identity. `doctor` and `connect` never
+register a new Agent. When the credential is lost or invalid, a human uses the
+existing identity's **Reconnect** action to reissue it. The previous credential
+immediately stops working; the new one retains the original agent/project/role
+and historical references. Stop and confirm active or uncertain work first.
+Human APIs are `POST /api/v1/agents/:id/recover?projectId=:projectId` and
+`DELETE /api/v1/agents/:id?projectId=:projectId`, each with JSON `{ "version": N }`.
+Agent credentials cannot invoke these management actions. Deletion hides the
+identity and invalidates access, retaining historical records; deleted identities
+cannot be recovered. There is no separate revoke action or endpoint. For active
+work, request a stop and confirm it before deleting the identity.
+
 Only `{persisted:true}` acknowledges a final submission. Use the same submission
 key and generation after a lost response; query the run status if uncertain.
 Never assume a network failure means a result was rejected. Stop-confirmation
@@ -170,6 +219,6 @@ Useful error codes include FILE_LOCKED, DEPENDENCIES, SCOPE_MISMATCH,
 STALE_GENERATION, LEASE_EXPIRED, RUN_NOT_ACTIVE, REVIEW_STALE, APPROVAL_STALE and
 VERSION_CONFLICT. The JSON envelope is `{error:{code,message,details}}`.
 
-Clients must stop on revoked credentials, expired leases or uncertain ownership.
+Clients must stop on invalid credentials, expired leases or uncertain ownership.
 This protocol cannot forcibly stop an external writer. No provider credentials
 belong in events, check logs, receipts, generated documentation or application logs.

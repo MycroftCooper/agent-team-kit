@@ -7,24 +7,60 @@ the only application database writer. External agents call a distinct authentica
 API; they neither inherit a browser session nor choose their own function.
 
 ```text
-Browser ── /api/v1 + SSE ── Backend ── SQLite (one global authority)
+Browser ── /api/v1 + SSE ── Backend ── SQLite (tasks, identity, project registry)
                               │
 External agents ─ /api/agent/v1┤
-                              └── project/.agent-team (documents + snapshots)
+                              ├── project/docsRoot (documents + snapshots + resources/)
+                              └── ATK data/resources (global shared resources)
 ```
 
 The backend uses pure domain and scheduling functions inside atomic claims.
+Resources keep the same kind/name layout in global and project scope. Global
+requests retain their existing behavior; explicit project requests resolve only
+under that project's docsRoot/resources after authorization and real-path checks.
+Built-ins remain global and read-only. Same-named custom entries do not override
+or fall back across scopes, and project metadata remains outside task write scopes.
 There is no resident scheduler worker, runtime host, provider SDK or model route.
 The launcher manages only the backend. The machine CLI handles HTTP, receipt
-retry and lease renewal, never AI process execution.
+retry and lease renewal. It can launch an explicitly requested team CLI script
+or stdio MCP server in the external client's process environment. The backend
+does not launch these resources or AI processes. The optional external
+`atk-agent run` client launches the local Codex CLI or DSH headless CLI for one selected bug, renews
+its lease, supervises the process tree, runs checks and submits the result.
+It preserves the same claim and human-acceptance boundaries; see [Codex runner](CODEX-RUNNER.md).
+
+Automation configuration and results belong to each project: `.atk/automations/*.json`
+is the definition authority, `.atk/runs/<runId>/` contains immutable request/configuration
+snapshots, logs, events, reports and collected exports; `.atk/local/` holds ownership
+and machine-local Git cursors. No automation bodies or events are written to SQLite.
+Human and Agent APIs share `/projects/:id/automations` and `/projects/:id/automation-runs`
+under their respective authenticated prefixes. The Agent CLI uses those APIs rather
+than spawning another CI executor. Progress uses per-run replayable SSE plus polling.
+Native argv execution is supervised with Windows kill-on-close Job Objects or POSIX
+process groups. Unconfirmed exits block the project in RECOVERY_REQUIRED until a human
+confirms the old tree stopped. See [the automation contract](AUTOMATION-PROJECT-DESIGN.md).
 
 Node.js 24, built-in `node:sqlite`, React/TypeScript/Vite. Production Node modules
 use relative package paths so the installed package needs no workspace links.
 The web build bundles React. Tests use throwaway SQLite files rather than a
 second production memory-store implementation.
 
+On Windows, `dev.bat` opens the same React UI in an Electron window. Two
+utility processes run the backend and the loopback Vite server. Vite proxies the
+human API and SSE; external Agents call the backend directly. The renderer has
+no Node integration. Development source changes restart only the backend
+process on the same port, after active or uncertain tasks and automations have
+settled. The renderer reconnects over SSE without reloading the page. Electron
+main process and startup configuration changes require relaunching the app.
+
 ## State and identity
 
+- Agent identities have immutable project ownership. Project membership and the
+  credential bound to it are enforced for claims, assignments, plans, artifacts,
+  resources and project agent queries, even across projects sharing a squad.
+  Role templates and global resources may be shared. Unambiguous legacy owners
+  are backfilled; ambiguous identities can settle existing runs but cannot claim
+  new work until explicitly assigned in Settings.
 - REQUEST tasks start DRAFT. ORCHESTRATOR planning runs leave them DRAFT until
   the human approves a submitted plan version.
 - Approval atomically materializes WORK tasks. REQUESTs are containers and cannot
@@ -35,6 +71,10 @@ second production memory-store implementation.
 - HUMAN work starts through the UI and completes through explicit human action.
   Its browser renews the lease across pages and workspace switches. A lost human lease uses
   the same conservative recovery rules as an agent lease.
+- BUG tasks are direct repair work and have no plan. The selected worker role
+  claims them under the same file locks and lease rules. A successful execution
+  goes to AWAITING_ACCEPTANCE. Human acceptance closes the bug; rejection
+  requeues it with feedback and a reference to the previous receipt.
 - Failed execution, content drift, review exhaustion and lease loss are BLOCKED
   reasons, not successful completion. Human retry creates another generation.
 - A plan's author identity cannot execute/review its work. An execution author
@@ -58,6 +98,130 @@ Revalidation requires the current approved plan and unchanged delivery results;
 it cannot alter a revised requirement or a newer delivery. Drift in a human-owned
 final output reopens that HUMAN task through BLOCKED and explicit retry, while
 legal downstream edits preserve the earlier human completion.
+
+### Task state machines
+
+The diagrams below show REQUEST, WORK and BUG task lifecycles, including review
+rework, blocked-task retries and acceptance. Plan and run statuses belong to
+separate lifecycles; waiting for dependencies or file locks leaves a task READY.
+
+[Editable draw.io file](diagrams/task-state-machine.drawio) contains all three
+diagrams as separate pages. Diagram labels and detailed transition notes are in
+Chinese.
+
+Human cancellation additionally moves unfinished REQUEST, WORK and BUG tasks to
+`CANCELLED`, after all affected runs are confirmed stopped. The impact includes
+unfinished request children or transitive work dependents; completed work is
+preserved. Archiving is visibility metadata, not a new lifecycle state. See
+[Cancellation and archive history](TASK-CANCELLATION-ARCHIVE.md) for these commands
+and their dependency, approval and acceptance effects.
+
+**REQUEST — requirement container**
+
+![REQUEST task state machine](diagrams/request-task.png)
+
+**WORK — planned execution task**
+
+![WORK task state machine](diagrams/work-task.png)
+
+**BUG — direct repair task**
+
+![BUG task state machine](diagrams/bug-task.png)
+
+### Agent and run state machines
+
+Agent identities are created OFFLINE. Successful contact through connect, claim
+or heartbeat writes ONLINE and refreshes `lastSeen`. Displayed contact status is
+computed from `revoked` and whether `lastSeen` is less than `LEASE_MS` (30 seconds)
+old; timeout does not write OFFLINE back to the database. Agent management offers
+deletion and connection recovery, with no separate revoke operation. Existing
+disabled identities can be reconnected by a human reissuing their credential, preserving
+the original ID, project, role and history. The old credential is invalidated;
+the replacement is shown once and the identity returns to OFFLINE until contact.
+Deleting an idle identity records `deletedAt` and DELETED, invalidates access and
+hides it from project rosters, overview and collaboration, while retaining the
+record for historical references. Recovery and deletion are project-scoped and
+versioned; active or uncertain task/CI runs block both operations. Agent clients
+cannot issue these human-only actions. Agent capacity usage is computed from active
+runs rather than an idle/busy identity status.
+
+Runs start RUNNING. STOP_REQUESTED and QUARANTINED remain active or uncertain,
+retaining their capacity reservation and existing file locks. Confirmation of
+stop transitions either state to INTERRUPTED. EXECUTION/HUMAN runs may also
+submit a stopped FAILED or INTERRUPTED receipt from these states. A running
+review is interrupted directly when its target changes. Review submission
+completes the run even when the verdict requests changes or blocks the task.
+Terminal runs are not restarted; another attempt creates a new run generation.
+
+[Editable Agent and Run draw.io file](diagrams/agent-run-state-machine.drawio)
+contains both diagrams as separate pages, with Chinese labels and transition
+notes. The Agent page separates stored status from derived contact status.
+
+**Agent — identity and contact status**
+
+![Agent identity and contact state machines](diagrams/agent-state-machine.png)
+
+**Run — individual execution lifecycle**
+
+![Run state machine](diagrams/run-state-machine.png)
+
+## Project collaboration and task details
+
+Work → Collaboration projects existing task, run and event records into a
+read-only project snapshot. It reports actual owners and reported progress,
+keeps the selected task stable and distinguishes contact from execution.
+SSE is scoped to the current project plus shared configuration and workspace
+metadata updates. Agent lifecycle events carry their owning project; other
+projects' agent events are excluded. Visible-page polling refreshes contact
+timestamps without requiring heartbeat events to be persisted.
+
+The UI animates new lifecycle changes, then reconciles authoritative snapshots.
+Initial load, reconnect, background resume and project switching reset the
+animation baseline. Motion never changes scheduling or invents completion.
+
+Tasks across Work use one nonmodal right drawer mounted above the individual
+pages. Closing it preserves the underlying view and filters; links retain task
+and project context. Human leases remain owned by the workspace shell rather
+than the currently selected page or drawer.
+
+See [Project agents and collaboration](COLLABORATION.md) for ownership migration,
+the user-facing workflow and snapshot API.
+
+## Human moves on the task board
+
+Task projections include lightweight `humanActions` for starting human work,
+submitting human delivery, retrying stopped blocked work, approving a submitted
+plan and accepting a whole requirement. Board handles and “Move to” controls
+dispatch the existing commands; there is no generic status-assignment endpoint.
+Forms and confirmations keep the source card unchanged until success. Agent
+claims, delivery and independent review remain credential-bound operations.
+
+Human delivery binds `version`, `runId` and `generation` in one transaction.
+An old form cannot finish a later restarted execution. Plans and acceptance
+panels keep their reviewed version/target, and acceptance lists affected work.
+Visible state columns and same-owner swimlanes accept legal pointer drops;
+executor grouping is not a state target. SSE changes cancel stale gestures,
+while existing filters, sorting, drawer links and workspace human renewal remain.
+See [Task board movement](TASK-BOARD-DRAG-DESIGN.md) for the supported operations.
+
+## Cancellation and historical records
+
+Cancellation previews bind a task version and `impactHash` computed from the
+affected tasks, source requirement and active runs. The command recomputes that
+scope inside the write transaction. RUNNING, STOP_REQUESTED and QUARANTINED runs
+all block cancellation; existing stop acknowledgement and explicit human
+confirmation remain responsible for releasing locks. A cancelled work node
+blocks its requirement for revision and invalidates pending acceptance. Whole
+requirement cancellation supersedes its plans and preserves completed children.
+
+Optional task fields `cancellation`, `archivedAt` and `archiveBatchId` extend the
+existing JSON records. Closed requirements archive unarchived children as a
+batch; restore only affects that batch and never changes execution status.
+Daily queries exclude archived rows, while evidence relationships and internal
+workflow reads retain them. A project-scoped history endpoint includes work,
+requests and bugs. Shared detail panels use the record's project ID explicitly,
+allowing archived-project history without restoring or scheduling that project.
+See [Task cancellation and archives](TASK-CANCELLATION-ARCHIVE.md).
 
 ## File coordination and evidence
 

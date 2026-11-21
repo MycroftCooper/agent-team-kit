@@ -6,8 +6,9 @@
 - `main`：默认分支，也是唯一的发布分支。只有准备发布新版本时，才把通过验证的 `dev` 合入 `main`。日常改动不直接提交到 `main`，也不另设 `release` 分支。
 
 发布时，在 `dev` 准备版本号和变更记录，确认 CI 通过后，发起 `dev` → `main` 的发布 PR。
-合入后，在 `main` 的发布提交上打与版本号一致的 `v<版本号>` 标签。推送该标签会触发 npm 发布；
-预发布版本进入 `next`，正式版本进入 `latest`。
+合入后，在 `main` 的发布提交上打与版本号一致的 `v<版本号>` 标签。推送该标签会自动发布
+GitHub Release（包含安装包、校验和与 release manifest），若仓库配置了 `NPM_TOKEN` 则同时触发 npm 发布；
+预发布版本标记为 prerelease（npm 进入 `next`），正式版本为最新正式版（npm 进入 `latest`）。
 
 This repository has two long-lived branches:
 
@@ -18,5 +19,7 @@ This repository has two long-lived branches:
 
 Prepare the version and changelog on `dev`. Once CI passes, open a release
 pull request from `dev` to `main`. After merging, tag the release commit on
-`main` with the matching `v<version>`. Pushing that tag triggers npm publishing
-under `next` for prereleases or `latest` for stable releases.
+`main` with the matching `v<version>`. Pushing that tag publishes a GitHub
+Release (with tarball, SHA256SUMS, and release manifest) and optionally
+publishes to npm when `NPM_TOKEN` is configured (`next` for prereleases,
+`latest` for stable releases).

@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useRef,
   useState,
   createContext,
@@ -8,9 +9,18 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react";
-import { LEASE_MS, type Row, type Page } from "@atk/contracts";
+import { LEASE_MS, TASK_STATUSES, VERSION, type Row, type Page } from "@atk/contracts";
 import { api, authorize, useData, useLive } from "./api";
+import { AgentTeam, AgentTeamNavigation, agentCliSetup, agentTeamSectionTitle, useAgentTeam } from "./agent-team";
+import { AutomationEditor, AutomationNavigation, Automations, useAutomationNavigation, type Workflow } from "./automations";
+import { Collaboration } from "./collaboration";
+import { AgentMigrations } from "./agent-migrations";
+import { actionKey, actionReason, type HumanAction } from "./task-actions";
+import { TaskMovementContext, TaskMoveControl, TaskDropTarget, TaskMoveFeedback, useTaskMovement } from "./task-movement";
+import { ArchiveHistory, ArchiveTaskPanel, CancelTaskPanel, TaskRecordActions } from "./task-lifecycle";
 import { label, reason, type Lang } from "./i18n";
+import { DesktopTitleBar, desktopWindow } from "./desktop-window";
+import { ThemeSettings, ThemeToggle } from "./theme";
 import {
   TaskDisplayMenu,
   columnLabels as boardLabels,
@@ -30,12 +40,15 @@ import {
 
 type View =
   | "overview"
-  | "drafts"
   | "tasks"
+  | "bugs"
   | "inbox"
   | "runs"
+  | "collaboration"
+  | "archives"
   | "team"
   | "projects"
+  | "automations"
   | "settings";
 type Modal = { kind: string; item?: Row };
 type DetailLink = { kind: "task" | "run"; id: string; projectId: string };
@@ -55,15 +68,21 @@ function detailUrl(target: DetailLink | null) {
   url.hash = "";
   return url;
 }
-const navs: [View, string, string, string][] = [
-  ["inbox", "待我处理", "My inbox", "◇"],
+const navs = [
   ["overview", "概览", "Overview", "◈"],
-  ["drafts", "预排池", "Intake", "▤"],
-  ["tasks", "任务", "Tasks", "☷"],
-  ["runs", "执行记录", "Runs", "↗"],
-  ["team", "Agent 与团队", "Agents & teams", "⊞"],
+  ["work", "工作", "Work", "☷"],
+  ["automations", "自动化", "Automations", "▷"],
+  ["team", "Agent 团队", "Agent team", "⊞"],
   ["projects", "项目", "Projects", "▦"],
-];
+] as const;
+const workPages = [
+  ["inbox", "待我处理", "My inbox", "◇"],
+  ["tasks", "任务", "Tasks", "☷"],
+  ["bugs", "Bug 单", "Bugs", "⊘"],
+  ["collaboration", "协作实况", "Collaboration", "⇄"],
+  ["runs", "执行记录", "Runs", "↗"],
+  ["archives", "归档记录", "Archive history", "▤"],
+] as const;
 const time = (v: string | number) => (v ? new Date(v).toLocaleString() : "—");
 function useRefreshTick(enabled: boolean, ms = 5000) {
   const [tick, setTick] = useState(0);
@@ -76,11 +95,47 @@ function useRefreshTick(enabled: boolean, ms = 5000) {
   }, [enabled, ms]);
   return tick;
 }
+function AppFooter({ lang, setLang, connection }: {
+  lang: Lang;
+  setLang: (lang: Lang) => void;
+  connection?: ReturnType<typeof useLive>["connection"];
+}) {
+  const english = lang === "en";
+  const languageLabel = english ? "Switch to Chinese" : "切换到英文";
+  return (
+    <footer className="app-footer">
+      {connection && (
+        <span className="live-label" role="status">
+          <span className={`connection ${connection}`} aria-hidden="true" />
+          {connection === "live"
+            ? (english ? "Live" : "实时同步")
+            : (english ? "Reconnecting" : "重新连接中")}
+        </span>
+      )}
+      <button
+        type="button"
+        className="quiet"
+        aria-label={languageLabel}
+        title={languageLabel}
+        onClick={() => setLang(english ? "zh" : "en")}
+      >
+        {english ? "中文" : "EN"}
+      </button>
+      <ThemeToggle lang={lang} />
+    </footer>
+  );
+}
+
 export function App() {
+  const [lang, setLanguage] = useState<Lang>(() => localStorage.getItem("atk-language") === "en" ? "en" : "zh");
   const [authorized, setAuthorized] = useState(false),
     [loading, setLoading] = useState(true),
     [failed, setFailed] = useState(false);
-  const english = localStorage.getItem("atk-language") === "en";
+  const english = lang === "en";
+  function setLang(next: Lang) {
+    setLanguage(next);
+    localStorage.setItem("atk-language", next);
+  }
   useEffect(() => {
     const connect = () => {
       setLoading(true);
@@ -93,8 +148,9 @@ export function App() {
     window.addEventListener("hashchange", connect);
     return () => window.removeEventListener("hashchange", connect);
   }, []);
-  if (authorized) return <WorkspaceApp />;
-  return (
+  if (authorized) return <WorkspaceApp lang={lang} setLang={setLang} />;
+  return <>
+    <DesktopTitleBar lang={lang} />
     <main className="auth-shell">
       <section className="panel auth-panel">
         <span className="eyebrow">AGENT TEAM KIT</span>
@@ -137,13 +193,11 @@ export function App() {
         </form>
       </section>
     </main>
-  );
+    <AppFooter lang={lang} setLang={setLang} />
+  </>;
 }
-function WorkspaceApp() {
-  const [lang, setLang] = useState<Lang>(() =>
-      localStorage.getItem("atk-language") === "en" ? "en" : "zh",
-    ),
-    [view, setView] = useState<View>(() => {
+function WorkspaceApp({ lang, setLang }: { lang: Lang; setLang: (lang: Lang) => void }) {
+  const [view, setView] = useState<View>(() => {
       const target = readDetailLink();
       return target?.kind === "task" ? "tasks" : target?.kind === "run" ? "runs" : "overview";
     }),
@@ -155,31 +209,50 @@ function WorkspaceApp() {
     [detail, setDetail] = useState(readDetailLink),
     [error, setError] = useState<Row | null>(null),
     [busy, setBusy] = useState(false),
-    [notice, setNotice] = useState("");
+    [notice, setNotice] = useState(""),
+    [detailClosing, setDetailClosing] = useState(false),
+    [actionBusyIds, setActionBusyIds] = useState<string[]>([]);
+  const [archivesProjectId, setArchivesProjectId] = useState("");
+  const taskActionsInFlight = useRef(new Set<string>());
+  const detailCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const detailReturnFocus = useRef<HTMLElement | null>(null);
   const t = (zh: string, en: string) => (lang === "zh" ? zh : en);
   const modal: Modal | null = dialog ?? (detail && { kind: detail.kind, item: detail });
   const detailPane = modal?.kind === "task" || modal?.kind === "run";
-  const refresh = useCallback(() => setEpoch((x) => x + 1), []),
-    live = useLive(refresh);
+  const refresh = useCallback(() => setEpoch((x) => x + 1), []);
   const projects = useData<Page>("/projects?limit=500", epoch),
     roles = useData<Page>("/roles?limit=500", epoch),
     teams = useData<Page>("/teams?limit=500", epoch);
   const activeProjects = projects.data?.items.filter((p) => !p.archived) ?? [],
-    linkedProject = detail && activeProjects.find((p) => p.id === detail.projectId),
+    linkedProject = detail && projects.data?.items.find((p) => p.id === detail.projectId),
     current =
-      linkedProject || (activeProjects.find((p) => p.id === selectedProjectId) ?? activeProjects[0]),
+      (linkedProject && !linkedProject.archived ? linkedProject : null) || (activeProjects.find((p) => p.id === selectedProjectId) ?? activeProjects[0]),
     projectId = current?.id ?? "",
     scope = `?projectId=${encodeURIComponent(projectId)}`,
     overview = useData<Row>(projectId ? "/overview" + scope : null, epoch),
     inbox = useData<Row>(projectId ? "/inbox" + scope : null, epoch),
     // Human work keeps its lease even when its workspace is not being viewed.
     humanWork = useData<Row>("/inbox", epoch);
+  const observedProjectId = detail?.projectId || (view === "archives"
+    ? projects.data?.items.find((p) => p.id === archivesProjectId)?.id || projectId || projects.data?.items[0]?.id : projectId);
+  const live = useLive(refresh, observedProjectId ?? "");
+  const activeProject = useRef(projectId);
+  activeProject.current = projectId;
   const allRoles = roles.data?.items ?? [],
     allTeams = teams.data?.items ?? [];
-  function clearDetail() {
+  const teamView = view === "team";
+  const agentTeam = useAgentTeam(teamView, epoch, projectId);
+  const automationNavigation = useAutomationNavigation(projectId, epoch, view === "automations");
+  function clearDetail(immediate = false) {
     if (!detail) return;
+    if (detailCloseTimer.current) clearTimeout(detailCloseTimer.current);
     history.replaceState(null, "", detailUrl(null));
-    setDetail(null);
+    const finish = () => {
+      setDetail(null); setDetailClosing(false); detailCloseTimer.current = null;
+      requestAnimationFrame(() => { if (detailReturnFocus.current?.isConnected) detailReturnFocus.current.focus({ preventScroll: true }); });
+    };
+    if (immediate || matchMedia("(prefers-reduced-motion: reduce)").matches) finish();
+    else { setDetailClosing(true); detailCloseTimer.current = setTimeout(finish, 180); }
   }
   function closeModal() {
     if (dialog) setModal(null);
@@ -188,8 +261,9 @@ function WorkspaceApp() {
   }
   function setProject(id: string) {
     selectProject(id);
+    setArchivesProjectId(id);
     setModal(null);
-    clearDetail();
+    clearDetail(true);
     setError(null);
     setNotice("");
   }
@@ -200,7 +274,12 @@ function WorkspaceApp() {
     else localStorage.removeItem("atk-workspace");
   }, [projects.data, projectId, detail]);
   useEffect(() => {
+    if (detail && linkedProject?.archived) { setArchivesProjectId(linkedProject.id); setView("archives"); }
+  }, [detail?.id, linkedProject?.archived]);
+  useEffect(() => {
     function syncDetail() {
+      if (detailCloseTimer.current) clearTimeout(detailCloseTimer.current);
+      setDetailClosing(false);
       setModal(null);
       setError(null);
       setDetail(readDetailLink());
@@ -217,6 +296,9 @@ function WorkspaceApp() {
   function open(kind: string, item?: Row) {
     setError(null);
     if ((kind === "task" || kind === "run") && item?.id) {
+      if (detailCloseTimer.current) clearTimeout(detailCloseTimer.current);
+      setDetailClosing(false);
+      if (!detail) detailReturnFocus.current = document.activeElement as HTMLElement;
       const target: DetailLink = { kind, id: item.id, projectId: item.projectId ?? projectId };
       const url = detailUrl(target);
       if (url.href !== location.href) history.pushState(null, "", url);
@@ -255,6 +337,36 @@ function WorkspaceApp() {
       setBusy(false);
     }
   }
+  async function performTaskAction(task: Row, action: HumanAction) {
+    if (!action || taskActionsInFlight.current.has(task.id)) return false;
+    taskActionsInFlight.current.add(task.id);
+    setActionBusyIds((ids) => [...ids, task.id]);
+    setError(null);
+    try {
+      const fresh = await api<Row>(`/tasks/${encodeURIComponent(task.id)}?projectId=${encodeURIComponent(task.projectId)}`);
+      if (activeProject.current !== task.projectId) return false;
+      const available = fresh.humanActions?.find((a: HumanAction) => a.type === action.type);
+      if (actionKey(fresh) !== actionKey(task) || !available?.enabled)
+        throw new Error(t("任务或操作条件已变化，请重新选择。", "The task or action changed. Please choose again."));
+      if (action.type === "START_HUMAN") {
+        await api(`/tasks/${task.id}/human-start?projectId=${encodeURIComponent(task.projectId)}`, { version: fresh.version });
+        refresh();
+        if (activeProject.current === task.projectId) setNotice(t("人工任务已开始；如不符合当前筛选，它会移出当前视图。", "Human work started; it may move outside the current filters."));
+      } else if (action.type === "COMPLETE_HUMAN") open("human", { ...fresh, moveTaskId: task.id });
+      else if (action.type === "RETRY_TASK") open("retry-task", { ...fresh, moveTaskId: task.id });
+      else if (action.type === "APPROVE_PLAN")
+        open("plan", { id: action.planId, guardVersion: action.planVersion, guardTaskVersion: fresh.version, moveTaskId: task.id });
+      else if (action.type === "ACCEPT_PLAN") {
+        const acceptance = await api<Row>(`/acceptances/${action.acceptanceId}`);
+        if (activeProject.current !== task.projectId) return false;
+        if (acceptance.version !== action.acceptanceVersion || acceptance.targetHash !== action.targetHash || acceptance.projectId !== task.projectId)
+          throw new Error(t("验收目标已变化，请重新核对。", "The acceptance target changed; review it again."));
+        open("acceptance", { ...acceptance, sourceTitle: fresh.title, moveTaskId: task.id });
+      }
+      return true;
+    } catch (e) { if (activeProject.current === task.projectId) setError(e as Row); refresh(); return false; }
+    finally { taskActionsInFlight.current.delete(task.id); setActionBusyIds((ids) => ids.filter((id) => id !== task.id)); }
+  }
   useEffect(() => {
     const listener = (e: KeyboardEvent) => {
       if (e.key === "Escape") closeModal();
@@ -263,15 +375,15 @@ function WorkspaceApp() {
         !["INPUT", "TEXTAREA", "SELECT"].includes(
           (e.target as HTMLElement)?.tagName,
         ) &&
-        !modal
+        !modal && !busy && projectId && (view === "tasks" || view === "bugs")
       ) {
         e.preventDefault();
-        open("draft");
+        open(view === "bugs" ? "new-bug" : "draft");
       }
     };
     window.addEventListener("keydown", listener);
     return () => window.removeEventListener("keydown", listener);
-  }, [dialog, detail, modal, projectId]);
+  }, [dialog, detail, modal, projectId, view, busy]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 3000);
@@ -281,7 +393,7 @@ function WorkspaceApp() {
     document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
   }, [lang]);
   useEffect(() => {
-    if (!modal) return;
+    if (!modal || detailPane) return;
     const previous = document.activeElement as HTMLElement;
     const frame = requestAnimationFrame(() => {
       const panel = document.querySelector<HTMLElement>("[role=dialog]");
@@ -311,7 +423,13 @@ function WorkspaceApp() {
       document.removeEventListener("keydown", trap);
       previous?.focus();
     };
-  }, [modal?.kind, modal?.item?.id]);
+  }, [modal?.kind, modal?.item?.id, detailPane]);
+  useEffect(() => {
+    if (!detail || dialog) return;
+    const frame = requestAnimationFrame(() => document.querySelector<HTMLElement>(".detail-pane .modal-close")?.focus({ preventScroll: true }));
+    return () => cancelAnimationFrame(frame);
+  }, [Boolean(detail), Boolean(dialog)]);
+  useEffect(() => () => { if (detailCloseTimer.current) clearTimeout(detailCloseTimer.current); }, []);
   useEffect(() => {
     const running =
       humanWork.data?.humanTasks?.filter(
@@ -333,6 +451,7 @@ function WorkspaceApp() {
     (inbox.data?.plans?.length ?? 0) +
     (inbox.data?.humanTasks?.length ?? 0) +
     (inbox.data?.acceptances?.length ?? 0) +
+    (inbox.data?.bugs?.length ?? 0) +
     (inbox.data?.runs?.length ?? 0);
   const projectName = (id: string) =>
     projects.data?.items.find((p) => p.id === id)?.name ?? id;
@@ -360,7 +479,7 @@ function WorkspaceApp() {
     </div>
   );
   const newButton = (
-    <button className="primary" onClick={() => open("draft")}>
+    <button className="primary" disabled={busy || !projectId} onClick={() => open("draft")}>
       ＋ {t("新建需求", "New request")} <kbd>N</kbd>
     </button>
   );
@@ -370,10 +489,52 @@ function WorkspaceApp() {
       new FormData(event.currentTarget).entries(),
     ) as Record<string, string>;
   }
+  const workPage = workPages.find(([key]) => key === view);
+  const sidebarView = workPage ? "work" : view;
   const titles =
-    navs.find((n) => n[0] === view) ??
+    workPage ?? navs.find(([key]) => key === view) ??
     (["settings", "设置", "Settings", "⚙"] as const);
+  const sectionTitle = workPage ? t("工作", "Work") : teamView ? t("Agent 团队", "Agent team") : view === "automations" ? t("自动化", "Automations") : null;
+  const pageTitle = teamView ? agentTeamSectionTitle(agentTeam.section, t) : view === "automations" ? automationNavigation.history ? t("全部运行记录", "All runs") : automationNavigation.workflow?.definition?.name ?? t("项目流程", "Project workflows") : t(titles[1], titles[2]);
+  const globalView = (teamView && agentTeam.section !== "agents") || view === "projects" || view === "settings";
   const item = modal?.item;
+  const agentRole = modal?.kind === "agent-role" ? allRoles.find((role) => role.id === item?.roleId) : undefined;
+  const workspaceSwitcher = (
+    <div className="workspace-switch" inert={Boolean(modal) && !detailPane}>
+      <span className="workspace-icon" aria-hidden="true">
+        {current?.name.slice(0, 1).toUpperCase() ?? "W"}
+      </span>
+      <select
+        aria-label={t("切换工作空间", "Switch workspace")}
+        name="workspace"
+        title={current ? `${current.name}\n${current.root}` : undefined}
+        value={projectId}
+        disabled={!activeProjects.length || busy}
+        onChange={(e) => setProject(e.target.value)}
+      >
+        {!activeProjects.length && (
+          <option value="">{t("尚未添加项目", "No projects yet")}</option>
+        )}
+        {activeProjects.map((p) => (
+          <option key={p.id} value={p.id}>{p.name}</option>
+        ))}
+      </select>
+      <button
+        type="button"
+        className="quiet workspace-add"
+        title={t("添加工作空间", "Add workspace")}
+        aria-label={t("添加工作空间", "Add workspace")}
+        disabled={busy}
+        onClick={() => open("project")}
+      >
+        ＋
+      </button>
+    </div>
+  );
+  const bugButton = view === "bugs" && projectId ? <button className="primary" onClick={() => open("new-bug")}>
+    ＋ {t("新建 Bug 单", "New bug")} <kbd>N</kbd>
+  </button> : null;
+  const showTopbar = !sectionTitle || !desktopWindow;
   return (
     <UIContext.Provider
       value={{
@@ -397,148 +558,104 @@ function WorkspaceApp() {
         act,
         busy,
         empty,
-        newButton,
         errorPanel,
         projectName,
         roleName,
         countInbox,
         copyText,
         closeModal,
+        closeTaskPanel: (id: string) => { setModal(null); if (detail?.id === id) clearDetail(); },
+        performTaskAction,
+        actionBusyIds,
+        pendingTaskId: dialog?.item?.moveTaskId,
+        showArchive: (id: string) => { setArchivesProjectId(id); setView("archives"); },
       }}
     >
-      <div className="app">
-        <aside className="sidebar" inert={Boolean(modal)}>
-          <button className="brand" onClick={() => setView("overview")}>
-            <span className="brand-mark">
-              <i />
-              <i />
-              <i />
-            </span>
-            <strong>Agent Team Kit</strong>
-            <span className="alpha">α</span>
-          </button>
-          <div className="workspace-switch">
-            <span className="workspace-icon" aria-hidden="true">
-              {current?.name.slice(0, 1).toUpperCase() ?? "W"}
-            </span>
-            <label className="workspace-choice">
-              <span>{t("工作空间", "Workspace")}</span>
-              <select
-                aria-label={t("切换工作空间", "Switch workspace")}
-                name="workspace"
-                title={current ? `${current.name}\n${current.root}` : undefined}
-                value={projectId}
-                disabled={!activeProjects.length || busy}
-                onChange={(e) => setProject(e.target.value)}
-              >
-                {!activeProjects.length && (
-                  <option value="">{t("尚未添加项目", "No projects yet")}</option>
-                )}
-                {activeProjects.map((p) => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
-                ))}
-              </select>
-            </label>
-            <button
-              className="quiet workspace-add"
-              aria-label={t("添加工作空间", "Add workspace")}
-              onClick={() => open("project")}
-            >
-              ＋
-            </button>
-          </div>
-          <nav>
+      <DesktopTitleBar lang={lang} workspace={workspaceSwitcher} />
+      <div className={(sectionTitle ? "app has-section-sidebar" : "app") + (view === "automations" ? " automation-shell" : "")}>
+        <aside className="sidebar" inert={Boolean(modal) && !detailPane}>
+          <nav aria-label={t("主导航", "Main navigation")}>
             {navs.map(([key, zh, en, icon]) => (
-              <div key={key}>
-                {key === "overview" && <div className="nav-label">{t("工作", "WORK")}</div>}
-                {key === "team" && (
-                  <div className="nav-label global-nav-label">
-                    {t("全局管理", "GLOBAL MANAGEMENT")}
-                  </div>
-                )}
                 <button
+                  key={key}
+                  type="button"
                   aria-label={t(zh, en)}
-                  aria-current={view === key ? "page" : undefined}
-                  className={view === key ? "nav-item active" : "nav-item"}
+                  title={t(zh, en)}
+                  aria-current={sidebarView === key ? "page" : undefined}
+                  className={sidebarView === key ? "nav-item active" : "nav-item"}
                   onClick={() => {
-                    setView(key);
+                    setView(key === "work" ? workPage?.[0] ?? "tasks" : key);
                     setError(null);
                   }}
                 >
-                  <span className="nav-icon">{icon}</span>
-                  {t(zh, en)}
-                  {key === "inbox" && countInbox > 0 && (
+                  <span className="nav-icon" aria-hidden="true">{icon}</span>
+                  {key === "team" ? t("团队", "Team") : t(zh, en)}
+                  {key === "work" && countInbox > 0 && (
                     <span className="nav-count">{countInbox}</span>
                   )}
                 </button>
-              </div>
             ))}
           </nav>
           <div className="sidebar-bottom">
             <button
+              type="button"
               className={view === "settings" ? "nav-item active" : "nav-item"}
+              aria-label={t("设置与运维", "Settings & operations")}
+              title={t("设置与运维", "Settings & operations")}
+              aria-current={view === "settings" ? "page" : undefined}
               onClick={() => setView("settings")}
             >
-              <span className="nav-icon">⚙</span>
-              {t("设置与运维", "Settings & operations")}
+              <span className="nav-icon" aria-hidden="true">⚙</span>
+              {t("设置", "Settings")}
             </button>
-            <div className="user">
+            <div className="user" title={t("你的工作台 · 本机单用户", "Your workspace · Local user")}>
               <span className="avatar small-avatar">Y</span>
-              <div>
-                <strong>{t("你的工作台", "Your workspace")}</strong>
-                <small>{t("本机单用户", "Local user")}</small>
-              </div>
-              <span
-                className={`connection ${live.connection}`}
-                title={live.connection}
-              />
             </div>
           </div>
         </aside>
-        <div className="main" inert={Boolean(modal)}>
-          <header className="topbar">
-            <div className="breadcrumbs">
-              <span className="workspace-breadcrumb" title={current?.root}>
-                {current?.name ?? t("工作空间", "Workspace")}
-              </span>
-              <span>/</span>
-              <strong>{t(titles[1], titles[2])}</strong>
-            </div>
-            <div className="top-actions">
-              <span className="live-label">
-                <span className={`connection ${live.connection}`} />
-                {live.connection === "live"
-                  ? t("实时同步", "Live")
-                  : t("重新连接中", "Reconnecting")}
-              </span>
-              <button
-                className="quiet"
-                onClick={() => {
-                  const l = lang === "zh" ? "en" : "zh";
-                  setLang(l);
-                  localStorage.setItem("atk-language", l);
-                }}
+        {sectionTitle && <aside className={"section-sidebar " + (workPage ? "work-sidebar" : view === "automations" ? "automation-sidebar" : "agent-team-sidebar")} inert={Boolean(modal) && !detailPane}>
+          <h2>{sectionTitle}</h2>
+          {workPage ? <>
+            <p className="section-nav-label">{t("视图", "Views")}</p>
+            <nav className="section-nav work-nav" aria-label={t("工作页面", "Work pages")}>
+              {workPages.map(([key, zh, en, icon]) => <button
+                type="button" key={key} aria-label={t(zh, en)} title={t(zh, en)} aria-current={view === key ? "page" : undefined}
+                onClick={() => { setView(key); setError(null); }}
               >
-                {lang === "zh" ? "EN" : "中文"}
-              </button>
-              {newButton}
+                <span className="section-nav-icon" aria-hidden="true">{icon}</span>
+                <span className="section-nav-text">{t(zh, en)}</span>
+                {key === "inbox" && countInbox > 0 && <span className="section-nav-count">{countInbox}</span>}
+              </button>)}
+            </nav>
+          </> : view === "automations" ? <AutomationNavigation state={automationNavigation} t={t} busy={busy || !projectId} create={() => open("automation-editor")} /> : <AgentTeamNavigation t={t} state={agentTeam} />}
+        </aside>}
+        <div className="main" inert={Boolean(modal) && !detailPane}>
+          {showTopbar && <header className="topbar">
+            <div className="topbar-left">
+              {!desktopWindow && workspaceSwitcher}
+              {!sectionTitle && <div className="breadcrumbs">
+                {!desktopWindow && <span>/</span>}
+                <strong>{pageTitle}</strong>
+              </div>}
             </div>
-          </header>
+          </header>}
           <main>
-            <div className="page-heading">
+            <div className={view === "tasks" ? "page-heading task-page-heading" : view === "bugs" ? "page-heading bug-page-heading" : "page-heading"} hidden={view === "automations"}>
               <div>
-                <h2>{t(titles[1], titles[2])}</h2>
+                <h2 id="page-heading-title">{pageTitle}</h2>
               </div>
-              {["team", "projects", "settings"].includes(view) && (
+              {globalView && (
                 <span className="muted">
                   {t("全局管理 · 跨工作空间共享", "Global management · Shared across workspaces")}
                 </span>
               )}
+              {view === "tasks" && newButton}
+              {bugButton}
             </div>
             {!modal && errorPanel(error)}
             {projects.error && errorPanel(projects.error as Row)}
-            <div key={projectId}>
-              {!projectId && !["team", "projects", "settings"].includes(view) ? (
+            <div key={globalView ? undefined : projectId}>
+              {!projectId && !globalView && view !== "archives" ? (
                 empty(
                   t("添加你的第一个工作空间", "Add your first workspace"),
                   t(
@@ -551,31 +668,34 @@ function WorkspaceApp() {
                 )
               ) : view === "overview" ? (
                 <Overview />
-              ) : view === "drafts" ? (
-                <TaskList key="drafts" drafts />
               ) : view === "tasks" ? (
-                <TaskList key="tasks" />
+                <TaskList />
+              ) : view === "archives" ? (
+                <ArchiveHistory key={archivesProjectId || projectId} t={t} lang={lang} epoch={epoch} projects={projects.data?.items ?? []} projectId={projectId}
+                  selectedId={archivesProjectId} select={setArchivesProjectId} open={open} />
+              ) : view === "bugs" ? (
+                <BugList />
               ) : view === "inbox" ? (
                 <Inbox />
               ) : view === "runs" ? (
                 <Runs />
+              ) : view === "collaboration" ? (
+                <Collaboration key={projectId} projectId={projectId} epoch={epoch} live={live} lang={lang} t={t} open={open}
+                  manage={() => { setView("team"); agentTeam.setSection("agents"); }} />
               ) : view === "team" ? (
-                <Team />
+                <AgentTeam t={t} state={agentTeam} currentTeamId={current?.teamId} projectId={projectId} roles={allRoles} teams={allTeams}
+                  open={open} badge={badge} errorPanel={errorPanel} copyText={copyText} />
               ) : view === "projects" ? (
                 <Projects />
+              ) : view === "automations" ? (
+                <Automations key={projectId + (automationNavigation.history ? ":history" : ":" + automationNavigation.workflow?.id)} t={t} lang={lang} projectId={projectId} epoch={epoch} busy={busy}
+                  edit={(workflow) => open("automation-editor", workflow)} act={act} navigation={automationNavigation} />
               ) : (
                 <Settings />
               )}
             </div>
           </main>
-          <footer>
-            <span>AGENT TEAM KIT</span>
-            <span>
-              {current?.name ?? t("独立工作空间", "Independent workspace")}{" "}
-              <span className="footer-dot">·</span>{" "}
-              {t("本地优先", "Local first")}
-            </span>
-          </footer>
+          <AppFooter lang={lang} setLang={setLang} connection={live.connection} />
         </div>
         {notice && (
           <div className="toast" role="status">
@@ -594,11 +714,11 @@ function WorkspaceApp() {
                 "modal " +
                 (["task", "plan", "run", "acceptance"].includes(modal.kind)
                   ? "wide"
-                  : "") + (detailPane ? " detail-pane" : "")
+                  : "") + (detailPane ? " detail-pane" + (detailClosing ? " closing" : "") : "")
               }
               role="dialog"
-              aria-modal="true"
-              aria-label={t("详情与操作", "Details and actions")}
+              aria-modal={!detailPane}
+              aria-label={modal.kind === "task" ? t("任务详情", "Task details") : modal.kind === "run" ? t("执行详情", "Run details") : modal.kind === "agent-role" ? t("角色模板", "Role template") : t("详情与操作", "Details and actions")}
             >
               <button
                 className="modal-close"
@@ -613,17 +733,19 @@ function WorkspaceApp() {
                   {projects.data ? t("链接中的工作空间不可用。", "The workspace in this link is unavailable.") : t("正在加载工作空间…", "Loading workspace…")}
                 </p>
               )}
-              {modal.kind === "task" && linkedProject && <Detail key={item!.id} id={item!.id} />}
-              {modal.kind === "plan" && <PlanDetail id={item!.id} />}
-              {modal.kind === "run" && linkedProject && <RunDetail key={item!.id} id={item!.id} />}
+              {modal.kind === "task" && linkedProject && <Detail key={item!.id} id={item!.id} taskProjectId={linkedProject.id} projectReadOnly={Boolean(linkedProject.archived)} />}
+              {modal.kind === "plan" && <PlanDetail key={item!.id} id={item!.id} guard={item} />}
+              {modal.kind === "run" && linkedProject && <RunDetail key={item!.id} id={item!.id} runProjectId={linkedProject.id} readOnly={Boolean(linkedProject.archived)} />}
+              {modal.kind === "cancel-task" && <CancelTaskPanel key={item!.id} task={item!} t={t} lang={lang} epoch={epoch} busy={busy} act={act} open={open} close={closeModal} />}
+              {modal.kind === "archive-task" && <ArchiveTaskPanel key={item!.id} task={item!} t={t} epoch={epoch} busy={busy} act={act} close={() => { setModal(null); if (detail?.id === item!.id) clearDetail(); }} />}
               {modal.kind === "draft" && (
                 <>
-                  <span className="eyebrow">INTAKE</span>
+                  <span className="eyebrow">{t("预排", "DRAFT")}</span>
                   <h2>{t("提交一个新需求", "Create a request")}</h2>
                   <p className="muted">
                     {t(
-                      "它会进入预排池，等待 PMAgent 规划。",
-                      "It enters the draft queue for your PM agent to plan.",
+                      "新需求会以「预排」状态出现在任务页，等待 PM Agent 规划。",
+                      "New requests appear in Tasks as Draft, ready for your PM agent to plan.",
                     )}
                   </p>
                   {!projects.data?.items.some((p) => !p.archived) ? (
@@ -682,12 +804,16 @@ function WorkspaceApp() {
                           {t("取消", "Cancel")}
                         </button>
                         <button className="primary" disabled={busy}>
-                          {t("提交到预排池", "Add to intake")}
+                          {t("创建需求", "Create request")}
                         </button>
                       </div>
                     </form>
                   )}
                 </>
+              )}
+              {modal.kind === "new-bug" && <BugEditor />}
+              {modal.kind === "automation-editor" && (
+                <AutomationEditor t={t} projectId={projectId} workflow={item as Workflow | undefined} busy={busy} act={act} />
               )}
               {modal.kind === "project" && (
                 <>
@@ -716,18 +842,9 @@ function WorkspaceApp() {
                     }}
                   >
                     <Fields>
-                      <Field
-                        name="name"
-                        title={t("项目名称", "Project name")}
-                        value={item?.name}
-                        required
-                      />
-                      <Field
-                        name="root"
-                        title={t("项目绝对路径", "Absolute project path")}
-                        value={item?.root}
-                        required
-                        placeholder="E:\Projects\my-project"
+                      <ProjectIdentityFields
+                        key={item?.id ?? "new-project"}
+                        project={item}
                       />
                       <Field
                         name="docsRoot"
@@ -761,17 +878,37 @@ function WorkspaceApp() {
                   </form>
                 </>
               )}
+              {modal.kind === "agent-role" && item && (
+                <>
+                  <h2>{t("角色模板", "Role template")}</h2>
+                  <p className="muted">{item.name}{agentRole && ` · ${agentRole.name}`}</p>
+                  {agentRole ? <>
+                    <dl className="role-template-details">
+                      <div><dt>{t("职能", "Function")}</dt><dd><code>{agentRole.function}</code></dd></div>
+                      <div><dt>{t("职责指令", "Instructions")}</dt><dd>{agentRole.instructions}</dd></div>
+                      <div><dt>{t("允许写入的范围", "Write scopes")}</dt><dd><code>{agentRole.files?.join("\n") || "—"}</code></dd></div>
+                      <div><dt>{t("输出要求", "Output requirements")}</dt><dd>{agentRole.output || "—"}</dd></div>
+                    </dl>
+                    <div className="modal-actions">
+                      <button type="button" onClick={() => open("role", agentRole)}>{t("编辑模板", "Edit template")}</button>
+                    </div>
+                  </> : errorPanel(roles.error) ?? <p className="muted" role="status">{roles.loading
+                    ? t("正在加载…", "Loading…")
+                    : t("暂时无法读取此 Agent 的角色模板。", "This agent’s role template is unavailable.")}</p>}
+                </>
+              )}
               {modal.kind === "role" && (
                 <>
                   <h2>
                     {item
-                      ? t("编辑角色", "Edit role")
+                      ? t("编辑角色模板", "Edit role template")
                       : t("新建角色模板", "New role template")}
                   </h2>
+                  {item && <p className="muted">{t("修改会应用到使用这份模板的所有 Agent。", "Changes apply to every agent using this template.")}</p>}
                   <form
-                    onSubmit={(e) => {
+                    onSubmit={async (e) => {
                       const v = formObject(e);
-                      void act(
+                      const saved = await act(
                         "/roles" + (item ? "/" + item.id : ""),
                         {
                           ...v,
@@ -782,7 +919,9 @@ function WorkspaceApp() {
                           version: item?.version,
                         },
                         item ? "PATCH" : "POST",
+                        false,
                       );
+                      if (saved) setModal((active) => active === dialog ? null : active);
                     }}
                   >
                     <Fields>
@@ -942,9 +1081,10 @@ function WorkspaceApp() {
                     onSubmit={async (e) => {
                       const v = formObject(e);
                       const result = await act(
-                        "/agents" + (item ? "/" + item.id : ""),
+                        "/agents" + (item ? "/" + item.id + "?projectId=" + encodeURIComponent(item.projectId) : ""),
                         {
                           ...v,
+                          projectId: item?.projectId ?? projectId,
                           capacity: Number(v.capacity),
                           version: item?.version,
                         },
@@ -963,18 +1103,10 @@ function WorkspaceApp() {
                         value={item?.name}
                         required
                       />
-                      <Field name="teamId" title={t("团队", "Team")}>
-                        <select name="teamId" defaultValue={item?.teamId}>
-                          {allTeams.map((team: Row) => (
-                            <option key={team.id} value={team.id}>
-                              {team.name}
-                            </option>
-                          ))}
-                        </select>
-                      </Field>
+                      <div className="field"><span>{t("所属项目（创建后固定）", "Project (fixed after creation)")}</span><strong>{projectName(item?.projectId ?? projectId)}</strong></div>
                       <Field name="roleId" title={t("角色", "Role")}>
                         <select name="roleId" defaultValue={item?.roleId}>
-                          {allRoles.map((role: Row) => (
+                          {allRoles.filter((role: Row) => allTeams.find((v: Row) => v.id === current?.teamId)?.roleIds.includes(role.id)).map((role: Row) => (
                             <option key={role.id} value={role.id}>
                               {role.name} · {role.function}
                             </option>
@@ -1001,6 +1133,7 @@ function WorkspaceApp() {
               {modal.kind === "credential" && (
                 <>
                   <h2>{t("保存接入凭据", "Save your credential")}</h2>
+                  {item!.recovered && <p>{t("已为原 Agent 重新签发凭据，身份和历史保持不变。", "Issued a new credential for the same agent; its identity and history are preserved.")}<br /><code>{item!.agent.id}</code></p>}
                   <p className="warning">
                     {t(
                       "只展示这一次。关闭后无法再次查看；不要将它提交到项目或日志。",
@@ -1034,6 +1167,7 @@ function WorkspaceApp() {
                 </>
               )}
               {modal.kind === "connection" && <AgentConnection id={item!.id} />}
+              {(modal.kind === "agent-recover" || modal.kind === "agent-delete") && <AgentIdentityAction id={item!.id} projectId={item!.projectId} action={modal.kind === "agent-recover" ? "recover" : "delete"} />}
               {modal.kind === "assignment" && (
                 <TaskAssignment key={item!.id} id={item!.id} projectId={item!.projectId} />
               )}
@@ -1044,114 +1178,9 @@ function WorkspaceApp() {
                     body, "PATCH",
                   )} />
               )}
-              {modal.kind === "human" && (
-                <>
-                  <h2>{t("完成人工任务", "Complete human task")}</h2>
-                  <h3>{item!.title}</h3>
-                  <p>{item!.acceptance}</p>
-                  <form
-                    onSubmit={(e) => {
-                      const v = formObject(e);
-                      void act(`/tasks/${item!.id}/human-complete`, {
-                        summary: v.summary,
-                        checks: item!.checks.map((c: Row, i: number) => ({
-                          name: c.name,
-                          passed: v["passed" + i] === "on",
-                          exitCode: 0,
-                          log: v["log" + i],
-                        })),
-                      });
-                    }}
-                  >
-                    <Fields>
-                      <Field
-                        name="summary"
-                        title={t("完成说明", "Completion notes")}
-                        required
-                        area
-                      />
-                      {item!.checks.map((c: Row, i: number) => (
-                        <fieldset key={c.name}>
-                          <legend>{c.name}</legend>
-                          <code>{c.command}</code>
-                          <label className="checkbox">
-                            <input
-                              type="checkbox"
-                              name={"passed" + i}
-                              required
-                            />
-                            {t("已执行并通过", "Executed and passed")}
-                          </label>
-                          <Field
-                            name={"log" + i}
-                            title={t("检查输出", "Check output")}
-                            required
-                            area
-                          />
-                        </fieldset>
-                      ))}
-                    </Fields>
-                    <div className="modal-actions">
-                      <button className="primary" disabled={busy}>
-                        {t("确认完成", "Confirm complete")}
-                      </button>
-                    </div>
-                  </form>
-                </>
-              )}
-              {modal.kind === "acceptance" && (
-                <>
-                  <div className="detail-top">
-                    {badge(item!.status)}
-                    <code>{item!.targetHash.slice(0, 16)}</code>
-                  </div>
-                  <h2>{t("验收整份计划", "Accept the complete plan")}</h2>
-                  <p>
-                    {t(
-                      "确认计划交付达到预期。系统会再次校验文件与当前验收目标一致。",
-                      "Confirm the delivered plan meets expectations. Files are checked again against this target.",
-                    )}
-                  </p>
-                  <div className="task-list">
-                    {Object.entries(item!.files).map(([file, data]) => (
-                      <div className="list-row" key={file}>
-                        <code>{file}</code>
-                        <code className="muted">
-                          {(data as Row).hash?.slice(0, 16) ??
-                            t("已删除", "Deleted")}
-                        </code>
-                      </div>
-                    ))}
-                  </div>
-                  {item!.drift && (
-                    <pre>{JSON.stringify(item!.drift, null, 2)}</pre>
-                  )}
-                  <div className="modal-actions">
-                    <button onClick={() => open("plan", { id: item!.planId })}>
-                      {t("查看计划", "View plan")}
-                    </button>
-                    <button
-                      onClick={() =>
-                        act(`/acceptances/${item!.id}/revalidate`, {})
-                      }
-                    >
-                      {t("检查变化并标记重验", "Detect changes & revalidate")}
-                    </button>
-                    <button
-                      className="primary"
-                      disabled={busy || item!.status !== "PENDING"}
-                      onClick={() =>
-                        act(`/acceptances/${item!.id}/approve`, {
-                          version: item!.version,
-                          targetHash: item!.targetHash,
-                        })
-                      }
-                    >
-                      {t("确认整份计划验收通过", "Accept this plan")}
-                    </button>
-                  </div>
-                </>
-              )}
+              {modal.kind === "human" && <HumanCompletion key={item!.id} task={item!} />}
+              {modal.kind === "retry-task" && <RetryTaskConfirmation key={item!.id} task={item!} />}
+              {modal.kind === "acceptance" && <AcceptanceReview key={item!.id} acceptance={item!} />}
               {modal.kind === "revision" && (
                 <>
                   <h2>{t("要求修改计划", "Request a plan revision")}</h2>
@@ -1228,26 +1257,6 @@ function WorkspaceApp() {
                   </form>
                 </>
               )}
-              {modal.kind === "revoke" && (
-                <>
-                  <h2>{t("撤销 Agent 凭据", "Revoke agent credential")}</h2>
-                  <p>{item!.name}</p>
-                  <p className="muted">
-                    {t(
-                      "正在执行的任务将要求停止，文件锁会保留到确认停止。",
-                      "Active executions will require stopping; locks remain until confirmed.",
-                    )}
-                  </p>
-                  <div className="modal-actions">
-                    <button
-                      className="danger"
-                      onClick={() => act(`/agents/${item!.id}/revoke`, {})}
-                    >
-                      {t("撤销凭据", "Revoke")}
-                    </button>
-                  </div>
-                </>
-              )}
               {["backup", "restore"].includes(modal.kind) && (
                 <>
                   <h2>
@@ -1308,8 +1317,138 @@ const UIContext = createContext<any>(null);
 function useUI() {
   return useContext(UIContext);
 }
+
+function HumanCompletion({ task }: { task: Row }) {
+  const { t, epoch, busy, act, closeModal } = useUI();
+  const current = useData<Row>(`/tasks/${task.id}?projectId=${encodeURIComponent(task.projectId)}`, epoch);
+  const run = task.humanRun;
+  const stale = !run || !current.data || current.error || current.data.version !== task.version ||
+    current.data.humanRun?.id !== run.id || current.data.humanRun?.generation !== run.generation ||
+    !current.data.humanActions?.some((a: HumanAction) => a.type === "COMPLETE_HUMAN" && a.enabled);
+  return <>
+    <h2>{t("完成人工任务", "Complete human task")}</h2><h3>{task.title}</h3><p>{task.acceptance}</p>
+    {current.data && stale && <p role="alert" className="warning">{t("任务或运行已变化，请关闭后重新打开。填写内容不会被自动提交。", "The task or run changed. Close and reopen; your notes will not be submitted automatically.")}</p>}
+    {current.error && <p role="alert">{t("无法核对当前运行，请稍后重新打开。", "Cannot check the current run. Reopen it when connected.")}</p>}
+    <form onSubmit={(e) => {
+      e.preventDefault();
+      const v = Object.fromEntries(new FormData(e.currentTarget));
+      if (stale) return;
+      void act(`/tasks/${task.id}/human-complete?projectId=${encodeURIComponent(task.projectId)}`, {
+        version: task.version, runId: run.id, generation: run.generation, summary: v.summary,
+        checks: task.checks.map((c: Row, i: number) => ({ name: c.name, passed: v["passed" + i] === "on", exitCode: 0, log: v["log" + i] })),
+      });
+    }}>
+      <Fields><Field name="summary" title={t("完成说明", "Completion notes")} required area />
+        {task.checks.map((c: Row, i: number) => <fieldset key={c.name}><legend>{c.name}</legend><code>{c.command}</code>
+          <label className="checkbox"><input type="checkbox" name={"passed" + i} required />{t("已执行并通过", "Executed and passed")}</label>
+          <Field name={"log" + i} title={t("检查输出", "Check output")} required area />
+        </fieldset>)}
+      </Fields>
+      <div className="modal-actions"><button type="button" onClick={closeModal}>{t("取消", "Cancel")}</button>
+        <button className="primary" disabled={busy || Boolean(stale)}>{t("确认完成", "Confirm complete")}</button></div>
+    </form>
+  </>;
+}
+
+function RetryTaskConfirmation({ task }: { task: Row }) {
+  const { t, epoch, act, busy, closeModal, closeTaskPanel } = useUI();
+  const current = useData<Row>(`/tasks/${task.id}?projectId=${encodeURIComponent(task.projectId)}`, epoch);
+  const stale = !current.data || current.error || actionKey(current.data) !== actionKey(task);
+  return <><h2>{t("重新排队", "Requeue task")}</h2><h3>{task.title}</h3>
+    <p>{t("旧运行已停止。重新排队恢复领取资格；依赖或文件条件尚未满足时，任务会继续等待。", "The old run has stopped. Requeueing restores eligibility; dependencies or files may still require waiting.")}</p>
+    {current.data && stale && <p className="warning" role="alert">{t("任务条件已变化，请重新核对。", "Task conditions changed; review again.")}</p>}
+    {current.error && <p role="alert">{t("无法核对当前任务，请稍后重新打开。", "Cannot check the task; reopen when connected.")}</p>}
+    <div className="modal-actions"><button onClick={closeModal}>{t("取消", "Cancel")}</button>
+      <button className="primary" disabled={busy || Boolean(stale)} onClick={async () => { if (await act(`/tasks/${task.id}/retry?projectId=${encodeURIComponent(task.projectId)}`, { version: task.version })) closeTaskPanel(task.id); }}>{t("确认重新排队", "Confirm requeue")}</button></div>
+  </>;
+}
+
+function AcceptanceReview({ acceptance }: { acceptance: Row }) {
+  const { t, epoch, badge, open, act, busy, closeModal, projects } = useUI();
+  const tasks = useData<Page>(`/tasks?projectId=${encodeURIComponent(acceptance.projectId)}&parentId=${encodeURIComponent(acceptance.sourceTaskId)}&planId=${encodeURIComponent(acceptance.planId)}&limit=500`, epoch);
+  const current = useData<Row>(`/acceptances/${acceptance.id}`, epoch);
+  const source = useData<Row>(`/tasks/${acceptance.sourceTaskId}?projectId=${encodeURIComponent(acceptance.projectId)}`, epoch);
+  const stale = !current.data || current.error || current.data.status !== "PENDING" || current.data.version !== acceptance.version || current.data.targetHash !== acceptance.targetHash;
+  const readOnly = acceptance.readOnly || source.data?.archivedAt || projects.data?.items.find((p: Row) => p.id === acceptance.projectId)?.archived;
+  return <>
+    <div className="detail-top">{badge(acceptance.status)}<code>{acceptance.targetHash.slice(0, 16)}</code></div>
+    <h2>{t("验收整份计划", "Accept the complete plan")}</h2>
+    <h3>{source.data?.title ?? acceptance.sourceTitle}</h3>
+    <p>{t("确认计划交付达到预期。系统会再次校验文件与当前验收目标一致。", "Confirm the delivered plan meets expectations. Files are checked again against this target.")}</p>
+    <section className="acceptance-impact"><h3>{t("本次验收影响的工作", "Work affected by this acceptance")}</h3>
+    <p className="muted">{t("验收通过会关闭整项需求，并同时关闭下列已验证工作。", "Acceptance closes the requirement and the verified work below.")}</p>
+    {tasks.error ? <p role="alert">{t("无法读取工作清单，请关闭后重新核对。", "Cannot load the work list. Close and review again.")}</p>
+      : tasks.data?.items.map((task: Row) => <p key={task.id}><strong>{task.title}</strong>{" "}{badge(task.status)}</p>)}
+    </section>
+    <div className="task-list">{Object.entries(acceptance.files).map(([file, data]) => <div className="list-row" key={file}>
+      <code>{file}</code><code className="muted">{(data as Row).hash?.slice(0, 16) ?? t("已删除", "Deleted")}</code>
+    </div>)}</div>
+    {acceptance.drift && <pre>{JSON.stringify(acceptance.drift, null, 2)}</pre>}
+    {current.data && stale && <p className="warning" role="alert">{t("验收状态或目标已变化，请重新核对。", "The acceptance state or target changed; review again.")}</p>}
+    {(current.error || source.error) && <p role="alert">{t("无法核对当前验收，请稍后重新打开。", "Cannot check current acceptance. Reopen when connected.")}</p>}
+    <div className="modal-actions">
+      <button onClick={closeModal}>{t("取消", "Cancel")}</button>
+      <button onClick={() => open("plan", { id: acceptance.planId, readOnly })}>{t("查看计划", "View plan")}</button>
+      {!readOnly && <button onClick={() => act(`/acceptances/${acceptance.id}/revalidate`, {})}>{t("检查变化并标记重验", "Detect changes & revalidate")}</button>}
+      {!readOnly && <button className="primary" disabled={busy || Boolean(stale) || !tasks.data || Boolean(tasks.error) || !source.data || Boolean(source.error)}
+        onClick={() => act(`/acceptances/${acceptance.id}/approve`, { version: acceptance.version, targetHash: acceptance.targetHash })}>{t("确认整份计划验收通过", "Accept this plan")}</button>}
+    </div>
+  </>;
+}
 function Fields({ children }: { children: ReactNode }) {
   return <div className="fields">{children}</div>;
+}
+function ProjectIdentityFields({ project }: { project?: Row }) {
+  const { t } = useUI();
+  const id = useId();
+  const [path, setPath] = useState<string>(project?.root ?? "");
+  const [customName, setCustomName] = useState<string | null>(project?.name ?? null);
+  const [choosing, setChoosing] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const choose = desktopWindow?.chooseProjectFolder;
+  const folderName = path.trim().split(/[\\/]+/).filter(Boolean).at(-1) ?? "";
+
+  return (
+    <>
+      <div className="field">
+        <label className="project-folder-label" htmlFor={id}>
+          {t("项目绝对路径", "Absolute project path")}
+        </label>
+        <div className="project-folder-input">
+          <input id={id} name="root" required placeholder="E:\Projects\my-project"
+            value={path} onChange={(event) => setPath(event.target.value)} />
+          {choose && <button type="button" disabled={choosing} onClick={async () => {
+            setChoosing(true);
+            setFailed(false);
+            try {
+              const selected = await choose(path.trim());
+              if (selected !== null) setPath(selected);
+            } catch {
+              setFailed(true);
+            } finally {
+              setChoosing(false);
+            }
+          }}>{t("选择文件夹", "Choose folder")}</button>}
+        </div>
+        {failed && <span role="alert">{t(
+          "无法打开文件夹选择器。你可以手动输入路径。",
+          "Could not open the folder picker. Enter the path manually.",
+        )}</span>}
+      </div>
+      <Field name="name" title={t("项目名称", "Project name")}>
+        <input
+          name="name"
+          required
+          value={customName ?? folderName}
+          placeholder={t("默认使用文件夹名称", "Defaults to the folder name")}
+          onChange={(event) => setCustomName(event.target.value)}
+          onBlur={() => {
+            if (!project && customName?.trim() === "") setCustomName(null);
+          }}
+        />
+      </Field>
+    </>
+  );
 }
 function Field({
   name,
@@ -1352,14 +1491,140 @@ function Field({
   );
 }
 
-function AgentConnection({ id }: { id: string }) {
-  const { t, epoch, roleName, copyText } = useUI();
+const bugStates: Record<string, [string, string]> = {
+  READY: ["待修复", "To fix"], RUNNING: ["修复中", "Fixing"],
+  AWAITING_ACCEPTANCE: ["待验收", "Awaiting acceptance"], DONE: ["已关闭", "Closed"],
+  BLOCKED: ["已阻塞", "Blocked"],
+  CANCELLED: ["已取消", "Cancelled"],
+};
+
+function BugBadge({ status }: { status: string }) {
+  const { t } = useUI();
+  return <span className={`badge status-${status}`}><span className="status-dot" />{t(...(bugStates[status] ?? [status, status]))}</span>;
+}
+
+function BugEditor() {
+  const { t, current, projectId, allRoles, allTeams, act, busy, closeModal } = useUI();
+  const team = allTeams.find((row: Row) => row.id === current?.teamId);
+  const roles = allRoles.filter((row: Row) => row.function === "WORKER" && team?.roleIds.includes(row.id) && row.files?.length);
+  const [selected, setSelected] = useState("");
+  const role = roles.find((row: Row) => row.id === selected) ?? roles[0];
+  return <>
+    <h2>{t("新建 Bug 单", "Report a bug")}</h2>
+    <p className="muted">{t("创建后直接进入待修复，由所选角色的 Agent 主动领取。", "The bug goes straight to the repair queue for an agent with the selected role.")}</p>
+    {!role ? <p role="status">{t("请先给当前小队添加一个有可写文件范围的执行角色。", "First add a worker role with writable file scopes to this squad.")}</p> :
+      <form onSubmit={(event) => {
+        event.preventDefault();
+        const fields = new FormData(event.currentTarget);
+        const files = String(fields.get("bugFiles") ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+        void act("/bugs", { projectId, title: fields.get("bugTitle"), description: fields.get("bugDescription"),
+          acceptance: fields.get("bugAcceptance"), roleId: role.id, ...(files.length ? { files } : {}) });
+      }}>
+        <Fields>
+          <Field name="bugTitle" title={t("Bug 标题", "Bug title")} required />
+          <Field name="bugDescription" title={t("Bug 描述", "Bug description")} required area
+            placeholder={t("复现步骤、实际结果和期望结果…", "Steps to reproduce, actual behavior, and expected behavior…")} />
+          <Field name="bugAcceptance" title={t("验收条件（可选）", "Acceptance criteria (optional)")} area />
+          <Field name="bugRole" title={t("修复角色", "Repair role")}>
+            <select name="bugRole" value={role.id} onChange={(event) => setSelected(event.target.value)}>
+              {roles.map((row: Row) => <option key={row.id} value={row.id}>{row.name}</option>)}
+            </select>
+          </Field>
+          <Field name="bugFiles" title={t("文件范围（每行一项，可留空）", "File scope (one per line, optional)")}>
+            <textarea key={role.id} name="bugFiles" rows={2} placeholder={role.files.join("\n")} />
+          </Field>
+          <small className="muted">{t("留空使用该角色的文件范围。知道涉及哪些文件时，建议填更小的范围。", "Leave blank to use the role's scope. Specify a narrower scope when you know the affected files.")}</small>
+        </Fields>
+        <div className="modal-actions">
+          <button type="button" onClick={closeModal}>{t("取消", "Cancel")}</button>
+          <button className="primary" disabled={busy}>{t("创建 Bug 单", "Create bug")}</button>
+        </div>
+      </form>}
+  </>;
+}
+
+function BugList() {
+  const { t, projectId, epoch, open, roleName, errorPanel, empty } = useUI();
+  const [status, setStatus] = useState("");
+  const [cursor, setCursor] = useState(0);
+  const query = new URLSearchParams({ projectId, status, cursor: String(cursor), limit: "30" });
+  const { data, loading, error } = useData<Page>(`/bugs?${query}`, epoch);
+  return <>
+    <div className="toolbar">
+      <label>{t("状态", "Status")} <select aria-label={t("Bug 状态", "Bug status")} value={status}
+        onChange={(event) => { setStatus(event.target.value); setCursor(0); }}>
+        <option value="">{t("全部状态", "All statuses")}</option>
+        {Object.entries(bugStates).map(([key, names]) => <option key={key} value={key}>{t(...names)}</option>)}
+      </select></label>
+    </div>
+    {errorPanel(error)}
+    {loading && !data && <p role="status">{t("正在加载…", "Loading…")}</p>}
+    {data?.items.length === 0 && empty(t("没有 Bug 单", "No bugs"),
+      status ? t("没有符合当前状态的 Bug 单。", "No bugs match this status.") : t("报一个 Bug，让修复角色的 Agent 领取。", "Report a bug for an agent with the repair role to claim."))}
+    {!!data?.items.length && <div className="task-list">{data.items.map((bug) => <div className="list-row" key={bug.id}>
+      <div className="grow"><button className="text-button" onClick={() => open("task", bug)}><strong>{bug.title}</strong></button>
+        <p className="muted">{roleName(bug.roleId)} · {time(bug.createdAt)}</p></div>
+      <BugBadge status={bug.status} />
+    </div>)}</div>}
+    {(cursor > 0 || data?.nextCursor != null) && <div className="pagination">
+      <button disabled={!cursor} onClick={() => setCursor(Math.max(0, cursor - 30))}>{t("上一页", "Previous")}</button>
+      <button disabled={data?.nextCursor == null} onClick={() => setCursor(data?.nextCursor ?? 0)}>{t("下一页", "Next")}</button>
+    </div>}
+  </>;
+}
+
+function BugAcceptance({ bug }: { bug: Row }) {
+  const { t, act, busy } = useUI();
+  const [rejecting, setRejecting] = useState(false);
+  const route = `/bugs/${encodeURIComponent(bug.id)}/review?projectId=${encodeURIComponent(bug.projectId)}`;
+  const candidate = { version: bug.version, targetHash: bug.resultHash };
+  return <section className="detail-section">
+    <h3>{t("修复验收", "Fix acceptance")}</h3>
+    {rejecting ? <form onSubmit={(event) => {
+      event.preventDefault();
+      const reason = new FormData(event.currentTarget).get("bugRejectionReason");
+      void act(route, { ...candidate, decision: "REJECT", reason }, "POST", false);
+    }}>
+      <Field name="bugRejectionReason" title={t("退回原因", "Reason for returning")} area required />
+      <div className="toolbar">
+        <button type="button" disabled={busy} onClick={() => setRejecting(false)}>{t("取消", "Cancel")}</button>
+        <button className="primary" disabled={busy}>{t("确认退回待修复", "Return to repair queue")}</button>
+      </div>
+    </form> : <div className="toolbar">
+      <button className="primary" disabled={busy} onClick={() => act(route, { ...candidate, decision: "ACCEPT" }, "POST", false)}>{t("验收通过并关闭", "Accept and close")}</button>
+      <button disabled={busy} onClick={() => setRejecting(true)}>{t("验收失败，退回", "Reject and return")}</button>
+    </div>}
+  </section>;
+}
+
+function AgentIdentityAction({ id, projectId, action }: { id: string; projectId: string; action: "recover" | "delete" }) {
+  const { t, epoch, busy, act, open, closeModal } = useUI();
   const tick = useRefreshTick(true);
-  const { data: agent, error } = useData<Row>("/agents/" + encodeURIComponent(id), epoch + tick);
-  const command = `$env:ATK_URL = "${location.origin}"\n$env:ATK_AGENT_TOKEN = "<credential>"\natk-agent doctor`;
+  const route = `/agents/${encodeURIComponent(id)}?projectId=${encodeURIComponent(projectId)}`;
+  const { data: agent, error } = useData<Row>(route, epoch + tick);
+  const recovering = action === "recover";
+  return <><h2>{recovering ? t("恢复 Agent 接入", "Reconnect agent") : t("删除项目 Agent", "Delete project agent")}</h2>
+    {agent ? <><h3>{agent.name}</h3><p className="muted mono">{agent.id}</p>
+      <p>{recovering ? t("为这个 Agent 重新签发凭据，原 ID、项目、角色和历史记录不变。旧凭据立即失效，新凭据只展示一次。", "Issue a new credential for this agent, preserving its ID, project, role and history. The old credential becomes invalid; the new one is shown once.") : t("从项目 Agent 列表移除，并让凭据失效。历史任务和运行记录保留；仍指派给它的任务需要改派。", "Remove this agent from the project list and invalidate its credential. Task and run history is preserved; tasks assigned to it will need reassignment.")}</p>
+      <p className="muted">{t("如有活动或不确定的任务、CI 执行，请先停止并确认结束。", "Stop and confirm any active or uncertain task or CI execution first.")}</p>
+    </> : <p role={error ? "alert" : "status"}>{error ? t("无法读取 Agent，请关闭后重试。", "Cannot load the agent. Close and retry.") : t("正在加载…", "Loading…")}</p>}
+    <div className="modal-actions"><button type="button" onClick={closeModal}>{t("取消", "Cancel")}</button>
+      <button className={recovering ? "primary" : "danger"} disabled={busy || !agent || Boolean(error)} onClick={async () => {
+        if (!agent) return;
+        const result = await act(recovering ? `/agents/${encodeURIComponent(id)}/recover?projectId=${encodeURIComponent(projectId)}` : route, { version: agent.version }, recovering ? "POST" : "DELETE", false);
+        if (result) { if (recovering) open("credential", { ...result, recovered: true }); else closeModal(); }
+      }}>{recovering ? t("重新签发凭据", "Issue new credential") : t("确认删除", "Delete agent")}</button></div>
+  </>;
+}
+
+function AgentConnection({ id }: { id: string }) {
+  const { t, epoch, roleName, copyText, projectId, open } = useUI();
+  const tick = useRefreshTick(true);
+  const { data: agent, error } = useData<Row>("/agents/" + encodeURIComponent(id) + "?projectId=" + encodeURIComponent(projectId), epoch + tick);
+  const command = agentCliSetup();
   const recent = agent?.lastSeen != null && Date.now() - agent.lastSeen < LEASE_MS;
   if (!agent) return <p role={error ? "alert" : "status"}>{error ? t("无法读取接入状态。", "Could not load connection status.") : t("正在加载…", "Loading…")}</p>;
-  const state = agent.revoked ? t("已撤销", "Revoked")
+  const state = agent.revoked ? t("凭据已失效", "Credential invalid")
     : recent ? t("最近已联系", "Recently seen")
     : agent.lastSeen != null ? t("联系已过期", "Contact expired")
     : t("尚未联系", "Not seen yet");
@@ -1371,7 +1636,7 @@ function AgentConnection({ id }: { id: string }) {
         <div><strong>{agent.name} · {state}</strong><small>{roleName(agent.roleId)} · {t("上次联系", "Last contact")}: {time(agent.lastSeen)}</small></div>
       </div>
       {error && <p role="alert">{t("状态刷新失败，上面显示的是上次结果。", "Refresh failed; showing the previous result.")}</p>}
-      {agent.revoked ? <p>{t("该凭据已失效。请创建一个新身份。", "This credential is invalid. Create a new identity to continue.")}</p> : (
+      {agent.revoked ? <p>{t("该凭据已失效。使用“恢复接入”为这个 Agent 重新签发凭据。", "This credential is invalid. Use Reconnect to issue a new credential for this agent.")}</p> : (
         <ol className="setup-steps">
           <li>
             <strong>{t("验证服务和凭据", "Verify the service and credential")}</strong>
@@ -1388,6 +1653,7 @@ function AgentConnection({ id }: { id: string }) {
           </li>
         </ol>
       )}
+      <div className="modal-actions"><button onClick={() => open("agent-recover", agent)}>{t("恢复接入", "Reconnect")}</button></div>
     </>
   );
 }
@@ -1463,22 +1729,23 @@ function DispatchNotice({ row, dispatch }: { row: Row; dispatch: Row | null }) {
         </small>
       )}
       {["NO_MATCHING_AGENT", "NO_RECENT_AGENT"].includes(code) && (
-        <button className="text-button" onClick={() => { closeModal(); setView("team"); }}>{t("查看 Agent 与团队", "Open agents & teams")} →</button>
+        <button className="text-button" onClick={() => { closeModal(); setView("team"); }}>{t("查看 Agent 团队", "Open agent team")} →</button>
       )}
       {row.waiting?.holders?.map((holder: Row) => (
-        <p key={holder.runId + holder.file}><code>{holder.file}</code> · {holder.agentName}{" "}
+        holder.external ? <p key={"external:" + holder.file}>{t("文件被其他项目占用。", "Files are occupied by another project.")}</p> : <p key={holder.runId + holder.file}><code>{holder.file}</code> · {holder.agentName}{" "}
           <button className="text-button" onClick={() => open("run", { id: holder.runId, projectId: holder.projectId })}>{t("查看占用执行", "View blocking run")}</button>
         </p>
       ))}
       {row.waiting?.tasks?.map((dep: Row) => (
-        <p key={dep.id}><button className="text-button" onClick={() => open("task", dep)}>{dep.title}</button>{" "}{badge(dep.status)}</p>
+        <p key={dep.id}><button className="text-button" onClick={() => open("task", { ...dep, projectId: row.projectId })}>{dep.title}</button>{" "}{badge(dep.status)}</p>
       ))}
     </section>
   );
 }
 
-function Detail({ id }: { id: string }) {
-  const { lang, t, epoch, badge, open, act, busy, projectId, projectName, roleName, copyText, errorPanel, closeModal } = useUI();
+function Detail({ id, taskProjectId, projectReadOnly = false }: { id: string; taskProjectId?: string; projectReadOnly?: boolean }) {
+  const { lang, t, epoch, badge, open, act, busy, projectId: selectedProjectId, projectName, roleName, copyText, errorPanel, closeModal, performTaskAction } = useUI();
+  const projectId = taskProjectId ?? selectedProjectId;
   const [cursor, setCursor] = useState(0);
   const [acceptanceError, setAcceptanceError] = useState<Row | null>(null);
   const projectQuery = "projectId=" + encodeURIComponent(projectId);
@@ -1493,44 +1760,52 @@ function Detail({ id }: { id: string }) {
   const children = useData<Page>(row?.kind === "REQUEST" && row.planId ? "/tasks?" + projectQuery + "&parentId=" + encodeURIComponent(id) + "&planId=" + encodeURIComponent(row.planId) + "&limit=200" : null, epoch);
   if (!row) return task.error ? errorPanel(task.error) : <p role="status">{t("正在加载…", "Loading…")}</p>;
   const acceptance = acceptances.data?.items[0];
+  const bug = row.kind === "BUG";
+  const readOnly = projectReadOnly || Boolean(row.archivedAt);
   return (
     <>
       <div className="detail-toolbar">
-        <span>{projectName(row.projectId)} / {row.kind === "REQUEST" ? t("需求", "Request") : t("任务", "Task")}</span>
+        <span>{projectName(row.projectId)} / {bug ? t("Bug 单", "Bug") : row.kind === "REQUEST" ? t("需求", "Request") : t("任务", "Task")}</span>
         <button className="quiet" onClick={() => copyText(detailUrl({ kind: "task", id, projectId }).href, t("已复制任务链接", "Task link copied"))}>{t("复制任务链接", "Copy task link")}</button>
       </div>
-      <div className="detail-heading">{badge(row.status)}<h2>{row.title}</h2></div>
+      <div className="detail-heading">{bug ? <BugBadge status={row.status} /> : badge(row.status)}<h2>{row.title}</h2></div>
       <div className="detail-layout">
         <div className="detail-body">
-          <p className="detail-description prewrap">{row.description}</p>
-          {row.acceptance && <section className="detail-section"><h3>{t("验收条件", "Acceptance criteria")}</h3><p className="prewrap">{row.acceptance}</p></section>}
+          <details className="detail-section" open><summary>{t("任务说明", "Task description")}</summary><p className="detail-description prewrap">{row.description}</p></details>
+          {row.cancellation && <section className="detail-section"><h3>{t("取消原因", "Cancellation reason")}</h3><p className="prewrap">{row.cancellation.reason}</p><small className="muted">{time(row.cancellation.at)}</small></section>}
+          {row.archivedAt && <p className="muted">{t("已归档", "Archived")} · {time(row.archivedAt)}</p>}
+          <TaskRecordActions task={row} projectReadOnly={projectReadOnly} t={t} busy={busy} open={open} />
+          {row.acceptance && <details className="detail-section"><summary>{t("验收条件", "Acceptance criteria")}</summary><p className="prewrap">{row.acceptance}</p></details>}
+          {bug && row.bugReview?.decision === "REJECT" && <section className="detail-section">
+            <h3>{t("上次退回原因", "Last rejection")}</h3><p className="prewrap">{row.bugReview.summary}</p>
+          </section>}
+          {!readOnly && bug && row.status === "AWAITING_ACCEPTANCE" && <BugAcceptance key={row.resultHash} bug={row} />}
           <DispatchNotice row={row} dispatch={dispatch.data} />
           {dispatch.error && <p className="muted" role="status">{t("领取诊断暂不可用。", "Claim diagnostics are temporarily unavailable.")}</p>}
           {row.blockReason && <div className="warning">{reason(row.blockReason, lang)}</div>}
           {row.drift && <details><summary>{t("查看文件变化", "View file changes")}</summary><pre>{JSON.stringify(row.drift, null, 2)}</pre></details>}
-          {row.status === "BLOCKED" && row.kind === "WORK" && (
-            <button className="primary" disabled={busy} onClick={async () => {
+          {!readOnly && row.status === "BLOCKED" && (row.kind === "WORK" || bug) && (
+            <button className="primary" disabled={busy || !bug && !row.humanActions?.some((a: HumanAction) => a.type === "RETRY_TASK" && a.enabled)} title={!bug ? actionReason(row, t) : undefined} onClick={async () => {
+              if (!bug) { void performTaskAction(row, row.humanActions.find((a: HumanAction) => a.type === "RETRY_TASK")); return; }
               if (await act(`/tasks/${id}/retry`, { version: row.version }, "POST", false)) closeModal();
-            }}>{t("重新开放执行", "Requeue task")}</button>
+            }}>{bug ? t("退回待修复", "Requeue bug") : t("重新开放执行", "Requeue task")}</button>
           )}
-          {row.executorType === "HUMAN" && row.status === "READY" && !row.waiting && (
-            <button className="primary" disabled={busy} onClick={() => act(
-              `/tasks/${id}/human-start`, { version: row.version }, "POST", false,
-            )}>{t("开始人工任务", "Start human task")}</button>
+          {!readOnly && row.executorType === "HUMAN" && row.status === "READY" && !row.waiting && (
+            <button className="primary" disabled={busy || !row.humanActions?.some((a: HumanAction) => a.type === "START_HUMAN" && a.enabled)} onClick={() => performTaskAction(row, row.humanActions.find((a: HumanAction) => a.type === "START_HUMAN"))}>{t("开始人工任务", "Start human task")}</button>
           )}
-          {row.executorType === "HUMAN" && row.status === "RUNNING" && (
-            <button className="primary" onClick={() => open("human", row)}>{t("提交人工交付", "Complete human task")}</button>
+          {!readOnly && row.executorType === "HUMAN" && row.status === "RUNNING" && (
+            <button className="primary" disabled={!row.humanActions?.some((a: HumanAction) => a.type === "COMPLETE_HUMAN" && a.enabled)} title={actionReason(row, t)} onClick={() => performTaskAction(row, row.humanActions.find((a: HumanAction) => a.type === "COMPLETE_HUMAN"))}>{t("提交人工交付", "Complete human task")}</button>
           )}
-          {children.data && children.data.items.length > 0 && <section className="detail-section">
-            <h3>{t("计划任务", "Planned work")}</h3>
+          {children.data && children.data.items.length > 0 && <details className="detail-section" open>
+            <summary>{t("计划任务", "Planned work")}</summary>
             <div className="attempt-list">{children.data.items.map((child) => (
               <button className="attempt-row" key={child.id} onClick={() => open("task", child)}>
                 <strong>{child.title}</strong>{badge(child.status)}<span aria-hidden="true">›</span>
               </button>
             ))}</div>
-          </section>}
-          <section className="detail-section">
-            <h3>{t("交付记录", "Delivery history")}</h3>
+          </details>}
+          <details className="detail-section">
+            <summary>{t("交付记录", "Delivery history")}</summary>
             {runs.error && errorPanel(runs.error)}
             {runs.data?.total === 0 && <p className="muted">{t("还没有执行尝试。", "No attempts yet.")}</p>}
             <div className="attempt-list">
@@ -1541,6 +1816,10 @@ function Detail({ id }: { id: string }) {
                 </button>
               ))}
             </div>
+            {!readOnly && runs.data?.items.filter((r: Row) => ["RUNNING", "STOP_REQUESTED", "QUARANTINED"].includes(r.status)).map((r: Row) => <p key={r.id}>
+              {r.status === "RUNNING" && <button className="danger" disabled={busy} onClick={() => act(`/runs/${r.id}/stop?projectId=${encodeURIComponent(projectId)}`, {}, "POST", false)}>{t("请求停止当前执行", "Request stop for current run")}</button>}{" "}
+              <button onClick={() => open("run", { id: r.id, projectId })}>{t("查看运行并处理停止", "Open run and resolve stopping")}</button>
+            </p>)}
             {(cursor > 0 || runs.data?.nextCursor != null) && (
               <div className="pagination">
                 <button disabled={!cursor} onClick={() => setCursor(Math.max(0, cursor - 10))}>{t("较新记录", "Newer")}</button>
@@ -1548,21 +1827,22 @@ function Detail({ id }: { id: string }) {
               </div>
             )}
             {row.planId && <div className="delivery-footer">
-              <button className="text-button" onClick={() => open("plan", { id: row.planId })}>{t("查看计划", "View plan")}</button>
+              <button className="text-button" onClick={() => open("plan", { id: row.planId, readOnly })}>{t("查看计划", "View plan")}</button>
               {acceptance && <>{badge(acceptance.status)}
                 <button className="text-button" onClick={() => {
                   const detailHref = location.href;
                   setAcceptanceError(null);
                   api("/acceptances/" + encodeURIComponent(acceptance.id))
-                    .then((data) => { if (location.href === detailHref) open("acceptance", data); })
+                    .then((data) => { if (location.href === detailHref) open("acceptance", { ...data, readOnly }); })
                     .catch(setAcceptanceError);
                 }}>{t("查看最终验收", "View final acceptance")}</button></>}
               {errorPanel(acceptanceError ?? acceptances.error)}
             </div>}
-          </section>
+          </details>
         </div>
         <aside className="detail-properties">
           <h3>{t("属性", "Properties")}</h3>
+          {bug && <dl><dt>{t("修复角色", "Repair role")}</dt><dd>{roleName(row.roleId)}</dd></dl>}
           {row.kind === "WORK" && <>
             <dl>
               <dt>{t("角色", "Role")}</dt><dd>{row.executorType === "HUMAN" ? t("人工", "Human") : roleName(row.roleId)}</dd>
@@ -1571,7 +1851,7 @@ function Detail({ id }: { id: string }) {
                 {row.executorType === "HUMAN" ? t("由我处理", "Handled by me") : (
                   row.assignee?.name ?? (row.assignedAgentId ? t("指派不可用", "Assignee unavailable") : t("同角色 Agent 可领取", "Any eligible agent"))
                 )}
-                {row.executorType === "AGENT" && ["READY", "BLOCKED"].includes(row.status) && (
+                {!readOnly && row.executorType === "AGENT" && ["READY", "BLOCKED"].includes(row.status) && (
                   <button className="text-button property-link" onClick={() => open("assignment", row)}>
                     {row.assignedAgentId ? t("更改指派", "Change assignee") : t("指派 Agent", "Assign agent")}
                   </button>
@@ -1579,19 +1859,19 @@ function Detail({ id }: { id: string }) {
               </dd>
               <dt>{t("评审", "Review")}</dt><dd>{row.reviewPolicy === "INDEPENDENT" ? t("独立评审", "Independent reviewer") : t("按检查结果验证", "Approved checks")}</dd>
             </dl>
-            {row.parentId && <button className="text-button" onClick={() => open("task", { id: row.parentId })}>{t("打开原始需求", "Open parent request")} ↗</button>}
+            {row.parentId && <button className="text-button" onClick={() => open("task", { id: row.parentId, projectId })}>{t("打开原始需求", "Open parent request")} ↗</button>}
           </>}
           {row.files?.length > 0 && <><h4>{t("文件范围", "File scope")}</h4><div className="chips">{row.files.map((f: string) => <code key={f}>{f}</code>)}</div></>}
           {row.deps?.length > 0 && <><h4>{t("依赖", "Dependencies")}</h4>{row.deps.map((dep: string) => (
-            <button className="text-button property-link" key={dep} onClick={() => open("task", { id: dep })}>{row.waiting?.tasks?.find((task: Row) => task.id === dep)?.title ?? dep}</button>
+            <button className="text-button property-link" key={dep} onClick={() => open("task", { id: dep, projectId })}>{row.dependencies?.find((task: Row) => task.id === dep)?.title ?? t("查看前置任务", "View dependency")}</button>
           ))}</>}
           <section className="task-metadata-summary">
             <h4>{t("日期和标签", "Due date and tags")}</h4>
             {row.dueDate ? <TaskDeadline task={row} t={t} /> : <p className="muted">{t("未设截止日期", "No due date")}</p>}
             <TaskTags tags={row.tags} />
-            <button className="text-button property-link" onClick={() => open("task-metadata", row)}>
+            {!readOnly && <button className="text-button property-link" onClick={() => open("task-metadata", row)}>
               {t("编辑日期和标签", "Edit date and tags")}
-            </button>
+            </button>}
           </section>
           <details className="property-id"><summary>{t("任务 ID", "Task ID")}</summary><code>{row.id}</code></details>
         </aside>
@@ -1600,8 +1880,8 @@ function Detail({ id }: { id: string }) {
   );
 }
 
-function PlanDetail({ id }: { id: string }) {
-  const { lang, t, epoch, badge, open, act, busy, roleName } = useUI();
+function PlanDetail({ id, guard }: { id: string; guard?: Row }) {
+  const { lang, t, epoch, badge, open, act, busy, roleName, projects } = useUI();
 
   const data = useData<Row>("/plans/" + id, epoch),
     source = useData<Row>(
@@ -1609,6 +1889,10 @@ function PlanDetail({ id }: { id: string }) {
       epoch,
     );
   const plan = data.data;
+  const firstVersion = useRef<number | null>(null);
+  if (plan && firstVersion.current === null) firstVersion.current = plan.version;
+  const stale = plan && (plan.version !== (guard?.guardVersion ?? firstVersion.current) ||
+    guard?.guardTaskVersion && (!source.data || source.data.version !== guard.guardTaskVersion));
   const versions = useData<Page>(
     plan ? "/plans?parentId=" + plan.sourceTaskId + "&limit=100" : null,
     epoch,
@@ -1617,6 +1901,7 @@ function PlanDetail({ id }: { id: string }) {
     .filter((p) => p.revision < plan?.revision)
     .sort((a, b) => b.revision - a.revision)[0];
   if (!plan || plan.id !== id) return <p>{t("正在加载…", "Loading…")}</p>;
+  const readOnly = guard?.readOnly || source.data?.archivedAt || projects.data?.items.find((p: Row) => p.id === plan.projectId)?.archived;
   return (
     <>
       <div className="detail-top">
@@ -1633,7 +1918,7 @@ function PlanDetail({ id }: { id: string }) {
           <select
             aria-label={t("计划版本", "Plan version")}
             value={plan.id}
-            onChange={(event) => open("plan", { id: event.target.value })}
+            onChange={(event) => open("plan", { id: event.target.value, readOnly })}
           >
             {versions.data?.items.map((version) => (
               <option key={version.id} value={version.id}>
@@ -1687,10 +1972,10 @@ function PlanDetail({ id }: { id: string }) {
         ))}
       </div>
       <div className="modal-actions">
-        {plan.status === "SUBMITTED" && (
+        {!readOnly && plan.status === "SUBMITTED" && (
           <button
             className="primary"
-            disabled={busy}
+            disabled={busy || Boolean(stale)}
             onClick={() =>
               act(`/plans/${id}/approve`, { version: plan.version })
             }
@@ -1698,13 +1983,14 @@ function PlanDetail({ id }: { id: string }) {
             {t("批准此版本并开放执行", "Approve this version & release tasks")}
           </button>
         )}
-        {!["SUPERSEDED"].includes(plan.status) &&
-          source.data?.status !== "DONE" && (
+        {!readOnly && !["SUPERSEDED"].includes(plan.status) &&
+          !["DONE", "CANCELLED"].includes(source.data?.status) && (
             <button onClick={() => open("revision", plan)}>
               {t("要求修改计划", "Request revision")}
             </button>
           )}
       </div>
+      {stale && <p role="alert" className="warning">{t("计划或需求已更新，请关闭后重新审阅。", "The plan or requirement changed. Close and review again.")}</p>}
       <p className="muted small">
         {t(
           "批准后，外部 Agent 可主动领取符合分工的任务。工具不会启动 Agent 或调用模型。",
@@ -1805,8 +2091,9 @@ function PlanComparison({ before, after }: { before: Row; after: Row }) {
     </details>
   );
 }
-function RunDetail({ id }: { id: string }) {
-  const { t, lang, epoch, live, badge, open, act, projectId, projectName, copyText, errorPanel } = useUI();
+function RunDetail({ id, runProjectId, readOnly = false }: { id: string; runProjectId?: string; readOnly?: boolean }) {
+  const { t, lang, epoch, live, badge, open, act, projectId: selectedProjectId, projectName, copyText, errorPanel } = useUI();
+  const projectId = runProjectId ?? selectedProjectId;
   const [showEvidence, setShowEvidence] = useState(false);
   const scope = "projectId=" + encodeURIComponent(projectId);
   const route = "/runs/" + encodeURIComponent(id);
@@ -1831,12 +2118,12 @@ function RunDetail({ id }: { id: string }) {
       <div className="detail-heading">{badge(r.status)}<h2>{r.title ?? id}</h2></div>
       <div className="detail-layout">
       <div className="detail-body">
-      {r.status === "RUNNING" && (
+      {!readOnly && r.status === "RUNNING" && (
         <button className="danger" onClick={() => act(`/runs/${id}/stop`, {}, "POST", false)}>
           {t("请求停止", "Request stop")}
         </button>
       )}
-      {["QUARANTINED", "STOP_REQUESTED"].includes(r.status) && (
+      {!readOnly && ["QUARANTINED", "STOP_REQUESTED"].includes(r.status) && (
         <button className="danger" onClick={() => open("stopped", r)}>
           {t("确认执行已停止并释放锁", "Confirm stopped & release locks")}
         </button>
@@ -1925,7 +2212,7 @@ function TaskOwner({ type }: { type: string }) {
 }
 
 function BoardTaskCard({ task, fields }: { task: Row; fields: CardProperty[] }) {
-  const { t, lang, badge, open, roleName, act, busy, projectName } = useUI();
+  const { t, lang, badge, open, roleName, busy, projectName, performTaskAction, actionBusyIds } = useUI();
   const owner = task.kind === "REQUEST" ? "REQUEST" : task.executorType;
   const waiting = task.blockReason ?? task.waiting?.code ??
     (task.assignee?.revoked && task.status === "READY" ? "ASSIGNEE_UNAVAILABLE" : null);
@@ -1967,20 +2254,21 @@ function BoardTaskCard({ task, fields }: { task: Row; fields: CardProperty[] }) 
             {task.assignedAgentId ? t("改派", "Reassign") : t("指派", "Assign")}
           </button>}
           {owner === "HUMAN" && task.status === "READY" && !task.waiting && (
-            <button className="quiet" disabled={busy} onClick={() =>
-              act(`/tasks/${task.id}/human-start`, { version: task.version }, "POST", false)
+            <button className="quiet" disabled={busy || actionBusyIds.includes(task.id) || !task.humanActions?.some((a: HumanAction) => a.type === "START_HUMAN" && a.enabled)} onClick={() =>
+              performTaskAction(task, task.humanActions.find((a: HumanAction) => a.type === "START_HUMAN"))
             }>{t("开始", "Start")}</button>
           )}
           {owner === "HUMAN" && task.status === "RUNNING" && (
-            <button className="quiet" onClick={() => open("human", task)}>{t("提交交付", "Complete")}</button>
+            <button className="quiet" disabled={actionBusyIds.includes(task.id) || !task.humanActions?.some((a: HumanAction) => a.type === "COMPLETE_HUMAN" && a.enabled)} onClick={() => performTaskAction(task, task.humanActions.find((a: HumanAction) => a.type === "COMPLETE_HUMAN"))}>{t("提交交付", "Complete")}</button>
           )}
         </div>
       )}
+      <TaskMoveControl task={task} />
     </article>
   );
 }
 
-function TaskList({ drafts = false }: { drafts?: boolean }) {
+function TaskList() {
   const {
     lang,
     t,
@@ -1989,26 +2277,28 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
     badge,
     open,
     empty,
-    newButton,
     errorPanel,
     projectName,
     roleName,
+    performTaskAction,
+    pendingTaskId,
+    actionBusyIds,
+    live,
   } = useUI();
 
-  const [status, setStatus] = useState(drafts ? "DRAFT" : ""),
+  const [status, setStatus] = useState(""),
     [cursor, setCursor] = useState(0),
     [search, setSearch] = useState(""),
     [query, setQuery] = useState(""),
     [owner, setOwner] = useState(""),
     [metadata, setMetadata] = useState(emptyTaskMetaFilters),
     [offsets, setOffsets] = useState<Record<string, number>>({});
-  const scope = `${projectId}:${drafts ? "intake" : "work"}`;
+  const scope = `${projectId}:work`;
   const storageKey = "atk-task-display:" + scope;
   const [display, setDisplay] = useState(() => readTaskDisplay(
     storageKey,
     localStorage.getItem("atk-task-view:" + scope),
     localStorage.getItem(`atk-task-group:${projectId}`),
-    drafts,
   ));
   const { layout, sort, direction, children, group } = display;
   const columnLayout = layout === "board" || layout === "swimlane";
@@ -2092,8 +2382,9 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
   function renderColumn(column: BoardColumn, lane?: string) {
     const cursorKey = lane ? `${lane}.${column.key}` : column.key;
     return <section key={column.key} className={"board-column" + (lane ? " swimlane-cell" : "")}
-      data-column={column.key} aria-label={t(...boardLabels[column.key])}>
+      data-column={column.key} data-drop-column={column.key} data-drop-lane={lane ?? ""} aria-label={t(...boardLabels[column.key])}>
       {!lane && columnHeading(column.key, column.total)}
+      <TaskDropTarget column={column.key} lane={lane} />
       <div className="board-column-items">
         {column.items.map((task) => <BoardTaskCard task={task} fields={display.card} key={task.id} />)}
         {!column.total && <p className="board-empty">{lane ? "—" : t("暂无任务", "No tasks")}</p>}
@@ -2112,9 +2403,13 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
   const boardView = boardData.data;
   const lanes = boardView?.lanes ?? [];
   const laneColumns = lanes[0]?.columns ?? [];
+  const visibleTasks = boardView ? [...boardView.columns, ...lanes.flatMap((lane) => lane.columns)].flatMap((column) => column.items) : [];
+  const movement = useTaskMovement({ tasks: visibleTasks, scope: boardQuery.toString(),
+    enabled: columnLayout && !(layout === "board" && group === "owner") && !boardData.error && live.connection === "live",
+    t, perform: performTaskAction, pendingTaskId, externalBusy: actionBusyIds });
   const onBoardScroll = (event: React.UIEvent<HTMLDivElement>) => { scrollLeft.current = event.currentTarget.scrollLeft; };
   return (
-    <>
+    <TaskMovementContext.Provider value={movement}>
       <div className="toolbar task-toolbar">
         <div className="search">
           <span>⌕</span>
@@ -2127,22 +2422,13 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
           />
         </div>
         <select
+          name="taskStatus"
           aria-label={t("状态筛选", "Status filter")}
           value={status}
           onChange={(e) => setStatus(e.target.value)}
         >
           <option value="">{t("所有状态", "All statuses")}</option>
-          {[
-            "DRAFT",
-            "READY",
-            "RUNNING",
-            "REVIEWING",
-            "VERIFIED",
-            "AWAITING_ACCEPTANCE",
-            "DONE",
-            "BLOCKED",
-            "CANCELLED",
-          ].map((v) => (
+          {TASK_STATUSES.map((v) => (
             <option key={v} value={v}>
               {label(v, lang)}
             </option>
@@ -2157,6 +2443,7 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
         <TaskMetadataFilters t={t} projectId={projectId} epoch={epoch} value={metadata} onChange={setMetadata} />
       </div>
       {errorPanel(columnLayout ? boardData.error : data.error)}
+      <TaskMoveFeedback />
       {columnLayout ? (
         !boardView ? boardData.loading && <p role="status" className="muted">{t("正在加载任务视图…", "Loading task view…")}</p>
         : layout === "board" && boardView.columns.length ? (
@@ -2187,7 +2474,6 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
             "提交需求后，PMAgent 会领取并制定计划。",
             "Submit a request for your PM agent to plan.",
           ),
-          newButton,
         )
       ) : layout === "table" ? (
         <div className="task-table-scroll" tabIndex={0} aria-label={t("工作空间任务表格", "Workspace task table")}>
@@ -2232,7 +2518,7 @@ function TaskList({ drafts = false }: { drafts?: boolean }) {
           →
         </button>
       </div>}
-    </>
+    </TaskMovementContext.Provider>
   );
 }
 
@@ -2249,6 +2535,7 @@ function Overview() {
   const counts = o.counts ?? {};
   return (
     <>
+      <div className="collab-toolbar"><p className="page-description">{t("查看项目进展，或进入协作实况观察 Agent 正在处理什么。", "View project progress or observe agents in Collaboration.")}</p><button onClick={() => setView("collaboration")}>{t("查看协作实况", "Open collaboration")} →</button></div>
       <div className="stats">
         {[
           [
@@ -2390,7 +2677,7 @@ function Overview() {
 }
 
 function Inbox() {
-  const { lang, t, inbox, badge, open, act, empty, projectName, countInbox } =
+  const { lang, t, inbox, badge, open, act, empty, projectName, countInbox, performTaskAction } =
     useUI();
   const data = inbox.data;
   if (!data) return <p>{t("正在加载…", "Loading…")}</p>;
@@ -2420,6 +2707,7 @@ function Inbox() {
               {t("计划等待批准", "Plan needs approval")} · v{p.revision}
             </strong>
             <p>{p.summary}</p>
+            <button className="text-button" onClick={() => open("task", { id: p.sourceTaskId, projectId: p.projectId })}>{p.sourceTitle ?? t("查看原始需求", "View requirement")}</button>
             <small>{projectName(p.projectId)}</small>
           </div>
           <button className="primary" onClick={() => open("plan", p)}>
@@ -2431,21 +2719,14 @@ function Inbox() {
         <div className="inbox-row" key={task.id}>
           <div className="inbox-symbol">◇</div>
           <div>
-            <strong>{task.title}</strong>
+            <button className="text-button" onClick={() => open("task", task)}><strong>{task.title}</strong></button>
             <p>{task.acceptance}</p>
             {badge(task.status)}
           </div>
           <button
-            onClick={() =>
-              task.status === "READY"
-                ? act(
-                    `/tasks/${task.id}/human-start`,
-                    { version: task.version },
-                    undefined,
-                    false,
-                  )
-                : open("human", task)
-            }
+            disabled={!task.humanActions?.some((a: HumanAction) => a.enabled)}
+            title={task.humanActions?.some((a: HumanAction) => a.enabled) ? undefined : actionReason(task, t)}
+            onClick={() => performTaskAction(task, task.humanActions.find((a: HumanAction) => a.enabled))}
           >
             {task.status === "READY"
               ? t("开始处理", "Start")
@@ -2458,6 +2739,7 @@ function Inbox() {
           <div className="inbox-symbol">✓</div>
           <div>
             <strong>{t("计划交付验收", "Plan acceptance")}</strong>
+            <button className="text-button" onClick={() => open("task", { id: a.sourceTaskId, projectId: a.projectId })}>{a.sourceTitle ?? t("查看原始需求", "View requirement")}</button>
             <p>
               {projectName(a.projectId)} · {a.results.length}{" "}
               {t("个任务", "tasks")}
@@ -2469,11 +2751,18 @@ function Inbox() {
           </button>
         </div>
       ))}
+      {(data.bugs ?? []).map((bug: Row) => (
+        <div className="inbox-row" key={bug.id}>
+          <div className="inbox-symbol">⊘</div>
+          <div><button className="text-button" onClick={() => open("task", bug)}><strong>{bug.title}</strong></button><p>{t("Bug 修复待验收", "Bug fix needs acceptance")}</p></div>
+          <button onClick={() => open("task", bug)}>{t("验收 Bug", "Review bug fix")}</button>
+        </div>
+      ))}
       {data.runs.map((r: Row) => (
         <div className="inbox-row" key={r.id}>
           <div className="inbox-symbol danger-text">!</div>
           <div>
-            <strong>{r.spec?.title ?? r.id}</strong>
+            <button className="text-button" onClick={() => open("task", { id: r.taskId, projectId: r.projectId })}><strong>{r.spec?.title ?? t("查看关联任务", "View linked task")}</strong></button>
             <p>
               {t(
                 "请确认旧执行已经停止，再释放文件锁。",
@@ -2491,7 +2780,7 @@ function Inbox() {
         <div className="inbox-row" key={r.id}>
           <div className="inbox-symbol">⊘</div>
           <div>
-            <strong>{r.title}</strong>
+            <button className="text-button" onClick={() => open("task", r)}><strong>{r.title}</strong></button>
             <p>{reason(r.blockReason, lang)}</p>
           </div>
           <button onClick={() => open("task", r)}>
@@ -2536,16 +2825,16 @@ function Runs() {
       </p>
       <div className="task-list">
         {data.data?.items.map((r) => (
-          <button className="run-row" key={r.id} onClick={() => open("run", r)}>
+          <div className="run-row" key={r.id}>
             <span>{badge(r.stage)}</span>
             <div>
-              <strong>{r.title ?? r.spec?.title ?? r.taskId}</strong>
-              <small className="mono">{r.id}</small>
+              <button className="text-button" onClick={() => open("task", { id: r.taskId, projectId: r.projectId })}><strong>{r.title ?? t("查看关联任务", "View linked task")}</strong></button>
+              <small>{t("第", "Attempt ")}{r.generation}{t("次执行", "")}</small>
             </div>
             {badge(r.status)}
             <small>{time(r.startedAt)}</small>
-            <span>↗</span>
-          </button>
+            <button onClick={() => open("run", r)}>{t("查看执行", "View run")} ↗</button>
+          </div>
         ))}
       </div>
       {data.data?.total === 0 &&
@@ -2594,108 +2883,8 @@ function Runs() {
   );
 }
 
-function Team() {
-  const { t, epoch, overview, allRoles, allTeams, badge, open, roleName } =
-    useUI();
-  const agents = useData<Page>("/agents?limit=500", epoch);
-  return (
-    <>
-      <div className="section-title">
-        <h3>{t("Agent 身份", "Agent identities")}</h3>
-        <button className="primary" onClick={() => open("agent")}>
-          ＋ {t("添加 Agent", "Add agent")}
-        </button>
-      </div>
-      <p className="page-description">
-        {t(
-          "这里配置身份、角色和权限。实际 Agent 在外部运行并主动领取任务。",
-          "Configure identities, roles and permissions. Actual agents run externally and pull work.",
-        )}
-      </p>
-      <div className="agent-grid">
-        {agents.data?.items.map((a) => (
-          <article className="agent-card" key={a.id}>
-            <div className="split">
-              <span className="avatar">{a.name.slice(0, 1).toUpperCase()}</span>
-              {badge(
-                a.revoked
-                  ? "REVOKED"
-                  : overview.data?.agents.find((x: Row) => x.id === a.id)
-                        ?.online
-                    ? "ONLINE"
-                    : "OFFLINE",
-              )}
-            </div>
-            <h3>{a.name}</h3>
-            <p>{roleName(a.roleId)}</p>
-            <small>
-              {allTeams.find((team: Row) => team.id === a.teamId)?.name}
-            </small>
-            <div className="card-actions">
-              <button disabled={a.revoked} onClick={() => open("agent", a)}>
-                {t("编辑", "Edit")}
-              </button>
-              <button onClick={() => open("connection", a)}>
-                {t("接入说明", "Connection guide")}
-              </button>
-              <button
-                disabled={a.revoked}
-                className="quiet"
-                onClick={() => open("revoke", a)}
-              >
-                {t("撤销", "Revoke")}
-              </button>
-            </div>
-          </article>
-        ))}
-      </div>
-      <div className="section-title">
-        <h3>{t("团队", "Teams")}</h3>
-        <button onClick={() => open("team")}>
-          ＋ {t("新建团队", "New team")}
-        </button>
-      </div>
-      <div className="task-list">
-        {allTeams.map((team: Row) => (
-          <div className="list-row" key={team.id}>
-            <div>
-              <strong>{team.name}</strong>
-              <p className="muted">
-                {team.roleIds.map(roleName).join(" · ")} ·{" "}
-                {t("并发", "Capacity")} {team.maxConcurrent}
-              </p>
-            </div>
-            <button onClick={() => open("team", team)}>
-              {t("编辑", "Edit")}
-            </button>
-          </div>
-        ))}
-      </div>
-      <div className="section-title">
-        <h3>{t("角色模板", "Role templates")}</h3>
-        <button onClick={() => open("role")}>
-          ＋ {t("新建角色", "New role")}
-        </button>
-      </div>
-      <div className="task-list">
-        {allRoles.map((role: Row) => (
-          <div className="list-row" key={role.id}>
-            <div>
-              <strong>{role.name}</strong> <code>{role.function}</code>
-              <p className="muted truncate">{role.instructions}</p>
-            </div>
-            <button onClick={() => open("role", role)}>
-              {t("编辑", "Edit")}
-            </button>
-          </div>
-        ))}
-      </div>
-    </>
-  );
-}
-
 function Projects() {
-  const { t, projects, open, act, projectId, setProject, setView } = useUI();
+  const { t, projects, open, act, projectId, setProject, setView, showArchive } = useUI();
   return (
     <>
       <p className="page-description">
@@ -2718,6 +2907,7 @@ function Projects() {
             {p.archived && (
               <span className="badge">{t("已归档", "Archived")}</span>
             )}
+            {p.archived && <button onClick={() => showArchive(p.id)}>{t("查看历史任务", "View task history")}</button>}
             {!p.archived && (
               <button
                 disabled={p.id === projectId}
@@ -2756,9 +2946,62 @@ function Projects() {
 }
 
 function Settings() {
-  const { lang, setLang, t, open } = useUI();
+  const { lang, setLang, t, open, epoch, projects, allTeams, busy, act } = useUI();
+  const [updateTick, setUpdateTick] = useState(0);
+  const [updateBusy, setUpdateBusy] = useState<"" | "check" | "apply">("");
+  const [updateMessage, setUpdateMessage] = useState("");
+  const updateState = useData("/system/update", epoch + updateTick);
+  const info = updateState.data;
+  async function checkUpdate() {
+    setUpdateBusy("check");
+    setUpdateMessage("");
+    try {
+      const next = await api("/operations/update/check", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setUpdateTick((v) => v + 1);
+      setUpdateMessage(
+        next.updateAvailable
+          ? t(
+              `发现新版本 v${next.latestVersion}。`,
+              `New version v${next.latestVersion} is available.`,
+            )
+          : t("当前已是最新版本。", "You are already on the latest version."),
+      );
+    } catch (e) {
+      setUpdateMessage(e instanceof Error ? e.message : String(e));
+      setUpdateTick((v) => v + 1);
+    } finally {
+      setUpdateBusy("");
+    }
+  }
+  async function applyUpdate() {
+    setUpdateBusy("apply");
+    setUpdateMessage("");
+    try {
+      const next = await api("/operations/update/apply", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setUpdateTick((v) => v + 1);
+      setUpdateMessage(
+        t(
+          `已安装 v${next.appliedVersion}（SHA-256 校验通过）。请重启 ATK 服务以生效。`,
+          `Installed v${next.appliedVersion} (SHA-256 verified). Restart the ATK service to apply.`,
+        ),
+      );
+    } catch (e) {
+      setUpdateMessage(e instanceof Error ? e.message : String(e));
+      setUpdateTick((v) => v + 1);
+    } finally {
+      setUpdateBusy("");
+    }
+  }
   return (
     <>
+      <ThemeSettings lang={lang} />
+      <AgentMigrations epoch={epoch} projects={projects.data?.items ?? []} teams={allTeams} busy={busy} t={t} act={act} open={open} />
       <section className="panel settings-panel">
         <h3>{t("语言", "Language")}</h3>
         <p>
@@ -2769,10 +3012,7 @@ function Settings() {
         </p>
         <select
           value={lang}
-          onChange={(e) => {
-            setLang(e.target.value as Lang);
-            localStorage.setItem("atk-language", e.target.value);
-          }}
+          onChange={(e) => setLang(e.target.value as Lang)}
         >
           <option value="zh">简体中文</option>
           <option value="en">English</option>
@@ -2794,15 +3034,64 @@ function Settings() {
         </button>
       </section>
       <section className="panel settings-panel">
-        <h3>{t("运行信息", "Application")}</h3>
+        <h3>{t("运行信息与更新", "Application & updates")}</h3>
         <div className="metadata">
           <span>{t("版本", "Version")}</span>
-          <b>2.0.0-alpha.1</b>
+          <b>{info?.currentVersion ?? VERSION}</b>
           <span>{t("部署", "Deployment")}</span>
           <b>{t("本机 · 单用户", "Local · single user")}</b>
           <span>{t("执行方式", "Execution")}</span>
           <b>{t("外部 Agent 主动领取", "External pull agents")}</b>
+          <span>{t("更新状态", "Updates")}</span>
+          <b>
+            {info?.restartRequired
+              ? t(`已安装 v${info.appliedVersion}，待重启`, `Installed v${info.appliedVersion}, restart required`)
+              : info?.updateAvailable
+                ? t(`可更新至 v${info.latestVersion}`, `Update available: v${info.latestVersion}`)
+                : info?.checkedAt
+                  ? t("已是最新", "Up to date")
+                  : t("尚未检查", "Not checked yet")}
+          </b>
         </div>
+        <div className="row" style={{ marginTop: 12, gap: 8, flexWrap: "wrap" }}>
+          <button
+            disabled={Boolean(updateBusy)}
+            onClick={() => void checkUpdate()}
+          >
+            {updateBusy === "check"
+              ? t("正在检查…", "Checking…")
+              : t("检查更新", "Check for updates")}
+          </button>
+          {info?.updateAvailable && !info?.restartRequired && (
+            <button
+              className="primary"
+              disabled={Boolean(updateBusy) || info?.installMode === "source"}
+              onClick={() => void applyUpdate()}
+            >
+              {updateBusy === "apply"
+                ? t("正在下载并安装…", "Downloading & installing…")
+                : t(`安装 v${info.latestVersion}`, `Install v${info.latestVersion}`)}
+            </button>
+          )}
+          {info?.releaseUrl && (
+            <a href={info.releaseUrl} target="_blank" rel="noreferrer">
+              {t("查看 GitHub Release", "View GitHub Release")}
+            </a>
+          )}
+        </div>
+        {info?.updateAvailable && info?.installMode === "source" && (
+          <p className="muted" style={{ marginTop: 8 }}>
+            {t(
+              "当前为 Git 源码运行模式，不直接覆盖源码目录；请拉取最新标签或从 GitHub Release 安装发行包。",
+              "Running from a Git source checkout; auto-install is disabled. Pull the release tag or install the GitHub Release archive.",
+            )}
+          </p>
+        )}
+        {(updateMessage || info?.lastError) && (
+          <p className="muted" style={{ marginTop: 8 }}>
+            {updateMessage || info?.lastError}
+          </p>
+        )}
         <p className="muted">
           {t(
             "文件锁约束遵守协议的执行端，无法阻止编辑器或其他进程修改文件。",

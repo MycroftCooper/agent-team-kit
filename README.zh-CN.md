@@ -2,11 +2,26 @@
 
 通过网页管理多个本地项目，由外部 Agent 主动领取任务的独立协作工具。
 
-当前版本 **2.0.0-alpha.1**。这是一次不保留兼容层的重构：旧任务池、旧 CLI、DSH
+当前版本 **0.0.1**。这是一次不保留兼容层的独立重构：旧任务池、旧 CLI、DSH
 插件、模型运行时和 worktree 流程均已退出生产代码。工具不配置模型、不转发请求，
-不启动外部 Agent，也不会自动清理旧数据库或用户项目。
+后端不启动外部 Agent，也不会自动清理旧数据库或用户项目。可选外部执行器
+`atk-agent run` 可调用本机 Codex CLI 或 DSH（`--engine dsh`），单次领取并修复一个指定 Bug。
 
 ## 启动
+
+**Windows x64 桌面开发版：双击根目录的 `dev.bat`。** 会直接打开 ATK 的独立窗口。
+首次启动需要联网准备 Electron 和工作区依赖，便携工具放在本项目的 `artifacts/desktop-dev/`，
+无需另装系统 Node.js，也无需先构建网页。后续启动复用已下载的依赖。
+
+修改 React 组件和样式时由 Vite 热更新。保存后端源码、内置资源或共享后端包时，开发版会自动重载后端，桌面窗口和页面保持打开。若有任务、待确认停止的执行或自动化正在占用后端，重载会等到空闲。修改 Electron 主进程或启动配置后，仍需关闭窗口并重新运行 `dev.bat`。
+桌面标题栏可切换或添加工作空间，也可拖动窗口，右侧有最小化、最大化／还原和关闭。
+底栏左侧显示同步状态，右侧可切换语言和深浅主题；「设置与运维 → 外观」还可以选择跟随系统，主题选择会记住。
+开发版关闭窗口即停止后台；有 Agent 正在执行时，请先结束或协调其停写再重启。
+Agent 仍使用 `http://127.0.0.1:1421` 和原凭据。开发版沿用 `atk.local.json`、`ATK_DATA_DIR` 与现有默认数据目录；
+若旧服务正在占用端口或数据目录，请先关闭它。可用 `ATK_PORT`、`ATK_DEV_PORT` 覆盖默认的 `1421`、`5173`。
+本阶段不提供安装包，也不支持 macOS 开发启动脚本。
+
+### 原有网页启动方式
 
 需要 **Node.js 24**。发布包包含构建好的网页，没有生产依赖；安装位置与目标项目无关。
 
@@ -18,13 +33,15 @@ Windows 可直接双击根目录的 **start.bat**：启动后台服务并在默�
 `{"dataDir":"E:/AgentTeamKitData"}`。相对路径以启动文件所在目录为准；该文件不会提交到 Git。
 不配置时使用下述默认目录。命令行 `--data` 优先于本机配置，`ATK_DATA_DIR` 也可覆盖本机配置。
 
-以下 npm 安装方式适用于新版本正式发布后；本次 GitHub 源码提交不等于 npm 发布：
+从 GitHub Release 下载发布包安装（支持 `atk update` 或网页「设置与运维 → 运行信息与更新」自动检测并校验 SHA-256 更新）：
 
 ```powershell
-npm install -g agent-team-kit@next
+npm install -g ./agent-team-kit-0.0.1.tgz
 atk start
 # 打开输出的私密 browserUrl 链接（含访问码，请勿分享）
 atk status
+atk check-update
+atk update
 atk stop
 ```
 
@@ -36,7 +53,7 @@ node scripts/build-web.mjs
 node apps/launcher/cli.mjs start
 # 也可构建并安装独立发布包：
 npm pack
-npm install -g ./agent-team-kit-2.0.0-alpha.1.tgz
+npm install -g ./agent-team-kit-0.0.1.tgz
 # 前后端可以分别启动；前端开发服务器为 http://127.0.0.1:5173
 pnpm --filter @atk/web dev
 ```
@@ -46,14 +63,19 @@ pnpm --filter @atk/web dev
 
 ## 使用流程
 
-1. 人工在网页新建需求，进入 **DRAFT 预排池**。
+1. 人工新建需求，在「工作 → 任务」中进入 **预排（DRAFT）** 状态。
 2. 外部 PM 身份以固定 **ORCHESTRATOR** 阶段领取，提交分工、依赖、文件范围和验收要求。
 3. 人工批准具体计划版本后，一次性发布 **READY** 执行任务。
 4. 外部 Agent 领取任务和文件锁，在项目目录执行，持续续租，回传检查结果和交付记录。
 5. 按批准计划配置可选独立评审；中间任务 **VERIFIED** 后推进依赖，人工任务在“待我处理”完成。
 6. 所有任务满足要求后，对整份计划统一人工验收。无需每个中间任务反复点确认。
 
-任务默认使用看板，可以按流程或执行方分组，也可以切回列表。需求、人工任务和 Agent 任务共用同一个看板；
+「工作」的二级侧栏包含「待我处理」「任务」「Bug 单」「协作实况」「执行记录」「归档记录」。协作实况展示本项目专属 Agent、正在处理的任务和实际流转动画；各工作页面点击任务名称共用右侧详情抽屉。
+Agent 身份固定归属一个项目，其他项目看不到也不能使用；角色模板和全局资源可以共享。旧身份归属不明确时，可在设置中处理。详见[项目 Agent 与协作实况](docs/COLLABORATION.md)。
+任务默认使用看板，可按流程或执行方分组，也可以切回列表。
+流程看板和泳道支持拖动把柄及「移动到…」：开始/完成人工任务、重试受阻工作、批准计划与整体验收。需要说明或确认的操作保留原有面板，Agent 执行和评审仍按真实回执推进。详见[任务看板拖动](docs/TASK-BOARD-DRAG-DESIGN.md)。
+任务详情支持填写原因并核对影响后取消；有活动执行时需先停止并确认。已结束任务可归档，在「工作 → 归档记录」查看或恢复；已归档项目可从「项目 → 查看历史任务」直接只读查看任务与交付证据。详见[任务取消与归档记录](docs/TASK-CANCELLATION-ARCHIVE.md)。
+按流程分组时，「预排」和「待开始」分别占一列。需求、人工任务和 Agent 任务共用同一个看板；
 人工任务依赖满足后可在卡片上开始或提交交付。对已批准、尚未执行或已停止的 Agent 任务，
 可以从卡片或任务详情指定同团队、符合角色的具体 Agent，也可以恢复为由符合角色的 Agent 领取。
 指派不会启动进程；指定的 Agent 仍需主动领取，并满足依赖、并发和文件锁条件。
@@ -67,6 +89,11 @@ pnpm --filter @atk/web dev
 
 PM 不能执行或评审自己规划的任务；WORKER 不能自审；Agent 凭据不能代替人工批准。
 
+在「工作 → Bug 单」填写标题和复现描述，选择当前小队的修复角色。Bug 单无需规划，创建后直接待修复；
+对应角色的 Agent 可照常领取，也可用 `atk-agent claim --kind bug --wait 30000` 只领 Bug 单。
+修复提交后，用户可从「待我处理」验收：通过即关闭，退回时填写原因，下次领取会附上这条反馈。
+报单时可缩小文件范围；留空则使用修复角色允许的范围。
+
 ## 文件锁与交付
 
 - 同文件、父目录和子文件的写入冲突会等待；不同文件可以并行。
@@ -76,14 +103,29 @@ PM 不能执行或评审自己规划的任务；WORKER 不能自审；Agent 凭�
 - 修改直接发生在项目目录，失败、停止和取消不会自动回滚代码。
 - 这是协议层的协作锁，不能阻止编辑器和不遵守协议的进程写入文件。
 
-全局 SQLite 保存权威状态。项目资料默认写入各自 `.agent-team/`，包括计划、
+全局 SQLite 保存任务、身份和项目登记状态。自动化配置和运行记录归项目所有：`.atk/automations/` 保存可提交的 JSON，`.atk/runs/` 保存逐次日志、结果和产物。项目资料默认写入各自 `.agent-team/`，包括计划、
 执行前后快照、检查证据和验收记录。资料生成失败会显示在网页并可重试。
 
 ## 外部 Agent
 
+已接入 Codex CLI 或 DSH 的项目可用 `atk-agent run --task <bugId> --check '<检查命令>'`
+完成单次 Bug 修复、独立检查和交付；DSH 增加 `--engine dsh`，随后由人工验收。
+见 [Codex / DSH 执行器](docs/CODEX-RUNNER.md)。
+
+自动化支持单次定时、多个指定时间、指定次数重复和持续循环。选择流程后点击
+「添加定时 / 管理定时」，也可以由 Agent 配置同一份项目 JSON。
+详见 [CI 定时计划](docs/AUTOMATION-SCHEDULING.md)。
+
 ![网页工作台](docs/screenshots/overview.png)
 
-在网页创建角色、团队和 Agent 身份，保存只展示一次的凭据。接入时通过外部环境
+打开「Agent 团队」，在左侧二级侧栏切换全部 Agent、当前工作空间的小队 Agent 和本机成员；
+点击 Agent 卡片上的「角色模板」，在弹窗中查看和编辑它绑定的模板；在「小队」新建角色、配置角色组成与并发。
+「资源」下的 Agent 模板、Skills、MCP 和 CLI 分为 ATK 自带、全局共享、当前项目专用。
+全局资源保留在 ATK 数据目录的 `resources/`；项目资源放在 `docsRoot/resources`，默认是
+`.agent-team/resources`。可以在网页分别新建，也可以复制完整资源文件夹进去。
+`atk-agent resources list` 仍查询全局；附加 `--scope project --project <id>` 查询项目资源，
+同名资源互不覆盖。目录约定和调用方式见[团队资源](docs/TEAM-RESOURCES.md)。
+创建 Agent 身份后，保存只展示一次的凭据。接入时通过外部环境
 变量 `ATK_AGENT_TOKEN` 提供凭据，`ATK_URL` 默认为 `http://127.0.0.1:1421`。
 
 ```powershell
@@ -105,6 +147,7 @@ atk-agent submit <runId> review --file review-receipt.json
 ## 文档与验证
 
 - [架构与状态机](docs/ARCHITECTURE.md)
+- [自动化接入、Agent CLI/API、进度和结果归档](docs/AUTOMATION-PROJECT-DESIGN.md)
 - [完整 Agent 协议及样例](docs/AGENT-PROTOCOL.md)
 - [启动、备份、恢复](docs/OPERATIONS.md)
 - [模块处置及阶段验收](docs/REFACTOR.md)

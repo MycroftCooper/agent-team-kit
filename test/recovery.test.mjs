@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { fixture, node, plan, finish } from "./helpers.mjs";
+import { fixture, node, plan, finish, completeHuman } from "./helpers.mjs";
 
 test("a revised plan's acceptance is retired and cannot change the new planning state", (t) => {
   const f = fixture(t), p = plan(f, [node("a")]);
@@ -65,7 +65,7 @@ test("drift in human delivery can be requeued and accepted without replacing the
   let task = p.tasks[0];
   f.app.startHuman(task.id, { version: task.version });
   fs.writeFileSync(path.join(f.p.root, "manual.txt"), "confirmed");
-  f.app.finishHuman(task.id, { summary: "Confirmed" });
+  completeHuman(f, task.id, { summary: "Confirmed" });
   const a = f.app.inbox(f.p.id).acceptances[0];
   fs.writeFileSync(path.join(f.p.root, "manual.txt"), "changed");
   f.app.maintenance();
@@ -77,7 +77,7 @@ test("drift in human delivery can be requeued and accepted without replacing the
   task = f.app.inbox(f.p.id).humanTasks[0];
   f.app.startHuman(task.id, { version: task.version });
   assert.throws(() => f.app.revalidateAcceptance(a.id), { code: "PLAN_BUSY" });
-  f.app.finishHuman(task.id, { summary: "Reconfirmed changed output" });
+  completeHuman(f, task.id, { summary: "Reconfirmed changed output" });
   const next = f.app.inbox(f.p.id).acceptances[0];
   assert.notEqual(next.id, a.id);
   assert.equal(f.app.get("acceptances", a.id).status, "SUPERSEDED");
@@ -94,7 +94,7 @@ test("legal downstream edits keep earlier human completion valid", (t) => {
   const human = p.tasks[0];
   f.app.startHuman(human.id, { version: human.version });
   fs.writeFileSync(path.join(f.p.root, "shared.txt"), "human");
-  f.app.finishHuman(human.id, { summary: "Confirmed" });
+  completeHuman(f, human.id, { summary: "Confirmed" });
   const worker = f.app.claim(f.dev.agent.id, {});
   fs.writeFileSync(path.join(f.p.root, "shared.txt"), "worker");
   finish(f, worker);

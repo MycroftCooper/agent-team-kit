@@ -134,9 +134,12 @@ export function openStore(file) {
         stage,
         planId,
         statuses,
+        kind,
+        excludeKind,
         owner,
         search,
         hideChildren,
+        archive,
         deadline,
         tag,
         sort,
@@ -156,6 +159,7 @@ export function openStore(file) {
         ["agent_id", agentId],
         ["stage", stage],
         ["json_extract(data,'$.planId')", planId],
+        ["json_extract(data,'$.kind')", kind],
       ])
         if (val !== undefined && val !== null) {
           filters.push(`${col}=?`);
@@ -165,6 +169,11 @@ export function openStore(file) {
         filters.push(`status IN (${statuses.map(() => "?").join(",")})`);
         params.push(...statuses);
       }
+      if (excludeKind) {
+        filters.push("json_extract(data,'$.kind') IS NOT ?");
+        params.push(excludeKind);
+      }
+      if (table === "agents") filters.push("json_extract(data,'$.deletedAt') IS NULL");
       if (owner === "REQUEST") {
         filters.push("json_extract(data,'$.kind')='REQUEST'");
       } else if (owner) {
@@ -176,6 +185,8 @@ export function openStore(file) {
         params.push(search);
       }
       if (hideChildren) filters.push("parent_id IS NULL");
+      if (table === "tasks" && ["active", "only"].includes(archive))
+        filters.push(`json_extract(data,'$.archivedAt') IS ${archive === "only" ? "NOT " : ""}NULL`);
       const due = "json_extract(data,'$.dueDate')";
       if (deadline?.missing) filters.push(`${due} IS NULL`);
       if (deadline?.openOnly) filters.push("status NOT IN ('VERIFIED','DONE','CANCELLED')");
@@ -286,16 +297,20 @@ export function openStore(file) {
         .get(id);
       return r ? { seq: Number(r.seq), ...JSON.parse(r.data) } : null;
     },
-    events({ after = 0, limit = 100, projectId, entityId, newest = false } = {}) {
+    events({ after = 0, limit = 100, projectId, entityId, newest = false, includeGlobal = false, excludeTypes = [] } = {}) {
       let q = "seq>?",
         args = [after];
       if (projectId) {
-        q += " AND project_id=?";
+        q += includeGlobal ? " AND (project_id=? OR (project_id IS NULL AND type NOT LIKE 'agent.%') OR type IN ('project.created','project.updated'))" : " AND project_id=?";
         args.push(projectId);
       }
       if (entityId) {
         q += " AND entity_id=?";
         args.push(entityId);
+      }
+      if (excludeTypes.length) {
+        q += ` AND type NOT IN (${excludeTypes.map(() => "?").join(",")})`;
+        args.push(...excludeTypes);
       }
       return db
         .prepare(`SELECT * FROM events WHERE ${q} ORDER BY seq ${newest ? "DESC" : "ASC"} LIMIT ?`)

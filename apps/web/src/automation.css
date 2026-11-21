@@ -1,0 +1,221 @@
+.app.automation-shell { --section-sidebar-width: 216px; }
+.automation-shell .page-heading { display: none; }
+.automation-sidebar { display: flex; flex-direction: column; }
+.automation-sidebar h2 { margin-bottom: 26px; }
+.automation-nav-heading { display: flex; align-items: center; justify-content: space-between; margin: 28px 0 6px; }
+.automation-nav-heading .section-nav-label { margin-bottom: 0; }
+.automation-nav-heading button { padding: 1px 6px; font-size: 16px; }
+.automation-workflow-nav button { align-items: flex-start; }
+.automation-nav-name { overflow-wrap: anywhere; line-height: 1.5; }
+.automation-nav-empty { padding: 0 8px; font-size: 12px; }
+.automation-page { display: grid; gap: 20px; min-width: 0; }
+.automation-workflow-overview { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 0; }
+.automation-workflow-copy { min-width: 0; }
+.automation-workflow-copy h2 { margin: 12px 0 8px; font-size: 24px; line-height: 1.35; letter-spacing: -.4px; overflow-wrap: anywhere; }
+.automation-workflow-copy p { margin: 0; max-width: 74ch; line-height: 1.7; font-size: 12px; }
+.automation-workflow-overview > .automation-actions { flex: none; padding-top: 12px; }
+.automation-eyebrow { display: flex; align-items: center; gap: 10px; color: var(--subtle); font-size: 10px; font-weight: 600; letter-spacing: .7px; }
+.automation-workflow-outline { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 0 20px; border-bottom: 1px solid var(--line); }
+.automation-workflow-outline > span { display: flex; align-items: center; gap: 9px; color: var(--text-soft); font-size: 12px; overflow-wrap: anywhere; }
+.automation-step-number { display: inline-flex; flex: none; align-items: center; justify-content: center; width: 22px; height: 22px; border: 1px solid var(--line); background: var(--raised); border-radius: 50%; color: var(--subtle); font-size: 10px; }
+.automation-step-number[data-status="SUCCEEDED"] { color: var(--success); background: var(--success-bg); border-color: var(--success-line); }
+.automation-step-arrow { margin: 0 8px; color: var(--subtle); }
+.automation-workflow-outline .automation-outline-count { margin-left: auto; color: var(--subtle); font-size: 11px; white-space: nowrap; }
+.automation-content-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.automation-content-heading h3 { display: flex; align-items: center; gap: 8px; margin: 4px 0 0; font-size: 13px; }
+.automation-count { padding: 1px 6px; border-radius: 4px; background: var(--raised); color: var(--subtle); font-size: 10px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.automation-active-hint { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.automation-active-hint .status-dot { background: var(--accent); }
+.automation-layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 22px; align-items: start; min-width: 0; }
+.automation-layout-empty { grid-template-columns: minmax(0, 1fr); }
+.automation-history-list { display: grid; gap: 7px; min-width: 0; }
+.automation-history { display: grid; gap: 8px; width: 100%; padding: 14px; border: 1px solid transparent; border-radius: 7px; text-align: left; background: transparent; min-width: 0; }
+.automation-history:hover { background: var(--hover); }
+.automation-history[aria-pressed="true"] { background: var(--selected); border-color: var(--accent-line); }
+.automation-history > strong { font-size: 12px; overflow-wrap: anywhere; }
+.automation-history-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.automation-history-top > small { color: var(--subtle); font-size: 10px; }
+.automation-history-date { font-size: 11px; color: var(--text-soft); }
+.automation-history-origin { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.automation-pagination { display: flex; gap: 6px; padding: 8px 0; }
+.automation-pagination button { flex: 1; font-size: 11px; padding: 6px; }
+.automation-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.automation-empty { padding: 48px 24px; text-align: center; }
+.automation-empty-icon { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; margin-bottom: 12px; border-radius: 12px; background: var(--accent-bg); color: var(--accent); font-size: 24px; }
+.automation-empty h3 { margin: 0; font-size: 14px; }
+.automation-empty p { margin: 10px auto 20px; max-width: 52ch; font-size: 12px; line-height: 1.7; }
+.automation-run { min-width: 0; overflow: hidden; }
+.automation-run > .section-title { padding: 18px 20px; align-items: flex-start; gap: 12px; }
+.automation-run .section-title h3 { margin: 0 0 7px; font-size: 13px; }
+.automation-trigger { margin: 0; font-size: 10px; overflow-wrap: anywhere; }
+.automation-run-body { display: grid; gap: 20px; padding: 20px; }
+.automation-run-body h4 { margin: 0 0 10px; font-size: 12px; }
+.automation-run-meta { display: grid; grid-template-columns: 1fr .8fr 1.5fr; gap: 16px; }
+.automation-run-meta > div { display: grid; gap: 8px; align-content: start; overflow-wrap: anywhere; }
+.automation-run-meta > div > span { font-size: 10px; }
+.automation-run-meta strong { font-size: 18px; font-weight: 550; font-variant-numeric: tabular-nums; line-height: 1.4; }
+.automation-run-meta > div:last-child strong { font-size: 13px; line-height: 1.9; }
+.automation-run-meta strong .muted { font-size: 13px; font-weight: 400; }
+.automation-progress { display: flex; gap: 12px; align-items: center; font-size: 11px; font-variant-numeric: tabular-nums; }
+.automation-progress strong { flex: none; color: var(--muted); font-size: 10px; font-weight: 400; }
+.automation-progress progress { appearance: none; width: 100%; height: 5px; border: 0; border-radius: 4px; overflow: hidden; background: var(--raised); accent-color: var(--accent); }
+.automation-progress progress::-webkit-progress-bar { background: var(--raised); border-radius: 4px; }
+.automation-progress progress::-webkit-progress-value { background: var(--accent); border-radius: 4px; transition: width .25s; }
+.automation-run[data-status="SUCCEEDED"] progress::-webkit-progress-value { background: var(--success-dot); }
+.automation-run[data-status="FAILED"] progress::-webkit-progress-value,
+.automation-run[data-status="INTERRUPTED"] progress::-webkit-progress-value { background: var(--danger-dot); }
+.automation-run[data-status="CANCELED"] progress::-webkit-progress-value { background: var(--subtle); }
+.automation-progress progress:indeterminate { background: repeating-linear-gradient(110deg, var(--raised) 0 15px, var(--accent-bg) 15px 30px); }
+.automation-progress progress:indeterminate::-webkit-progress-bar { background: repeating-linear-gradient(110deg, var(--raised) 0 15px, var(--accent-bg) 15px 30px); }
+.automation-steps { margin: 0; padding: 0; list-style: none; }
+.automation-steps li { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto 62px; align-items: center; gap: 10px; padding: 11px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; font-size: 12px; }
+.automation-steps li:last-child { border-bottom: 0; }
+.automation-steps li > small { text-align: right; color: var(--subtle); font-size: 10px; }
+.automation-status { white-space: nowrap; font-size: 10px; border: 0; padding: 2px 0; background: transparent; gap: 5px; }
+.automation-status[data-status="SUCCEEDED"] { color: var(--success); }
+.automation-status[data-status="SUCCEEDED"] .status-dot { background: var(--success-dot); }
+.automation-status[data-status="FAILED"], .automation-status[data-status="INTERRUPTED"] { color: var(--danger); }
+.automation-status[data-status="FAILED"] .status-dot, .automation-status[data-status="INTERRUPTED"] .status-dot { background: var(--danger-dot); }
+.automation-status[data-status="RUNNING"], .automation-status[data-status="STOPPING"] { color: var(--accent); }
+.automation-status[data-status="RUNNING"] .status-dot, .automation-status[data-status="STOPPING"] .status-dot { background: var(--accent); }
+.automation-status[data-status="RECOVERY_REQUIRED"], .automation-status[data-status="CORRUPT"] { color: var(--warning); }
+.automation-live-detail { display: grid; gap: 7px; padding: 12px 14px; border-radius: 6px; border: 1px solid var(--accent-line); background: var(--accent-bg); font-size: 12px; }
+.automation-live-detail p { margin: 0; }
+.automation-live-detail small { font-size: 10px; }
+.automation-tabs { display: flex; gap: 24px; border-bottom: 1px solid var(--line); }
+.automation-tabs button { display: flex; align-items: center; gap: 7px; position: relative; border: 0; border-radius: 0; padding: 0 0 12px; background: transparent; color: var(--subtle); font-size: 12px; }
+.automation-tabs button[aria-selected="true"] { color: var(--text); }
+.automation-tabs button[aria-selected="true"]::after { content: ""; position: absolute; height: 2px; bottom: -1px; left: 0; right: 0; background: var(--accent); }
+.automation-log { margin: 0; min-height: 200px; max-height: 430px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--input); font-size: 11px; line-height: 1.8; padding: 16px; border-radius: 6px; }
+.automation-result-summary { display: flex; align-items: baseline; gap: 9px; margin-bottom: 22px; font-size: 11px; }
+.automation-result-summary > strong { color: var(--success); font-size: 24px; font-weight: 550; }
+.automation-result-summary > strong .muted { font-size: 14px; }
+.automation-step-results + .automation-step-results { margin-top: 22px; }
+.automation-step-results section > p { font-size: 11px; margin-bottom: 10px; }
+.automation-check { display: grid; grid-template-columns: minmax(0, 1fr) auto 60px; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 12px; overflow-wrap: anywhere; }
+.automation-check > small { text-align: right; font-size: 10px; }
+.automation-check > p { grid-column: 1 / -1; margin: 0; font-size: 11px; line-height: 1.7; }
+.automation-note { margin: 0; padding: 12px 0; font-size: 12px; line-height: 1.7; }
+.automation-info { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0 0 16px; }
+.automation-info > div { border: 1px solid var(--line); border-radius: 5px; padding: 10px 12px; overflow-wrap: anywhere; font-size: 11px; }
+.automation-info dt { color: var(--muted); }
+.automation-info dd { margin: 5px 0 0; }
+.automation-export-group + .automation-export-group { margin-top: 24px; }
+.automation-export-group > div > p { font-size: 10px; margin: 12px 0 6px; }
+.automation-file { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; border-color: var(--line); background: transparent; padding: 12px; margin: 6px 0; }
+.automation-file > span:first-child { color: var(--accent); font-size: 18px; }
+.automation-file > span:nth-child(2) { flex: 1; display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.automation-file strong { font-size: 12px; font-weight: 500; }
+.automation-file small { font-size: 10px; }
+.automation-file > small { flex: none; }
+.automation-run-info { border-top: 1px solid var(--line); padding-top: 16px; font-size: 11px; overflow-wrap: anywhere; }
+.automation-run-info summary, .automation-command-details summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+.automation-run-info dl { display: grid; gap: 14px; margin-top: 18px; }
+.automation-run-info dl > div { display: grid; gap: 5px; }
+.automation-run-info dt { color: var(--subtle); }
+.automation-run-info dd { margin: 0; }
+.automation-run-info pre { white-space: pre-wrap; }
+.automation-run-starter { padding: 26px; max-width: 720px; width: 100%; }
+.automation-run-starter h3 { margin: 12px 0 24px; font-size: 18px; }
+.automation-run-starter form { display: grid; gap: 18px; }
+.automation-run-starter .field { margin: 0; }
+.automation-run-starter .field small { line-height: 1.7; font-size: 11px; }
+.automation-run-starter .field select { max-width: 320px; }
+.automation-command-details { border-top: 1px solid var(--line); padding-top: 18px; }
+.automation-command-preview { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.automation-recovery { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--warning-line); border-radius: 6px; background: var(--warning-bg); font-size: 12px; }
+.automation-recovery p { margin: 0; }
+.automation-editor { display: grid; gap: 16px; min-width: 0; margin-top: 20px; }
+.automation-editor > p { margin: 0; }
+.automation-step-editor { display: grid; gap: 10px; min-width: 0; margin: 0; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px 12px; }
+.automation-step-editor > button, .automation-add-step { justify-self: start; }
+.automation-editor .modal-actions { margin-top: 0; }
+.automation-json { min-height: 400px; }
+.automation-schedules-overview { padding: 16px 18px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+.automation-schedules-overview > header, .automation-schedule-editor > header { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.automation-schedules-overview h3 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 12px; }
+.automation-schedules-overview h3 > span:first-child { color: var(--subtle); font-size: 16px; font-weight: 400; }
+.automation-schedules-overview > p { font-size: 11px; margin: 12px 0 0; }
+.automation-schedules-overview > header button { font-size: 11px; }
+.automation-schedules-overview > small { display: block; margin-top: 14px; font-size: 10px; line-height: 1.7; }
+.automation-schedule-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.automation-schedule-grid:has(.automation-schedule-card) { margin-top: 14px; }
+.automation-schedule-grid:has(.automation-schedule-card:only-child) { grid-template-columns: minmax(0, 1fr); }
+.automation-schedule-card { padding: 14px; border: 1px solid var(--line); border-radius: 6px; min-width: 0; }
+.automation-schedule-title { display: flex; align-items: center; gap: 12px; }
+.automation-schedule-title > div { display: grid; gap: 5px; flex: 1; min-width: 0; }
+.automation-schedule-title strong { font-size: 12px; font-weight: 500; overflow-wrap: anywhere; }
+.automation-schedule-title small { font-size: 10px; }
+.automation-schedule-title button { font-size: 10px; padding: 4px 9px; }
+.automation-schedule-state { color: var(--success); font-size: 10px; flex: none; }
+.automation-schedule-card[data-enabled="false"] .automation-schedule-state { color: var(--subtle); }
+.automation-schedule-next { display: flex; gap: 12px; margin-top: 12px; font-size: 11px; flex-wrap: wrap; }
+.automation-schedule-next strong { font-weight: 400; font-variant-numeric: tabular-nums; }
+.automation-schedule-last { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; font-size: 10px; margin: 9px 0 0; line-height: 1.8; overflow-wrap: anywhere; }
+.automation-schedule-last button { padding: 0 4px; font-size: 10px; color: var(--link); }
+.automation-schedule-card details { font-size: 10px; margin-top: 10px; color: var(--muted); }
+.automation-schedule-card details summary { cursor: pointer; }
+.automation-schedule-card ul { padding-left: 18px; display: grid; gap: 6px; }
+.automation-schedule-editor { display: grid; gap: 16px; padding: 20px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); scroll-margin-top: 20px; }
+.automation-schedule-editor h3 { font-size: 14px; margin: 0; }
+.automation-schedule-editor header p { font-size: 11px; margin: 6px 0 0; }
+.automation-schedule-editor > small { font-size: 11px; line-height: 1.7; }
+.automation-schedule-fields { display: grid; gap: 16px; padding: 16px; margin: 0; min-width: 0; border: 1px solid var(--line); border-radius: 6px; }
+.automation-schedule-fields legend { color: var(--text-soft); padding: 0 6px; font-size: 12px; }
+.automation-schedule-fields .field { margin: 0; }
+.automation-schedule-fields .field small { font-size: 11px; line-height: 1.7; }
+.automation-schedule-fields-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 11px; }
+.automation-schedule-fields-heading > label { display: flex; align-items: center; gap: 6px; }
+.automation-schedule-fields-heading input { width: auto; }
+.automation-schedule-fields-heading button { font-size: 10px; }
+.automation-schedule-times { display: grid; gap: 12px; }
+.automation-schedule-times > div { display: flex; gap: 8px; align-items: end; }
+.automation-schedule-times .field { flex: 1; min-width: 0; }
+.automation-schedule-times > button { justify-self: start; }
+.automation-schedule-interval { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.automation-schedule-parameters { display: grid; gap: 14px; padding-top: 16px; border-top: 1px solid var(--line); }
+.automation-schedule-parameters h4 { font-size: 12px; margin: 0; }
+.automation-schedule-fields input[type="datetime-local"] { width: 100%; min-width: 0; }
+@media (max-width: 1150px) {
+  .app.automation-shell { --section-sidebar-width: 184px; }
+  .automation-shell .main > main { padding: 24px; }
+  .automation-layout { grid-template-columns: 180px minmax(0, 1fr); gap: 16px; }
+  .automation-history { padding: 11px; }
+  .automation-run-body { padding: 16px; }
+  .automation-run > .section-title { padding: 16px; }
+}
+@media (max-width: 950px) {
+  .automation-schedule-grid { grid-template-columns: minmax(0, 1fr); }
+  .automation-layout { grid-template-columns: minmax(0, 1fr); }
+  .automation-history-list { display: flex; overflow-x: auto; padding-bottom: 6px; }
+  .automation-history { flex: 0 0 200px; }
+  .automation-layout-empty .automation-history-list { display: block; }
+  .automation-pagination { flex: 0 0 140px; }
+  .automation-workflow-overview { flex-wrap: wrap; gap: 14px; }
+  .automation-workflow-overview > .automation-actions { padding-top: 0; }
+}
+@media (max-width: 760px) {
+  .app.automation-shell { --section-sidebar-width: 48px; }
+  .automation-nav-heading { justify-content: center; margin-top: 18px; }
+  .automation-nav-empty { display: none; }
+  .automation-shell .main > main { padding: 20px 16px; }
+  .automation-workflow-copy h2 { font-size: 21px; }
+  .automation-run-starter { padding: 20px; }
+}
+@media (max-width: 470px) {
+  .automation-schedule-interval { grid-template-columns: minmax(0, 1fr); }
+  .automation-schedule-title { flex-wrap: wrap; }
+  .automation-schedule-title > div { flex-basis: 100%; }
+  .automation-schedules-overview { padding: 14px; }
+  .automation-run > .section-title { flex-wrap: wrap; }
+  .automation-run-meta { grid-template-columns: 1fr 1fr; }
+  .automation-run-meta > div:last-child { grid-column: 1 / -1; }
+  .automation-info { grid-template-columns: minmax(0, 1fr); }
+  .automation-steps li { grid-template-columns: 22px minmax(0, 1fr) auto; }
+  .automation-steps li > small { display: none; }
+  .automation-tabs { gap: 16px; }
+  .automation-tabs button { font-size: 11px; gap: 4px; }
+  .automation-active-hint { display: none; }
+  .automation-workflow-outline { gap: 10px; }
+  .automation-workflow-outline .automation-outline-count { display: none; }
+}

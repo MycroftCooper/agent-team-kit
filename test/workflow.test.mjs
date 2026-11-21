@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { fixture, node, plan, finish } from "./helpers.mjs";
+import { fixture, node, plan, finish, completeHuman } from "./helpers.mjs";
 test("DRAFT -> approved plan -> execution -> human dependency -> final acceptance", (t) => {
   const f = fixture(t);
   const p = plan(f, [
@@ -24,7 +24,7 @@ test("DRAFT -> approved plan -> execution -> human dependency -> final acceptanc
   assert.equal(f.app.claim(f.dev.agent.id, {}).run, null);
   const human = f.app.get("tasks", p.tasks[1].id);
   f.app.startHuman(human.id, { version: human.version });
-  f.app.finishHuman(human.id, { summary: "Human provided confirmation" });
+  completeHuman(f, human.id, { summary: "Human provided confirmation" });
   const second = f.app.claim(f.dev.agent.id, {});
   fs.writeFileSync(path.join(f.p.root, "b.txt"), "B");
   finish(f, second);

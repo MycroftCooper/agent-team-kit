@@ -3,7 +3,7 @@ on:
   push:
     tags: ["v*"]
 permissions:
-  contents: read
+  contents: write
   id-token: write
 jobs:
   publish:
@@ -23,11 +23,48 @@ jobs:
       - run: node scripts/build-web.mjs
       - run: node scripts/e2e.mjs
       - run: node scripts/smoke.mjs
-      - name: Verify tag and publish
+      - name: Verify tag and prepare GitHub Release artifacts
         shell: bash
         run: |
           version=$(node -p "JSON.parse(require('fs').readFileSync('package.json')).version")
           test "$GITHUB_REF_NAME" = "v$version"
+          node scripts/prepare-release.mjs artifacts/release
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(node -p "JSON.parse(require('fs').readFileSync('package.json')).version")
+          tarball="artifacts/release/agent-team-kit-${version}.tgz"
+          prerelease_flag=""
+          case "$version" in *-*) prerelease_flag="--prerelease" ;; esac
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              "$tarball" \
+              artifacts/release/SHA256SUMS.txt \
+              artifacts/release/release-manifest.json \
+              --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file artifacts/release/RELEASE_NOTES.md \
+              $prerelease_flag
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "$tarball" \
+              artifacts/release/SHA256SUMS.txt \
+              artifacts/release/release-manifest.json \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file artifacts/release/RELEASE_NOTES.md \
+              $prerelease_flag
+          fi
+      - name: Publish to npm (optional when NPM_TOKEN is configured)
+        shell: bash
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN is not configured; skipping npm publish."
+            exit 0
+          fi
+          version=$(node -p "JSON.parse(require('fs').readFileSync('package.json')).version")
           tag=latest
           case "$version" in *-*) tag=next ;; esac
           npm publish --access public --provenance --tag "$tag"

@@ -11,7 +11,7 @@ test("different files execute concurrently while same file and directories wait"
     node("b", { files: ["src/x.txt"] }),
     node("c"),
   ]);
-  const second = f.app.createAgent({
+  const second = f.app.createAgent({ projectId: f.p.id,
     name: "second",
     roleId: "role-dev",
     teamId: "team-default",
@@ -25,7 +25,7 @@ test("different files execute concurrently while same file and directories wait"
   const c2 = f.app.claim(second.agent.id, {});
   assert.equal(f.app.get("tasks", c2.run.taskId).nodeKey, "c");
   finish(f, c1);
-  const third = f.app.createAgent({
+  const third = f.app.createAgent({ projectId: f.p.id,
     name: "third",
     roleId: "role-dev",
     teamId: "team-default",
@@ -42,7 +42,7 @@ test("a duplicate claim cannot share a run; full scope is required", (t) => {
   assert.equal(f.app.list("locks").total, 0);
   const r = f.app.claim(f.dev.agent.id, {});
   assert.equal(f.app.list("locks").total, 2);
-  const b = f.app.createAgent({
+  const b = f.app.createAgent({ projectId: f.p.id,
     name: "b",
     roleId: "role-dev",
     teamId: "team-default",
@@ -57,7 +57,7 @@ test("case aliases cannot bypass locks and path escape is refused", (t) => {
     node("a", { files: ["File.txt"] }),
     node("b", { files: ["file.TXT"] }),
   ]);
-  const b = f.app.createAgent({
+  const b = f.app.createAgent({ projectId: f.p.id,
     name: "b",
     roleId: "role-dev",
     teamId: "team-default",

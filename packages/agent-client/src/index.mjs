@@ -80,6 +80,16 @@ export function createAgentClient({
   }
   return {
     request,
+    automation: {
+      list: projectId => request(`/projects/${encodeURIComponent(projectId)}/automations`),
+      show: (projectId, id) => request(`/projects/${encodeURIComponent(projectId)}/automations/${encodeURIComponent(id)}`),
+      schedules: (projectId, id) => request(`/projects/${encodeURIComponent(projectId)}/automations/${encodeURIComponent(id)}/schedules`),
+      validate: (projectId, definition) => request(`/projects/${encodeURIComponent(projectId)}/automations/validate`, { definition }),
+      apply: (projectId, definition, expectedRevision = null) => request(`/projects/${encodeURIComponent(projectId)}/automations/${encodeURIComponent(definition.id)}`, { definition, expectedRevision }, "PUT"),
+      run: (projectId, id, body) => request(`/projects/${encodeURIComponent(projectId)}/automations/${encodeURIComponent(id)}/runs`, { ...body, idempotencyKey: body.idempotencyKey ?? crypto.randomUUID() }),
+      status: (projectId, runId) => request(`/projects/${encodeURIComponent(projectId)}/automation-runs/${encodeURIComponent(runId)}`),
+      stop: (projectId, runId) => request(`/projects/${encodeURIComponent(projectId)}/automation-runs/${encodeURIComponent(runId)}/stop`, {}),
+    },
     async doctor() {
       if (u.pathname !== "/" || u.search || u.hash || u.username || u.password)
         throw Object.assign(new Error("Use the local service origin, such as http://127.0.0.1:1421"), { code: "INVALID_SERVICE_URL" });
@@ -100,14 +110,14 @@ export function createAgentClient({
         agent = await request("/identity", undefined, "GET", true);
       } catch (error) {
         if (error.code === "UNAUTHENTICATED")
-          throw Object.assign(new Error("ATK rejected this credential; verify the token or check whether the identity was revoked"), { code: "UNAUTHENTICATED" });
+          throw Object.assign(new Error("ATK rejected this credential; verify the token or check whether it was replaced or the identity was deleted"), { code: "UNAUTHENTICATED" });
         if (error.code === "NOT_FOUND")
           throw Object.assign(new Error("This ATK service does not support doctor; update it or use atk-agent connect"), { code: "DOCTOR_UNSUPPORTED" });
         throw error;
       }
       return {
         ok: true, service: u.origin, version: health.version,
-        identity: { id: agent.id, name: agent.name, roleId: agent.roleId, teamId: agent.teamId, lastSeen: agent.lastSeen },
+        identity: { id: agent.id, name: agent.name, roleId: agent.roleId, teamId: agent.teamId, projectId: agent.projectId ?? null, lastSeen: agent.lastSeen },
       };
     },
     connect: () => request("/connect", {}),
@@ -132,10 +142,10 @@ export function createAgentClient({
           `/runs/${encodeURIComponent(receipt.runId)}/${receipt.action}`,
           receipt.body,
         );
-        if (result.persisted === true) {
-          fs.unlinkSync(file);
-          results.push(result);
-        }
+        if (result.persisted !== true)
+          throw new Error("Result not durably acknowledged; retain receipt");
+        fs.unlinkSync(file);
+        results.push(result);
       }
       return results;
     },

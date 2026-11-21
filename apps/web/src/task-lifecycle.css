@@ -1,0 +1,6 @@
+.archive-history-toolbar { flex-wrap:wrap; }
+.archive-history-project { display:flex; align-items:center; gap:8px; min-width:0; max-width:100%; }
+.archive-history-project select { min-width:0; max-width:100%; }
+.archive-history-toolbar .search { flex:1 1 220px; min-width:0; }
+.task-record-actions { flex-wrap:wrap; }
+@media(max-width:600px) { .archive-history-project { width:100%; } .archive-history-project select { flex:1; } }

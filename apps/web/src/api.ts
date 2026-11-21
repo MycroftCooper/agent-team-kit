@@ -38,24 +38,34 @@ export async function authorize(code?: string) {
   }
   return auth();
 }
+async function authorizedFetch(route: string, options: RequestInit = {}) {
+  function send({ token, csrf }: { token: string; csrf: string }) {
+    const headers = new Headers(options.headers);
+    headers.set("x-atk-token", token);
+    headers.set("x-atk-csrf", csrf);
+    return fetch("/api/v1" + route, { ...options, headers });
+  }
+  const original = auth(), cached = session;
+  const response = await send(await original);
+  if (response.status !== 401) return response;
+  // Authentication failed before the backend dispatched the request. Its
+  // in-memory session may have been replaced by a development reload.
+  if (session === cached) session = null;
+  await response.body?.cancel();
+  return send(await auth());
+}
 export async function api<T = Row>(
   route: string,
   body?: unknown,
   method?: string,
 ): Promise<T> {
-  const s = await auth();
-  const r = await fetch("/api/v1" + route, {
+  const r = await authorizedFetch(route, {
     method: method ?? (body === undefined ? "GET" : "POST"),
-    headers: {
-      "content-type": "application/json",
-      "x-atk-token": s.token,
-      "x-atk-csrf": s.csrf,
-    },
+    headers: { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await r.json();
   if (!r.ok) {
-    if (r.status === 401) session = null;
     const error = new Error(data.error?.message ?? r.statusText);
     Object.assign(error, {
       code: data.error?.code,
@@ -64,6 +74,32 @@ export async function api<T = Row>(
     throw error;
   }
   return data;
+}
+export async function downloadFile(route: string, filename: string) {
+  const response = await authorizedFetch(route);
+  if (!response.ok) throw new Error((await response.json()).error?.message ?? response.statusText);
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url; link.download = filename; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+export async function streamEvents(route: string, signal: AbortSignal, onEvent: () => void) {
+  const response = await authorizedFetch(route, { signal });
+  if (!response.ok || !response.body) throw new Error("Event stream unavailable");
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  let partial = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      partial += decoder.decode(value, { stream: true });
+      let boundary;
+      while ((boundary = partial.indexOf("\n\n")) >= 0) {
+        const event = partial.slice(0, boundary); partial = partial.slice(boundary + 2);
+        if (event.includes("data:")) onEvent();
+      }
+    }
+  } finally { reader.releaseLock(); }
 }
 export function useData<T = Row>(route: string | null, epoch: number) {
   const previousRoute = useRef(route),
@@ -109,10 +145,14 @@ export function useData<T = Row>(route: string | null, epoch: number) {
   }, [route, epoch]);
   return sameRoute ? state : { data: null, error: null, loading: true };
 }
-export function useLive(onChange: () => void) {
+export function useLive(onChange: () => void, projectId: string) {
   const [connection, setConnection] = useState("connecting"),
-    [events, setEvents] = useState<Row[]>([]);
+    [events, setEvents] = useState<Row[]>([]),
+    [syncVersion, setSyncVersion] = useState(0);
   useEffect(() => {
+    setEvents([]);
+    setConnection("connecting");
+    if (!projectId) return;
     let disposed = false,
       controller: AbortController | null = null,
       seq: number | null = null,
@@ -129,19 +169,15 @@ export function useLive(onChange: () => void) {
     async function connect() {
       controller = new AbortController();
       try {
-        const s = await auth();
-        const response = await fetch("/api/v1/events/stream", {
-          headers: {
-            "x-atk-token": s.token,
-            ...(seq === null ? {} : { "last-event-id": String(seq) }),
-          },
+        const response = await authorizedFetch("/events/stream?projectId=" + encodeURIComponent(projectId), {
+          headers: seq === null ? {} : { "last-event-id": String(seq) },
           signal: controller.signal,
         });
         if (!response.ok || !response.body) {
-          if (response.status === 401) session = null;
           throw new Error("Stream unavailable");
         }
         setConnection("live");
+        setSyncVersion((v) => v + 1);
         attempt = 0;
         invalidate();
         const reader = response.body.getReader(),
@@ -175,6 +211,8 @@ export function useLive(onChange: () => void) {
                   .trim();
               if (type === "system.resync-required") {
                 seq = null;
+                setEvents([]);
+                setSyncVersion((v) => v + 1);
                 invalidate();
                 continue;
               }
@@ -214,6 +252,6 @@ export function useLive(onChange: () => void) {
       clearTimeout(refresh);
       window.removeEventListener("online", invalidate);
     };
-  }, [onChange]);
-  return { connection, events };
+  }, [onChange, projectId]);
+  return { connection, events, syncVersion };
 }

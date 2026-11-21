@@ -2,10 +2,37 @@
 
 A local web workspace for coordinating external agents across multiple projects.
 
-**2.0.0-alpha.1** is a breaking rebuild: no legacy task import, software plugins,
+**0.0.1** is the initial GitHub Release of the standalone web workspace rebuild: no legacy task import, software plugins,
 model adapters, model gateway, automatic agent launch, or worktrees.
 
+An optional external client, `atk-agent run --task <bugId> --check '<command>'`,
+uses the locally installed Codex CLI (default) or DSH (`--engine dsh`) to repair
+one selected bug, run checks, and submit delivery for human acceptance.
+See [Codex / DSH runner](docs/CODEX-RUNNER.md).
+
 ## Run
+
+**Windows x64 desktop development: double-click `dev.bat`.** It opens the ATK
+desktop window directly. The first launch downloads workspace dependencies and
+Electron using portable tools kept under `artifacts/desktop-dev/`; it needs an
+internet connection, but no system Node.js installation or prebuilt web UI.
+
+React and CSS changes use Vite hot updates. Saving backend source, bundled resources, or a
+shared backend package reloads the backend without refreshing the window. Reload waits until
+tasks and automations are idle, including runs awaiting stop confirmation. Relaunch manually
+after changing Electron's main process or startup configuration. Closing the development window
+stops the backend, so stop active agents before restarting. The app uses the
+existing data directory configuration and Agent API (default `127.0.0.1:1421`).
+Stop any existing service using the same port or data directory first. Override
+the Agent and Vite ports with `ATK_PORT` and `ATK_DEV_PORT`, respectively. This is
+a development launcher; installers and macOS are outside this prototype.
+
+Switch or add workspaces in the custom title bar, and drag its empty area to move
+the desktop window. Its controls minimize, maximize or restore, and close it.
+The bottom bar shows sync status on the left and language and theme controls on the right.
+**Settings & operations → Appearance** also offers **Follow system**.
+
+### Existing web launcher
 
 Use Node.js 24. The release package contains the built web application and has
 no production dependencies. It installs outside the projects it manages.
@@ -20,13 +47,16 @@ An optional, Git-ignored `atk.local.json` beside the batch files can set
 Explicit `--data` and `ATK_DATA_DIR` take precedence; without configuration the
 standard application data directory is used.
 
-After a release has been published to npm (a GitHub source push does not publish it):
+Download a release archive from GitHub Releases (or install from npm when published):
 
 ```sh
-npm install -g agent-team-kit@next
+# Install from GitHub Release tarball
+npm install -g ./agent-team-kit-0.0.1.tgz
 atk start
 # Open the private browserUrl printed by start (keep its access fragment private)
 atk status
+atk check-update
+atk update
 atk stop
 ```
 
@@ -38,7 +68,7 @@ node scripts/build-web.mjs
 node apps/launcher/cli.mjs start
 # To build/install your own independent release:
 npm pack
-npm install -g ./agent-team-kit-2.0.0-alpha.1.tgz
+npm install -g ./agent-team-kit-0.0.1.tgz
 ```
 
 The new database defaults to `%LOCALAPPDATA%/AgentTeamKit/Next` on Windows.
@@ -47,7 +77,7 @@ loaded or upgraded. Register projects in the web UI; Git is optional.
 
 ## Workflow
 
-1. Create a DRAFT request in the browser.
+1. Create a request. It appears in **Work → Tasks** in the **Draft** column.
 2. An external ORCHESTRATOR claims the planning stage and submits a versioned plan.
 3. Approve that plan in the browser. WORKER tasks become eligible for claiming.
 4. External agents claim authorized tasks, obtain cooperative file locks, renew
@@ -64,10 +94,54 @@ discards project edits.
 
 ## Agent connection
 
+Project automations use versioned JSON in `.atk/automations/` and archive each run
+in `.atk/runs/<runId>/`. Humans and project Agents configure and trigger the same
+executor; the UI shows Agent-originated progress, logs and detailed CI results.
+Use `atk-agent automation ... --project <id>` or the Automations page. See the
+[project automation contract](docs/AUTOMATION-PROJECT-DESIGN.md). Automation data
+is not stored in the central database; old workflows must be reconnected.
+Automations support one-time runs, multiple dates, finite interval repeats and
+ongoing intervals. Configure them in the workflow's Schedules section or through
+the same Agent definition API; see [CI scheduling](docs/AUTOMATION-SCHEDULING.md).
+
+Every agent identity is owned by one project, with its own credential. Choose the
+workspace before creating identities. Sharing a role template does not share an
+identity between projects. Unbound legacy identities can be assigned a project
+in Settings after unresolved runs have stopped.
+
+**Work → Collaboration** shows project agents, current runs and observed task
+transitions. Task names across Work open the same collapsible right drawer,
+preserving the underlying page and filters. See
+[Project agents and collaboration](docs/COLLABORATION.md).
+
+Workflow boards and swimlanes support drag handles and **Move to…** for the five
+human operations: start/complete human work, requeue stopped blocked work, approve
+a submitted plan and accept a whole requirement. Required forms and confirmation
+panels remain in place; agent delivery and review still advance through real
+receipts. See [Task board movement](docs/TASK-BOARD-DRAG-DESIGN.md).
+
+Task details also support cancellation with a reviewed impact list and explicit
+stop reconciliation for active runs. Closed tasks can be archived and restored
+from **Work → Archive history**. Archived projects have a **View task history**
+entry in **Projects**, with read-only access to tasks and delivery evidence.
+See [Cancellation and archive history](docs/TASK-CANCELLATION-ARCHIVE.md).
+
+In **Work → Bugs**, report a bug and choose a worker role from the workspace's squad.
+The bug goes straight to that role's queue. After a worker submits a fix, accept it in
+**My inbox** or return it with feedback for another attempt. `atk-agent claim --kind bug`
+limits an agent's claims to bugs.
+
 ![Workspace](docs/screenshots/overview.png)
 
-Create roles, teams and agent identities in the UI. Save the issued credential;
-it is shown once. Agents can use HTTP or the package's machine CLI:
+Open **Agent team** and use its left sidebar to manage identities and squads. Select **Role template** on
+an agent's card to view or edit its assigned template. Create new roles under **Squads**.
+Use **Resources** for agent templates, skills, MCP configurations and CLI scripts, grouped into ATK built-ins,
+global shared entries and the current project's entries. Global resources stay under ATK's data directory;
+project resources live in docsRoot/resources (normally .agent-team/resources).
+Use `atk-agent resources list` for global entries or add `--scope project --project <id>` for a project.
+Same-named resources stay separate. See [Team resources](docs/TEAM-RESOURCES.md).
+Save the credential when creating an agent identity; it is shown once. Agents
+can use HTTP or the package's machine CLI:
 
 ```sh
 # Set ATK_AGENT_TOKEN securely in the external agent's environment.

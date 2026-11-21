@@ -5,7 +5,10 @@ import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { createService } from "./service.mjs";
 import { acquireInstance } from "./instance-lock.mjs";
+import { automationRoute } from "./automation-routes.mjs";
+import { strictJson } from "./automation-definition.mjs";
 import { backup, restore } from "./operations.mjs";
+import { createUpdaterService } from "./updater-service.mjs";
 import {
   createSession,
   isSessionExpired,
@@ -20,6 +23,7 @@ import {
 import {
   AppError,
   requireThat,
+  requiredString,
   VERSION,
 } from "../../../packages/contracts/src/index.mjs";
 import { normalizeDueDate, normalizeTaskTag } from "../../../packages/domain/src/index.mjs";
@@ -57,7 +61,10 @@ function taskViewFilters(params) {
       deadline = { from: day, through: through.getUTCFullYear() > 9999 ? "9999-12-31" : through.toISOString().slice(0, 10) };
     } else deadline = { from: day, through: day };
   }
+  const archive = params.get("archive") ?? (params.has("parentId") || params.has("planId") ? "all" : "active");
+  requireThat(["active", "only", "all"].includes(archive), "VALIDATION_ERROR", "Unknown task archive filter");
   return {
+    archive,
     status: params.get("status") || undefined,
     owner: params.get("owner") || undefined,
     search: params.get("q")?.trim().slice(0, 200),
@@ -83,7 +90,8 @@ async function readBody(req) {
   }
   if (!bytes) return {};
   try {
-    const b = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const text = Buffer.concat(chunks).toString("utf8");
+    const b = /\/projects\/[^/]+\/automations/.test(req.url) ? strictJson(text, 512 * 1024) : JSON.parse(text);
     requireThat(
       b && typeof b === "object" && !Array.isArray(b),
       "VALIDATION_ERROR",
@@ -101,6 +109,7 @@ export function createServer({
   service,
   now,
   logger = console,
+  updateOptions,
 } = {}) {
   const instanceId = crypto.randomUUID(),
     ownership = acquireInstance(dataDir ?? service?.dataDir, instanceId),
@@ -113,11 +122,18 @@ export function createServer({
     ownership.release();
     throw error;
   }
+  const updater = createUpdaterService(app, updateOptions);
   let session = createSession(),
     maintenance,
-    streamTimer;
+    automationTimer,
+    streamTimer,
+    updateStartupTimer,
+    updateIntervalTimer;
   let port = 0;
-  let shutdownHandler;
+  let shutdownHandler, closing;
+  function requireServing() {
+    requireThat(!closing, "SERVICE_RESTARTING", "The service is restarting; retry shortly", 503);
+  }
   const json = (res, status, value) => {
     res.writeHead(status, {
       "content-type": "application/json; charset=utf-8",
@@ -145,6 +161,7 @@ export function createServer({
         after: client.seq,
         limit: 200,
         projectId: client.projectId,
+        includeGlobal: true,
       });
       for (const e of events) {
         client.res.write(
@@ -169,6 +186,7 @@ export function createServer({
     const deadline = Date.now() + number(body.waitMs, 0, 0, 30000);
     let result;
     do {
+      requireServing();
       result = app.claim(agentId, body);
       if (result.run || Date.now() >= deadline || req.aborted) return result;
       await new Promise((resolve) => {
@@ -187,6 +205,7 @@ export function createServer({
     const started = performance.now();
     let url;
     try {
+      requireServing();
       requireThat(req.url.length < 8192, "URL_TOO_LONG", "URL too long", 414);
       requireThat(
         isLoopbackRemote(req.socket.remoteAddress) &&
@@ -262,13 +281,23 @@ export function createServer({
             403,
           );
       }
-      const body = ["POST", "PATCH", "PUT"].includes(method)
+      const body = ["POST", "PATCH", "PUT", "DELETE"].includes(method)
         ? await readBody(req)
         : {};
-      const segments = pathname.split("/").filter(Boolean),
-        route = isAgent ? segments.slice(3) : segments.slice(2);
-      const [resource, id, action] = route;
+      requireServing();
+      const segments = pathname.split("/").filter(Boolean);
+      let route = isAgent ? segments.slice(3) : segments.slice(2);
       const projectId = url.searchParams.get("projectId") ?? undefined;
+      let resourceOptions = { scope: url.searchParams.get("scope") ?? undefined, projectId };
+      if (route[0] === "project-resources") {
+        requireThat(route[1] && (projectId === undefined || projectId === route[1]) &&
+          (resourceOptions.scope === undefined || resourceOptions.scope === "project"),
+          "INVALID_RESOURCE_SCOPE", "Project resource path and scope must agree");
+        resourceOptions = { scope: "project", projectId: route[1] };
+        route = ["resources", ...route.slice(2)];
+      }
+      const [resource, id, action] = route;
+      if (await automationRoute({ app, route, method, body, agent, req, res, url, json })) return;
       if (isAgent) {
         let result;
         if (method === "POST" && resource === "connect")
@@ -279,30 +308,17 @@ export function createServer({
           result = app.heartbeat(agent.id, null, body);
         else if (method === "POST" && resource === "claims")
           result = await waitClaim(agent.id, body, req);
+        else if (method === "GET" && resource === "resources" && route.length === 1)
+          result = app.resourceLibrary(resourceOptions, agent.id).list(url.searchParams.get("kind") ?? undefined);
+        else if (method === "GET" && resource === "resources" && route.length === 3)
+          result = app.resourceLibrary(resourceOptions, agent.id).read(id, action);
         else if (method === "GET" && resource === "plans" && id) {
-          const plan = app.get("plans", id),
-            p = app.get("projects", plan.projectId),
-            team = app.get("teams", agent.teamId);
-          requireThat(
-            p.teamId === team.id &&
-              (team.projectIds.length === 0 || team.projectIds.includes(p.id)),
-            "PROJECT_FORBIDDEN",
-            "Project not authorized",
-            403,
-          );
+          const plan = app.get("plans", id);
+          app.authorizeAgentProject(agent.id, plan.projectId, { planId: id });
           result = plan;
         } else if (resource === "runs" && id) {
           const run = app.get("runs", id);
-          const targetProject = app.get("projects", run.projectId),
-            team = app.get("teams", agent.teamId);
-          requireThat(
-            targetProject.teamId === team.id &&
-              (team.projectIds.length === 0 ||
-                team.projectIds.includes(targetProject.id)),
-            "PROJECT_FORBIDDEN",
-            "Project is not assigned to this team",
-            403,
-          );
+          app.authorizeAgentProject(agent.id, run.projectId, { runId: id });
           if (method === "GET" && action === "artifact")
             result = app.artifact(id);
           else {
@@ -373,12 +389,46 @@ export function createServer({
           "acceptances",
           "materializations",
         ];
+        if (resource === "tasks" && id && projectId && ["human-start", "human-complete", "retry", "cancel", "archive"].includes(action))
+          requireThat(app.store.get("tasks", id)?.projectId === projectId, "NOT_FOUND", "Task not found in this project", 404);
+        if (resource === "runs" && id && projectId && ["stop", "confirm-stopped"].includes(action))
+          requireThat(app.store.get("runs", id)?.projectId === projectId, "NOT_FOUND", "Run not found in this project", 404);
         if (method === "GET" && resource === "overview")
           result = app.overview(projectId);
+        else if (method === "GET" && resource === "agent-migrations")
+          result = { items: app.agentMigrations() };
+        else if (method === "GET" && resource === "collaboration")
+          result = app.collaboration(projectId, url.searchParams.get("planId") ?? undefined);
+        else if (method === "POST" && resource === "agents" && id && action === "bind")
+          result = app.bindAgent(id, body);
+        else if (method === "GET" && resource === "resources" && route.length <= 2)
+          result = app.resourceLibrary(resourceOptions).list(id);
+        else if (method === "GET" && resource === "resources" && route.length === 3)
+          result = app.resourceLibrary(resourceOptions).read(id, action, { parseConfig: false });
+        else if (method === "POST" && resource === "resources" && route.length === 2)
+          result = app.resourceLibrary(resourceOptions).create(id, body);
+        else if (method === "PATCH" && resource === "resources" && route.length === 3)
+          result = app.resourceLibrary(resourceOptions).update(id, action, body);
+        else if (method === "DELETE" && resource === "resources" && route.length === 3)
+          result = app.resourceLibrary(resourceOptions).remove(id, action, url.searchParams.get("revision"));
         else if (method === "GET" && resource === "inbox")
           result = app.inbox(projectId);
+        else if (resource === "bugs" && !id && method === "GET")
+          result = app.listBugs(projectId, {
+            status: url.searchParams.get("status") ?? undefined,
+            limit: number(url.searchParams.get("limit"), 30, 1, 100),
+            offset: number(url.searchParams.get("cursor"), 0, 0, 1_000_000),
+          });
+        else if (resource === "bugs" && !id && method === "POST")
+          result = app.createBug(body);
+        else if (resource === "bugs" && id && action === "review" && method === "POST" && route.length === 3)
+          result = app.reviewBug(id, body, projectId);
         else if (method === "GET" && resource === "tasks" && id === "tags" && !action)
           result = app.taskTags(projectId);
+        else if (method === "GET" && resource === "tasks" && id === "history" && !action)
+          result = app.taskHistory(projectId, { ...taskViewFilters(url.searchParams),
+            limit: number(url.searchParams.get("limit"), 50, 1, 500),
+            offset: number(url.searchParams.get("cursor"), 0, 0, 1_000_000) });
         else if (method === "GET" && resource === "tasks" && id === "board" && !action)
           result = app.taskBoard(projectId, {
             ...taskViewFilters(url.searchParams),
@@ -408,6 +458,10 @@ export function createServer({
             latestSeq: app.store.latestSeq(),
           };
         else if (method === "GET" && listables.includes(resource)) {
+          if (resource === "agents") {
+            requiredString(projectId, "projectId");
+            if (id) requireThat(app.store.get("agents", id)?.projectId === projectId, "NOT_FOUND", "Agent not found in this project", 404);
+          }
           if (id) {
             if (projectId && ["tasks", "runs"].includes(resource))
               requireThat(
@@ -417,6 +471,8 @@ export function createServer({
             result =
               action === "dispatch" && resource === "tasks"
                 ? app.taskDispatch(id)
+                : action === "cancellation" && resource === "tasks"
+                  ? app.cancellation(id)
                 : action === "assignment" && resource === "tasks"
                   ? app.taskAssignment(id)
                 : action === "artifact" && resource === "runs"
@@ -456,16 +512,22 @@ export function createServer({
           result = app.updateTeam(id, body);
         else if (method === "POST" && resource === "agents" && !id)
           result = app.createAgent(body);
+        else if (resource === "agents" && id && ((method === "DELETE" && !action) || (method === "POST" && action === "recover"))) {
+          const target = app.store.get("agents", id);
+          requireThat(projectId && target?.projectId === projectId && !target.deletedAt, "NOT_FOUND", "Agent not found in this project", 404);
+          result = method === "DELETE" ? app.deleteAgent(id, body) : app.recoverAgent(id, body);
+        }
         else if (method === "PATCH" && resource === "agents" && id)
-          result = app.updateAgent(id, body);
-        else if (
-          method === "POST" &&
-          resource === "agents" &&
-          action === "revoke"
-        )
-          result = app.revokeAgent(id);
+          {
+            requireThat(projectId && app.store.get("agents", id)?.projectId === projectId, "NOT_FOUND", "Agent not found in this project", 404);
+            result = app.updateAgent(id, body);
+          }
         else if (method === "POST" && resource === "tasks" && !id)
           result = app.createDraft(body);
+        else if (method === "POST" && resource === "tasks" && action === "cancel")
+          result = app.cancelTask(id, body);
+        else if (method === "POST" && resource === "tasks" && action === "archive")
+          result = app.archiveTask(id, body);
         else if (method === "PATCH" && resource === "tasks" && id && ["assignment", "metadata"].includes(action)) {
           if (projectId)
             requireThat(app.store.get(resource, id)?.projectId === projectId, "NOT_FOUND", "Item not found in this project", 404);
@@ -528,6 +590,29 @@ export function createServer({
         )
           result = app.revalidateAcceptance(id);
         else if (
+          method === "GET" &&
+          resource === "system" &&
+          id === "update"
+        )
+          result = updater.getState();
+        else if (
+          method === "POST" &&
+          resource === "operations" &&
+          id === "update" &&
+          action === "check"
+        )
+          result = await updater.check(body);
+        else if (
+          method === "POST" &&
+          resource === "operations" &&
+          id === "update" &&
+          action === "apply"
+        ) {
+          result = await updater.apply(body);
+          if (body.restart === true) {
+            setTimeout(() => shutdownHandler?.(), 150);
+          }
+        } else if (
           method === "POST" &&
           resource === "operations" &&
           id === "shutdown"
@@ -555,7 +640,7 @@ export function createServer({
         return json(res, 200, result);
       }
       requireThat(
-        ["GET", "HEAD"].includes(method),
+        webDist && ["GET", "HEAD"].includes(method),
         "NOT_FOUND",
         "Unknown route",
         404,
@@ -619,6 +704,30 @@ export function createServer({
         );
     }
   });
+  function close() {
+    if (closing) return closing;
+    // Set the guard before aborting connections so an in-flight claim cannot
+    // dispatch new work after the reload's idle check.
+    closing = Promise.resolve().then(async () => {
+      clearInterval(maintenance);
+      clearInterval(automationTimer);
+      clearInterval(streamTimer);
+      clearTimeout(updateStartupTimer);
+      clearInterval(updateIntervalTimer);
+      const stopAutomations = app.automations.shutdown();
+      for (const c of streams) c.res.end();
+      streams.clear();
+      app.signals.off("change", pump);
+      try {
+        const stopHttp = new Promise((resolve) => server.close(resolve));
+        server.closeAllConnections();
+        await Promise.all([stopHttp, stopAutomations]);
+      } finally {
+        try { app.close(); } finally { ownership.release(); }
+      }
+    });
+    return closing;
+  }
   return {
     app,
     server,
@@ -645,26 +754,35 @@ export function createServer({
         }
       }, 1000);
       maintenance.unref();
+      const pollAutomations = () => void app.automations.poll().catch((error) => logger.error?.(error.message));
+      pollAutomations();
+      automationTimer = setInterval(pollAutomations, 2000);
+      automationTimer.unref();
       streamTimer = setInterval(() => {
         for (const c of streams) c.res.write(": heartbeat\n\n");
       }, 15000);
       streamTimer.unref();
+      const autoCheck =
+        updateOptions?.autoCheck !== false &&
+        process.env.ATK_DISABLE_UPDATE_CHECK !== "1" &&
+        !process.env.NODE_TEST_CONTEXT;
+      if (autoCheck) {
+        const bgCheck = () => {
+          void updater.check().catch(() => {});
+        };
+        updateStartupTimer = setTimeout(bgCheck, 30_000);
+        updateStartupTimer.unref();
+        updateIntervalTimer = setInterval(bgCheck, 6 * 60 * 60 * 1000);
+        updateIntervalTimer.unref();
+      }
       const url = `http://127.0.0.1:${port}`;
       return { url, browserUrl: browserUrl(url, browserAccess), port };
     },
-    async close() {
-      clearInterval(maintenance);
-      clearInterval(streamTimer);
-      for (const c of streams) c.res.end();
-      streams.clear();
-      app.signals.off("change", pump);
-      server.closeAllConnections();
-      await new Promise((resolve) => server.close(resolve));
-      try {
-        app.close();
-      } finally {
-        ownership.release();
-      }
+    close,
+    closeWhenIdle() {
+      if (closing) return closing;
+      if (app.store.activeRuns().length || app.automations.busy()) return null;
+      return close();
     },
   };
 }

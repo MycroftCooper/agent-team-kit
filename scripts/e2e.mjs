@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { createServer } from "../apps/backend/src/server.mjs";
 import { createAgentClient } from "../packages/agent-client/src/index.mjs";
 import { openBrowser } from "./browser.mjs";
@@ -16,6 +17,8 @@ const server = createServer({ dataDir: path.join(root, "data") }),
 let browser;
 const steps = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const primaryRailWidth = "document.querySelector('.sidebar').offsetWidth";
+const leftSecondarySidebar = "(()=>{const rail=document.querySelector('.sidebar').getBoundingClientRect(), section=document.querySelector('.section-sidebar').getBoundingClientRect(), main=document.querySelector('.main').getBoundingClientRect();return rail.right===section.left && section.right===main.left && section.top===rail.top;})()";
 async function step(name, fn) {
   await fn();
   steps.push({ name, passed: true, at: new Date().toISOString() });
@@ -29,6 +32,15 @@ async function taskLayout(name) {
   await displayMenu(true);
   await browser.click(name, { exact: true, within: "document.querySelector('.task-layout-options')" });
   await displayMenu(false);
+}
+async function workPage(name) {
+  const menu = "document.querySelector('.work-sidebar .work-nav')";
+  if (!await browser.evaluate(`!!${menu}`)) {
+    const english = await browser.evaluate("document.documentElement.lang === 'en'");
+    await browser.click(english ? "Work" : "工作", { exact: true });
+    await browser.wait(`!!${menu}`);
+  }
+  await browser.click(name, { exact: true, within: menu });
 }
 try {
   browser = await openBrowser({ url: info.url, outputDir: output });
@@ -44,11 +56,30 @@ try {
   });
   await step("Linear workspace renders without overflow", async () => {
     await browser.wait("document.body.innerText.includes('添加本地项目')");
+    assert.equal(await browser.evaluate("!!document.querySelector('.topbar [name=workspace]') && !document.querySelector('.sidebar .brand, .sidebar .workspace-switch')"), true);
     assert.equal(
       await browser.evaluate("document.documentElement.scrollWidth>innerWidth"),
       false,
     );
     await browser.screenshot("01-workspace-empty");
+  });
+  await step("browser appearance switches, persists, and can follow the OS", async () => {
+    assert.equal(await browser.evaluate("typeof window.atkDesktop"), "undefined");
+    assert.equal(await browser.evaluate("Boolean(document.querySelector('.desktop-titlebar'))"), false);
+    const background = "getComputedStyle(document.documentElement).backgroundColor";
+    await browser.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+    await browser.wait(`document.documentElement.dataset.theme === "system" && ${background} === "rgb(11, 12, 14)"`);
+    await browser.click("切换到浅色主题", { exact: true, within: "document.querySelector('.app-footer')" });
+    await browser.wait(`${background} === "rgb(247, 248, 251)"`);
+    await browser.send("Page.reload");
+    await browser.wait(`document.querySelector('.topbar') && ${background} === "rgb(247, 248, 251)"`);
+    await browser.click("设置与运维", { exact: true });
+    await browser.fill("theme", "system");
+    await browser.wait(`${background} === "rgb(11, 12, 14)"`);
+    await browser.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "light" }] });
+    await browser.wait(`${background} === "rgb(247, 248, 251)"`);
+    await browser.fill("theme", "dark");
+    await browser.click("概览", { exact: true });
   });
   await step("register a non-Git project from the UI", async () => {
     await browser.click("添加本地项目");
@@ -59,17 +90,71 @@ try {
       "!document.querySelector('[role=dialog]') && document.body.innerText.includes('Browser Project')",
     );
   });
+  const overviewRailWidth = await browser.evaluate(primaryRailWidth);
+  await step("automation shows live progress, elapsed time, custom fields and logs", async () => {
+    fs.writeFileSync(path.join(projectRoot, "automation-check.mjs"), [
+      'import fs from "node:fs";',
+      'console.log(\'::atk::{"schemaVersion":1,"type":"progress","percent":40,"current":"local-check"}\');',
+      'console.log(\'::atk::{"schemaVersion":1,"type":"info","values":{"artifact":"demo.txt"}}\');',
+      'while (!fs.existsSync("automation-continue.txt")) await new Promise((resolve) => setTimeout(resolve, 50));',
+      'console.log("Local check passed");',
+    ].join("\n"));
+    await browser.click("自动化", { exact: true });
+    await browser.click("新建流程", { exact: true });
+    await browser.click("演示流程", { exact: true });
+    await browser.fill("step-args", JSON.stringify(["automation-check.mjs"]));
+    await browser.submit();
+    await browser.wait("!document.querySelector('[role=dialog]')");
+    await browser.click("运行流程", { exact: true, within: "[...document.querySelectorAll('.automation-row')].find(row=>row.textContent.includes('演示流程'))" });
+    await browser.click("启动流程", { exact: true });
+    await browser.wait("document.querySelector('.automation-progress progress')?.value === 40 && document.querySelector('.automation-run-meta strong')?.textContent !== '00:00:00' && document.querySelector('.automation-info')?.textContent.includes('demo.txt')");
+    await browser.screenshot("automation-running");
+    fs.writeFileSync(path.join(projectRoot, "automation-continue.txt"), "");
+    await browser.wait("document.querySelector('.automation-progress progress')?.value === 100 && document.querySelector('.automation-run .section-title .badge')?.dataset.status === 'SUCCEEDED' && document.querySelector('.automation-log')?.textContent.includes('Local check passed')");
+    assert.equal(await browser.evaluate("document.querySelector('.automation-info').textContent.includes('artifact')"), true);
+    await browser.click("概览", { exact: true, within: "document.querySelector('.sidebar')" });
+  });
+  await step("a file workflow can watch a project-specific Git branch from the UI", async () => {
+    const branch = "checks/browser";
+    const git = (...args) => execFileSync("git", [
+      "-c", "user.name=ATK Browser Test", "-c", "user.email=atk@example.test",
+      "-c", "commit.gpgsign=false", "-c", "core.hooksPath=.git/no-hooks", ...args,
+    ], { cwd: projectRoot, encoding: "utf8", windowsHide: true }).trim();
+    git("init", "-b", branch);
+    git("commit", "--allow-empty", "-m", "baseline");
+    await browser.click("自动化", { exact: true });
+    const nav = await browser.evaluate("[...document.querySelectorAll('.sidebar nav button')].map(button=>button.getAttribute('aria-label'))");
+    assert.deepEqual(nav.slice(1, 4), ["工作", "自动化", "Agent 团队"]);
+    const smoke = "[...document.querySelectorAll('.automation-row')].find(row=>row.textContent.includes('演示流程'))";
+    await browser.click("编辑流程", { exact: true, within: smoke });
+    assert.equal(await browser.evaluate("document.querySelector('[name=automationTrigger]').value"), "manual");
+    await browser.fill("step-args", JSON.stringify(["-e", "console.log('Git-triggered check passed')"]));
+    await browser.fill("automationTrigger", "git-commit");
+    await browser.fill("automationBranch", branch);
+    await browser.submit();
+    await browser.wait("!document.querySelector('[role=dialog]') && !!(" + smoke + ")");
+    await server.app.automations.poll();
+    git("commit", "--allow-empty", "-m", "trigger");
+    const sha = git("rev-parse", "HEAD").slice(0, 8);
+    await browser.wait("document.querySelector('.automation-history')?.textContent.includes('Git · checks/browser')");
+    await browser.evaluate("document.querySelector('.automation-history').click()");
+    await browser.wait("document.querySelector('.automation-run-body')?.textContent.includes('" + sha + "') && document.querySelector('.automation-log')?.textContent.includes('Git-triggered check passed')");
+    await browser.click("概览", { exact: true, within: "document.querySelector('.sidebar')" });
+  });
   const credentials = {};
   await step(
     "create PM, worker and reviewer identities in the UI",
     async () => {
-      await browser.click("Agent 与团队");
+      await browser.click("Agent 团队", { exact: true });
+      await browser.wait("!!document.querySelector('.agent-team-sidebar .agent-team-nav')");
+      assert.equal(await browser.evaluate(leftSecondarySidebar), true);
+      assert.equal(await browser.evaluate(primaryRailWidth), overviewRailWidth);
       for (const [name, role] of [
         ["PM Browser", "role-pm"],
         ["Developer Browser", "role-dev"],
         ["Reviewer Browser", "role-qa"],
       ]) {
-        await browser.click("添加 Agent");
+        await browser.click("添加项目 Agent");
         await browser.fill("name", name);
         await browser.fill("roleId", role);
         await browser.submit();
@@ -84,8 +169,183 @@ try {
       await browser.screenshot("02-agent-team");
     },
   );
+  await step("agent team shows scoped agents, role dialogs and setup resources", async () => {
+    const otherTeam = server.app.createTeam({ name: "Other squad", roleIds: ["role-dev"] });
+    const outsideProject = server.app.createProject({ name: "Other squad project", teamId: otherTeam.id, root: fs.mkdtempSync(path.join(root, "outside-project-")) });
+    server.app.createAgent({ projectId: outsideProject.id, name: "Outside squad agent", roleId: "role-dev" });
+    const content = "document.querySelector('.agent-team-content')";
+    await browser.wait(`${content}?.innerText.includes('Developer Browser') && !${content}?.innerText.includes('Outside squad agent')`);
+    const template = "document.querySelector('[role=dialog][aria-label=角色模板]')";
+    const cardLayout = "[...document.querySelectorAll('.agent-card')].map(card=>[card.offsetLeft,card.offsetTop,card.offsetWidth,card.offsetHeight])";
+    const originalLayout = await browser.evaluate(cardLayout);
+    await browser.click("PM Browser 的角色模板", { exact: true, within: content });
+    await browser.wait(`${template}?.innerText.includes('PM Browser') && ${template}?.innerText.includes('ORCHESTRATOR')`);
+    await browser.click("关闭", { exact: true, within: template });
+    await browser.wait(`!${template}`);
+    await browser.click("Developer Browser 的角色模板", { exact: true, within: content });
+    await browser.wait(`${template}?.innerText.includes('Developer Browser') && ${template}?.innerText.includes('WORKER')`);
+    assert.deepEqual(await browser.evaluate(cardLayout), originalLayout);
+    await browser.screenshot("02-agent-role-template");
+    await browser.click("编辑模板", { exact: true, within: template });
+    const developerRole = server.app.get("roles", "role-dev");
+    await browser.wait(`document.querySelector('[role=dialog] [name=name]')?.value === ${JSON.stringify(developerRole.name)}`);
+    await browser.click("关闭", { exact: true });
+    await browser.click("小队", { exact: true });
+    await browser.wait(`${content}?.innerText.includes('Other squad')`);
+    await browser.click("新建角色", { exact: true, within: content });
+    await browser.fill("name", "Documentation worker");
+    await browser.fill("instructions", "Maintain project documentation.");
+    await browser.click("保存角色", { exact: true });
+    await browser.wait("!document.querySelector('[role=dialog]')");
+    assert.ok(server.app.list("roles").items.some((role) => role.name === "Documentation worker"));
+    await browser.click("成员", { exact: true });
+    await browser.wait(`${content}?.innerText.includes('本机用户')`);
+    await browser.click("Skills", { exact: true });
+    await browser.wait(`${content}?.innerText.includes('skill/atk-create-automation/SKILL.md')`);
+    for (const name of ["linus-review", "linus-design-guard"]) {
+      assert.ok(await browser.evaluate(`${content}?.innerText.includes('skill/${name}/SKILL.md')`));
+      assert.equal(await browser.evaluate(`${content}?.querySelector('[aria-label="编辑 ${name}"], [aria-label="删除 ${name}"]')`), null);
+      await browser.click(`查看 ${name}`, { exact: true, within: content });
+      await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent.includes('name: ${name}')`);
+      await browser.click(`收起 ${name}`, { exact: true, within: content });
+    }
+    assert.ok(await browser.evaluate(`${content}?.innerText.includes('skill/atk-create-skill/SKILL.md')`));
+    assert.equal(await browser.evaluate(`${content}?.querySelector('[aria-label="编辑 atk-create-skill"], [aria-label="删除 atk-create-skill"]')`), null);
+    await browser.click("查看 atk-create-skill", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent.includes('name: atk-create-skill')`);
+    await browser.click("收起 atk-create-skill", { exact: true, within: content });
+    assert.equal(await browser.evaluate(`${content}.innerText.includes('角色模板')`), false);
+    await browser.click("新建全局资源", { exact: true });
+    await browser.fill("resourceName", "release-notes");
+    await browser.fill("resourceContent", "# Release notes\nCheck the delivered files.");
+    await browser.click("创建资源", { exact: true });
+    await browser.wait(`${content}?.innerText.includes('skill/release-notes/SKILL.md')`);
+    assert.equal(server.app.resources.read("skill", "release-notes").content, "# Release notes\nCheck the delivered files.");
+    await browser.click("编辑 release-notes", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('[name=resourceEditContent]')?.value.startsWith('# Release notes')`);
+    await browser.fill("resourceEditContent", "# Updated release notes");
+    await browser.click("保存修改", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent === '# Updated release notes'`);
+    await browser.click("删除 release-notes", { exact: true, within: content });
+    await browser.click("取消删除", { exact: true, within: content });
+    assert.equal(server.app.resources.read("skill", "release-notes").content, "# Updated release notes");
+    await browser.click("删除 release-notes", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-preview .danger')?.disabled === false`);
+    await browser.click("确认删除", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-notice') && !${content}?.innerText.includes('skill/release-notes/SKILL.md')`);
+    assert.throws(() => server.app.resources.read("skill", "release-notes"), { code: "RESOURCE_NOT_FOUND" });
+    await browser.click("Agent 模板", { exact: true });
+    await browser.wait(`${content}?.innerText.includes('AGENT.md')`);
+    await browser.click("MCP", { exact: true });
+    await browser.click("查看 CLI 接入");
+    await browser.wait(`${content}?.querySelector('pre')?.textContent.includes('atk-agent connect')`);
+    assert.equal(await browser.evaluate(`${content}.querySelector('pre').textContent.includes('<credential>')`), true);
+    await browser.wait(`${content}?.innerText.includes('自带 CLI') && ${content}?.querySelectorAll('.team-resource-list .badge').length === 2`);
+    await browser.click("查看 atk", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent.includes('atk backup')`);
+    await browser.click("查看 atk-agent", { exact: true, within: content });
+    await browser.wait(`${content}?.querySelector('.team-resource-preview pre')?.textContent.includes('atk-agent claim')`);
+    await browser.click("项目 Agent", { exact: true });
+    await browser.send("Emulation.setDeviceMetricsOverride", { width: 420, height: 900, deviceScaleFactor: 1, mobile: false });
+    const narrowRailWidth = await browser.evaluate(primaryRailWidth);
+    assert.equal(await browser.evaluate(leftSecondarySidebar), true);
+    assert.equal(await browser.evaluate("document.documentElement.scrollWidth > innerWidth"), false);
+    await browser.click("概览", { exact: true });
+    await browser.wait("!document.querySelector('.section-sidebar')");
+    assert.equal(await browser.evaluate(primaryRailWidth), narrowRailWidth);
+    await browser.send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+  });
+  await step("project resource forms, same names and workspace switches stay scoped", async () => {
+    const primary = server.app.list("projects").items.find((p) => p.root === projectRoot);
+    const secondaryRoot = path.join(root, "resource-project");
+    fs.mkdirSync(secondaryRoot);
+    const secondary = server.app.createProject({ name: "Resource workspace", root: secondaryRoot, docsRoot: "atk-docs" });
+    server.app.resources.create("skill", { name: "project-notes", content: "# Global notes" });
+    server.app.resourceLibrary({ scope: "project", projectId: secondary.id }).create("skill", { name: "project-notes", content: "# Second project" });
+    await browser.click("Agent 团队", { exact: true });
+    await browser.click("Skills", { exact: true });
+    const shared = "document.querySelector('[data-resource-scope=global]')";
+    const local = "document.querySelector('[data-resource-scope=project]')";
+    await browser.wait(`${local}?.innerText.includes(${JSON.stringify(primary.docsRoot)}) && ${shared}?.innerText.includes('project-notes')`);
+    await browser.click("新建项目资源", { exact: true });
+    await browser.fill("resourceName", "project-notes");
+    await browser.fill("resourceContent", "# First project");
+    await browser.click("创建资源", { exact: true, within: local });
+    await browser.wait(`${local}?.innerText.includes('skill/project-notes/SKILL.md')`);
+    const library = server.app.resourceLibrary({ scope: "project", projectId: primary.id });
+    assert.equal(library.read("skill", "project-notes").content, "# First project");
+    await browser.click("编辑 project-notes", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('[name=resourceEditContent]')?.value === '# First project'`);
+    await browser.fill("resourceEditContent", "# Updated first project");
+    await browser.click("保存修改", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('.team-resource-preview pre')?.textContent === '# Updated first project'`);
+    assert.equal(server.app.resources.read("skill", "project-notes").content, "# Global notes");
+    await browser.click("编辑 project-notes", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('[name=resourceEditContent]')?.value === '# Updated first project'`);
+    await browser.fill("resourceEditContent", "Unsaved draft from first project");
+    await browser.wait(`[...document.querySelector('[name=workspace]').options].some(o=>o.value===${JSON.stringify(secondary.id)})`);
+    await browser.fill("workspace", secondary.id);
+    await browser.wait(`${local}?.innerText.includes(${JSON.stringify(secondary.docsRoot)}) && !${local}?.querySelector('[name=resourceEditContent]')`);
+    await browser.click("查看 project-notes", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('.team-resource-preview pre')?.textContent === '# Second project'`);
+    await browser.click("查看 project-notes", { exact: true, within: shared });
+    await browser.wait(`${shared}?.querySelector('.team-resource-preview pre')?.textContent === '# Global notes'`);
+    await browser.evaluate(`${local}.scrollIntoView({block:'center'})`);
+    await browser.screenshot("02-project-resources");
+    await browser.fill("workspace", primary.id);
+    await browser.wait(`${local}?.innerText.includes(${JSON.stringify(primary.docsRoot)}) && !${local}?.querySelector('.team-resource-preview')`);
+    await browser.click("删除 project-notes", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('.team-resource-preview .danger')?.disabled === false`);
+    await browser.click("确认删除", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('.team-resource-notice') && !${local}?.innerText.includes('skill/project-notes/SKILL.md')`);
+    assert.throws(() => library.read("skill", "project-notes"), { code: "RESOURCE_NOT_FOUND" });
+    assert.equal(server.app.resources.read("skill", "project-notes").content, "# Global notes");
+    assert.equal(server.app.resourceLibrary({ scope: "project", projectId: secondary.id }).read("skill", "project-notes").content, "# Second project");
+    const other = server.app.get("projects", secondary.id);
+    server.app.updateProject(other.id, { version: other.version, archived: true });
+    await browser.click("概览", { exact: true, within: "document.querySelector('.sidebar')" });
+  });
+  await step("project resource actions fail closed with an older or mismatched backend", async () => {
+    const shared = "document.querySelector('[data-resource-scope=global]')";
+    const local = "document.querySelector('[data-resource-scope=project]')";
+    const globalCount = server.app.resources.list("skill").items.length;
+    await browser.evaluate(`(() => {
+      window.resourceOriginalFetch = window.fetch;
+      window.resourceBackendMode = 'unsupported';
+      window.fetch = (input, init) => {
+        if (String(input).startsWith('/api/v1/project-resources/')) {
+          const unsupported = window.resourceBackendMode === 'unsupported';
+          const body = unsupported ? {error:{code:'NOT_FOUND',message:'Project resources unsupported'}}
+            : {scope:'global',folders:{skill:'wrong-library'},items:[{id:'skill/foreign-global',name:'foreign-global',scope:'global'}]};
+          return Promise.resolve(new Response(JSON.stringify(body), {status:unsupported ? 404 : 200,headers:{'content-type':'application/json'}}));
+        }
+        return window.resourceOriginalFetch(input, init);
+      };
+    })()`);
+    try {
+      await browser.click("Agent 团队", { exact: true });
+      await browser.click("Skills", { exact: true });
+      await browser.wait(`${local}?.querySelector('[role=alert]') && ${local}?.querySelector('.team-resource-header .primary')?.disabled === true`);
+      assert.equal(await browser.evaluate(`!!${local}?.querySelector('.team-resource-list')`), false);
+      await browser.click("新建全局资源", { exact: true });
+      await browser.wait(`!!${shared}?.querySelector('[name=resourceName]')`);
+      await browser.click("取消", { exact: true, within: shared });
+      await browser.evaluate("window.resourceBackendMode = 'mismatched'");
+      await browser.click("刷新", { exact: true, within: local });
+      await browser.wait(`${local}?.querySelector('[role=alert]')?.textContent.includes('未确认项目资源归属')`);
+      assert.equal(await browser.evaluate(`${local}?.innerText.includes('foreign-global')`), false);
+      assert.equal(await browser.evaluate(`${local}?.querySelector('.team-resource-header .primary')?.disabled`), true);
+    } finally {
+      await browser.evaluate("window.fetch = window.resourceOriginalFetch; delete window.resourceOriginalFetch; delete window.resourceBackendMode;");
+    }
+    await browser.click("刷新", { exact: true, within: local });
+    await browser.wait(`${local}?.querySelector('.team-resource-path') && ${local}?.querySelector('.team-resource-header .primary')?.disabled === false`);
+    assert.equal(server.app.resources.list("skill").items.length, globalCount);
+    await browser.click("概览", { exact: true, within: "document.querySelector('.sidebar')" });
+  });
   const project = server.app.list("projects").items[0];
-  await step("submit a DRAFT request in the browser", async () => {
+  await step("work uses a secondary sidebar and new requests have their own draft column", async () => {
+    await workPage("任务");
     await browser.click("新建需求");
     await browser.fill("title", "Build the release summary");
     await browser.fill(
@@ -98,10 +358,18 @@ try {
     );
     await browser.submit();
     await browser.wait("!document.querySelector('[role=dialog]')");
-    await browser.click("预排池");
-    await browser.wait(
-      "document.body.innerText.includes('Build the release summary')",
-    );
+    await browser.click("工作", { exact: true });
+    await browser.wait("document.querySelector('.work-sidebar [aria-current=page]')?.getAttribute('aria-label') === '任务'");
+    assert.equal(await browser.evaluate(leftSecondarySidebar), true);
+    assert.equal(await browser.evaluate(primaryRailWidth), overviewRailWidth);
+    assert.equal(await browser.evaluate("!!document.querySelector('.sidebar [aria-label=预排池]')"), false);
+    await browser.wait("document.querySelector('[data-column=draft] .board-card')?.innerText.includes('Build the release summary')");
+    assert.equal(await browser.evaluate("!!document.querySelector('[data-column=queue] .board-card')"), false);
+    await browser.fill("taskStatus", "DRAFT");
+    await browser.wait("document.querySelectorAll('.board-column').length === 1 && !!document.querySelector('[data-column=draft] .board-card')");
+    await browser.fill("taskStatus", "");
+    await browser.wait("!!document.querySelector('[data-column=queue]')");
+    await browser.screenshot("03-work-draft");
   });
   const pm = createAgentClient({
       baseUrl: info.url,
@@ -117,7 +385,7 @@ try {
     });
   let submitted;
   await step("agent connection guide distinguishes valid credentials from first contact", async () => {
-    await browser.click("Agent 与团队");
+    await browser.click("Agent 团队", { exact: true });
     const card = "[...document.querySelectorAll('.agent-card')].find(r=>r.textContent.includes('Developer Browser'))";
     await browser.wait("Boolean(" + card + ")");
     await browser.click("接入说明", { within: card });
@@ -177,7 +445,7 @@ try {
     assert.equal((await dev.claim({ waitMs: 0 })).run, null);
   });
   await step("approve the exact plan version in the UI", async () => {
-    await browser.click("待我处理");
+    await workPage("待我处理");
     await browser.wait("document.body.innerText.includes('审阅计划')");
     await browser.click("审阅计划");
     await browser.wait(
@@ -188,9 +456,9 @@ try {
     await browser.wait("!document.querySelector('[role=dialog]')");
   });
   await step("board mixes human and agent work and lets a human reserve an agent task", async () => {
-    await browser.click("任务", { exact: true });
+    await workPage("任务");
     await browser.wait("!!document.querySelector('.board-card[data-executor=HUMAN]') && !!document.querySelector('.board-card[data-executor=AGENT]')");
-    const agentCard = "[...document.querySelectorAll('.board-card')].find(card=>card.innerText.includes('Produce first output'))";
+    const agentCard = "[...document.querySelectorAll('.board-card')].find(card=>card.querySelector('.board-card-main > strong')?.textContent === 'Produce first output')";
     await browser.click("指派", { within: agentCard, exact: true });
     await browser.wait("!!document.querySelector('[name=assignedAgent] option[value]:not([value=\"\"])')");
     const assigned = (await dev.doctor()).identity.id;
@@ -198,7 +466,7 @@ try {
     await browser.click("保存指派", { exact: true });
     await browser.wait("!document.querySelector('[role=dialog]') && " + agentCard + "?.innerText.includes('Developer Browser')");
     const task = server.app.list("tasks", { projectId: project.id }).items.find((row) => row.title === "Produce first output");
-    const competitor = server.app.createAgent({ name: "Another worker", roleId: "role-dev", teamId: "team-default" });
+    const competitor = server.app.createAgent({ projectId: server.app.list("projects").items.find((p) => p.root === projectRoot).id, name: "Another worker", roleId: "role-dev", teamId: "team-default" });
     const client = createAgentClient({ baseUrl: info.url, credential: competitor.credential });
     assert.equal((await client.claim({ taskId: task.id, waitMs: 0 })).run, null);
     await displayMenu(true);
@@ -212,7 +480,7 @@ try {
     await displayMenu(true);
     await browser.fill("taskGrouping", "flow");
     await displayMenu(false);
-    await browser.wait("document.querySelectorAll('.board-column').length === 6");
+    await browser.wait("document.querySelectorAll('.board-column').length === 7");
     await browser.send("Emulation.setDeviceMetricsOverride", { width: 420, height: 900, deviceScaleFactor: 1, mobile: false });
     assert.equal(await browser.evaluate("document.documentElement.scrollWidth > innerWidth"), false);
     assert.equal(await browser.evaluate("document.querySelector('.board').scrollWidth > document.querySelector('.board').clientWidth"), true);
@@ -220,10 +488,12 @@ try {
     await browser.send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
   });
   await step("worker output updates the task list through SSE", async () => {
-    await browser.click("任务", { exact: true });
+    await workPage("任务");
     await taskLayout("列表");
     await browser.wait("[...document.querySelectorAll('.task-row')].some(row=>row.innerText.includes('Produce first output'))");
     await browser.evaluate("[...document.querySelectorAll('.task-row')].find(row=>row.innerText.includes('Produce first output')).click()");
+    await browser.wait("[...document.querySelectorAll('.detail-section summary')].some(s=>s.textContent==='交付记录')");
+    await browser.evaluate("[...document.querySelectorAll('.detail-section summary')].find(s=>s.textContent==='交付记录').parentElement.open=true");
     await browser.wait("document.querySelector('.dispatch-notice')?.innerText.includes('等待外部 Agent 领取')");
     await browser.screenshot("12-task-claim-diagnostics");
     await browser.click("关闭", { exact: true });
@@ -269,7 +539,7 @@ try {
     await browser.wait("Boolean(" + card + "?.querySelector('.board-card-footer button'))");
     await browser.click("开始", { within: card, exact: true });
     await browser.wait("document.querySelector('[data-column=running] .board-card[data-executor=HUMAN]')?.innerText.includes('Confirm the release content')");
-    await browser.click("待我处理");
+    await workPage("待我处理");
     await browser.wait(
       "document.body.innerText.includes('Confirm the release content')",
     );
@@ -290,7 +560,7 @@ try {
     await browser.fill("workspace", project.id);
     await browser.wait("document.body.innerText.includes('确认完成')");
     server.app.updateProject(heartbeatProject.id, { version: heartbeatProject.version, archived: true });
-    await browser.click("任务", { exact: true });
+    await workPage("任务");
     await browser.wait("Boolean(" + card + "?.querySelector('.board-card-footer button'))");
     await browser.click("提交交付", { within: card, exact: true });
     await browser.fill("summary", "The release content is correct.");
@@ -312,7 +582,7 @@ try {
         stopped: true,
         summary: "Final release ready",
       });
-      await browser.click("待我处理");
+      await workPage("待我处理");
       await browser.wait("document.body.innerText.includes('查看交付')");
       await browser.click("查看交付");
       await browser.screenshot("05-plan-acceptance");
@@ -326,10 +596,12 @@ try {
   );
   await step("task and run links keep delivery context and load receipts on demand", async () => {
     const first = server.app.list("tasks", { projectId: project.id }).items.find((t) => t.title === "Produce first output");
-    await browser.click("任务", { exact: true });
+    await workPage("任务");
     await taskLayout("列表");
     await browser.wait("[...document.querySelectorAll('.task-row')].some(row=>row.innerText.includes('Produce first output'))");
     await browser.evaluate("[...document.querySelectorAll('.task-row')].find(row=>row.innerText.includes('Produce first output')).click()");
+    await browser.wait("[...document.querySelectorAll('.detail-section summary')].some(s=>s.textContent==='交付记录')");
+    await browser.evaluate("[...document.querySelectorAll('.detail-section summary')].find(s=>s.textContent==='交付记录').parentElement.open=true");
     await browser.wait("document.querySelector('.attempt-row')?.innerText.includes('#2')");
     const taskUrl = new URL(await browser.evaluate("location.href"));
     assert.equal(taskUrl.searchParams.get("project"), project.id);
@@ -346,6 +618,8 @@ try {
     await browser.wait("document.querySelector('.detail-toolbar')?.innerText.includes('执行 #1')");
     assert.equal(await browser.evaluate("location.hash"), "");
     await browser.evaluate("history.back()");
+    await browser.wait("[...document.querySelectorAll('.detail-section summary')].some(s=>s.textContent==='交付记录')");
+    await browser.evaluate("[...document.querySelectorAll('.detail-section summary')].find(s=>s.textContent==='交付记录').parentElement.open=true");
     await browser.wait("document.querySelector('.attempt-row')?.innerText.includes('#2')");
     assert.equal(await browser.evaluate("location.href"), taskUrl.href);
     await browser.send("Emulation.setDeviceMetricsOverride", { width: 420, height: 900, deviceScaleFactor: 1, mobile: false });
@@ -355,7 +629,7 @@ try {
     await browser.click("关闭", { exact: true });
   });
   await step("display settings switch all task layouts and persist across reload", async () => {
-    await browser.click("任务", { exact: true });
+    await workPage("任务");
     await taskLayout("表格");
     await browser.wait("document.querySelectorAll('.task-table tbody tr').length === 4");
     await displayMenu(true);
@@ -368,8 +642,8 @@ try {
     await browser.click("显示子任务", { exact: true });
     await browser.wait("document.querySelectorAll('.task-table tbody tr').length === 1");
     await browser.send("Page.reload");
-    await browser.wait("!!document.querySelector('.nav-item[aria-label=任务]')");
-    await browser.click("任务", { exact: true });
+    await browser.wait("!!document.querySelector('.nav-item[aria-label=工作]')");
+    await workPage("任务");
     await browser.wait("document.querySelectorAll('.task-table tbody tr').length === 1");
     await displayMenu(true);
     assert.equal(await browser.evaluate("document.querySelector('[name=taskSort]').value"), "title");
@@ -380,10 +654,10 @@ try {
     await browser.wait("!!document.querySelector('[data-lane=HUMAN] .board-card') && !!document.querySelector('[data-lane=AGENT] .board-card')");
     await browser.screenshot("17-task-swimlanes");
     await taskLayout("看板");
-    await browser.wait("document.querySelectorAll('.board > .board-column').length === 6");
+    await browser.wait("document.querySelectorAll('.board > .board-column').length === 7");
     await displayMenu(true);
     await browser.click("已结束", { exact: true, within: "document.querySelector('[aria-labelledby=task-columns-label]')" });
-    await browser.wait("document.querySelectorAll('.board > .board-column').length === 5 && !document.querySelector('.board > [data-column=closed]')");
+    await browser.wait("document.querySelectorAll('.board > .board-column').length === 6 && !document.querySelector('.board > [data-column=closed]')");
     await browser.click("已结束", { exact: true, within: "document.querySelector('[aria-labelledby=task-columns-label]')" });
     await browser.click("描述", { exact: true, within: "document.querySelector('[aria-labelledby=task-card-fields-label]')" });
     await browser.wait("[...document.querySelectorAll('.board-card-description')].some(node=>node.innerText.includes('Write first.txt'))");
@@ -446,7 +720,7 @@ try {
   await step(
     "language switch, keyboard navigation and 1280px layout",
     async () => {
-      await browser.click("EN", { exact: true });
+      await browser.click("切换到英文", { exact: true, within: "document.querySelector('.app-footer')" });
       await browser.wait("document.body.innerText.includes('My inbox')");
       await browser.click("Overview", { exact: true });
       await browser.send("Emulation.setDeviceMetricsOverride", {
@@ -467,6 +741,12 @@ try {
   await step(
     "keyboard dialog and form preservation during SSE refresh",
     async () => {
+      await workPage("Tasks");
+      // The helper's synthetic click does not focus navigation as a real click would.
+      await browser.wait("!document.querySelector('[role=dialog]')");
+      await browser.send("Page.bringToFront");
+      await browser.evaluate("document.querySelector('.sidebar [aria-current=page]').focus()");
+      assert.equal(await browser.evaluate("document.activeElement.matches('.sidebar [aria-current=page]')"), true);
       await browser.send("Input.dispatchKeyEvent", {
         type: "keyDown",
         key: "n",
@@ -521,7 +801,7 @@ try {
         generation: run.generation,
         plan: { summary: "First comparison plan", nodes: [node] },
       });
-      await browser.click("My inbox", { exact: true });
+      await workPage("My inbox");
       await browser.wait("document.body.innerText.includes('Review plan')");
       await browser.click("Review plan");
       await browser.wait(
@@ -556,7 +836,8 @@ try {
   await step(
     "browser reconnect fills missed task updates without duplicates",
     async () => {
-      await browser.click("Intake", { exact: true });
+      await workPage("Tasks");
+      await browser.fill("taskStatus", "DRAFT");
       await browser.send("Network.enable");
       await browser.send("Network.emulateNetworkConditions", {
         offline: true,
@@ -581,6 +862,7 @@ try {
         "document.body.innerText.includes('Reconnect delivery')",
         15000,
       );
+      await browser.wait("document.querySelector('.app-footer .live-label')?.textContent.trim() === 'Live'");
       assert.equal(
         await browser.evaluate(
           "[...document.querySelectorAll('.task-row')].filter(r=>r.textContent.includes('Reconnect delivery')).length",
@@ -600,6 +882,7 @@ try {
     await browser.wait("!document.querySelector('[role=dialog]') && [...document.querySelector('[name=workspace]').options].some(o=>o.textContent==='Second Workspace')");
     const other = server.app.list("projects").items.find((p) => p.name === "Second Workspace");
     await browser.wait(`document.querySelector('[name=workspace]').value === ${JSON.stringify(other.id)} && !document.querySelector('[role=dialog]')`);
+    await workPage("Tasks");
     await browser.click("New request");
     assert.equal(await browser.evaluate("document.querySelector('[name=projectId]').value"), other.id);
     assert.equal(await browser.evaluate("!!document.querySelector('select[name=projectId]')"), false);
@@ -607,23 +890,21 @@ try {
     await browser.fill("description", "Workspace isolation fixture");
     await browser.submit();
     await browser.wait("!document.querySelector('[role=dialog]')");
-    await browser.click("Intake", { exact: true });
-    await browser.wait("document.body.innerText.includes('Only in the second workspace')");
+    await workPage("Tasks");
+    await browser.wait("document.querySelector('[data-column=draft] .board-card')?.innerText.includes('Only in the second workspace')");
     assert.equal(await browser.evaluate("document.body.innerText.includes('Reconnect delivery')"), false);
-    await browser.click("Tasks", { exact: true });
-    await browser.wait("document.body.innerText.includes('Only in the second workspace')");
     assert.equal(await browser.evaluate("document.body.innerText.includes('Build the release summary')"), false);
-    await browser.click("My inbox", { exact: true });
+    await workPage("My inbox");
     await browser.wait("document.body.innerText.includes('You’re all caught up')");
     assert.equal(await browser.evaluate("document.body.innerText.includes('Review plan')"), false);
-    await browser.click("Runs", { exact: true });
+    await workPage("Runs");
     await browser.wait("document.body.innerText.includes('No runs yet')");
     await browser.send("Page.reload");
     await browser.wait(`document.querySelector('[name=workspace]')?.value === ${JSON.stringify(other.id)}`);
     assert.equal(await browser.evaluate("localStorage.getItem('atk-workspace')"), other.id);
     await browser.screenshot("08-project-workspace");
     await browser.fill("workspace", project.id);
-    await browser.click("Intake", { exact: true });
+    await workPage("Tasks");
     await browser.wait("document.body.innerText.includes('Reconnect delivery')");
     assert.equal(await browser.evaluate("document.body.innerText.includes('Only in the second workspace')"), false);
     await browser.evaluate("(()=>{const el=document.querySelector('.search input');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,'No matching tasks');el.dispatchEvent(new Event('input',{bubbles:true}));})()");
@@ -645,7 +926,7 @@ try {
       generation: planning.generation,
       plan: { summary: "Human drift recovery", nodes: [{ key: "human", title: "Reconfirm manual output", description: "Read manual.txt", acceptance: "Confirm current contents", executorType: "HUMAN", files: ["manual.txt"], checks: [], reviewPolicy: "NONE", deps: [] }] },
     });
-    await browser.click("My inbox", { exact: true });
+    await workPage("My inbox");
     await browser.wait("[...document.querySelectorAll('.inbox-row')].some(r=>r.textContent.includes('Human drift recovery'))");
     await browser.click("Review plan", { within: "[...document.querySelectorAll('.inbox-row')].find(r=>r.textContent.includes('Human drift recovery'))" });
     await browser.click("Approve this version & release tasks");
@@ -664,16 +945,48 @@ try {
     await browser.wait("[...document.querySelectorAll('.inbox-row')].some(r=>r.textContent.includes('Reconfirm manual output') && r.textContent.includes('Open task'))");
     await browser.click("Open task", { within: "[...document.querySelectorAll('.inbox-row')].find(r=>r.textContent.includes('Reconfirm manual output'))" });
     await browser.click("Requeue task");
+    await browser.click("Confirm requeue", { exact: true, within: "document.querySelector('[role=dialog]')" });
     await browser.wait("!document.querySelector('[role=dialog]')");
     await browser.click("Start", { exact: true });
     await browser.click("Complete", { exact: true });
     await browser.fill("summary", "Reconfirmed changed contents");
     await browser.submit();
     await browser.wait("!document.querySelector('[role=dialog]')");
-    await browser.click("Inspect output");
+    const pendingAcceptance = "document.querySelector('.inbox-row:has(.status-PENDING)')";
+    await browser.wait(`!!(${pendingAcceptance})`);
+    await browser.click("Inspect output", { exact: true, within: pendingAcceptance });
     await browser.click("Accept this plan", { exact: true });
     await browser.wait("!document.querySelector('[role=dialog]')");
     assert.equal(server.app.get("tasks", draft.id).status, "DONE");
+  });
+  await step("report a bug, return the first fix, and accept the second in the UI", async () => {
+    await workPage("Bugs");
+    await browser.click("New bug");
+    await browser.fill("bugTitle", "Opening a widget fails");
+    await browser.fill("bugDescription", "Open the same widget twice; the second open fails.");
+    await browser.fill("bugFiles", "bug-demo.txt");
+    await browser.click("Create bug", { exact: true });
+    await browser.wait("!document.querySelector('[role=dialog]') && document.querySelector('.task-list')?.innerText.includes('To fix')");
+    const attempt = await dev.claim({ projectId: project.id, kind: "BUG", waitMs: 0 });
+    assert.equal(attempt.spec.taskKind, "BUG");
+    await browser.wait("document.querySelector('.task-list')?.innerText.includes('Fixing')");
+    const submitFix = async (claim, content) => {
+      fs.writeFileSync(path.join(projectRoot, "bug-demo.txt"), content);
+      await dev.submit(claim.run.id, "result", { generation: claim.generation, outcome: "COMPLETED", stopped: true, summary: content });
+    };
+    await submitFix(attempt, "Initial widget fix");
+    await workPage("My inbox");
+    await browser.click("Review bug fix", { exact: true });
+    await browser.click("Reject and return", { exact: true });
+    await browser.fill("bugRejectionReason", "Check repeated opens");
+    await browser.click("Return to repair queue", { exact: true });
+    await browser.wait("document.querySelector('.detail-heading')?.innerText.includes('To fix')");
+    const next = await dev.claim({ projectId: project.id, kind: "BUG", waitMs: 0 });
+    assert.equal(next.spec.rework.summary, "Check repeated opens");
+    await submitFix(next, "Repeated opens now work");
+    await browser.click("Accept and close", { exact: true });
+    await browser.wait("document.querySelector('.detail-heading')?.innerText.includes('Closed')");
+    await browser.click("Close", { exact: true });
   });
   await step("manual access-code unlock survives reload without exposing the code in the URL", async () => {
     await browser.evaluate("sessionStorage.clear()");

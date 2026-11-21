@@ -56,6 +56,24 @@ export async function openBrowser({
     child.kill();
     throw new Error("Browser did not expose its test endpoint");
   }
+  const close = async () => {
+    child.kill();
+    await sleep(200);
+    if (process.platform === "win32" && child.pid)
+      spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+  };
+  try {
+    return await attachBrowser({ port, url, outputDir, width, height, close });
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+
+export async function attachBrowser({ port, url, outputDir, width = 1440, height = 1000, close }) {
   const tabs = await fetch(`http://127.0.0.1:${port}/json`).then((r) =>
     r.json(),
   );
@@ -105,7 +123,7 @@ export async function openBrowser({
     deviceScaleFactor: 1,
     mobile: false,
   });
-  await send("Page.navigate", { url });
+  if (url) await send("Page.navigate", { url });
   async function evaluate(expression) {
     const result = await send("Runtime.evaluate", {
       expression,
@@ -134,17 +152,19 @@ export async function openBrowser({
     errors,
     async click(text, { exact = false, within = "document" } = {}) {
       const target = `[...(${within}).querySelectorAll('button')].find(e=>${exact ? "(e.getAttribute('aria-label')||e.textContent.trim())===" : "e.textContent.includes("}${JSON.stringify(text)}${exact ? "" : ")"})`;
-      await wait(`!!(${target}) && !(${target}).disabled`);
+      await wait(`!!(${within}) && !!(${target}) && !(${target}).disabled`);
       await evaluate(
         `(()=>{const el=${target};if(!el)throw new Error('Button not found');el.scrollIntoView({block:'center'});el.click();})()`,
       );
     },
     async fill(name, value) {
+      await wait(`!!document.querySelector('[name="'+${JSON.stringify(name)}+'"]') && !document.querySelector('[name="'+${JSON.stringify(name)}+'"]').disabled`);
       await evaluate(
         `(()=>{const el=document.querySelector('[name="'+${JSON.stringify(name)}+'"]');if(!el)throw new Error('Field not found');const p=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:el.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;Object.getOwnPropertyDescriptor(p,'value').set.call(el,${JSON.stringify(value)});el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));})()`,
       );
     },
     async submit() {
+      await wait("!!document.querySelector('[role=dialog] form') && [...document.querySelector('[role=dialog] form').querySelectorAll('button')].some(b=>b.type==='submit'&&!b.disabled)");
       await evaluate(
         "document.querySelector('[role=dialog] form').requestSubmit()",
       );
@@ -160,13 +180,7 @@ export async function openBrowser({
     },
     async close() {
       socket.close();
-      child.kill();
-      await sleep(200);
-      if (process.platform === "win32" && child.pid)
-        spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-          windowsHide: true,
-          stdio: "ignore",
-        });
+      await close?.();
     },
   };
 }

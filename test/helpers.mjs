@@ -3,6 +3,30 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { createService } from "../apps/backend/src/service.mjs";
+import { createServer } from "../apps/backend/src/server.mjs";
+import { readBrowserAccess } from "../packages/platform/src/index.mjs";
+
+export async function serverFixture(t) {
+  const f = fixture();
+  const server = createServer({ service: f.app, logger: { error: console.error } });
+  const info = await server.listen({ port: 0 });
+  t.after(async () => {
+    await server.close();
+    fs.rmSync(f.root, { recursive: true, force: true });
+  });
+  const session = await fetch(info.url + "/api/v1/session", {
+    headers: { "x-atk-access": readBrowserAccess(f.data) },
+  }).then((r) => r.json());
+  async function human(route, body, method = body === undefined ? "GET" : "POST") {
+    const r = await fetch(info.url + "/api/v1" + route, {
+      method,
+      headers: { "content-type": "application/json", "x-atk-token": session.token, "x-atk-csrf": session.csrf },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: r.status, body: await r.json() };
+  }
+  return { ...f, server, ...info, session, human };
+}
 export function fixture(t) {
   const base = path.resolve(
     process.env.ATK_TEST_ROOT ?? path.join(os.tmpdir(), "atk-next-tests"),
@@ -23,6 +47,7 @@ export function fixture(t) {
     qa: "role-qa",
   })) {
     const value = app.createAgent({
+      projectId: p.id,
       name: key,
       roleId,
       teamId: "team-default",
@@ -54,14 +79,15 @@ export function node(key, more = {}) {
   };
 }
 export function plan(f, nodes, more = {}) {
+  const pm = f.pm.agent.projectId === f.p.id ? f.pm : f.app.createAgent({ projectId: f.p.id, name: "Project planner", roleId: "role-pm" });
   const draft = f.app.createDraft({
     projectId: f.p.id,
     title: "Feature",
     description: "Build a useful feature",
     ...more,
   });
-  const claim = f.app.claim(f.pm.agent.id, { taskId: draft.id });
-  const submitted = f.app.submitPlan(f.pm.agent.id, claim.run.id, {
+  const claim = f.app.claim(pm.agent.id, { taskId: draft.id });
+  const submitted = f.app.submitPlan(pm.agent.id, claim.run.id, {
     generation: claim.generation,
     idempotencyKey: crypto.randomUUID(),
     plan: { summary: "Implementation plan", nodes },
@@ -70,6 +96,10 @@ export function plan(f, nodes, more = {}) {
     version: submitted.plan.version,
   });
   return { draft, claim, ...approved };
+}
+export function projectForTeam(f, teamId) {
+  const existing = f.app.store.all("projects").find((p) => p.teamId === teamId);
+  return existing ?? f.app.createProject({ name: "Other project", teamId, root: fs.mkdtempSync(path.join(f.root, "other-project-")) });
 }
 export function finish(f, claim, more = {}) {
   return f.app.finishRun(claim.run.agentId, claim.run.id, {
@@ -81,4 +111,8 @@ export function finish(f, claim, more = {}) {
     checks: [],
     ...more,
   });
+}
+export function completeHuman(f, id, body = {}) {
+  const task = f.app.get("tasks", id);
+  return f.app.finishHuman(id, { ...body, version: task.version, runId: task.humanRun?.id, generation: task.humanRun?.generation });
 }

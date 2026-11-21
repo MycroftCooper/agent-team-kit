@@ -1,4 +1,4 @@
-export const VERSION = "2.0.0-alpha.1";
+export const VERSION = "0.0.1";
 export const FUNCTIONS = Object.freeze(["ORCHESTRATOR", "WORKER", "REVIEWER"]);
 export const TASK_STATUSES = Object.freeze([
   "DRAFT",
@@ -18,7 +18,8 @@ export const STAGES = Object.freeze([
   "HUMAN",
 ]);
 export const TASK_BOARD_COLUMNS = Object.freeze([
-  { key: "queue", statuses: ["DRAFT", "READY"] },
+  { key: "draft", statuses: ["DRAFT"] },
+  { key: "queue", statuses: ["READY"] },
   { key: "running", statuses: ["RUNNING"] },
   { key: "review", statuses: ["REVIEWING"] },
   { key: "acceptance", statuses: ["VERIFIED", "AWAITING_ACCEPTANCE"] },
