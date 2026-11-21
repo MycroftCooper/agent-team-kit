@@ -125,7 +125,7 @@ test("result protocol and required exports cannot turn failures or stale reports
 test("stopping kills detached descendants, prevents later steps, and timeout is a failure", async t => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.p.root, "parent.mjs"), `import {spawn} from 'node:child_process';
-spawn(process.execPath,['-e',"setTimeout(()=>require('node:fs').writeFileSync('escaped.txt','bad'),4000)"],{detached:true,stdio:'ignore'}).unref();
+spawn(process.execPath,['-e',"setTimeout(()=>require('node:fs').writeFileSync('escaped.txt','bad'),4000)"],{detached:process.platform==='win32',stdio:'ignore'}).unref();
 console.log('waiting');setInterval(()=>{},1000);`);
   const d = def("", { steps: [{ id: "test", name: "Wait", cli: "node", args: ["parent.mjs"] }, { id: "later", name: "Never", cli: "node", args: ["-e", "require('node:fs').writeFileSync('unexpected.txt','bad')"] }] });
   const run = await start(f, apply(f, d));

@@ -58,9 +58,12 @@ jobs:
               $prerelease_flag
           fi
       - name: Publish to npm (optional when NPM_TOKEN is configured)
-        if: ${{ secrets.NPM_TOKEN != '' }}
         shell: bash
         run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN is not configured; skipping npm publish."
+            exit 0
+          fi
           version=$(node -p "JSON.parse(require('fs').readFileSync('package.json')).version")
           tag=latest
           case "$version" in *-*) tag=next ;; esac

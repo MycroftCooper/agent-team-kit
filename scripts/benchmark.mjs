@@ -159,10 +159,11 @@ try {
     height: 1000,
   });
   await browser.wait("document.body.innerText.includes('概览')");
+  await browser.click("工作", { exact: true });
   await browser.click("执行记录", { exact: true });
   await browser.wait("document.body.innerText.includes('Benchmark stream')");
   await browser.evaluate(
-    `[...document.querySelectorAll('.run-row')].find(r=>r.textContent.includes(${JSON.stringify(active.run.id)})).click()`,
+    `[...[...document.querySelectorAll('.run-row')].find(r=>r.textContent.includes('Benchmark stream')&&r.textContent.includes('执行中')).querySelectorAll('button')].find(b=>b.textContent.includes('查看执行')).click()`,
   );
   await browser.wait("!!document.querySelector('.timeline')");
   for (let i = 0; i < 300; i += 100)
