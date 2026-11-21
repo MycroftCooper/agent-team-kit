@@ -9,6 +9,7 @@ import {
   compareSemver,
   parseSha256Sums,
   extractChangelogSection,
+  validateBilingualChangelog,
   checkForUpdate,
   downloadAndVerifyRelease,
 } from "../packages/platform/src/updater.mjs";
@@ -22,13 +23,18 @@ function makeTempDir(prefix) {
 async function startMockReleaseServer({
   tagName = "v0.0.2",
   assetContent = Buffer.from("mock-tarball-payload"),
+  exeContent = Buffer.from("MZ-mock-windows-installer"),
+  includeExe = false,
   tamperChecksum = false,
   includeChecksum = true,
 } = {}) {
   const version = tagName.replace(/^v/, "");
   const assetName = `agent-team-kit-${version}.tgz`;
+  const exeName = `Agent-Team-Kit-Setup-${version}.exe`;
   const realSha = crypto.createHash("sha256").update(assetContent).digest("hex");
+  const realExeSha = crypto.createHash("sha256").update(exeContent).digest("hex");
   const advertisedSha = tamperChecksum ? "0".repeat(64) : realSha;
+  const advertisedExeSha = tamperChecksum ? "f".repeat(64) : realExeSha;
 
   const server = http.createServer((req, res) => {
     const host = `http://127.0.0.1:${server.address().port}`;
@@ -40,6 +46,13 @@ async function startMockReleaseServer({
           browser_download_url: `${host}/download/${assetName}`,
         },
       ];
+      if (includeExe) {
+        assets.push({
+          name: exeName,
+          size: exeContent.length,
+          browser_download_url: `${host}/download/${exeName}`,
+        });
+      }
       if (includeChecksum) {
         assets.push(
           {
@@ -73,22 +86,34 @@ async function startMockReleaseServer({
       res.end(assetContent);
       return;
     }
+    if (includeExe && req.url === `/download/${exeName}`) {
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      res.end(exeContent);
+      return;
+    }
     if (req.url === "/download/SHA256SUMS.txt") {
       res.writeHead(200, { "content-type": "text/plain" });
-      res.end(`${advertisedSha}  ${assetName}\n`);
+      const lines = [`${advertisedSha}  ${assetName}`];
+      if (includeExe) lines.push(`${advertisedExeSha}  ${exeName}`);
+      res.end(lines.join("\n") + "\n");
       return;
     }
     if (req.url === "/download/release-manifest.json") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          format: "atk-release-manifest-1",
-          version,
-          tag: tagName,
-          asset: assetName,
-          sha256: advertisedSha,
-        }),
-      );
+      const manifest = {
+        format: "atk-release-manifest-1",
+        version,
+        tag: tagName,
+        asset: assetName,
+        sha256: advertisedSha,
+        assets: {
+          tarball: { name: assetName, sha256: advertisedSha, size: assetContent.length },
+          ...(includeExe
+            ? { winExe: { name: exeName, sha256: advertisedExeSha, size: exeContent.length } }
+            : {}),
+        },
+      };
+      res.end(JSON.stringify(manifest));
       return;
     }
     res.writeHead(404);
@@ -100,7 +125,9 @@ async function startMockReleaseServer({
   return {
     url,
     realSha,
+    realExeSha,
     assetName,
+    exeName,
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
@@ -231,6 +258,76 @@ test("backend update endpoints check, block source auto-install, and apply verif
     assert.equal(applied.appliedVersion, "0.0.2");
     assert.equal(applied.restartRequired, true);
     assert.equal(installedPaths.length, 1);
+  } finally {
+    await srv.close();
+    await mock.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("validateBilingualChangelog requires Chinese before English", () => {
+  assert.equal(
+    validateBilingualChangelog("### 中文\n- 修复问题\n\n### English\n- Fixed bug").ok,
+    true,
+  );
+  assert.equal(
+    validateBilingualChangelog("### English\n- Fixed bug\n\n### 中文\n- 修复问题").ok,
+    false,
+  );
+  assert.equal(validateBilingualChangelog("### English\n- Only English").ok, false);
+  assert.equal(validateBilingualChangelog("### 中文\n- 仅有中文").ok, false);
+});
+
+test("desktop installMode selects, SHA-256 verifies, and stages Windows .exe installer", async () => {
+  const mock = await startMockReleaseServer({ tagName: "v0.0.2", includeExe: true });
+  const dataDir = makeTempDir("atk-updater-desktop-");
+  const staged = [];
+  const srv = createServer({
+    dataDir,
+    updateOptions: {
+      currentVersion: "0.0.1",
+      apiBase: mock.url,
+      installMode: "desktop",
+      autoCheck: false,
+      desktopInstaller: async (info) => {
+        staged.push(info);
+        return { installed: true };
+      },
+    },
+  });
+  try {
+    const { url } = await srv.listen({ port: 0 });
+    const sessionRes = await fetch(url + "/api/v1/session", {
+      headers: { "x-atk-access": readBrowserAccess(dataDir) },
+    });
+    const session = await sessionRes.json();
+    const headers = {
+      "content-type": "application/json",
+      "x-atk-token": session.token,
+      "x-atk-csrf": session.csrf,
+    };
+
+    const checked = await fetch(url + "/api/v1/operations/update/check", {
+      method: "POST",
+      headers,
+      body: "{}",
+    }).then((r) => r.json());
+    assert.equal(checked.updateAvailable, true);
+    assert.equal(checked.installMode, "desktop");
+    assert.equal(checked.asset.name, "Agent-Team-Kit-Setup-0.0.2.exe");
+    assert.equal(checked.asset.kind, "win-exe");
+
+    const applied = await fetch(url + "/api/v1/operations/update/apply", {
+      method: "POST",
+      headers,
+      body: "{}",
+    }).then((r) => r.json());
+    assert.equal(applied.installed, true);
+    assert.equal(applied.restartRequired, true);
+    assert.equal(applied.sha256, mock.realExeSha);
+    assert.equal(staged.length, 1);
+    assert.ok(staged[0].installerPath.endsWith("Agent-Team-Kit-Setup-0.0.2.exe"));
+    assert.ok(fs.existsSync(staged[0].installerPath));
   } finally {
     await srv.close();
     await mock.close();

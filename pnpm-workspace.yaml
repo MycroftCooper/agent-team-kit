@@ -3,7 +3,8 @@ packages:
   - "packages/*"
 
 # pnpm blocks dependency build scripts by default. Vite's bundler needs
-# esbuild's install script to place its platform binary, so it is the only
-# dependency allowed to run one.
+# esbuild's install script to place its platform binary. electron-winstaller
+# (Squirrel.Windows) is unused because desktop packaging targets NSIS.
 allowBuilds:
+  electron-winstaller: false
   esbuild: true

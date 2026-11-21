@@ -8,6 +8,7 @@ if (process.isMainFrame) {
     minimize: () => invoke("minimize"),
     toggleMaximize: () => invoke("toggle-maximize"),
     close: () => invoke("close"),
+    restartAndInstallUpdate: () => invoke("install-update"),
     onWindowState(callback) {
       const listener = (_event, state) => callback(state);
       ipcRenderer.on("atk:window-state", listener);

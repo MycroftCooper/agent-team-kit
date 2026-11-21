@@ -2948,7 +2948,7 @@ function Projects() {
 function Settings() {
   const { lang, setLang, t, open, epoch, projects, allTeams, busy, act } = useUI();
   const [updateTick, setUpdateTick] = useState(0);
-  const [updateBusy, setUpdateBusy] = useState<"" | "check" | "apply">("");
+  const [updateBusy, setUpdateBusy] = useState<"" | "check" | "apply" | "restart">("");
   const [updateMessage, setUpdateMessage] = useState("");
   const updateState = useData("/system/update", epoch + updateTick);
   const info = updateState.data;
@@ -2986,15 +2986,31 @@ function Settings() {
       });
       setUpdateTick((v) => v + 1);
       setUpdateMessage(
-        t(
-          `已安装 v${next.appliedVersion}（SHA-256 校验通过）。请重启 ATK 服务以生效。`,
-          `Installed v${next.appliedVersion} (SHA-256 verified). Restart the ATK service to apply.`,
-        ),
+        next.installMode === "desktop"
+          ? t(
+              `已下载 v${next.appliedVersion} 安装包（SHA-256 校验通过）。点击「立即重启并安装」即可自动升级并重启应用。`,
+              `Downloaded v${next.appliedVersion} installer (SHA-256 verified). Click "Restart & install" to upgrade and relaunch automatically.`,
+            )
+          : t(
+              `已安装 v${next.appliedVersion}（SHA-256 校验通过）。请重启 ATK 服务以生效。`,
+              `Installed v${next.appliedVersion} (SHA-256 verified). Restart the ATK service to apply.`,
+            ),
       );
     } catch (e) {
       setUpdateMessage(e instanceof Error ? e.message : String(e));
       setUpdateTick((v) => v + 1);
     } finally {
+      setUpdateBusy("");
+    }
+  }
+  async function restartDesktopUpdate() {
+    if (!desktopWindow?.restartAndInstallUpdate) return;
+    setUpdateBusy("restart");
+    setUpdateMessage("");
+    try {
+      await desktopWindow.restartAndInstallUpdate();
+    } catch (e) {
+      setUpdateMessage(e instanceof Error ? e.message : String(e));
       setUpdateBusy("");
     }
   }
@@ -3039,13 +3055,19 @@ function Settings() {
           <span>{t("版本", "Version")}</span>
           <b>{info?.currentVersion ?? VERSION}</b>
           <span>{t("部署", "Deployment")}</span>
-          <b>{t("本机 · 单用户", "Local · single user")}</b>
+          <b>
+            {info?.installMode === "desktop"
+              ? t("Windows 桌面版 · 本机单用户", "Windows Desktop · local single user")
+              : t("本机 · 单用户", "Local · single user")}
+          </b>
           <span>{t("执行方式", "Execution")}</span>
           <b>{t("外部 Agent 主动领取", "External pull agents")}</b>
           <span>{t("更新状态", "Updates")}</span>
           <b>
             {info?.restartRequired
-              ? t(`已安装 v${info.appliedVersion}，待重启`, `Installed v${info.appliedVersion}, restart required`)
+              ? info?.installMode === "desktop"
+                ? t(`已下载 v${info.appliedVersion}，待重启安装`, `Downloaded v${info.appliedVersion}, ready to install`)
+                : t(`已安装 v${info.appliedVersion}，待重启`, `Installed v${info.appliedVersion}, restart required`)
               : info?.updateAvailable
                 ? t(`可更新至 v${info.latestVersion}`, `Update available: v${info.latestVersion}`)
                 : info?.checkedAt
@@ -3069,10 +3091,25 @@ function Settings() {
               onClick={() => void applyUpdate()}
             >
               {updateBusy === "apply"
-                ? t("正在下载并安装…", "Downloading & installing…")
-                : t(`安装 v${info.latestVersion}`, `Install v${info.latestVersion}`)}
+                ? t("正在下载并校验…", "Downloading & verifying…")
+                : info?.installMode === "desktop"
+                  ? t(`下载并更新至 v${info.latestVersion}`, `Download & update to v${info.latestVersion}`)
+                  : t(`安装 v${info.latestVersion}`, `Install v${info.latestVersion}`)}
             </button>
           )}
+          {info?.restartRequired &&
+            info?.installMode === "desktop" &&
+            desktopWindow?.restartAndInstallUpdate && (
+              <button
+                className="primary"
+                disabled={Boolean(updateBusy)}
+                onClick={() => void restartDesktopUpdate()}
+              >
+                {updateBusy === "restart"
+                  ? t("正在重启并安装…", "Restarting to install…")
+                  : t(`立即重启并安装 v${info.appliedVersion}`, `Restart & install v${info.appliedVersion}`)}
+              </button>
+            )}
           {info?.releaseUrl && (
             <a href={info.releaseUrl} target="_blank" rel="noreferrer">
               {t("查看 GitHub Release", "View GitHub Release")}

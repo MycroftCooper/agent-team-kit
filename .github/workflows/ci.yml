@@ -1,8 +1,8 @@
 name: ci
+# Daily CI runs locally via `pnpm run ci:smoke` and `pnpm run ci:release`.
+# Keep manual dispatch only in case cloud cross-check is explicitly needed.
 on:
-  push:
-    branches: [main, dev]
-  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:

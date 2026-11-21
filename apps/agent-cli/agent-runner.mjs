@@ -19,9 +19,25 @@ const help = `ATK agent runner — execute one explicitly selected Bug, then exi
 Environment: ATK_URL, ATK_AGENT_TOKEN. Engines use their existing configuration.
 Does not approve fixes, commit, push, or start a persistent polling loop.`;
 
+const renameSleepBuf = new Int32Array(new SharedArrayBuffer(4));
 function atomic(file, value) {
-  fs.writeFileSync(file + ".next", JSON.stringify(value, null, 2), { mode: 0o600 });
-  fs.renameSync(file + ".next", file);
+  const next = file + ".next";
+  fs.writeFileSync(next, JSON.stringify(value, null, 2), { mode: 0o600 });
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.renameSync(next, file);
+      return;
+    } catch (error) {
+      if (
+        process.platform !== "win32" ||
+        attempt >= 6 ||
+        !["EPERM", "EBUSY", "EACCES"].includes(error?.code)
+      ) {
+        throw error;
+      }
+      Atomics.wait(renameSleepBuf, 0, 0, 15 * (attempt + 1));
+    }
+  }
 }
 
 export { resolveCodex } from "./runner-engines.mjs";
