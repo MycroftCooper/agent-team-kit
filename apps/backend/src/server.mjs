@@ -8,6 +8,7 @@ import { acquireInstance } from "./instance-lock.mjs";
 import { automationRoute } from "./automation-routes.mjs";
 import { strictJson } from "./automation-definition.mjs";
 import { backup, restore } from "./operations.mjs";
+import { createUpdaterService } from "./updater-service.mjs";
 import {
   createSession,
   isSessionExpired,
@@ -108,6 +109,7 @@ export function createServer({
   service,
   now,
   logger = console,
+  updateOptions,
 } = {}) {
   const instanceId = crypto.randomUUID(),
     ownership = acquireInstance(dataDir ?? service?.dataDir, instanceId),
@@ -120,10 +122,13 @@ export function createServer({
     ownership.release();
     throw error;
   }
+  const updater = createUpdaterService(app, updateOptions);
   let session = createSession(),
     maintenance,
     automationTimer,
-    streamTimer;
+    streamTimer,
+    updateStartupTimer,
+    updateIntervalTimer;
   let port = 0;
   let shutdownHandler, closing;
   function requireServing() {
@@ -585,6 +590,29 @@ export function createServer({
         )
           result = app.revalidateAcceptance(id);
         else if (
+          method === "GET" &&
+          resource === "system" &&
+          id === "update"
+        )
+          result = updater.getState();
+        else if (
+          method === "POST" &&
+          resource === "operations" &&
+          id === "update" &&
+          action === "check"
+        )
+          result = await updater.check(body);
+        else if (
+          method === "POST" &&
+          resource === "operations" &&
+          id === "update" &&
+          action === "apply"
+        ) {
+          result = await updater.apply(body);
+          if (body.restart === true) {
+            setTimeout(() => shutdownHandler?.(), 150);
+          }
+        } else if (
           method === "POST" &&
           resource === "operations" &&
           id === "shutdown"
@@ -684,6 +712,8 @@ export function createServer({
       clearInterval(maintenance);
       clearInterval(automationTimer);
       clearInterval(streamTimer);
+      clearTimeout(updateStartupTimer);
+      clearInterval(updateIntervalTimer);
       const stopAutomations = app.automations.shutdown();
       for (const c of streams) c.res.end();
       streams.clear();
@@ -732,6 +762,19 @@ export function createServer({
         for (const c of streams) c.res.write(": heartbeat\n\n");
       }, 15000);
       streamTimer.unref();
+      const autoCheck =
+        updateOptions?.autoCheck !== false &&
+        process.env.ATK_DISABLE_UPDATE_CHECK !== "1" &&
+        !process.env.NODE_TEST_CONTEXT;
+      if (autoCheck) {
+        const bgCheck = () => {
+          void updater.check().catch(() => {});
+        };
+        updateStartupTimer = setTimeout(bgCheck, 30_000);
+        updateStartupTimer.unref();
+        updateIntervalTimer = setInterval(bgCheck, 6 * 60 * 60 * 1000);
+        updateIntervalTimer.unref();
+      }
       const url = `http://127.0.0.1:${port}`;
       return { url, browserUrl: browserUrl(url, browserAccess), port };
     },

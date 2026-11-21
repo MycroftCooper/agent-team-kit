@@ -71,7 +71,7 @@ try {
     const names = packed.files.map((f) => f.path);
     assert.ok(names.includes("apps/web/dist/index.html"));
     assert.ok(names.includes("apps/agent-cli/cli.mjs"));
-    for (const file of ["apps/agent-cli/automation.mjs", "apps/backend/src/project-automations.mjs", "apps/backend/src/automation-job.ps1", "packages/platform/src/strict-json.mjs"])
+    for (const file of ["apps/agent-cli/automation.mjs", "apps/backend/src/project-automations.mjs", "packages/platform/src/managed-job.ps1", "packages/platform/src/strict-json.mjs", "packages/platform/src/updater.mjs"])
       assert.ok(names.includes(file), `Missing automation runtime asset: ${file}`);
     assert.ok(!names.includes("apps/backend/src/automations.mjs"));
     for (const name of builtInSkills)

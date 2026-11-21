@@ -1,6 +1,8 @@
 export const ATK_HELP = `Agent Team Kit
   atk start [--port 1421] [--data <directory>]
   atk stop|status|logs [--data <directory>]
+  atk check-update [--prerelease]
+  atk update [--check] [--prerelease] [--restart] [--data <directory>]
   atk backup [--to <new directory>]
   atk restore --from <backup directory>
   atk --version

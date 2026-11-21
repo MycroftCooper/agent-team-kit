@@ -2,7 +2,7 @@
 
 通过网页管理多个本地项目，由外部 Agent 主动领取任务的独立协作工具。
 
-当前版本 **2.0.0-alpha.1**。这是一次不保留兼容层的重构：旧任务池、旧 CLI、DSH
+当前版本 **0.0.1**。这是一次不保留兼容层的独立重构：旧任务池、旧 CLI、DSH
 插件、模型运行时和 worktree 流程均已退出生产代码。工具不配置模型、不转发请求，
 后端不启动外部 Agent，也不会自动清理旧数据库或用户项目。可选外部执行器
 `atk-agent run` 可调用本机 Codex CLI 或 DSH（`--engine dsh`），单次领取并修复一个指定 Bug。
@@ -33,13 +33,15 @@ Windows 可直接双击根目录的 **start.bat**：启动后台服务并在默�
 `{"dataDir":"E:/AgentTeamKitData"}`。相对路径以启动文件所在目录为准；该文件不会提交到 Git。
 不配置时使用下述默认目录。命令行 `--data` 优先于本机配置，`ATK_DATA_DIR` 也可覆盖本机配置。
 
-以下 npm 安装方式适用于新版本正式发布后；本次 GitHub 源码提交不等于 npm 发布：
+从 GitHub Release 下载发布包安装（支持 `atk update` 或网页「设置与运维 → 运行信息与更新」自动检测并校验 SHA-256 更新）：
 
 ```powershell
-npm install -g agent-team-kit@next
+npm install -g ./agent-team-kit-0.0.1.tgz
 atk start
 # 打开输出的私密 browserUrl 链接（含访问码，请勿分享）
 atk status
+atk check-update
+atk update
 atk stop
 ```
 
@@ -51,7 +53,7 @@ node scripts/build-web.mjs
 node apps/launcher/cli.mjs start
 # 也可构建并安装独立发布包：
 npm pack
-npm install -g ./agent-team-kit-2.0.0-alpha.1.tgz
+npm install -g ./agent-team-kit-0.0.1.tgz
 # 前后端可以分别启动；前端开发服务器为 http://127.0.0.1:5173
 pnpm --filter @atk/web dev
 ```

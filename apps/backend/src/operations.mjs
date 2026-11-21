@@ -9,7 +9,7 @@ import {
   inside,
   atomicJson,
 } from "../../../packages/project-files/src/index.mjs";
-function idle(service) {
+export function assertIdle(service) {
   requireThat(
     !service.automations.busy() && service.store
       .all("runs")
@@ -27,6 +27,7 @@ function idle(service) {
     409,
   );
 }
+const idle = assertIdle;
 function files(root, relative = "", out = {}) {
   for (const name of fs.readdirSync(path.join(root, relative)).sort()) {
     const rel = path.join(relative, name),

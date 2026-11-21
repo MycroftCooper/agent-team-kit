@@ -1,6 +1,6 @@
 {
   "name": "agent-team-kit",
-  "version": "2.0.0-alpha.1",
+  "version": "0.0.1",
   "description": "Local web workspace for human-approved plans and external pull-based agents.",
   "license": "MIT",
   "type": "module",

@@ -1,4 +1,4 @@
-export const VERSION = "2.0.0-alpha.1";
+export const VERSION = "0.0.1";
 export const FUNCTIONS = Object.freeze(["ORCHESTRATOR", "WORKER", "REVIEWER"]);
 export const TASK_STATUSES = Object.freeze([
   "DRAFT",

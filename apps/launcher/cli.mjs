@@ -11,6 +11,13 @@ import {
 } from "../../packages/platform/src/index.mjs";
 import { VERSION } from "../../packages/contracts/src/index.mjs";
 import { ATK_HELP } from "../../packages/platform/src/cli-help.mjs";
+import {
+  checkForUpdate,
+  detectInstallMode,
+  downloadAndVerifyRelease,
+  installUpdateTarball,
+} from "../../packages/platform/src/updater.mjs";
+const PACKAGE_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const args = argumentsOf(process.argv.slice(2)),
   command = args._[0] ?? "help",
   dataDir = path.resolve(args.data ?? runtimePaths().root),
@@ -139,6 +146,82 @@ async function main() {
     console.log(
       JSON.stringify(
         await humanCall("/api/v1/operations/backup", { destination: args.to }),
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+  if (command === "check-update") {
+    const result = await checkForUpdate({
+      currentVersion: VERSION,
+      includePrerelease: Boolean(args.prerelease),
+    });
+    console.log(
+      JSON.stringify(
+        { ...result, installMode: detectInstallMode(PACKAGE_ROOT) },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+  if (command === "update") {
+    const installMode = detectInstallMode(PACKAGE_ROOT);
+    const check = await checkForUpdate({
+      currentVersion: VERSION,
+      includePrerelease: Boolean(args.prerelease),
+    });
+    if (args.check || !check.updateAvailable) {
+      console.log(
+        JSON.stringify(
+          {
+            updated: false,
+            upToDate: !check.updateAvailable,
+            installMode,
+            ...check,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+    if (installMode === "source" && !args["force-source"]) {
+      throw new Error(
+        `Current installation is a Git source checkout. Download ${check.tagName} from ${check.releaseUrl} or re-run with --force-source to install globally.`,
+      );
+    }
+    const runningBefore = await health();
+    const downloaded = await downloadAndVerifyRelease({
+      release: check,
+      destDir: path.join(dataDir, "updates", check.latestVersion),
+    });
+    if (runningBefore.running) {
+      await humanCall("/api/v1/operations/shutdown", {});
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 200));
+        if (!(await health()).running) break;
+      }
+    }
+    const installed = installUpdateTarball({
+      tarballPath: downloaded.filePath,
+      prefix: typeof args.prefix === "string" ? path.resolve(args.prefix) : undefined,
+    });
+    console.log(
+      JSON.stringify(
+        {
+          updated: true,
+          previousVersion: VERSION,
+          version: check.latestVersion,
+          tagName: check.tagName,
+          sha256: downloaded.sha256,
+          verified: downloaded.verified,
+          tarballPath: downloaded.filePath,
+          installed: installed.installed,
+          restartRequired: Boolean(runningBefore.running),
+        },
         null,
         2,
       ),

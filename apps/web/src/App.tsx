@@ -9,7 +9,7 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react";
-import { LEASE_MS, TASK_STATUSES, type Row, type Page } from "@atk/contracts";
+import { LEASE_MS, TASK_STATUSES, VERSION, type Row, type Page } from "@atk/contracts";
 import { api, authorize, useData, useLive } from "./api";
 import { AgentTeam, AgentTeamNavigation, agentCliSetup, agentTeamSectionTitle, useAgentTeam } from "./agent-team";
 import { AutomationEditor, AutomationNavigation, Automations, useAutomationNavigation, type Workflow } from "./automations";
@@ -2947,6 +2947,57 @@ function Projects() {
 
 function Settings() {
   const { lang, setLang, t, open, epoch, projects, allTeams, busy, act } = useUI();
+  const [updateTick, setUpdateTick] = useState(0);
+  const [updateBusy, setUpdateBusy] = useState<"" | "check" | "apply">("");
+  const [updateMessage, setUpdateMessage] = useState("");
+  const updateState = useData("/system/update", epoch + updateTick);
+  const info = updateState.data;
+  async function checkUpdate() {
+    setUpdateBusy("check");
+    setUpdateMessage("");
+    try {
+      const next = await api("/operations/update/check", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setUpdateTick((v) => v + 1);
+      setUpdateMessage(
+        next.updateAvailable
+          ? t(
+              `发现新版本 v${next.latestVersion}。`,
+              `New version v${next.latestVersion} is available.`,
+            )
+          : t("当前已是最新版本。", "You are already on the latest version."),
+      );
+    } catch (e) {
+      setUpdateMessage(e instanceof Error ? e.message : String(e));
+      setUpdateTick((v) => v + 1);
+    } finally {
+      setUpdateBusy("");
+    }
+  }
+  async function applyUpdate() {
+    setUpdateBusy("apply");
+    setUpdateMessage("");
+    try {
+      const next = await api("/operations/update/apply", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setUpdateTick((v) => v + 1);
+      setUpdateMessage(
+        t(
+          `已安装 v${next.appliedVersion}（SHA-256 校验通过）。请重启 ATK 服务以生效。`,
+          `Installed v${next.appliedVersion} (SHA-256 verified). Restart the ATK service to apply.`,
+        ),
+      );
+    } catch (e) {
+      setUpdateMessage(e instanceof Error ? e.message : String(e));
+      setUpdateTick((v) => v + 1);
+    } finally {
+      setUpdateBusy("");
+    }
+  }
   return (
     <>
       <ThemeSettings lang={lang} />
@@ -2983,15 +3034,64 @@ function Settings() {
         </button>
       </section>
       <section className="panel settings-panel">
-        <h3>{t("运行信息", "Application")}</h3>
+        <h3>{t("运行信息与更新", "Application & updates")}</h3>
         <div className="metadata">
           <span>{t("版本", "Version")}</span>
-          <b>2.0.0-alpha.1</b>
+          <b>{info?.currentVersion ?? VERSION}</b>
           <span>{t("部署", "Deployment")}</span>
           <b>{t("本机 · 单用户", "Local · single user")}</b>
           <span>{t("执行方式", "Execution")}</span>
           <b>{t("外部 Agent 主动领取", "External pull agents")}</b>
+          <span>{t("更新状态", "Updates")}</span>
+          <b>
+            {info?.restartRequired
+              ? t(`已安装 v${info.appliedVersion}，待重启`, `Installed v${info.appliedVersion}, restart required`)
+              : info?.updateAvailable
+                ? t(`可更新至 v${info.latestVersion}`, `Update available: v${info.latestVersion}`)
+                : info?.checkedAt
+                  ? t("已是最新", "Up to date")
+                  : t("尚未检查", "Not checked yet")}
+          </b>
         </div>
+        <div className="row" style={{ marginTop: 12, gap: 8, flexWrap: "wrap" }}>
+          <button
+            disabled={Boolean(updateBusy)}
+            onClick={() => void checkUpdate()}
+          >
+            {updateBusy === "check"
+              ? t("正在检查…", "Checking…")
+              : t("检查更新", "Check for updates")}
+          </button>
+          {info?.updateAvailable && !info?.restartRequired && (
+            <button
+              className="primary"
+              disabled={Boolean(updateBusy) || info?.installMode === "source"}
+              onClick={() => void applyUpdate()}
+            >
+              {updateBusy === "apply"
+                ? t("正在下载并安装…", "Downloading & installing…")
+                : t(`安装 v${info.latestVersion}`, `Install v${info.latestVersion}`)}
+            </button>
+          )}
+          {info?.releaseUrl && (
+            <a href={info.releaseUrl} target="_blank" rel="noreferrer">
+              {t("查看 GitHub Release", "View GitHub Release")}
+            </a>
+          )}
+        </div>
+        {info?.updateAvailable && info?.installMode === "source" && (
+          <p className="muted" style={{ marginTop: 8 }}>
+            {t(
+              "当前为 Git 源码运行模式，不直接覆盖源码目录；请拉取最新标签或从 GitHub Release 安装发行包。",
+              "Running from a Git source checkout; auto-install is disabled. Pull the release tag or install the GitHub Release archive.",
+            )}
+          </p>
+        )}
+        {(updateMessage || info?.lastError) && (
+          <p className="muted" style={{ marginTop: 8 }}>
+            {updateMessage || info?.lastError}
+          </p>
+        )}
         <p className="muted">
           {t(
             "文件锁约束遵守协议的执行端，无法阻止编辑器或其他进程修改文件。",

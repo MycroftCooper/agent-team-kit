@@ -2,7 +2,7 @@
 
 A local web workspace for coordinating external agents across multiple projects.
 
-**2.0.0-alpha.1** is a breaking rebuild: no legacy task import, software plugins,
+**0.0.1** is the initial GitHub Release of the standalone web workspace rebuild: no legacy task import, software plugins,
 model adapters, model gateway, automatic agent launch, or worktrees.
 
 An optional external client, `atk-agent run --task <bugId> --check '<command>'`,
@@ -47,13 +47,16 @@ An optional, Git-ignored `atk.local.json` beside the batch files can set
 Explicit `--data` and `ATK_DATA_DIR` take precedence; without configuration the
 standard application data directory is used.
 
-After a release has been published to npm (a GitHub source push does not publish it):
+Download a release archive from GitHub Releases (or install from npm when published):
 
 ```sh
-npm install -g agent-team-kit@next
+# Install from GitHub Release tarball
+npm install -g ./agent-team-kit-0.0.1.tgz
 atk start
 # Open the private browserUrl printed by start (keep its access fragment private)
 atk status
+atk check-update
+atk update
 atk stop
 ```
 
@@ -65,7 +68,7 @@ node scripts/build-web.mjs
 node apps/launcher/cli.mjs start
 # To build/install your own independent release:
 npm pack
-npm install -g ./agent-team-kit-2.0.0-alpha.1.tgz
+npm install -g ./agent-team-kit-0.0.1.tgz
 ```
 
 The new database defaults to `%LOCALAPPDATA%/AgentTeamKit/Next` on Windows.
